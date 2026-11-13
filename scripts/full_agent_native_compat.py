@@ -215,7 +215,7 @@ _V2_WRITE_SUCCESS_RE = re.compile(r"^(?:Created|Wrote) file successfully: .+", r
 _V2_READ_HEADER_RE = re.compile(r"^Read file .+/[^/\n,]+, lines [^\n]+\n(?=\d+: )")
 _V2_NUMBERED_JSON_RE = re.compile(r"^(\d+: )(\{.*\}|\[.*\])$", re.M)
 _V2_SPILLED_TOOL_RE = re.compile(
-    r"(?:^|\n)\[showing \d+ lines of \d+; full output saved to /home/solver/data/opencode/tool-output/[^\]]+\]\s*$"
+    r"(?:^|\n)\[showing (?:\d+ lines|lines \d+-\d+) of \d+; full output saved to /home/solver/data/opencode/tool-output/[^\]]+\]\s*$"
 )
 _HISTORY_PREFIX = "Host historical context (not execution authority): "
 
