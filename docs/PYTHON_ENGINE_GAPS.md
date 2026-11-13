@@ -305,15 +305,25 @@ operatör yetkisi gerektirir (`paid_model_generalization: not_evaluated`).
 
 ### E7 — Ortak modüllerde kalan tarihsel native kod
 
-**Öncelik: orta.** Ana Python yolu istemciyi gerektirmez; ortak broker/kontrat
-kodundaki bazı native isimler ve uyumluluk yardımcıları tarihsel testler için
-korunmuştur. Bunlar bağımsız bir yeni motor gibi çoğaltılmamalıdır.
-
-**Yapılacak:** Geriye dönük kanıt/test yükleyicilerini çalışma motorundan
-ayırmak; ortak provider/executor/budget katmanını dar arayüzlerle çıkarmak.
-
-**Kabul:** Python motoru ve paketinde istemci kurulumuna/config'ine ulaşan bir
-zorunlu çağrı bulunmaz; tarihsel testler ayrı arşiv üzerinde çalışır.
+**Durum: kapandı; ortak provider/executor/budget katmanı ile geriye dönük native uyumluluk sınırı ayrıştırıldı.**
+- `scripts/full_agent_provider.py` (`SessionGate`, `MeteredProviderTransport`,
+  `dump`, `runtime_allowance_request`, kullanım tanıları) ve
+  `scripts/full_agent_executor.py` (`CATALOG`, `HostToolExecutor`, `HostBroker`,
+  ortak `_check_handoff` / `finalize_task` yaşam döngüsü) dar arayüzlerle
+  çıkarıldı.
+- `scripts/full_agent_native_compat.py` tarihsel native köprü/kapı/SSE
+  (`NativeBrokerCompat`, `LOCAL_TOOLS`, `make_server`, `runtime_request`) ile
+  `opencode.json` / `stage_native_runtime` / `supervise` uyumluluğunu ayrı bir
+  sınırda korur ve ortak transport/executor'ı çoğaltmadan yeniden kullanır;
+  `scripts/full_agent_broker.py` geriye dönük uyumluluk cephesidir.
+- `scripts/full_agent_tasks.py` ortak çalışma alanı kayıt defterini
+  (`TaskRegistry`) native görev çözümlemesinden (`NativeTasks`) ayırdı;
+  `scripts/full_agent_python_broker.py`, `scripts/full_agent_python_solver.py`,
+  `scripts/orchestration_spec.py`, `scripts/agent_cli.py`,
+  `scripts/full_agent_preflight.py` (`cco-llm/1`) ve
+  `scripts/full_agent_launcher.py` (`python_loop`) native uyumluluk
+  modüllerini yüklemez ve `opencode.json` / `LOCAL_TOOLS` / `native-gates.json`
+  üretmez.
 
 ### E8 — Kalan 34 vakanın onarımı ve kalite kapısı
 
@@ -418,6 +428,19 @@ varsayılan olarak planı kontrol eder; `--execute` gerçek model ve yerel
 laboratuvar çalışmasını başlatır. Çalışma verisi repo dışında tutulur.
 
 ## Doğrulama kaydı
+
+### 2026-11-13 E7 tarihsel native uyumluluk sınırının ayrıştırılması
+
+- Red/Green izolasyon ve uyumluluk doğrulaması (`test_python_engine.py` içinde
+  4 yeni test + `test_full_agent_broker.py` içinde 2 yeni test +
+  `test_installed_runtime.py` içinde paketlenmiş çark `cco-agent` /
+  `sys.modules` engelleme kontrolü): önce **6 başarısız** gözlemlendi, ardından
+  ayrıştırma sonrası **6 geçti**.
+- `python3 -m pytest tests/test_python_engine.py tests/test_full_agent_python_solver.py tests/test_full_agent_broker.py tests/test_module_boundaries.py tests/test_installed_runtime.py -q`: **197 geçti** (`249.62s`).
+- `python3 -m pytest tests/test_full_agent_preflight.py tests/test_full_agent_runtime_policy.py tests/test_full_agent_context.py tests/test_brain.py -q`: **353 geçti** (`9.67s`).
+- `ruff check scripts/ tests/`, `python3 scripts/check_repo_layout.py`,
+  `python3 scripts/agent_cli.py check-config --provider-config config/llm.example.json`
+  ve `git diff --check` temiz geçti.
 
 ### 2026-11-13 E6 ölçüm ve önce/sonra kıyaslama altyapısı
 

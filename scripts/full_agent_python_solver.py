@@ -20,7 +20,7 @@ from jsonschema.validators import validator_for
 from referencing import Registry
 from referencing.exceptions import Unresolvable
 
-from full_agent_broker import dump
+from full_agent_provider import dump
 from authz_matrix import identity_fact, same_principal
 from full_agent_budget import BudgetError, compact_tools, provider_json
 from full_agent_python_broker import (CRAWL_TOOL, COVERAGE_TOOL, PHASE_CALL_LIMITS, READ_TOOL, REPORT_CARRYOVER_STEP,

@@ -18,7 +18,7 @@ import full_agent_holdout as holdout
 import full_agent_launcher as launcher
 import full_agent_preflight as preflight
 import llm_config
-from full_agent_broker import dump
+from full_agent_provider import dump
 from runtime_paths import runtime_root
 
 ROOT = runtime_root()

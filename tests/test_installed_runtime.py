@@ -37,6 +37,8 @@ def test_installed_wheel_exposes_all_servers_and_cli(tmp_path):
         packaged = set(archive.namelist())
     for profile in (ROOT / "config" / "program-profiles").glob("*.json"):
         assert any(name.endswith("/config/program-profiles/" + profile.name) for name in packaged), profile.name
+    for mod_name in ("full_agent_provider.py", "full_agent_executor.py", "full_agent_native_compat.py"):
+        assert any(name.endswith("scripts/" + mod_name) for name in packaged), mod_name
     venv = tmp_path / "venv"
     _run([sys.executable, "-m", "venv", "--system-site-packages", str(venv)], cwd=tmp_path, env=env)
     py, bindir = venv / "bin" / "python", venv / "bin"
@@ -251,3 +253,39 @@ print(json.dumps(results))
     assert data["mcp-hunter"]["native_wire_count"]
     assert all(data["mcp-kali-tools"][flag] for flag in ("HAS_SURFACE", "HAS_JS_CORE", "HAS_POSTEX"))
     assert all(data["mcp-browser"][flag] for flag in ("HAS_FALLBACK", "HAS_SESSION", "HAS_RUNTIME_HOOKS"))
+    llm_cfg = tmp_path / "llm.json"
+    llm_cfg.write_text(json.dumps({
+        "schema": "cco-llm/1",
+        "model": "owned/model",
+        "providers": {"owned": {"base_url": "https://provider.invalid/v1", "models": ["model"], "api_key_env": "LOCAL_TEST_KEY"}},
+    }))
+    plan_work = tmp_path / "plan-work"
+    plan_work.mkdir()
+    checked = json.loads(_run([str(bindir / "cco-agent"), "check-config", "--provider-config", str(llm_cfg)], cwd=tmp_path, env=env))
+    assert checked["status"] == "valid" and checked["model"] == "owned/model"
+    planned = json.loads(_run([str(bindir / "cco-agent"), "plan", "--target", "https://owned.test", "--workdir", str(plan_work)], cwd=tmp_path, env=env))
+    assert [row["id"] for row in planned] == ["recon-1", "enum-2", "access-3", "report-4"]
+    isolated_py = tmp_path / "check_python_isolation.py"
+    isolated_py.write_text(
+        f"""
+from pathlib import Path
+import sys
+import scripts
+sys.path.insert(0, str(Path(scripts.__file__).resolve().parent))
+for blocked in ('full_agent_native_compat', 'scripts.full_agent_native_compat', 'full_agent_broker', 'scripts.full_agent_broker'):
+    sys.modules[blocked] = None
+import agent_cli
+import full_agent_provider
+import full_agent_executor
+import full_agent_python_broker
+import full_agent_python_solver
+import full_agent_preflight
+import full_agent_launcher
+import orchestration_spec
+assert agent_cli.main(['check-config', '--provider-config', {str(llm_cfg)!r}]) == 0
+assert agent_cli.main(['plan', '--target', 'https://owned.test', '--workdir', {str(plan_work)!r}]) == 0
+for forbidden in ('full_agent_native_compat', 'scripts.full_agent_native_compat', 'full_agent_broker', 'scripts.full_agent_broker'):
+    assert sys.modules.get(forbidden) is None, forbidden
+"""
+    )
+    _run([str(py), str(isolated_py)], cwd=tmp_path, env=env)

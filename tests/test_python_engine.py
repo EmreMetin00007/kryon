@@ -177,3 +177,186 @@ def test_full_tool_catalog_fits_byte_fallback_without_premature_closure(python_b
     assert {'hunter_run_web_loop', 'validator_session_vault_check', SUMMARY_TOOL} <= sent
     assert spec.id not in python_broker.runtime_policy.finalizing
     assert python_broker.budget.used['tokens'] == 200 and python_broker.budget.used['http'] == 0
+
+
+def test_python_engine_imports_without_native_compat_modules(tmp_path):
+    """Python engine modules and orchestration catalog must not pull native compat."""
+    import os
+    import subprocess
+    import sys
+
+    scripts_dir = str(Path(__file__).resolve().parents[1] / "scripts")
+    env = dict(os.environ, PYTHONDONTWRITEBYTECODE="1")
+    env.pop("PYTHONPATH", None)
+    probe = """
+import importlib, sys
+
+BLOCKED = {
+    "full_agent_broker",
+    "full_agent_native_compat",
+    "full_agent_context",
+    "full_agent_history",
+    "full_agent_bridge",
+}
+
+class Blocker:
+    def find_spec(self, fullname, path=None, target=None):
+        root = fullname.split(".", 1)[0]
+        if root in BLOCKED:
+            raise ImportError(f"blocked native module: {fullname}")
+        return None
+
+sys.meta_path.insert(0, Blocker())
+sys.path.insert(0, sys.argv[1])
+
+for name in (
+    "agent_cli",
+    "full_agent_provider",
+    "full_agent_executor",
+    "full_agent_python_broker",
+    "full_agent_python_solver",
+    "full_agent_tasks",
+    "full_agent_preflight",
+    "full_agent_launcher",
+    "orchestration_spec",
+):
+    importlib.import_module(name)
+
+from orchestration_spec import broker_tools
+assert "kali-tools_curl_request" in broker_tools()
+from full_agent_tasks import TaskRegistry
+assert not hasattr(TaskRegistry, "resolve")
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", probe, scripts_dir],
+        cwd=tmp_path,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stderr[-2000:]
+
+
+def test_python_broker_omits_native_mediator_and_local_tool_surfaces(python_broker):
+    import inspect
+    import full_agent_python_broker as python_broker_mod
+
+    for native_attr in (
+        "gate",
+        "dispatch",
+        "record_task_completion",
+        "gates",
+        "ready",
+        "nonce",
+        "completed_tasks",
+        "task_calls",
+    ):
+        assert not hasattr(python_broker, native_attr), f"unexpected native attribute: {native_attr}"
+    assert "native_context" not in inspect.signature(python_broker.completion).parameters
+    assert not hasattr(python_broker_mod, "LOCAL_TOOLS")
+
+
+def test_python_snapshot_rejects_opencode_json_and_excludes_new_host_modules(
+    config, baseline, tmp_path, monkeypatch
+):
+    monkeypatch.setattr(preflight, "browser_preflight", lambda: [{"name": "local_fixture", "ok": True}])
+    for name in (
+        "scripts/full_agent_provider.py",
+        "scripts/full_agent_executor.py",
+        "scripts/full_agent_native_compat.py",
+    ):
+        assert not preflight.runtime_file(Path(name))
+    output = tmp_path.parent / (tmp_path.name + "-preflights-e7")
+    assert agent_cli.main([
+        "preflight", "--baseline", str(baseline), "--provider-config", str(config),
+        "--token-budget", "150000", "--output-dir", str(output),
+    ]) == 0
+    preflight_path = next(output.glob("*/preflight.json"))
+    prepared = launcher.prepared_run(preflight_path)
+    inventory = prepared["manifest"]["host_runtime"]
+    assert "scripts/full_agent_provider.py" in inventory
+    assert "scripts/full_agent_executor.py" in inventory
+    assert "scripts/full_agent_native_compat.py" in inventory
+
+    # Adding opencode.json into a python_loop snapshot must be rejected even with matching index hash.
+    runtime = prepared["runtime"]
+    index_path = Path(prepared["manifest"]["runtime_snapshot"]["index"])
+    index_path.chmod(0o644)
+    runtime.chmod(0o755)
+    (runtime / "opencode.json").write_text("{}\n")
+    index = json.loads(index_path.read_text())
+    index["files"].append({"path": "opencode.json", "sha256": preflight.sha256(runtime / "opencode.json")})
+    index_path.write_text(json.dumps(index, indent=2) + "\n")
+    manifest = json.loads(preflight_path.read_text())
+    manifest["runtime_snapshot"]["index_sha256"] = preflight.sha256(index_path)
+    manifest["runtime_snapshot"]["files"] = len(index["files"])
+    preflight_path.write_text(json.dumps(manifest, indent=2) + "\n")
+    with pytest.raises(ValueError, match="invalid runtime inventory"):
+        launcher.prepared_run(preflight_path)
+
+
+def test_python_launch_seed_omits_local_tools_and_native_gate_artifacts(
+    config, baseline, tmp_path, monkeypatch
+):
+    import campaign_worker
+    import full_agent_python_solver as solver_mod
+    from full_agent_python_broker import PythonBroker
+    import lab.blind_lab as blind_lab
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(preflight, "browser_preflight", lambda: [{"name": "local_fixture", "ok": True}])
+    output = tmp_path.parent / (tmp_path.name + "-preflight-launch")
+    assert agent_cli.main([
+        "preflight", "--baseline", str(baseline), "--provider-config", str(config),
+        "--token-budget", "150000", "--output-dir", str(output),
+    ]) == 0
+    prepared = launcher.prepared_run(next(output.glob("*/preflight.json")))
+
+    class FakeLab:
+        server_port = 18765
+        blind_state = {"requests": 0, "accounts": {}, "db": None, "fixtures": None}
+        def serve_forever(self):
+            pass
+        def shutdown(self):
+            pass
+        def server_close(self):
+            pass
+
+    class FakeExecutor:
+        timeout_seconds = 900
+        def __call__(self, _task):
+            return {"actual_request_cost": 0, "result": {"output": "{}"}}
+        def terminate(self):
+            pass
+
+    seen = {}
+    class FakeSolver:
+        def __init__(self, broker, **_kwargs):
+            seen["broker"] = broker
+            seen["tasks_type"] = type(broker.tasks).__name__
+        def run(self):
+            return {"status": "python_finished_verified", "closure_verified": True}
+
+    monkeypatch.setattr(blind_lab, "serve", lambda *_a, **_kw: FakeLab())
+    monkeypatch.setattr(campaign_worker, "LocalMCPExecutor", lambda _home: FakeExecutor())
+    monkeypatch.setattr(PythonBroker, "load_catalog", lambda self, _home: self.catalog.update({"kali-tools": []}))
+    monkeypatch.setattr(solver_mod, "PythonSolver", FakeSolver)
+
+    runs = tmp_path.parent / (tmp_path.name + "-runs")
+    runs.mkdir()
+    provider = llm_config.provider_settings(config, prepared["contract"]["models"])
+    seed = prepared["contract"]["baseline"]["seeds"][0]
+    path, manifest = launcher.launch_seed(
+        prepared, seed=seed, output=runs, provider=provider, api_key="host-only-sentinel"
+    )
+    assert manifest["status"] == "python_finished_verified"
+    assert "native_session_ids" not in manifest
+    assert "native_delegations" not in manifest
+    assert seen["tasks_type"] == "TaskRegistry"
+    private = path.parent / "private"
+    assert not (private / "native-gates.json").exists()
+    perms = json.loads((private / "state/permissions.json").read_text())
+    for local_tool in ("read", "glob", "grep", "list", "skill", "todowrite", "task", "bash", "write", "edit", "apply_patch"):
+        assert local_tool not in perms["tools"]
+    assert "kali-tools_curl_request" in perms["tools"]

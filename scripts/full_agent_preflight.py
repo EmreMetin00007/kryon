@@ -61,20 +61,8 @@ def model_selection(config, model="", worker_model=""):
     data = json.loads(Path(config).read_text())
     if data.get("schema") == llm_config.SCHEMA:
         return llm_config.model_selection(config, model, worker_model)
-    selected = model or data.get("model") or ""
-    worker = worker_model or selected
-    for value in (selected, worker):
-        if not isinstance(value, str) or "/" not in value or any(c.isspace() for c in value):
-            raise ValueError("model must be a provider/model identifier")
-        provider, name = value.split("/", 1)
-        if not name or provider not in data.get("provider", {}):
-            raise ValueError("selected model provider is not configured")
-        models = data["provider"][provider].get("models", {})
-        if models and name not in models:
-            raise ValueError("selected model is not present in the provider configuration")
-    return {"planner": selected, "worker": worker,
-            "worker_selection": "explicit" if worker_model else "same_as_planner",
-            "credentials": "provider runtime only; never stored in benchmark artifacts"}
+    from full_agent_native_compat import native_model_selection
+    return native_model_selection(data, model, worker_model)
 
 
 def runtime_file(path):
@@ -104,77 +92,15 @@ def prepare_runtime(directory, models, provider_config=None):
     Scope starts empty. The snapshot is not a runnable benchmark until the
     operator launcher supplies scoped sessions and metered host interfaces.
     """
-    directory = Path(directory)
-    runtime = directory / "runtime"
-    runtime.mkdir()
-    legacy = ROOT / "legacy/opencode"
-    client_config = ROOT / "opencode.json"
-    if not client_config.is_file():
-        client_config = legacy / "opencode.json"
-    source = json.loads(Path(provider_config or client_config).read_text())
-    files = []
-    candidates = [ROOT / name for name in ("pyproject.toml", "AGENTS.md", "CLAUDE.md")]
-    for name in ("scripts", "mcp-servers", "config", "rules", ".claude/skills", ".opencode/agents", ".opencode/plugins"):
-        candidates.extend((ROOT / name).rglob("*"))
-    for name in ("agents", "plugins"):
-        candidates.extend((legacy / "client" / name).rglob("*"))
-    for path in sorted(candidates):
-        relative = path.relative_to(ROOT)
-        if relative.parts[:3] == ("legacy", "opencode", "client"):
-            relative = Path(".opencode", *relative.parts[3:])
-        if path.is_symlink() or not path.is_file() or not runtime_file(relative):
-            continue
-        if any(parent.is_symlink() for parent in path.parents if parent != ROOT and ROOT in parent.parents):
-            raise ValueError("runtime source contains a symlinked parent")
-        target = runtime / relative
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_bytes(path.read_bytes())
-        files.append({"path": relative.as_posix(), "source_sha256": sha256(path), "sha256": sha256(target)})
-    providers = {}
-    for value in (models["planner"], models["worker"]):
-        provider, model = value.split("/", 1)
-        original = source["provider"][provider]
-        # Retain model limits/pricing, but never a configured credential value.
-        if provider not in providers:
-            providers[provider] = {key: original[key] for key in ("npm", "name") if key in original}
-            options = original.get("options", {})
-            providers[provider]["options"] = {"apiKey": "{env:CCO_BENCHMARK_API_KEY}"}
-            if "baseURL" in options:
-                providers[provider]["options"]["baseURL"] = options["baseURL"]
-            providers[provider]["models"] = {}
-        if model in original.get("models", {}):
-            providers[provider]["models"][model] = original["models"][model]
-    generated = {
-        "$schema": "https://opencode.ai/config.json", "model": models["planner"], "default_agent": "kalibounty",
-        "provider": providers, "agent": {"kalibounty": {"model": models["planner"]},
-                                          "worker": {"model": models["worker"]}},
-        "instructions": ["CLAUDE.md", "rules/scope-guard.md", "rules/safety-rules.md"],
-        "plugin": ["./.opencode/plugins/security-gate.js"],
-        "permission": {"*": "deny", "read": "allow", "skill": "allow", "todowrite": "allow",
-                       "task": {"*": "deny", "worker": "allow"}},
-        # Host-custodied, metered MCP transport is a separate implementation
-        # prerequisite. Direct unmetered server starts are deliberately absent.
-        "mcp": {},
-    }
-    generated_files = {
-        "opencode.json": generated,
-        ".codex/scope.json": {"in_scope": [], "allow_loopback": False, "allow_osint": False, "allow_public_labs": False},
-        ".codex/program-policy.json": {"denied_tools": ["*"]},
-    }
-    for name, data in generated_files.items():
-        path = runtime / name
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(data, indent=2) + "\n")
-        files.append({"path": name, "sha256": sha256(path), "generated": True})
-    index = {"schema": "full-agent-runtime-snapshot/1", "runnable": False,
-             "models": models, "files": sorted(files, key=lambda item: item["path"])}
-    index_path = directory / "runtime-index.json"
-    index_path.write_text(json.dumps(index, indent=2) + "\n")
-    for path in runtime.rglob("*"):
-        path.chmod(0o555 if path.is_dir() else 0o444)
-    runtime.chmod(0o555)
-    return {"path": str(runtime), "index": str(index_path), "index_sha256": sha256(index_path),
-            "files": len(files), "runnable": False}
+    from full_agent_native_compat import prepare_native_runtime
+    return prepare_native_runtime(
+        directory,
+        models,
+        provider_config,
+        root=ROOT,
+        runtime_file=runtime_file,
+        sha256=sha256,
+    )
 
 
 def prepare_python_runtime(directory, models, provider_config):
