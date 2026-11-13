@@ -8,7 +8,7 @@ belgenin yazıldığı dilime aittir; bugün çalışan kodun tamamını temsil 
 
 | Konu | Belge |
 | --- | --- |
-| Başlatma ve OpenCode uyarlaması | [OPENCODE.md](../OPENCODE.md) |
+| Python motoru durumu ve eksikler (E1–E9) | [PYTHON_ENGINE_GAPS.md](PYTHON_ENGINE_GAPS.md) |
 | Bileşenler ve veri sınırları | [Mimari](architecture.md) |
 | Operasyon, güvenlik ve kampanyalar | [Operasyon](operations.md) |
 | MCP araç kataloğu | [MCP referansı](mcp-reference.md) |
@@ -42,8 +42,8 @@ Bu belgelerin yolları korunur; operasyon ve MCP rehberlerinden bağlantı alır
 ## Tasarım, inceleme ve açık iş kayıtları
 
 Bu kayıtlar otomatik olarak tamamlanmış sayılmaz. Açık maddelerin bugünkü kod ve
-testlerle karşılaştırılması gerekir; devam eden handoff dosyaları
-`.agents/plans/` altında korunur.
+testlerle karşılaştırılması gerekir. Güncel Python motoru durumu için
+[PYTHON_ENGINE_GAPS.md](PYTHON_ENGINE_GAPS.md) esas alınır.
 
 - [Mimari derinleştirme](architecture-deepening.md)
 - [Mimari ödünleşim incelemesi](architecture-tradeoff-review-2026-11-02.md)
@@ -59,15 +59,11 @@ testlerle karşılaştırılması gerekir; devam eden handoff dosyaları
 
 - [Temizlik öncesi Claude Code README](history/claude-code-readme.md)
 - [Temizlik öncesi mimari anlatımı](history/architecture-before-cleanup.md)
-- `system_prompt.md`, `memory/PRD.md` ve `yapılacaklar.txt`: referans/backlog;
-  güncel başlatma talimatı olarak kullanılmaz.
-- `install-cco.sh`, `scripts/cco-profile.sh` ve `scripts/token-estimate.py`:
-  Claude Code kurulum/profil yolu; mevcut OpenCode başlatıcısının yerine geçmez.
-- `.opencode/agents/archive/`: emekli brain tanımları. Agent frontmatter ve
-  etkin runtime keşfi değerlendirilmeden dosyalar kaldırılmadı.
+- `scripts/cco-profile.sh` ve `scripts/token-estimate.py`: eski Claude Code
+  profil yardımcıları; güncel `cco-agent` Python başlatıcısının yerine geçmez.
 - `rules/brain-routing.md`: emekli agent adları içeren tarihsel yönlendirme;
-  aktif kaynaklar `AGENTS.md`, `opencode.json` ve güncel agent dosyalarıdır.
+  güncel çalışma kuralları `AGENTS.md` içindedir.
 
-`CLAUDE.md`, `.claude/skills/`, `skills` symlink'i ve uyumluluk CLI girişleri
-mevcut yapı tarafından kullanılır. Tarihsel belgeler ile bu çalışan kaynaklar
-aynı temizlik kararı altında değerlendirilmez.
+`CLAUDE.md` ve `.claude/skills/` (`skills` symlink'i ile) mevcut yapı tarafından
+metodoloji/skill kataloğu olarak kullanılır. Tarihsel belgeler ile çalışan
+kaynaklar karıştırılmamalıdır.

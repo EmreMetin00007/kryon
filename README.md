@@ -1,38 +1,11 @@
-> **Güncel çalışma motoru: Python + LLM.** Başlangıç:
-> `python3 scripts/agent_cli.py --help` veya `./scripts/cco.sh --help`.
-> Sağlayıcı şeması: `config/llm.example.json`.
-> [Güncel mimari ve eksikler](docs/PYTHON_ENGINE_GAPS.md).
+# HackAgent (`kryon`) — Python + LLM Güvenlik Motoru
 
-# CCO — HackAgent on OpenCode
+Politika, kapsam, bütçe ve imzalı kanıt kontrolleriyle yönetilen bağımsız Python + OpenAI uyumlu LLM güvenlik operatörü. Model yalnızca veri üretir; aşama geçişlerini, araç izinlerini, wire bütçesini, imzalı doğrulamayı ve kapanış kararlarını Python host katmanı kontrol eder.
 
-OpenCode üzerinden çalışan, kapsam ve kanıt kontrolleriyle yönetilen güvenlik
-operatörü. `kalibounty` planlama ve değerlendirmeyi, `worker` yürütme görevlerini
-üstlenir. MCP sunucuları araçları; Python katmanı görev sözleşmelerini, kampanya
-kuyruğunu, güvenlik politikasını, oturumları ve doğrulanabilir kanıtları sağlar.
+> Güncel yetenek sınırları ve tamamlanan/açık aşamalar (E1–E9): [PYTHON_ENGINE_GAPS.md](docs/PYTHON_ENGINE_GAPS.md).
+> Dokümantasyon dizini: [docs/README.md](docs/README.md).
 
-Başlangıç noktası bu belge. [Dokümantasyon dizini](docs/README.md), güncel
-rehberleri, özellik notlarını ve tarihsel incelemeleri ayrı gösterir.
-
-## Başlatma
-
-Mevcut kurulumda proje kökünden:
-
-```bash
-./scripts/opencode-cco.sh
-```
-
-İlk OpenCode oturumunda `/connect` ile sağlayıcıyı yapılandırın. Sağlayıcı
-kimlik bilgileri OpenCode credential store'da tutulur; MCP'ye özel anahtarlar
-başlatma ortamından alınır. Runtime ve model seçimi OpenCode'a aittir.
-
-OpenCode başlatma ve uyarlama ayrıntıları: [OPENCODE.md](OPENCODE.md).
-`install-cco.sh` Claude Code/global kurulum yoludur; bu clone'un ana
-başlatıcısı değildir. Eski kılavuz [tarihsel arşivde](docs/history/claude-code-readme.md)
-korunur.
-
-## Python ortamı
-
-Python 3.12 veya üzeri ve OpenCode CLI gerekir. Yeni bir Python ortamı için:
+## Kurulum (Python 3.12+)
 
 ```bash
 python3 -m venv .venv
@@ -41,55 +14,62 @@ python3 -m pip install --require-hashes -r requirements.lock
 python3 -m pip install --no-deps --no-build-isolation -e .
 ```
 
-Playwright/Chromium, Kali araçları ve bazı MCP sunucularının ek bağımlılıkları
-kullanılacak özelliklere göre kurulmalıdır. Sunucuların kendi `requirements.txt`
-dosyaları ve [MCP referansı](docs/mcp-reference.md) bu sınırları gösterir.
-`requirements.lock` mevcut Python bağımlılık kilididir.
+Playwright/Chromium, Kali araçları ve opsiyonel MCP sunucu bağımlılıkları kullanılacak özelliklere göre ayrıca kurulur (`requirements.lock` ana Python bağımlılık kilididir).
 
-## Göreve uygun profil
+## Yapılandırma
+
+1. Örnek sağlayıcı yapılandırmasını (`cco-llm/1`) kopyalayıp kendi endpoint/model adınızla `config/llm.json` olarak uyarlayın (Git tarafından yok sayılır) veya `CCO_LLM_CONFIG` ile yol verin:
 
 ```bash
-./scripts/opencode-cco.sh profile list
-./scripts/opencode-cco.sh profile apply web
-./scripts/opencode-optimized.sh --task "web application security test"
-python3 scripts/tool_counts.py
+cp config/llm.example.json config/llm.json
+python3 scripts/agent_cli.py check-config --provider-config config/llm.json
 ```
 
-Profil kaynağı `.opencode/profiles.json`: `min`, `recon`, `web`, `llm`, `ctf`,
-`ad`, `full`. 16 MCP sunucusu tanımlıdır; etkin kayıtlar `opencode.json` ve
-seçilen profile bağlıdır. AD/container/CTF sunucuları ilgili profillerde
-korunur. `tool_counts.py` kaynakta bildirilen araçları sayar; etkin profilde
-yüklenen araç sayısı farklı olabilir. Profil değişiminden sonra yeni oturum açın.
+2. Yapılandırmaya **hiçbir zaman ham API anahtarı yazmayın**; yalnızca anahtarın bulunduğu ortam değişkeni adını (`api_key_env`, örnek: `CCO_LLM_API_KEY`) belirtin. Sağlayıcı URL'si HTTPS veya sahip olunan loopback olmalıdır.
 
-## Çalışma yapısı
+## Temel Kullanım (`cco-agent` / `scripts/agent_cli.py`)
+
+Paket kurulduğunda `cco-agent` girişi, repo içinden doğrudan `./scripts/cco.sh` veya `python3 scripts/agent_cli.py` kullanılabilir:
+
+```bash
+python3 scripts/agent_cli.py --help
+python3 scripts/agent_cli.py check-config --provider-config config/llm.example.json
+
+# Çevrimdışı plan ve operasyon özeti üretir (ağ trafiği oluşturmaz)
+python3 scripts/agent_cli.py plan --target https://example.invalid --workdir ~/cco-work/example
+python3 scripts/agent_cli.py operations --workdir ~/cco-work/example
+
+# Laboratuvar çalışması: preflight + imzalı koşu (yalnız --execute verildiğinde çalışır)
+python3 scripts/agent_cli.py preflight --baseline <baseline-dir> --provider-config config/llm.json --output-dir ~/cco-work/preflight
+python3 scripts/agent_cli.py run --preflight ~/cco-work/preflight/<id>/preflight.json --seed 123456 --execute
+python3 scripts/agent_cli.py run --resume ~/cco-work/runs/<run-dir> --execute
+
+# E6 çok-aileli benchmark sözleşmesi (plan sıfır trafik üretir; canlı uzak sağlayıcı açık onay ister)
+python3 scripts/agent_cli.py benchmark plan --label e6-plan --baseline <baseline-dir> --output-dir ~/cco-work/e6-plan
+```
+
+Diğer alt komutlar: `audit`, `campaign`, `worker`, `security`, `status`.
+
+- `plan` ve `operations` ağ isteği göndermez.
+- `preflight`/`run` bugün dondurulmuş baseline ve sentetik test kimlikleriyle sınırlı laboratuvar akışını yürütür; canlı hedef etkileşimi öncesinde `.codex/scope.json` (veya `CCO_SCOPE_FILE`), `.codex/program-policy.json` ve açık operatör onayı zorunludur.
+
+## Mimari Özeti
 
 | Bileşen | Görevi |
-| --- | --- |
-| `opencode.json`, `.opencode/` | Sağlayıcı/MCP yapılandırması, agent, komut, plugin ve TUI |
-| `AGENTS.md`, `CLAUDE.md`, `.claude/skills/` | Runtime uyarlaması, metodoloji ve 24 skill |
-| `scripts/brain.py`, `orchestration_spec.py` | Deterministik plan, TaskSpec ve kanıt sözleşmesi |
-| Campaign/worker/workflow/chain modülleri | Kalıcı kuyruk, görev yürütme ve taşıma |
-| `policy_engine.py`, `policy_gate_cli.py`, security plugin | Scope, approval, araç/bütçe ve izolasyon kontrolleri |
-| `mcp-servers/`, `cco_*_core/` | MCP API'leri ve bağlı core modülleri |
-| Oturum, kimlik ve ledger modülleri | Oturum devamı, hedef bağları, doğrulanabilir kanıt |
-| `tests/`, CI ve release araçları | Regresyon, paket ve kalite kontrolleri |
+|---|---|
+| `scripts/agent_cli.py`, `./scripts/cco.sh`, `cco-agent` | Tek Python CLI girişi (`plan`, `operations`, `preflight`, `run`, `audit`, `benchmark`, `campaign`, `worker`, `security`, `status`) |
+| `scripts/full_agent_python_solver.py` | Sınırlı model/araç döngüsü (`recon`, `enum`, `access`, `report`) ve atomik imzalı checkpoint/resume |
+| `scripts/full_agent_python_broker.py`, `full_agent_broker.py`, `full_agent_budget.py` | Bağlam projeksiyonu, aşama araç izni, oturum referansları, sağlayıcı/token/HTTP muhasebesi |
+| `scripts/brain.py`, `orchestration_spec.py` | TaskSpec planlama, P5 hipotez gözlem seçimi ve kapanış sözleşmesi |
+| `scripts/policy_engine.py`, `policy_gate_cli.py`, `wire_budget.py` | Scope, onay, secret koruması ve istek bazında egress/bütçe kapıları |
+| `scripts/campaign_runtime.py`, `campaign_worker.py` | Kalıcı SQLite görev kuyruğu ve sınırlı worker yürütmesi |
+| `scripts/full_agent_holdout.py`, `full_agent_e6_benchmark.py` | Bağımsız holdout puanlama ve ≥3-aile önce/sonra benchmark karşılaştırıcısı |
+| `mcp-servers/`, `config/mcp-servers.json`, `config/profiles.json` | Yeniden kullanılabilir keşif, kimlik, hipotez, doğrulama, iş mantığı ve kanıt sunucuları/profilleri |
 
-`CLAUDE.md` ve `.claude/skills` OpenCode tarafından hâlâ kullanılır. `skills`
-bunlara yönelen uyumluluk symlink'idir. `.opencode/tui/` içindeki HUD, server
-plugin dizininden ayrı kalır.
+## Çalışma Verisi ve Scope Sınırları
 
-Ayrıntılar: [mimari](docs/architecture.md), [operasyon](docs/operations.md),
-[MCP kataloğu](docs/mcp-reference.md).
-
-## Kod ve çalışma verisi
-
-Kod bu repoda kalır. Engagement çıktıları `CCO_WORKDIR` altında tutulur
-(varsayılan `~/cco-work`). MCP state/vault kökü `CCO_HOME`'dur; mevcut
-başlatıcıların varsayılanı repo içindeki ignore edilmiş `.cco/` dizinidir.
-Bu iki kök aynı görevde değildir ve mevcut state sıradan dosya temizliğiyle
-taşınmaz.
-
-Her program için ayrı state/çalışma alanı kullanan giriş:
+- Kod repoda kalır; engagement ve koşu çıktıları `CCO_WORKDIR` (varsayılan `~/cco-work`), host imza/ledger/vault durumu `CCO_HOME` altında tutulur. Repoya çalışma çıktısı bırakılmaz.
+- Program bazlı çalışma alanı hazırlığı için:
 
 ```bash
 python3 scripts/engagement_workspace.py \
@@ -97,26 +77,13 @@ python3 scripts/engagement_workspace.py \
   --policy .codex/program-policy.json
 ```
 
-Bu komut yalnız izolasyon planını gösterir. Sonuna `--` ile bir komut eklenirse
-ayrı dizinleri oluşturup o ortamda çalıştırır.
-
-Scope ve program policy ayarları `.codex/` altında; yeniden kullanılabilir
-presetler `config/program-profiles/` altında korunur. Canlı hedef etkileşimi
-öncesinde kesin scope ve kullanıcı onayı gerekir. Bulgular raporlanmadan önce
-tekrarlanabilir araç/istek-cevap kanıtıyla doğrulanır.
-
 ## Doğrulama
 
 ```bash
-python3 -m pytest tests -q
-python3 scripts/release_artifacts.py check-lock
+python3 -m pytest tests -q -m 'not integration'
 python3 scripts/check_repo_layout.py
+python3 scripts/release_artifacts.py check-lock
+python3 scripts/agent_cli.py check-config --provider-config config/llm.example.json
+python3 scripts/governance_audit.py --root scripts --format json --fail-on high
+python3 scripts/release_check.py --list
 ```
-
-Lab senaryoları ve benchmark yeniden üretimleri [operasyon rehberinde](docs/operations.md)
-ve [benchmark skor kartında](docs/benchmark-scorecard.md) bulunur.
-
-Düzen kapısı yeni çalışma çıktıları için başarısız olur. Kalıcı arşive taşınması
-beklenen mevcut dosyalar adlarıyla ayrıca gösterilir; başarılı çıkış kodu bu
-verilerin taşındığı anlamına gelmez. Temizlik ilerlemesi ve açık işler
-[repo temizlik planında](docs/repo-cleanup-plan-2026-11-02.md) kayıtlıdır.
