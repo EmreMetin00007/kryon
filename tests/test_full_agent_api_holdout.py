@@ -15,7 +15,7 @@ from full_agent_broker import dump
 from test_full_agent_integration import (
     CLOSURE_INTEGRITY, ROOT, ScriptedProvider, assert_isolated, finished,
     integration_run, kernel_support, acceptance_evidence, message_text, read_json,
-    read_result_json, returned_json, tool_call,
+    read_result_json, returned_json, returned_text, tool_call,
 )
 
 pytestmark = pytest.mark.integration
@@ -111,8 +111,7 @@ class APIProvider(ScriptedProvider):
                         "description": "Respect the existing host rate window before the next bounded comparison batch",
                         "timeout": 70000})]
                 if index:
-                    assert "RATE_WINDOW_ELAPSED" in message_text(next(
-                        row["content"] for row in body["messages"] if row.get("tool_call_id") == pause_id))
+                    assert "RATE_WINDOW_ELAPSED" in returned_text(body, pause_id)
                 if ident not in completed:
                     return [tool_call(ident, "hunter_run_web_loop", {
                         "target": base, "live": True, "crawl": False, "blind_discovery": True,
