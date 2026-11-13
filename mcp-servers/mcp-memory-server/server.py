@@ -934,6 +934,19 @@ class _LazyGraph:
         _ensure_initialized()
         setattr(_graph_backend, name, value)
 
+    def __delattr__(self, name):
+        _ensure_initialized()
+        if name in vars(_graph_backend):
+            delattr(_graph_backend, name)
+            return
+        if name in vars(self):
+            object.__delattr__(self, name)
+            return
+        # Backend sınıfından gelen öznitelikte silinecek override yoktur.
+        if hasattr(_graph_backend, name):
+            return
+        raise AttributeError(name)
+
 
 kg = _LazyGraph()
 _graph_backend = None
