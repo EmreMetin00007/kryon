@@ -131,3 +131,336 @@ def test_malformed_source_map_fails_closed():
     assert out["source_map"]["valid"] is False
     assert out["source_map"]["diagnostics"]
     assert _endpoint(out, "GET", "/api/v2/minified")
+
+
+# ---------------------------------------------------------------------------
+# E9: explicit parser diagnostics + machine-readable coverage gaps.
+# Optional Babel must never silently imply complete JS coverage.
+# ---------------------------------------------------------------------------
+
+def _fake_proc(returncode=0, stdout="", stderr=""):
+    class _Proc:
+        pass
+
+    proc = _Proc()
+    proc.returncode = returncode
+    proc.stdout = stdout
+    proc.stderr = stderr
+    return proc
+
+
+def _gaps(meta_or_out):
+    """Collect coverage gaps from parser meta or top-level map."""
+    gaps = []
+    if isinstance(meta_or_out, dict):
+        gaps.extend(meta_or_out.get("coverage_gaps") or [])
+        parser = meta_or_out.get("parser")
+        if isinstance(parser, dict):
+            gaps.extend(parser.get("coverage_gaps") or [])
+    return gaps
+
+
+def _assert_not_tested_gap(meta_or_out):
+    gaps = _gaps(meta_or_out)
+    assert gaps, f"expected coverage_gaps, got {meta_or_out!r}"
+    assert any(
+        (g.get("status") == "NOT TESTED" or "NOT TESTED" in repr(g))
+        for g in gaps
+        if isinstance(g, dict)
+    ), f"expected NOT TESTED gap, got {gaps!r}"
+    return gaps
+
+
+def _assert_bounded_safe_diagnostics(meta_or_out, forbidden=()):
+    diags = []
+    if isinstance(meta_or_out, dict):
+        diags.extend(meta_or_out.get("diagnostics") or [])
+        parser = meta_or_out.get("parser")
+        if isinstance(parser, dict):
+            diags.extend(parser.get("diagnostics") or [])
+        # parse_javascript meta is itself the parser dict
+        if "requested" in meta_or_out:
+            diags.extend(meta_or_out.get("diagnostics") or [])
+    # also accept result dict diagnostics
+    for diag in diags:
+        assert isinstance(diag, str)
+        assert len(diag) <= 240, f"diagnostic too long: {diag!r}"
+        for secret in forbidden:
+            assert secret not in diag, f"diagnostic echoed secret: {diag!r}"
+    return diags
+
+
+def test_missing_node_emits_coverage_gap_not_tested(monkeypatch):
+    import cco_js_core.parsers as parsers
+
+    monkeypatch.setattr(parsers.shutil, "which", lambda name: None)
+    from cco_js_core.parsers import parse_javascript
+
+    result, meta = parse_javascript("fetch('/api/v2/x')", parser="auto")
+    assert meta["used"] == "static"
+    assert meta["ast_available"] is False
+    assert meta["diagnostics"], "missing Node must emit explicit diagnostic"
+    _assert_not_tested_gap(meta)
+    _assert_not_tested_gap(result)
+    assert result["functions"] is not None  # fallback still returns shape
+    # Propagation through build_client_logic_map, endpoints preserved
+    out = build_client_logic_map("fetch('/api/v2/x')", parser="auto")
+    assert out["parser"]["used"] == "static"
+    assert out["parser"]["diagnostics"]
+    _assert_not_tested_gap(out)
+    assert _endpoint(out, "GET", "/api/v2/x")
+
+
+def test_missing_babel_despite_node_emits_gap_without_echoing_stderr(monkeypatch):
+    import cco_js_core.parsers as parsers
+
+    secret = "SECRET_CANARY_BABEL_STDERR_9f3"
+    monkeypatch.setattr(parsers.shutil, "which", lambda name: "/usr/bin/node")
+    monkeypatch.setattr(
+        parsers.subprocess,
+        "run",
+        lambda *a, **k: _fake_proc(
+            returncode=1,
+            stdout="",
+            stderr=f"Error: Cannot find module '@babel/parser' {secret}",
+        ),
+    )
+    from cco_js_core.parsers import parse_javascript
+
+    result, meta = parse_javascript("fetch('/api/v2/x')", parser="babel")
+    assert meta["used"] == "static"
+    assert meta["ast_available"] is False
+    assert meta["diagnostics"]
+    _assert_not_tested_gap(meta)
+    _assert_bounded_safe_diagnostics(meta, forbidden=(secret,))
+    _assert_bounded_safe_diagnostics(result, forbidden=(secret,))
+    # fallback endpoints still useful via client_logic
+    out = build_client_logic_map("fetch('/api/v2/x')", parser="babel")
+    assert out["parser"]["used"] == "static"
+    _assert_not_tested_gap(out)
+    _assert_bounded_safe_diagnostics(out, forbidden=(secret,))
+    assert _endpoint(out, "GET", "/api/v2/x")
+
+
+def test_babel_execution_failure_emits_gap(monkeypatch):
+    import subprocess as _sp
+
+    import cco_js_core.parsers as parsers
+
+    monkeypatch.setattr(parsers.shutil, "which", lambda name: "/usr/bin/node")
+
+    def _timeout(*a, **k):
+        raise _sp.TimeoutExpired(cmd="node", timeout=8)
+
+    monkeypatch.setattr(parsers.subprocess, "run", _timeout)
+    from cco_js_core.parsers import parse_javascript
+
+    result, meta = parse_javascript("fetch('/api/v2/x')", parser="auto")
+    assert meta["used"] == "static"
+    assert meta["diagnostics"]
+    _assert_not_tested_gap(meta)
+
+    def _oserror(*a, **k):
+        raise OSError("SECRET_CANARY_OSERROR_detail")
+
+    monkeypatch.setattr(parsers.subprocess, "run", _oserror)
+    result, meta = parse_javascript("fetch('/api/v2/x')", parser="auto")
+    assert meta["used"] == "static"
+    assert meta["diagnostics"]
+    _assert_not_tested_gap(meta)
+    _assert_bounded_safe_diagnostics(meta, forbidden=("SECRET_CANARY_OSERROR_detail",))
+    _assert_bounded_safe_diagnostics(result, forbidden=("SECRET_CANARY_OSERROR_detail",))
+
+
+def test_babel_parse_failure_does_not_echo_source_secret(monkeypatch):
+    import cco_js_core.parsers as parsers
+
+    secret = "SECRET_SOURCE_SNIPPET_7a1"
+    monkeypatch.setattr(parsers.shutil, "which", lambda name: "/usr/bin/node")
+    monkeypatch.setattr(
+        parsers.subprocess,
+        "run",
+        lambda *a, **k: _fake_proc(
+            returncode=2,
+            stdout="",
+            stderr=f"SyntaxError: Unexpected token, expected \",\" {secret} fetch('/api/secret')",
+        ),
+    )
+    from cco_js_core.parsers import parse_javascript
+
+    result, meta = parse_javascript(f"fetch('/api/x'); {secret}", parser="babel")
+    assert meta["used"] == "static"
+    assert meta["diagnostics"]
+    _assert_not_tested_gap(meta)
+    _assert_bounded_safe_diagnostics(meta, forbidden=(secret,))
+    _assert_bounded_safe_diagnostics(result, forbidden=(secret,))
+    out = build_client_logic_map("fetch('/api/v2/x')", parser="babel")
+    _assert_bounded_safe_diagnostics(out, forbidden=(secret,))
+
+
+def test_babel_invalid_and_nonobject_json_do_not_crash(monkeypatch):
+    import cco_js_core.parsers as parsers
+
+    monkeypatch.setattr(parsers.shutil, "which", lambda name: "/usr/bin/node")
+    from cco_js_core.parsers import parse_javascript
+
+    for payload in ("not-json", "[]", '"hello"', "123", "null", "true"):
+        monkeypatch.setattr(
+            parsers.subprocess,
+            "run",
+            lambda *a, _p=payload, **k: _fake_proc(returncode=0, stdout=_p, stderr=""),
+        )
+        result, meta = parse_javascript("fetch('/api/v2/x')", parser="babel")
+        assert meta["used"] == "static", payload
+        assert meta["diagnostics"], payload
+        _assert_not_tested_gap(meta)
+        out = build_client_logic_map("fetch('/api/v2/x')", parser="babel")
+        assert _endpoint(out, "GET", "/api/v2/x")
+
+
+def test_babel_nonobject_fields_do_not_crash(monkeypatch):
+    import cco_js_core.parsers as parsers
+
+    monkeypatch.setattr(parsers.shutil, "which", lambda name: "/usr/bin/node")
+    monkeypatch.setattr(
+        parsers.subprocess,
+        "run",
+        lambda *a, **k: _fake_proc(
+            returncode=0,
+            stdout='{"functions": "bad", "calls": 42}',
+            stderr="",
+        ),
+    )
+    from cco_js_core.parsers import parse_javascript
+
+    result, meta = parse_javascript("fetch('/api/v2/x')", parser="babel")
+    # malformed shape must be treated as parser failure, not crash
+    assert meta["used"] == "static"
+    _assert_not_tested_gap(meta)
+    out = build_client_logic_map("fetch('/api/v2/x')", parser="babel")
+    assert _endpoint(out, "GET", "/api/v2/x")
+
+
+def test_deliberate_static_mode_emits_diagnostic_and_gap():
+    from cco_js_core.parsers import get_parser, parse_javascript
+
+    result, meta = parse_javascript(SOURCE, parser="static")
+    assert meta["requested"] == "static"
+    assert meta["used"] == "static"
+    assert meta["ast_available"] is False
+    assert meta["diagnostics"], "deliberate static mode must not be silent"
+    _assert_not_tested_gap(meta)
+    _assert_not_tested_gap(result)
+    _, get_meta = get_parser("static")
+    assert get_meta["diagnostics"], "get_parser(static) must not be silent"
+    _assert_not_tested_gap(get_meta)
+    out = build_client_logic_map(SOURCE, parser="static")
+    assert out["parser"]["diagnostics"]
+    _assert_not_tested_gap(out)
+    assert _endpoint(out, "POST", "/api/v2/checkout/{id}")
+
+
+def test_source_truncation_emits_gap():
+    from cco_js_core.parsers import MAX_SOURCE, parse_javascript
+
+    filler = "// filler line for truncation coverage\n" * 100
+    # Build source just over MAX_SOURCE without a single huge token line.
+    prefix = "fetch('/api/early');\n"
+    repeats = (MAX_SOURCE // len(filler)) + 20
+    source = prefix + (filler * repeats) + "fetch('/api/late');\n"
+    assert len(source) > MAX_SOURCE
+    result, meta = parse_javascript(source, parser="static")
+    assert meta["diagnostics"], "truncation must emit diagnostic"
+    gaps = _assert_not_tested_gap(meta)
+    assert any("truncat" in repr(g).lower() for g in gaps), gaps
+    assert any("truncat" in d.lower() for d in meta["diagnostics"])
+    # client_logic propagation
+    out = build_client_logic_map(source, parser="static")
+    assert out["parser"]["diagnostics"]
+    ogaps = _assert_not_tested_gap(out)
+    assert any("truncat" in repr(g).lower() for g in ogaps), ogaps
+    assert _endpoint(out, "GET", "/api/early")
+
+
+def test_build_map_propagates_gap_and_never_claims_complete_coverage(monkeypatch):
+    import cco_js_core.parsers as parsers
+
+    monkeypatch.setattr(parsers.shutil, "which", lambda name: None)
+    out = build_client_logic_map(SOURCE, parser="auto")
+    assert out["parser"]["used"] == "static"
+    _assert_not_tested_gap(out)
+    # top-level machine-readable gaps must be present (additive field)
+    assert out.get("coverage_gaps"), f"missing top-level coverage_gaps: {list(out)}"
+    assert any(g.get("status") == "NOT TESTED" for g in out["coverage_gaps"] if isinstance(g, dict))
+    # unknowns must keep NOT TESTED visible, never claim complete coverage
+    assert any("NOT TESTED" in str(u) for u in out.get("unknowns", [])), out.get("unknowns")
+    assert not any(
+        "complete js coverage" in str(u).lower() or "full security coverage" in str(u).lower() and "not" not in str(u).lower()
+        for u in out.get("unknowns", [])
+    )
+    assert _endpoint(out, "POST", "/api/v2/checkout/{id}")
+
+
+def test_source_map_originals_propagate_coverage_gap():
+    import json
+
+    source_map = json.dumps({
+        "version": 3,
+        "sources": ["src/orders.ts"],
+        "sourcesContent": [
+            "export const load = (id) => fetch(`/api/v2/orders/${id}`);"
+        ],
+        "names": [],
+        "mappings": "AAAA",
+    })
+    out = build_client_logic_map("fetch('/api/v2/minified')", source_map=source_map, parser="static")
+    assert out["source_map"]["valid"] is True
+    original = out["source_map"]["original_endpoints"]
+    assert any(e["path"] == "/api/v2/orders/{id}" for e in original)
+    # originals are parsed with static fallback: their limited coverage
+    # must be visible as a gap, not silently implied complete
+    gaps = _gaps(out)
+    # also check source_map-scoped gaps if present
+    sm = out.get("source_map") or {}
+    gaps = gaps + list(sm.get("coverage_gaps") or []) + list(sm.get("parser_coverage_gaps") or [])
+    assert gaps, "source-map originals must propagate coverage gaps"
+    assert any(
+        (isinstance(g, dict) and (g.get("status") == "NOT TESTED" or "NOT TESTED" in repr(g)))
+        for g in gaps
+    ), gaps
+
+
+def test_babel_success_does_not_claim_full_security_coverage():
+    import shutil
+
+    if not shutil.which("node"):
+        return
+    out = build_client_logic_map(SOURCE, parser="babel")
+    if out["parser"]["used"] != "babel":
+        return  # babel not resolvable in this env; fallback case covered elsewhere
+    assert out["parser"]["ast_available"] is True
+    # AST success alone must not be reported as complete security coverage
+    blob = repr(out.get("unknowns", [])) + repr(out.get("notes", []))
+    assert "full security coverage" not in blob.lower() or "not" in blob.lower()
+    # no coverage gap should claim TESTED for overall JS/security coverage
+    for gap in _gaps(out):
+        assert gap.get("status") != "TESTED" or "security" not in repr(gap).lower()
+
+
+def test_parser_candidates_use_explicit_env_not_repo_local(monkeypatch, tmp_path):
+    import cco_js_core.parsers as parsers
+
+    monkeypatch.delenv("CCO_JS_PARSER_PATH", raising=False)
+    monkeypatch.delenv("NODE_PATH", raising=False)
+    monkeypatch.chdir(tmp_path)
+    # Even when a cwd-local node_modules exists, it must not be auto-discovered;
+    # only explicit env or standard external dirs may locate the parser.
+    local_nm = tmp_path / "node_modules"
+    local_nm.mkdir()
+    candidates = parsers._node_path_candidates()
+    assert str(local_nm) not in candidates
+    # explicit env is honoured
+    custom = str(tmp_path / "custom_modules")
+    monkeypatch.setenv("CCO_JS_PARSER_PATH", custom)
+    candidates = parsers._node_path_candidates()
+    assert custom in candidates or str(parsers.Path(custom) / "node_modules") in candidates
