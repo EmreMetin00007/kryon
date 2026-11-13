@@ -14,7 +14,13 @@ import re
 from typing import Any
 
 from .compose import MAX_SOURCE, compose_js_routes
-from .parsers import parse_javascript
+from .parsers import (
+    _bounded_diagnostics,
+    _coverage_gap,
+    _dedupe_gaps,
+    _truncation_diagnostic,
+    parse_javascript,
+)
 from .sourcemap import original_position_for, parse_source_map
 
 SCHEMA = "cco-client-logic-map/1"
@@ -380,10 +386,28 @@ def build_client_logic_map(
     parser: str = "auto",
 ) -> dict[str, Any]:
     """Build Client Logic Map v1 from JavaScript source text."""
-    text = (source or "")[:MAX_SOURCE]
-    parsed, parser_meta = parse_javascript(text, parser=parser)
-    functions = parsed.get("functions") or _functions(text)
-    endpoints = _dedupe_endpoints(_extract_calls(text, functions, parsed.get("calls")))
+    original_source = source or ""
+    truncated_input = len(original_source) > MAX_SOURCE
+    text = original_source[:MAX_SOURCE]
+    # Pass the full source so the parser can report truncation itself;
+    # both backends slice to MAX_SOURCE internally for parsing.
+    parsed, parser_meta = parse_javascript(original_source, parser=parser)
+    # Defence in depth: never trust a malformed parser shape here.
+    raw_functions = parsed.get("functions")
+    functions = (
+        raw_functions
+        if isinstance(raw_functions, list) and all(isinstance(f, dict) for f in raw_functions)
+        else _functions(text)
+    )
+    if not functions:
+        functions = _functions(text)
+    raw_calls = parsed.get("calls")
+    calls_arg = (
+        raw_calls
+        if isinstance(raw_calls, list) and all(isinstance(c, dict) for c in raw_calls)
+        else None
+    )
+    endpoints = _dedupe_endpoints(_extract_calls(text, functions, calls_arg))
     logic_functions = _logic_functions(text, functions)
     signing_functions = sorted({
         fn["name"] for fn in logic_functions if "signer" in fn["roles"]
@@ -394,6 +418,7 @@ def build_client_logic_map(
         "literals": [], "templates": [], "headers": [],
     }
     source_map_meta, source_contents = parse_source_map(source_map, text)
+    original_coverage_gaps: list[dict[str, Any]] = []
     if source_map_meta.get("valid") and source_contents:
         original_endpoints: list[dict[str, Any]] = []
         sources = source_map_meta.get("sources") or []
@@ -405,7 +430,24 @@ def build_client_logic_map(
                 endpoint = dict(endpoint)
                 endpoint["original_source"] = sources[idx] if idx < len(sources) else None
                 original_endpoints.append(endpoint)
+            # Propagate the original's limited (static) coverage explicitly.
+            orig_gaps: list[dict[str, Any]] = []
+            orig_gaps.extend(original.get("coverage_gaps") or [])
+            orig_parser = original.get("parser")
+            if isinstance(orig_parser, dict):
+                orig_gaps.extend(orig_parser.get("coverage_gaps") or [])
+            for gap in _dedupe_gaps(orig_gaps):
+                annotated = dict(gap)
+                annotated["original_source"] = (
+                    sources[idx] if idx < len(sources) else None
+                )
+                annotated["source"] = "source_map_original"
+                original_coverage_gaps.append(annotated)
         source_map_meta["original_endpoints"] = original_endpoints
+        if original_coverage_gaps:
+            deduped_original = _dedupe_gaps(original_coverage_gaps)
+            source_map_meta["coverage_gaps"] = deduped_original
+            source_map_meta["parser_coverage_gaps"] = deduped_original
     segments = source_map_meta.get("segments") or []
     sources = source_map_meta.get("sources") or []
     for endpoint in endpoints:
@@ -417,9 +459,55 @@ def build_client_logic_map(
         if pos and "source_index" in pos and pos["source_index"] < len(sources):
             endpoint["original_source"] = sources[pos["source_index"]]
             endpoint["original_line"] = pos.get("source_line")
+    # Aggregate machine-readable coverage gaps (additive, bounded).
+    parser_gaps = _dedupe_gaps(parser_meta.get("coverage_gaps") or [])
+    parser_diagnostics = _bounded_diagnostics(parser_meta.get("diagnostics") or [])
+    if truncated_input and not any(
+        "truncat" in str(g.get("code") or "").lower()
+        or "truncat" in str(g.get("detail") or "").lower()
+        for g in parser_gaps
+    ):
+        trunc_diag = _truncation_diagnostic()
+        if trunc_diag not in parser_diagnostics:
+            parser_diagnostics = _bounded_diagnostics(parser_diagnostics + [trunc_diag])
+        parser_gaps = _dedupe_gaps(parser_gaps + [_coverage_gap(
+            "source_truncated", trunc_diag,
+            str(parser_meta.get("used") or "static"), truncated=True,
+        )])
+    # Keep parser meta consistent with the aggregated view.
+    parser_meta = dict(parser_meta)
+    parser_meta["diagnostics"] = parser_diagnostics
+    parser_meta["coverage_gaps"] = parser_gaps
+    if parser_gaps:
+        parser_meta["coverage_status"] = "NOT TESTED"
+    parser_meta.setdefault("coverage_status", "ast_parsed")
+    parser_meta["truncated"] = bool(
+        parser_meta.get("truncated") or truncated_input
+    )
+    coverage_gaps = _dedupe_gaps(parser_gaps + original_coverage_gaps)
+    if parser_meta.get("ast_available") and not coverage_gaps:
+        unknowns_first = (
+            "AST backend parsed the source; dynamic expressions are still "
+            "marked runtime_required. This AST result alone is not full "
+            "security coverage; broader security coverage remains NOT TESTED."
+        )
+    elif parser_meta.get("ast_available"):
+        unknowns_first = (
+            "AST backend parsed the source; dynamic expressions are still "
+            "marked runtime_required. JS coverage is NOT TESTED for the "
+            "gaps listed in coverage_gaps; broader security coverage "
+            "remains NOT TESTED."
+        )
+    else:
+        unknowns_first = (
+            "Static parser fallback used; dynamic expressions are marked "
+            "runtime_required. JS AST coverage is NOT TESTED; see "
+            "coverage_gaps for the machine-readable gaps."
+        )
     return {
         "schema": SCHEMA,
         "parser": parser_meta,
+        "coverage_gaps": coverage_gaps,
         "endpoints": endpoints,
         "logic_functions": logic_functions,
         "signing": {
@@ -435,11 +523,7 @@ def build_client_logic_map(
             "headers": inventory.get("headers", []),
         },
         "unknowns": [
-            (
-                "AST backend parsed the source; dynamic expressions are still marked runtime_required."
-                if parser_meta.get("ast_available")
-                else "Static parser fallback used; dynamic expressions are marked runtime_required."
-            ),
+            unknowns_first,
             "Header and storage values are never emitted; only names and fields are mapped.",
         ],
         "notes": [
