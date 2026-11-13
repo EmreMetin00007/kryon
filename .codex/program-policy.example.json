@@ -1,0 +1,49 @@
+{
+  "profile": "bug_bounty",
+  "approval_required_tools": [
+    "kali-tools_*",
+    "web-advanced_*",
+    "validator_*",
+    "browser_*",
+    "webfetch",
+    "bash"
+  ],
+  "denied_tools": [
+    "kali-tools_sliver_command"
+  ],
+  "blocked_http_methods": [
+    "DELETE",
+    "PUT",
+    "PATCH"
+  ],
+  "blocked_paths": [
+    "/delete",
+    "/destroy",
+    "/admin/delete"
+  ],
+  "active_requires": "Grant ACTIVE_OK via ./scripts/opencode-cco.sh security approve before live target interaction.",
+  "rate_limit_profile": "conservative",
+  "rate_limits": {
+    "default": {
+      "window_seconds": 60,
+      "max_calls": 60
+    },
+    "conservative": {
+      "window_seconds": 60,
+      "max_calls": 20
+    },
+    "overrides": {
+      "kali-tools_curl_request": {
+        "window_seconds": 60,
+        "max_calls": 15
+      },
+      "browser_*": {
+        "window_seconds": 60,
+        "max_calls": 10
+      }
+    }
+  },
+  "allow_loopback": true,
+  "allow_osint": true,
+  "allow_public_labs": true
+}

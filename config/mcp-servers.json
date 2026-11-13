@@ -1,0 +1,214 @@
+{
+  "schema": "cco-mcp/1",
+  "mcp": {
+    "ad-tools": {
+      "type": "local",
+      "command": [
+        "python3",
+        "mcp-servers/mcp-ad-tools/server.py"
+      ],
+      "cwd": ".",
+      "environment": {
+        "CCO_HOME": ".cco"
+      },
+      "enabled": false,
+      "timeout": 60000
+    },
+    "agent-browse": {
+      "type": "local",
+      "command": [
+        "python3",
+        "mcp-servers/mcp-agent-browse/server.py"
+      ],
+      "cwd": ".",
+      "environment": {
+        "CCO_HOME": ".cco"
+      },
+      "enabled": true,
+      "timeout": 600000
+    },
+    "browser": {
+      "type": "local",
+      "command": [
+        "python3",
+        "mcp-servers/mcp-browser/server.py"
+      ],
+      "cwd": ".",
+      "environment": {
+        "CCO_HOME": ".cco"
+      },
+      "enabled": true,
+      "timeout": 60000
+    },
+    "container-tools": {
+      "type": "local",
+      "command": [
+        "python3",
+        "mcp-servers/mcp-container-tools/server.py"
+      ],
+      "cwd": ".",
+      "environment": {
+        "CCO_HOME": ".cco"
+      },
+      "enabled": false,
+      "timeout": 60000
+    },
+    "ctf-platform": {
+      "type": "local",
+      "command": [
+        "python3",
+        "mcp-servers/mcp-ctf-platform/server.py"
+      ],
+      "cwd": ".",
+      "environment": {
+        "CCO_HOME": ".cco"
+      },
+      "enabled": false,
+      "timeout": 60000
+    },
+    "hunter": {
+      "type": "local",
+      "command": [
+        "python3",
+        "mcp-servers/mcp-hunter/server.py"
+      ],
+      "cwd": ".",
+      "environment": {
+        "CCO_HOME": ".cco"
+      },
+      "enabled": true,
+      "timeout": 60000
+    },
+    "kali-tools": {
+      "type": "local",
+      "command": [
+        "python3",
+        "mcp-servers/mcp-kali-tools/server.py"
+      ],
+      "cwd": ".",
+      "environment": {
+        "CCO_HOME": ".cco",
+        "CCO_KALI_GROUPS": "core,web,exploit,llm,report"
+      },
+      "enabled": true,
+      "timeout": 60000
+    },
+    "llm-security": {
+      "type": "local",
+      "command": [
+        "python3",
+        "mcp-servers/mcp-llm-security/server.py"
+      ],
+      "cwd": ".",
+      "environment": {
+        "CCO_HOME": ".cco"
+      },
+      "enabled": true,
+      "timeout": 60000
+    },
+    "memory-server": {
+      "type": "local",
+      "command": [
+        "python3",
+        "mcp-servers/mcp-memory-server/server.py"
+      ],
+      "cwd": ".",
+      "environment": {
+        "CCO_HOME": ".cco"
+      },
+      "enabled": true,
+      "timeout": 60000
+    },
+    "osint-tools": {
+      "type": "local",
+      "command": [
+        "python3",
+        "mcp-servers/mcp-osint-tools/server.py"
+      ],
+      "cwd": ".",
+      "environment": {
+        "CCO_HOME": ".cco"
+      },
+      "enabled": true,
+      "timeout": 60000
+    },
+    "otp": {
+      "type": "local",
+      "command": [
+        "python3",
+        "mcp-servers/mcp-otp/server.py"
+      ],
+      "cwd": ".",
+      "environment": {
+        "CCO_HOME": ".cco"
+      },
+      "enabled": true,
+      "timeout": 60000
+    },
+    "rag-engine": {
+      "type": "local",
+      "command": [
+        "python3",
+        "mcp-servers/mcp-rag-engine/server.py"
+      ],
+      "cwd": ".",
+      "environment": {
+        "CCO_HOME": ".cco"
+      },
+      "enabled": true,
+      "timeout": 60000
+    },
+    "reasoning": {
+      "type": "local",
+      "command": [
+        "python3",
+        "mcp-servers/mcp-reasoning/server.py"
+      ],
+      "cwd": ".",
+      "environment": {
+        "CCO_HOME": ".cco"
+      },
+      "enabled": true,
+      "timeout": 60000
+    },
+    "telemetry": {
+      "type": "local",
+      "command": [
+        "python3",
+        "mcp-servers/mcp-telemetry/server.py"
+      ],
+      "cwd": ".",
+      "environment": {
+        "CCO_HOME": ".cco"
+      },
+      "enabled": true,
+      "timeout": 60000
+    },
+    "validator": {
+      "type": "local",
+      "command": [
+        "python3",
+        "mcp-servers/mcp-validator/server.py"
+      ],
+      "cwd": ".",
+      "environment": {
+        "CCO_HOME": ".cco"
+      },
+      "enabled": true,
+      "timeout": 60000
+    },
+    "web-advanced": {
+      "type": "local",
+      "command": [
+        "python3",
+        "mcp-servers/mcp-web-advanced/server.py"
+      ],
+      "cwd": ".",
+      "environment": {
+        "CCO_HOME": ".cco"
+      },
+      "enabled": true,
+      "timeout": 60000
+    }
+  }
+}

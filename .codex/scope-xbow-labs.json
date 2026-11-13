@@ -1,0 +1,87 @@
+{
+  "program": "XBow Validation Labs",
+  "platform_url": "https://github.com/xbow-engineering/validation-benchmarks",
+  "scope_updated": "2026-07-21",
+  "scope_policy": "explicit_only",
+  "note": "Dedicated lab scope for the XBow benchmark host. Keep separate from bug bounty scopes. Only the exact host and listed challenge URLs are in scope.",
+  "in_scope": [
+    {
+      "asset": "31.58.247.169",
+      "type": "lab-host",
+      "note": "XBow benchmark/lab host"
+    },
+    {
+      "asset": "http://31.58.247.169:32811",
+      "type": "web-lab",
+      "challenge": "XBEN-021"
+    },
+    {
+      "asset": "http://31.58.247.169:32812",
+      "type": "web-lab",
+      "challenge": "XBEN-022"
+    },
+    {
+      "asset": "http://31.58.247.169:32813",
+      "type": "web-lab",
+      "challenge": "XBEN-023"
+    },
+    {
+      "asset": "http://31.58.247.169:32814",
+      "type": "web-lab",
+      "challenge": "XBEN-024"
+    },
+    {
+      "asset": "http://31.58.247.169:32815",
+      "type": "web-lab",
+      "challenge": "XBEN-025"
+    },
+    {
+      "asset": "http://31.58.247.169:32816",
+      "type": "web-lab",
+      "challenge": "XBEN-026"
+    },
+    {
+      "asset": "http://31.58.247.169:32817",
+      "type": "web-lab",
+      "challenge": "XBEN-027"
+    },
+    {
+      "asset": "http://31.58.247.169:32818",
+      "type": "web-lab",
+      "challenge": "XBEN-028"
+    },
+    {
+      "asset": "http://31.58.247.169:32819",
+      "type": "web-lab",
+      "challenge": "XBEN-029"
+    },
+    {
+      "asset": "http://31.58.247.169:32820",
+      "type": "web-lab",
+      "challenge": "XBEN-030"
+    }
+  ],
+  "out_of_scope": [
+    "Any other IP, hostname, or port not listed above",
+    "Third-party assets discovered from the lab applications",
+    "Any non-lab production system"
+  ],
+  "rules": {
+    "destructive_prohibited": [
+      "DELETE",
+      "DROP",
+      "TRUNCATE",
+      "data_modification_outside_challenge_need",
+      "DoS",
+      "brute_force_unbounded",
+      "real_user_data_exfil"
+    ],
+    "rate_limit": "conservative",
+    "active_requires": "ACTIVE_OK from user after exact target and action are shown",
+    "evidence_standard": "deterministic_validator_or_minimal_repro",
+    "notes": [
+      "Prefer passive review first, then smallest reproducible live step.",
+      "Treat unsupported claims as hypotheses until validated."
+    ]
+  }
+}

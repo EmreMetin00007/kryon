@@ -1,0 +1,141 @@
+{
+  "profiles": {
+    "min": {
+      "description": "Minimal setup - core tools only",
+      "servers": [
+        "kali-tools",
+        "memory-server",
+        "reasoning",
+        "telemetry"
+      ],
+      "kali_groups": "core",
+      "estimated_tokens": 18000
+    },
+    "recon": {
+      "description": "Reconnaissance and OSINT",
+      "servers": [
+        "kali-tools",
+        "osint-tools",
+        "browser",
+        "memory-server",
+        "reasoning",
+        "hunter",
+        "telemetry"
+      ],
+      "kali_groups": "core,osint,swarm",
+      "estimated_tokens": 22000
+    },
+    "web": {
+      "description": "Web application security testing (default)",
+      "servers": [
+        "kali-tools",
+        "web-advanced",
+        "validator",
+        "reasoning",
+        "hunter",
+        "llm-security",
+        "browser",
+        "memory-server",
+        "rag-engine",
+        "telemetry"
+      ],
+      "kali_groups": "core,web,exploit,llm,report,postex",
+      "estimated_tokens": 29000
+    },
+    "llm": {
+      "description": "LLM/AI security testing",
+      "servers": [
+        "llm-security",
+        "browser",
+        "web-advanced",
+        "memory-server",
+        "telemetry"
+      ],
+      "kali_groups": "",
+      "estimated_tokens": 8000
+    },
+    "ctf": {
+      "description": "Capture The Flag competitions",
+      "servers": [
+        "kali-tools",
+        "ctf-platform",
+        "validator",
+        "reasoning",
+        "memory-server",
+        "rag-engine",
+        "telemetry"
+      ],
+      "kali_groups": "core,web,pwn,exploit,postex",
+      "estimated_tokens": 23000
+    },
+    "ad": {
+      "description": "Active Directory and Windows exploitation",
+      "servers": [
+        "kali-tools",
+        "ad-tools",
+        "container-tools",
+        "memory-server",
+        "reasoning",
+        "telemetry"
+      ],
+      "kali_groups": "core,ad,exploit,swarm,postex",
+      "estimated_tokens": 21000
+    },
+    "full": {
+      "description": "All servers enabled (highest token cost)",
+      "servers": [
+        "kali-tools",
+        "web-advanced",
+        "ctf-platform",
+        "validator",
+        "reasoning",
+        "hunter",
+        "ad-tools",
+        "memory-server",
+        "container-tools",
+        "osint-tools",
+        "telemetry",
+        "browser",
+        "rag-engine",
+        "llm-security",
+        "agent-browse",
+        "otp"
+      ],
+      "kali_groups": "all",
+      "estimated_tokens": 34000
+    }
+  },
+  "auto_detect": {
+    "enabled": true,
+    "rules": [
+      {
+        "pattern": "(?i)(web|http|api|graphql|jwt|sql|xss|ssrf)",
+        "profile": "web"
+      },
+      {
+        "pattern": "(?i)(recon|osint|subdomain|dns|whois|enumeration)",
+        "profile": "recon"
+      },
+      {
+        "pattern": "(?i)(llm|ai|prompt|jailbreak|chatbot)",
+        "profile": "llm"
+      },
+      {
+        "pattern": "(?i)(ctf|flag|challenge|hackthebox|tryhackme)",
+        "profile": "ctf"
+      },
+      {
+        "pattern": "(?i)(ad|active directory|kerberos|windows|smb|ntlm)",
+        "profile": "ad"
+      }
+    ]
+  },
+  "lazy_loading": {
+    "enabled": true,
+    "startup_servers": [
+      "memory-server",
+      "telemetry"
+    ],
+    "on_demand_timeout": 30000
+  }
+}

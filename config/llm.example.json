@@ -1,0 +1,12 @@
+{
+  "schema": "cco-llm/1",
+  "model": "local/model-name",
+  "providers": {
+    "local": {
+      "base_url": "http://127.0.0.1:8000/v1",
+      "models": ["model-name"],
+      "api_key_env": "CCO_LLM_API_KEY",
+      "api_key_header": "Authorization"
+    }
+  }
+}

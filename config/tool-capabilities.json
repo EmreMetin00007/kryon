@@ -1,0 +1,596 @@
+{
+  "schema_version": "1.0",
+  "defaults": {
+    "network": false,
+    "requires_scope": false,
+    "requires_approval": false,
+    "mutates_local_state": false,
+    "mutates_remote_state": false,
+    "destructive": false,
+    "sensitive_output": false,
+    "untrusted_output": false,
+    "request_multiplier": 1,
+    "target_fields": []
+  },
+  "tools": {
+    "browser_browser_session_close": {
+      "network": false,
+      "requires_scope": false,
+      "requires_approval": false
+    },
+    "bash": {
+      "network": true,
+      "requires_scope": true,
+      "requires_approval": true,
+      "mutates_local_state": true,
+      "sensitive_output": true,
+      "untrusted_output": true,
+      "target_fields": [
+        "command"
+      ]
+    },
+    "webfetch": {
+      "network": true,
+      "requires_scope": true,
+      "requires_approval": true,
+      "sensitive_output": true,
+      "untrusted_output": true,
+      "target_fields": [
+        "url"
+      ]
+    },
+    "kali-tools_cvss_calculate": {
+      "network": false,
+      "requires_scope": false,
+      "requires_approval": false
+    },
+    "kali-tools_compose_js_routes": {
+      "network": false,
+      "requires_scope": false,
+      "requires_approval": false,
+      "sensitive_output": true
+    },
+    "kali-tools_get_rate_limit_status": {
+      "network": false,
+      "requires_scope": false,
+      "requires_approval": false
+    },
+    "kali-tools_request_approval": {
+      "network": false,
+      "requires_scope": false,
+      "requires_approval": false
+    },
+    "kali-tools_ledger_attempt_add": {
+      "network": false,
+      "requires_scope": false,
+      "requires_approval": false,
+      "mutates_local_state": true
+    },
+    "kali-tools_ledger_attempt_add_batch": {
+      "network": false,
+      "requires_scope": false,
+      "requires_approval": false,
+      "mutates_local_state": true
+    },
+    "kali-tools_ledger_coverage": {
+      "network": false,
+      "requires_scope": false,
+      "requires_approval": false
+    },
+    "kali-tools_ledger_prepare_handoff": {
+      "network": false,
+      "requires_scope": true,
+      "requires_approval": false,
+      "mutates_local_state": true
+    },
+    "kali-tools_member_login": {
+      "network": true,
+      "requires_scope": true,
+      "requires_approval": true,
+      "mutates_local_state": true,
+      "mutates_remote_state": true,
+      "sensitive_output": false,
+      "request_multiplier": 8,
+      "target_fields": ["target"]
+    },
+    "kali-tools_ledger_checkpoint": {
+      "network": false,
+      "requires_scope": false,
+      "requires_approval": false,
+      "mutates_local_state": true
+    },
+    "hunter_coverage_report_run": {
+      "network": false,
+      "requires_scope": false,
+      "requires_approval": false,
+      "sensitive_output": true,
+      "untrusted_output": true
+    },
+    "kali-tools_race_check": {
+      "network": false,
+      "requires_scope": false,
+      "requires_approval": false
+    },
+    "kali-tools_approve_operation": {
+      "network": false,
+      "requires_scope": false,
+      "requires_approval": false,
+      "mutates_local_state": true
+    },
+    "kali-tools_reject_operation": {
+      "network": false,
+      "requires_scope": false,
+      "requires_approval": false,
+      "mutates_local_state": true
+    },
+    "kali-tools_list_pending_approvals": {
+      "network": false,
+      "requires_scope": false,
+      "requires_approval": false
+    },
+    "validator_generate_validation_report": {
+      "network": false,
+      "requires_scope": false,
+      "requires_approval": false,
+      "sensitive_output": true
+    },
+    "memory-server_store_credential": {
+      "network": false,
+      "requires_scope": false,
+      "requires_approval": true,
+      "mutates_local_state": true,
+      "sensitive_output": true
+    },
+    "memory-server_store_finding": {
+      "network": false,
+      "requires_scope": false,
+      "requires_approval": false,
+      "mutates_local_state": true
+    },
+    "memory-server_store_validated_finding": {
+      "network": false,
+      "requires_scope": false,
+      "requires_approval": false,
+      "mutates_local_state": true
+    },
+    "memory-server_store_endpoint": {
+      "network": false,
+      "requires_scope": false,
+      "requires_approval": false,
+      "mutates_local_state": true
+    },
+    "memory-server_drop_target_memory": {
+      "network": false,
+      "requires_scope": false,
+      "requires_approval": true,
+      "mutates_local_state": true,
+      "destructive": true
+    },
+    "memory-server_get_target_memory": {
+      "network": false,
+      "requires_scope": false,
+      "requires_approval": false,
+      "sensitive_output": true
+    },
+    "rag-engine_rag_search": {
+      "network": false,
+      "requires_scope": false,
+      "requires_approval": false,
+      "sensitive_output": true,
+      "untrusted_output": true
+    },
+    "rag-engine_rag_similar_exploits": {
+      "network": false,
+      "requires_scope": false,
+      "requires_approval": false,
+      "sensitive_output": true,
+      "untrusted_output": true
+    },
+    "rag-engine_rag_stats": {
+      "network": false,
+      "requires_scope": false,
+      "requires_approval": false
+    },
+    "rag-engine_rag_ingest_exploitdb": {
+      "network": false,
+      "requires_scope": false,
+      "requires_approval": true,
+      "mutates_local_state": true
+    },
+    "rag-engine_rag_ingest_writeup": {
+      "network": false,
+      "requires_scope": false,
+      "requires_approval": true,
+      "mutates_local_state": true
+    },
+    "rag-engine_rag_ingest_cve": {
+      "network": true,
+      "requires_scope": false,
+      "requires_approval": true,
+      "mutates_local_state": true,
+      "untrusted_output": true
+    },
+    "rag-engine_rag_bulk_ingest": {
+      "network": false,
+      "requires_scope": false,
+      "requires_approval": true,
+      "mutates_local_state": true,
+      "sensitive_output": true
+    },
+    "hunter_enrich_with_rag": {
+      "network": false,
+      "requires_scope": false,
+      "requires_approval": false,
+      "sensitive_output": true,
+      "untrusted_output": true
+    },
+    "validator_analyze_differential_observations": {
+      "network": false,
+      "requires_scope": false,
+      "requires_approval": false,
+      "sensitive_output": true
+    },
+    "validator_forge_cbc_token": {
+      "network": false,
+      "requires_scope": false,
+      "requires_approval": false,
+      "sensitive_output": true
+    },
+    "validator_splice_cbc_token": {
+      "network": false,
+      "requires_scope": false,
+      "requires_approval": false,
+      "sensitive_output": true
+    },
+    "kali-tools_linpeas_fetch": {
+      "network": true,
+      "requires_scope": false,
+      "requires_approval": true,
+      "mutates_local_state": true,
+      "sensitive_output": true,
+      "untrusted_output": true,
+      "target_fields": []
+    },
+    "kali-tools_privesc_scan_local": {
+      "network": false,
+      "requires_scope": false,
+      "requires_approval": true,
+      "mutates_local_state": true,
+      "sensitive_output": true
+    },
+    "kali-tools_parse_privesc_report": {
+      "network": false,
+      "requires_scope": false,
+      "requires_approval": false,
+      "sensitive_output": true
+    },
+    "memory-server_suggest_lateral_moves": {
+      "network": false,
+      "requires_scope": false,
+      "requires_approval": false,
+      "sensitive_output": true
+    },
+    "validator_session_vault_put": {
+      "network": true,
+      "requires_scope": true,
+      "requires_approval": true,
+      "sensitive_output": true,
+      "request_multiplier": 2,
+      "target_fields": [
+        "target"
+      ]
+    },
+    "validator_session_vault_bind_resources": {
+      "network": false,
+      "requires_scope": true,
+      "requires_approval": false,
+      "mutates_local_state": true,
+      "sensitive_output": true,
+      "target_fields": ["target"]
+    },
+    "validator_session_vault_check": {
+      "network": true,
+      "requires_scope": true,
+      "requires_approval": true,
+      "sensitive_output": true,
+      "request_multiplier": 2,
+      "target_fields": [
+        "target"
+      ]
+    },
+    "validator_validate_stored_reflection": {
+      "network": true,
+      "requires_scope": true,
+      "requires_approval": true,
+      "sensitive_output": true,
+      "request_multiplier": 8,
+      "target_fields": [
+        "write_url",
+        "read_url"
+      ]
+    }
+  },
+  "patterns": [
+    {
+      "pattern": "validator_validate_*",
+      "network": true,
+      "requires_scope": true,
+      "requires_approval": true,
+      "sensitive_output": true,
+      "request_multiplier": 8,
+      "target_fields": [
+        "target_url",
+        "object_url",
+        "protected_url",
+        "encrypt_url",
+        "decrypt_url"
+      ]
+    },
+    {
+      "pattern": "validator_confirm_oob_callback",
+      "network": false,
+      "requires_scope": false,
+      "requires_approval": false,
+      "sensitive_output": true
+    },
+    {
+      "pattern": "kali-tools_interactsh_*",
+      "network": true,
+      "requires_scope": false,
+      "requires_approval": false,
+      "sensitive_output": true,
+      "untrusted_output": true,
+      "target_fields": [],
+      "note": "kendi OOB altyapisi; hedef degil (blind-03: 4x blocked_missing_target)"
+    },
+    {
+      "pattern": "kali-tools_zap_map_surface",
+      "network": true,
+      "requires_scope": true,
+      "requires_approval": true,
+      "sensitive_output": true,
+      "untrusted_output": true,
+      "request_multiplier": 4,
+      "target_fields": [
+        "target",
+        "url"
+      ]
+    },
+    {
+      "pattern": "kali-tools_*",
+      "network": true,
+      "requires_scope": true,
+      "requires_approval": true,
+      "sensitive_output": true,
+      "untrusted_output": true,
+      "target_fields": [
+        "target",
+        "url",
+        "domain",
+        "login_url"
+      ]
+    },
+    {
+      "pattern": "web-advanced_jwt_*",
+      "network": false,
+      "requires_scope": false,
+      "requires_approval": false,
+      "sensitive_output": true,
+      "note": "offline token forge/analiz; ag yok, target yok (blind-02: gate blokluyordu)"
+    },
+    {
+      "pattern": "web-advanced_*",
+      "network": true,
+      "requires_scope": true,
+      "requires_approval": true,
+      "sensitive_output": true,
+      "untrusted_output": true,
+      "target_fields": [
+        "url",
+        "base_url",
+        "auth_url",
+        "ws_url"
+      ]
+    },
+    {
+      "pattern": "browser_*",
+      "network": true,
+      "requires_scope": true,
+      "requires_approval": true,
+      "sensitive_output": true,
+      "untrusted_output": true,
+      "target_fields": [
+        "url"
+      ]
+    },
+    {
+      "pattern": "llm-security_*",
+      "network": true,
+      "requires_scope": true,
+      "requires_approval": true,
+      "sensitive_output": true,
+      "untrusted_output": true,
+      "target_fields": [
+        "endpoint"
+      ]
+    },
+    {
+      "pattern": "ad-tools_*",
+      "network": true,
+      "requires_scope": true,
+      "requires_approval": true,
+      "sensitive_output": true,
+      "target_fields": [
+        "target",
+        "domain"
+      ]
+    },
+    {
+      "pattern": "container-tools_*",
+      "network": false,
+      "requires_scope": false,
+      "requires_approval": true,
+      "mutates_local_state": true,
+      "sensitive_output": true
+    },
+    {
+      "pattern": "ctf-platform_*",
+      "network": true,
+      "requires_scope": false,
+      "requires_approval": true,
+      "sensitive_output": true
+    },
+    {
+      "pattern": "osint-tools_*",
+      "network": true,
+      "requires_scope": false,
+      "requires_approval": false,
+      "sensitive_output": true,
+      "untrusted_output": true,
+      "target_fields": [
+        "domain",
+        "target"
+      ]
+    },
+    {
+      "pattern": "otp_*",
+      "network": true,
+      "requires_scope": false,
+      "requires_approval": false,
+      "sensitive_output": false,
+      "untrusted_output": false,
+      "target_fields": []
+    },
+    {
+      "pattern": "agent-browse_*",
+      "network": true,
+      "requires_scope": true,
+      "requires_approval": true,
+      "sensitive_output": true,
+      "untrusted_output": true,
+      "target_fields": [
+        "start_url"
+      ]
+    },
+    {
+      "pattern": "hunter_auto_fanout_variants",
+      "network": true,
+      "requires_scope": true,
+      "requires_approval": true,
+      "sensitive_output": true,
+      "target_fields": [
+        "target",
+        "endpoint"
+      ]
+    },
+    {
+      "pattern": "hunter_test_access_matrix",
+      "network": true,
+      "requires_scope": true,
+      "requires_approval": true,
+      "sensitive_output": true,
+      "target_fields": [
+        "endpoint"
+      ]
+    },
+    {
+      "pattern": "hunter_fuzz_attack_surface",
+      "network": true,
+      "requires_scope": true,
+      "requires_approval": true,
+      "sensitive_output": true,
+      "untrusted_output": true,
+      "request_multiplier": 8,
+      "target_fields": [
+        "target"
+      ]
+    },
+    {
+      "pattern": "hunter_exploit_confirmed",
+      "network": true,
+      "requires_scope": true,
+      "requires_approval": true,
+      "sensitive_output": true,
+      "untrusted_output": true,
+      "target_fields": []
+    },
+    {
+      "pattern": "hunter_run_web_loop",
+      "network": true,
+      "requires_scope": true,
+      "requires_approval": true,
+      "sensitive_output": true,
+      "untrusted_output": true,
+      "request_multiplier": 8,
+      "target_fields": [
+        "target",
+        "endpoint",
+        "url"
+      ]
+    },
+    {
+      "pattern": "hunter_*",
+      "network": false,
+      "requires_scope": false,
+      "requires_approval": false,
+      "sensitive_output": false
+    },
+    {
+      "pattern": "reasoning_verify_origin",
+      "network": true,
+      "requires_scope": true,
+      "requires_approval": true,
+      "sensitive_output": true,
+      "target_fields": [
+        "domain",
+        "candidate_ips"
+      ]
+    },
+    {
+      "pattern": "reasoning_*",
+      "network": false,
+      "requires_scope": false,
+      "requires_approval": false
+    },
+    {
+      "pattern": "rag-engine_rag_ingest_*",
+      "network": true,
+      "requires_scope": false,
+      "requires_approval": true,
+      "mutates_local_state": true,
+      "sensitive_output": false
+    },
+    {
+      "pattern": "rag-engine_*",
+      "network": false,
+      "requires_scope": false,
+      "requires_approval": false
+    },
+    {
+      "pattern": "telemetry_*",
+      "network": false,
+      "requires_scope": false,
+      "requires_approval": false,
+      "mutates_local_state": true
+    },
+    {
+      "pattern": "memory-server_*",
+      "network": false,
+      "requires_scope": false,
+      "requires_approval": false,
+      "mutates_local_state": true,
+      "sensitive_output": true
+    },
+    {
+      "pattern": "chain_runner_*",
+      "network": true,
+      "requires_scope": true,
+      "requires_approval": true,
+      "sensitive_output": true,
+      "request_multiplier": 1,
+      "target_fields": [
+        "url"
+      ]
+    }
+  ]
+}

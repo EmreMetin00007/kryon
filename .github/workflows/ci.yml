@@ -1,0 +1,77 @@
+name: cco-quality-gate
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --require-hashes -r requirements.lock
+          python -m pip install --no-deps --no-build-isolation -e .
+
+      - name: Validate dependency lock
+        run: python3 scripts/release_artifacts.py check-lock
+
+      - name: Check repository layout
+        run: python3 scripts/check_repo_layout.py
+
+      - name: Install lint tools
+        run: python -m pip install ruff mypy coverage
+
+      - name: Ruff (blocking, narrow ratchet)
+        run: >-
+          ruff check --select E9,F63,F7,F82 scripts
+          mcp-servers/mcp-validator/cco_validator_core
+          mcp-servers/mcp-hunter/cco_hunter_core
+          mcp-servers/mcp-reasoning/cco_reasoning_core
+
+      - name: Mypy core (blocking)
+        run: mypy scripts/policy_engine.py scripts/tool_counts.py
+
+      - name: Run unit tests (coverage)
+        env:
+          CCO_GRAPH_BACKEND: networkx
+        run: |
+          coverage run -m pytest tests -q
+          coverage report --include="scripts/policy_engine.py,scripts/campaign_runtime.py,mcp-servers/mcp-validator/cco_validator_core/*,mcp-servers/mcp-hunter/cco_hunter_core/*,mcp-servers/mcp-reasoning/cco_reasoning_core/*" | tee coverage-core.txt
+
+      - name: Run loopback lab validation
+        env:
+          CCO_GRAPH_BACKEND: networkx
+        run: python3 scripts/lab-validate.py --skip-rag --quiet --json
+
+      - name: Run negative-control battery (FP rate)
+        env:
+          CCO_GRAPH_BACKEND: networkx
+        run: python3 scripts/negative-control.py --rounds 1 --json
+
+      - name: Check Python provider configuration
+        run: python3 scripts/agent_cli.py check-config --provider-config config/llm.example.json
+
+      - name: Governance audit smoke
+        run: python3 scripts/governance_audit.py --root scripts --format json --fail-on high
+
+      - name: Multi-worker soak smoke
+        run: python3 scripts/worker_soak.py --tasks 16 --workers 4 --stale-claims 2 --executor synthetic --max-tasks 16 --json
+
+      - name: Signed release bundle smoke
+        run: |
+          python3 scripts/release_artifacts.py build --output-dir /tmp/cco-release-smoke --ephemeral-key --no-verify-reproducible
+          python3 scripts/release_artifacts.py verify --release-dir /tmp/cco-release-smoke --public-key /tmp/cco-release-smoke/release-public-key.pem
+
+      - name: Release gate smoke
+        run: python3 scripts/release_check.py --list

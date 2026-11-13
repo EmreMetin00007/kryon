@@ -1,0 +1,117 @@
+{
+ "engagement": "Anduril Industries bug bounty (HackerOne, wildcard web)",
+ "declared_by": "user (2026-09-22), activation by operator",
+ "authorization": "operator-confirmed HackerOne program participation; grants issued by operator",
+ "approval": "Quoted operator approval: 'HAZIRLA BASLAYALIM' + activation run 2026-09-22. Limits: 6 wildcards + apexes, andurilgear.com excluded, no exfiltration, no destructive/DoS/social-engineering, no physical testing.",
+ "in_scope": [
+  {
+   "asset": "*.anduril.com",
+   "type": "domain-wildcard",
+   "note": "HackerOne scope CSV 2026-09-22, max critical"
+  },
+  {
+   "asset": "anduril.com",
+   "type": "domain",
+   "note": "apex of listed wildcard"
+  },
+  {
+   "asset": "*.andurildev.com",
+   "type": "domain-wildcard",
+   "note": "HackerOne scope CSV 2026-09-22, max critical"
+  },
+  {
+   "asset": "andurildev.com",
+   "type": "domain",
+   "note": "apex of listed wildcard"
+  },
+  {
+   "asset": "*.anduril.dev",
+   "type": "domain-wildcard",
+   "note": "HackerOne scope CSV 2026-09-22, max critical"
+  },
+  {
+   "asset": "anduril.dev",
+   "type": "domain",
+   "note": "apex of listed wildcard"
+  },
+  {
+   "asset": "*.andurildev.au",
+   "type": "domain-wildcard",
+   "note": "HackerOne scope CSV 2026-09-22, max critical"
+  },
+  {
+   "asset": "andurildev.au",
+   "type": "domain",
+   "note": "apex of listed wildcard"
+  },
+  {
+   "asset": "*.anduril.au",
+   "type": "domain-wildcard",
+   "note": "HackerOne scope CSV 2026-09-22, max critical"
+  },
+  {
+   "asset": "anduril.au",
+   "type": "domain",
+   "note": "apex of listed wildcard"
+  },
+  {
+   "asset": "*.anduril.com.au",
+   "type": "domain-wildcard",
+   "note": "HackerOne scope CSV 2026-09-22, max critical"
+  },
+  {
+   "asset": "anduril.com.au",
+   "type": "domain",
+   "note": "apex of listed wildcard"
+  }
+ ],
+ "targets": [
+  "anduril.com",
+  "andurildev.com",
+  "anduril.dev",
+  "andurildev.au",
+  "anduril.au",
+  "anduril.com.au"
+ ],
+ "excluded_assets": [
+  "andurilgear.com"
+ ],
+ "out_of_scope": [
+  "andurilgear.com (gate-enforced ineligible)",
+  "Anduril property/facilities, physical/proximal testing (program prohibition)",
+  "unlisted domains (ask program first per rules)",
+  "DoS / load testing, service degradation",
+  "social engineering of any kind",
+  "other users' accounts and data; personnel privacy/safety impact",
+  "any data exfiltration (program prohibition)",
+  "mobile apps (not listed in scope)"
+ ],
+ "rules": {
+  "passive_first": true,
+  "max_rps": 5,
+  "rate_limit": "default",
+  "pii_exfiltration": false,
+  "dos_testing": false,
+  "social_engineering": false,
+  "required_headers": [
+   "X-HackerOne-Research: <handle>"
+  ],
+  "test_identity_only": true,
+  "human_verification_before_report": true,
+  "destructive_prohibited": [
+   "DELETE",
+   "DROP",
+   "TRUNCATE",
+   "DoS",
+   "brute_force_unbounded",
+   "real_user_data_exfil",
+   "data_exfiltration_any"
+  ],
+  "evidence_standard": "deterministic_validator_or_minimal_repro",
+  "notes": [
+   "DEFENSE CONTRACTOR \u2014 strict scope discipline, minimum touch, own accounts only",
+   "HACKERONE_HANDLE env must be set; gate enforces researcher header",
+   "ask program before testing unscoped subdomains"
+  ]
+ }
+}

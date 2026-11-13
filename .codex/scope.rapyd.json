@@ -1,0 +1,113 @@
+{
+ "engagement": "Rapyd bug bounty (Bugcrowd, API + dashboard)",
+ "declared_by": "user (2026-09-22), activation by operator",
+ "authorization": "operator-confirmed Bugcrowd program participation; own Iceland+UK accounts, handle letmet4y",
+ "approval": "Quoted operator approval: 'hesap actim' + handle 'letmet4y' 2026-09-22. Limits: listed rapyd/korta hosts, sandbox API only, no form automation, ~50/min, own accounts only.",
+ "in_scope": [
+  {
+   "asset": "api.rapyd.net",
+   "type": "api",
+   "note": "Tier 3, P1 $5-7.5k. SANDBOX ONLY. Signed requests."
+  },
+  {
+   "asset": "dashboard.rapyd.net",
+   "type": "web",
+   "note": "Tier 2 client portal. Own Iceland account (prod mode)."
+  },
+  {
+   "asset": "verify.rapyd.net",
+   "type": "web",
+   "note": "Tier 2 Verify. Own UK account."
+  },
+  {
+   "asset": "checkout.rapyd.net",
+   "type": "web",
+   "note": "Tier 2 checkout pages. Own account only."
+  },
+  {
+   "asset": "*.rapyd.net",
+   "type": "domain-wildcard",
+   "note": "Tier 1. Minus excluded hosts."
+  },
+  {
+   "asset": "*.korta.is",
+   "type": "domain-wildcard",
+   "note": "Tier 1"
+  },
+  {
+   "asset": "jointhemoment.net",
+   "type": "web",
+   "note": "Tier 1"
+  },
+  {
+   "asset": "*.rapyd.com",
+   "type": "domain-wildcard",
+   "note": "Tier 1"
+  },
+  {
+   "asset": "*.rapyd.org",
+   "type": "domain-wildcard",
+   "note": "Tier 1"
+  },
+  {
+   "asset": "*.kortathjonustan.is",
+   "type": "domain-wildcard",
+   "note": "Tier 1"
+  }
+ ],
+ "targets": [
+  "api.rapyd.net",
+  "dashboard.rapyd.net",
+  "verify.rapyd.net",
+  "checkout.rapyd.net",
+  "jointhemoment.net"
+ ],
+ "excluded_assets": [
+  "community.rapyd.net",
+  "support.rapyd.net",
+  "docs.rapyd.net",
+  "sandbox.rapyd.net",
+  "ghost.rapyd.net"
+ ],
+ "out_of_scope": [
+  "community/support/docs/sandbox/ghost.rapyd.net (gate-enforced)",
+  "*.neatcommerce.com, *.neattest.com, *.neat.com.hk, *.neat.hk, *.neat.wtf (3rd party)",
+  "production API traffic (sandbox only for api.rapyd.net)",
+  "form-submission automation of any kind (BAN RISK)",
+  "other merchants' accounts and data",
+  "known idp_id IDOR (already tracked, do not submit)",
+  "rate-limit findings, headers/cookies, CSRF-low, open redirect, error text (program OOS list)",
+  "DoS / load testing, social engineering"
+ ],
+ "rules": {
+  "passive_first": true,
+  "max_rps": 1,
+  "rate_limit": "conservative",
+  "pii_exfiltration": false,
+  "dos_testing": false,
+  "social_engineering": false,
+  "no_form_automation": true,
+  "required_headers": [
+   "X-Bugcrowd: Bugcrowd-<handle>"
+  ],
+  "test_identity_only": true,
+  "human_verification_before_report": true,
+  "destructive_prohibited": [
+   "DELETE",
+   "DROP",
+   "TRUNCATE",
+   "DoS",
+   "brute_force_unbounded",
+   "real_user_data_exfil",
+   "form_automation",
+   "production_api_traffic"
+  ],
+  "evidence_standard": "deterministic_validator_or_minimal_repro",
+  "notes": [
+   "sandbox mode for ALL api.rapyd.net testing; production mode only via own Iceland dashboard account",
+   "every request must carry X-Bugcrowd header (gate-enforced); include operation ID from responses in evidence",
+   "known focus: race conditions (refunds), business logic (wallet balance), email template injection",
+   "SAML bonus expired; SAML area normal scope"
+  ]
+ }
+}

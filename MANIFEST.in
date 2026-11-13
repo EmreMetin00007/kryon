@@ -1,0 +1,18 @@
+include README.md
+include pyproject.toml
+include requirements.lock
+include MANIFEST.in
+recursive-include scripts *.py *.sh *.json
+recursive-include mcp-servers *.py requirements.txt
+include config/tool-capabilities.json
+include config/executor-contract.example.json
+include config/bounty-program-policy.json
+include config/mcp-core-tools.json
+include config/program-profiles/ctf.json config/program-profiles/lab.json
+include config/program-profiles/strict-bounty.json config/program-profiles/strict-bounty-anduril.json
+include config/program-profiles/strict-bounty-coupang.json config/program-profiles/strict-bounty-expedia.json
+include config/program-profiles/strict-bounty-rapyd.json config/program-profiles/vdp-nebius.json
+include config/program-profiles/strict-bounty-clear.json config/program-profiles/strict-bounty-livenation.json
+include config/profiles.json config/mcp-servers.json config/llm.example.json
+include scripts/lab/Dockerfile scripts/lab/docker-compose.yml scripts/lab/README.md
+global-exclude __pycache__ *.py[cod] *.db *.sqlite *.sqlite3 .env .env.* *.pem *.key

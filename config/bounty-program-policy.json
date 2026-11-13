@@ -1,0 +1,31 @@
+{
+  "profile": "autonomous_bounty_l3",
+  "approval_required_tools": [],
+  "denied_tools": [
+    "kali-tools_sliver_command",
+    "kali-tools_msfconsole",
+    "container-tools_*"
+  ],
+  "blocked_http_methods": ["DELETE", "PUT", "PATCH"],
+  "blocked_paths": ["/delete", "/destroy", "/admin/delete"],
+  "active_requires": "",
+  "rate_limit_profile": "bounty",
+  "rate_limits": {
+    "default": {"window_seconds": 60, "max_calls": 60},
+    "bounty": {"window_seconds": 60, "max_calls": 120},
+    "conservative": {"window_seconds": 60, "max_calls": 20},
+    "overrides": {
+      "hunter_run_web_loop": {"window_seconds": 60, "max_calls": 200},
+      "hunter_auto_fanout_variants": {"window_seconds": 60, "max_calls": 100},
+      "hunter_fuzz_attack_surface": {"window_seconds": 60, "max_calls": 200},
+      "hunter_exploit_confirmed": {"window_seconds": 60, "max_calls": 100},
+      "validator_validate_*": {"window_seconds": 60, "max_calls": 200},
+      "kali-tools_discover_web_surface": {"window_seconds": 60, "max_calls": 60},
+      "kali-tools_curl_request": {"window_seconds": 60, "max_calls": 120},
+      "kali-tools_*": {"window_seconds": 60, "max_calls": 120}
+    }
+  },
+  "allow_loopback": true,
+  "allow_osint": true,
+  "allow_public_labs": true
+}

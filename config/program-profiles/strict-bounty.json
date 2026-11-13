@@ -1,0 +1,32 @@
+{
+  "profile": "strict-bounty",
+  "approval_required_tools": [],
+  "denied_tools": [
+    "kali-tools_masscan_scan",
+    "kali-tools_nikto_scan",
+    "kali-tools_nuclei_scan",
+    "kali-tools_sqlmap_test",
+    "kali-tools_sqlmap_test_structured",
+    "kali-tools_hydra_brute",
+    "kali-tools_msfconsole",
+    "kali-tools_sliver_command",
+    "container-tools_*"
+  ],
+  "blocked_http_methods": ["DELETE", "PUT", "PATCH"],
+  "blocked_paths": ["/delete", "/destroy", "/admin/delete"],
+  "rate_limits": {
+    "default": {"window_seconds": 60, "max_calls": 60},
+    "conservative": {"window_seconds": 60, "max_calls": 20},
+    "aggressive": {"window_seconds": 60, "max_calls": 120},
+    "overrides": {}
+  },
+  "background_network_jobs": "deny",
+  "fuzz_max_requests_per_call": 50,
+  "required_request_headers": {
+    "User-Agent": "HackerOne/{handle}",
+    "X-HackerOne": "{handle}"
+  },
+  "allow_loopback": true,
+  "allow_osint": true,
+  "allow_public_labs": false
+}
