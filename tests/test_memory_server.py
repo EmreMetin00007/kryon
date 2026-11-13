@@ -17,6 +17,17 @@ def memory_server():
     return load_server("memory-server")
 
 
+def test_lazy_graph_deletion_restores_backend_method(memory_server):
+    original = memory_server.kg.add_node
+    replacement = lambda *args, **kwargs: None
+    memory_server.kg.add_node = replacement
+    assert memory_server.kg.add_node is replacement
+    del memory_server.kg.add_node
+    assert memory_server.kg.add_node == original
+    with pytest.raises(AttributeError):
+        del memory_server.kg.nonexistent_proxy_attribute
+
+
 def test_invalid_backend_is_rejected(memory_server):
     original = memory_server.GRAPH_BACKEND
     memory_server.GRAPH_BACKEND = "invalid"
