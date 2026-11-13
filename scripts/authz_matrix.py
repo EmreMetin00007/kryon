@@ -5,6 +5,8 @@ are provenance, not validation receipts; this planner never confirms a finding.
 """
 from __future__ import annotations
 
+from typing import Any
+
 from object_identity import object_id_key
 
 CATEGORIES = ('owner', 'same_tenant_other_user', 'cross_tenant_user', 'different_role', 'anonymous')
@@ -74,7 +76,7 @@ def build_identity_matrix(identities, resources):
             continue
         owner_name = resource.get('owner_identity')
         owner = identities.get(owner_name) or {}
-        groups = {c: [] for c in CATEGORIES}
+        groups: dict[str, list[Any]] = {c: [] for c in CATEGORIES}
         if owner.get('test_data_only') is True and identity_fact(owner, 'principal'):
             groups['owner'].append(owner_name)
         for name, actor in identities.items():

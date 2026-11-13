@@ -4,6 +4,7 @@ from __future__ import annotations
 import copy
 import json
 from pathlib import Path
+from typing import Any
 
 from full_agent_budget import provider_json
 from full_agent_context import content_snapshot, verified_file
@@ -42,7 +43,8 @@ def bounded_history(body, tasks, *, max_bytes, recent_turns=2, compact=False):
     if not eligible:
         return body, None
     view = copy.deepcopy(body)
-    removed, archives = set(), []
+    removed: set[int] = set()
+    archives: list[Any] = []
     for start, end in eligible:
         raw = provider_json(messages[start:end])
         artifact = content_snapshot(tasks, spec, "native-history", raw)

@@ -59,7 +59,7 @@ def test_second_order_confirms_stored_flow(guestbook):
 
 
 def test_second_order_unconfirmed_when_not_rendered(guestbook):
-    out = json.loads(validator.validate_second_order(
+    json.loads(validator.validate_second_order(
         guestbook + "/yaz", guestbook + "/baska-sayfa",
         data_template="comment={{PAYLOAD}}"))
     # /baska-sayfa da ayni handler'a duser (yorumlar) -> render eder; gercek

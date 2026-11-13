@@ -77,7 +77,7 @@ def ad_kerberoast(target: str, domain: str, username: str, password: str, dc_ip:
         finally:
             try:
                 os.unlink(out_file)
-            except:
+            except OSError:
                 pass
                 
     if not summary["hashes"] and res["exit_code"] != 0:
@@ -111,7 +111,7 @@ def ad_asreproast(target: str, domain: str, users_file: str = "", dc_ip: str = "
         finally:
             try:
                 os.unlink(out_file)
-            except:
+            except OSError:
                 pass
 
     if not summary["hashes"] and res["exit_code"] != 0:

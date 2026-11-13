@@ -32,15 +32,11 @@ jobs:
       - name: Install lint tools
         run: python -m pip install ruff mypy coverage
 
-      - name: Ruff (blocking, narrow ratchet)
-        run: >-
-          ruff check --select E9,F63,F7,F82 scripts
-          mcp-servers/mcp-validator/cco_validator_core
-          mcp-servers/mcp-hunter/cco_hunter_core
-          mcp-servers/mcp-reasoning/cco_reasoning_core
+      - name: Ruff (blocking, central pyproject config)
+        run: ruff check .
 
-      - name: Mypy core (blocking)
-        run: mypy scripts/policy_engine.py scripts/tool_counts.py
+      - name: Mypy core (blocking, central pyproject config)
+        run: mypy
 
       - name: Run unit tests (coverage)
         env:

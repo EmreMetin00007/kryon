@@ -15,6 +15,7 @@ from pathlib import Path
 import tempfile
 import threading
 import time
+from typing import Any
 import uuid
 
 
@@ -96,6 +97,7 @@ def usage_tokens(usage, *, nonempty_completion=False):
     prompt, completion = usage.get("prompt_tokens"), usage.get("completion_tokens")
     if any(type(n) is not int or n < 0 for n in (prompt, completion)):
         raise BudgetError("invalid provider token usage", code="usage_counts_invalid")
+    assert isinstance(prompt, int) and isinstance(completion, int)
     if nonempty_completion and completion == 0:
         raise BudgetError("provider reported zero usage for nonempty completion",
                           code="usage_zero_on_nonempty_completion")
@@ -114,7 +116,10 @@ def usage_tokens(usage, *, nonempty_completion=False):
             # completion counts remain mandatory and cover these subsets once.
             if count is None:
                 continue
-            if type(count) is not int or not 0 <= count <= bound:
+            if type(count) is not int:
+                raise BudgetError("invalid provider usage subset", code="usage_subset_invalid")
+            assert isinstance(count, int)
+            if not 0 <= count <= bound:
                 raise BudgetError("invalid provider usage subset", code="usage_subset_invalid")
     return total
 
@@ -280,7 +285,7 @@ def compact_tools(tools, *, description_limit=320, strip_annotations=False):
     def schema(value):
         if not isinstance(value, dict):
             return copy.deepcopy(value)
-        result = {}
+        result: dict[str, Any] = {}
         for key, item in value.items():
             if key in {"title", "description"} and isinstance(item, str):
                 continue

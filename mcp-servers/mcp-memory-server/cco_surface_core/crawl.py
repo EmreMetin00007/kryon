@@ -231,7 +231,6 @@ def _crawl_site_sync(start, max_pages, extra_headers, timeout_ms, allow_subdomai
                              authenticated=identity != "anonymous")
     visited = set()
     action_budget = max(0, int(max_actions))
-    base = start
 
     origin = _origin(start)
 

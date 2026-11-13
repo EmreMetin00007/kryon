@@ -808,7 +808,7 @@ def validate_sqli(target_url: str, param: str = "", method: str = "GET",
             ok, tinfo = True, {**tinfo2, "dialect": "oracle_dbms_pipe"}
     if ok:
         return _result("SQL Injection (time-based blind)", target_url, CONFIRMED,
-                       "timing_statistical", {"payload": f"' OR SLEEP(N)-- -", **tinfo},
+                       "timing_statistical", {"payload": "' OR SLEEP(N)-- -", **tinfo},
                        _reproduction(method, target_url, param=param,
                                      payload=f"{base_val}' OR SLEEP(4)-- -",
                                      body_template=body_template, headers=H, carrier=carrier),

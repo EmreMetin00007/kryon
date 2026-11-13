@@ -167,11 +167,11 @@ def isolation_command(workdir, command, *, bwrap, opencode=None, workspace="/wor
         if Path(path).is_dir():
             args += ["--ro-bind", path, path]
     for name in ("bin", "sbin", "lib", "lib64"):
-        path = Path("/" + name)
-        if path.is_symlink():
-            args += ["--symlink", os.readlink(path), str(path)]
-        elif path.is_dir():
-            args += ["--ro-bind", str(path), str(path)]
+        entry = Path("/" + name)
+        if entry.is_symlink():
+            args += ["--symlink", os.readlink(entry), str(entry)]
+        elif entry.is_dir():
+            args += ["--ro-bind", str(entry), str(entry)]
     args += ["--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp",
              "--dir", "/home/solver", "--bind", str(workdir), workspace,
              "--chdir", workspace, "--setenv", "PATH", "/usr/local/bin:/usr/bin:/bin",

@@ -1767,7 +1767,6 @@ def fuzz_attack_surface(target: str, limit: int = 8, max_requests: int = 40,
     invalid_baselines = {}
     for probe in probes:
         declared_file = probe.pop("_declared_file", None)
-        classes_to_mark = probe.get("classes_to_mark") or ([probe["vuln_class"]] if probe.get("vuln_class") else [])
         hook = probe.get("validator_hook") or _hook(probe.get("vuln_class") or "")
         variant = {
             **probe,

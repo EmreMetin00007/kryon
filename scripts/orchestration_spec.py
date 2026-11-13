@@ -22,7 +22,7 @@ try:
     from .runtime_paths import runtime_root
 except ImportError:
     from mcp_inventory import registered_mcp_tools
-    from runtime_paths import runtime_root
+    from runtime_paths import runtime_root  # type: ignore[no-redef]
 
 # Proven core inventory (~29 tools). Other tools are
 # opt-in and must be justified per task; the gate still checks registration.
@@ -76,7 +76,7 @@ def broker_tools() -> frozenset[str]:
     try:
         from .full_agent_executor import CATALOG
     except ImportError:
-        from full_agent_executor import CATALOG
+        from full_agent_executor import CATALOG  # type: ignore[no-redef]
     return frozenset(group + "_" + name for group, names in CATALOG.items() for name in names)
 
 

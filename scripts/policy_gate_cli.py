@@ -11,7 +11,7 @@ import sys
 try:
     from .policy_engine import PolicyEngine
 except ImportError:
-    from policy_engine import PolicyEngine
+    from policy_engine import PolicyEngine  # type: ignore[no-redef]
 
 
 def _engine() -> PolicyEngine:
