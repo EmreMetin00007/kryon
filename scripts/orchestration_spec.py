@@ -74,9 +74,9 @@ def broker_tools() -> frozenset[str]:
     if path.is_file():
         return frozenset(json.loads(path.read_text()))
     try:
-        from .full_agent_broker import CATALOG
+        from .full_agent_executor import CATALOG
     except ImportError:
-        from full_agent_broker import CATALOG
+        from full_agent_executor import CATALOG
     return frozenset(group + "_" + name for group, names in CATALOG.items() for name in names)
 
 

@@ -48,7 +48,7 @@ def replay(selected, seed=None):
 
 def start(selected, private):
     module = replay(selected)
-    from full_agent_broker import dump
+    from full_agent_provider import dump
     evaluator = Path(private) / "evaluator"
     evaluator.mkdir(mode=0o700)
     lab = module.serve(selected["seed"], **({"fixture_parent": evaluator}
@@ -426,7 +426,7 @@ def audit_run(manifest_path):
     import full_agent_launcher as launcher
     import attempt_ledger
     import evidence_trust
-    from full_agent_broker import dump
+    from full_agent_provider import dump
     manifest_path = Path(manifest_path).resolve(strict=True)
     directory = manifest_path.parent
     private, work = directory / "private", directory / "solver"
@@ -547,7 +547,7 @@ def audit_run_status(manifest_path):
     return structured failed-run metrics preserving positive/negative denominators.
     """
     import full_agent_launcher as launcher
-    from full_agent_broker import dump
+    from full_agent_provider import dump
 
     manifest_path = Path(manifest_path).resolve(strict=True)
     manifest = json.loads(manifest_path.read_text())

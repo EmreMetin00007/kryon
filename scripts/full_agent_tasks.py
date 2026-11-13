@@ -1,4 +1,4 @@
-"""Host-rendered native worker contracts; the planner sends task IDs only."""
+"""Host-rendered task registry and native worker contracts."""
 from __future__ import annotations
 
 import json
@@ -11,7 +11,9 @@ from orchestration_spec import (TaskSpec, render_task_prompt, skeleton_summary,
                                 validate_chain, validate_summary, validate_worker_prompt)
 
 
-class NativeTasks:
+class TaskRegistry:
+    """Bounded, workspace-confined frozen TaskSpec and summary registry."""
+
     def __init__(self, specs, workdir, bindings, *, setup_checks_passed=False):
         if type(setup_checks_passed) is not bool:
             raise ValueError("setup_checks_passed must be boolean")
@@ -21,19 +23,18 @@ class NativeTasks:
         self.setup_checks_passed = setup_checks_passed
         self.active_spec = None
         self.normalizations = []
-        self.active_prompt = None
         errors = validate_chain(self.specs)
         if errors or any(spec.tool_profile != "broker" for spec in self.specs):
-            raise ValueError("native task registry requires a valid broker plan")
+            raise ValueError("task registry requires a valid broker plan")
         for spec in self.specs:
             if not re.fullmatch(r"[a-z0-9][a-z0-9-]*", spec.id):
-                raise ValueError("invalid native task ID")
+                raise ValueError("invalid task ID")
             self.confine(Path(spec.evidence_dir))
 
     def confine(self, path):
         path = Path(path).resolve()
         if path != self.workdir and self.workdir not in path.parents:
-            raise ValueError("native task path escapes workspace")
+            raise ValueError("task path escapes workspace")
         return path
 
     def summary_path(self, spec):
@@ -69,7 +70,7 @@ class NativeTasks:
                     changes.append({"field": f"surface.id_formats[{index}].example",
                                     "from": "value", "to": "example"})
         if changes:
-            from full_agent_broker import dump
+            from full_agent_provider import dump
             dump(path, summary)
             self.normalizations.append({"spec_id": spec.id, "fields": [change["field"] for change in changes],
                 "changes": changes, "from": changes[0]["from"], "to": changes[0]["to"],
@@ -83,6 +84,68 @@ class NativeTasks:
             if self.summary_path(spec) == path:
                 return self.read_summary(spec)
         raise ValueError("summary is outside the frozen task registry")
+
+    def finalize_active(self, reason, evidence, private):
+        """Preserve draft bytes and actual tool receipts after execution stops.
+
+        This records interruption, never successful discovery or validation.
+        Terminal valid summaries stay byte-for-byte unchanged. Bad drafts are
+        retained in host-private storage rather than repaired into assertions.
+        """
+        from full_agent_provider import dump
+        spec = self.active_spec
+        path = self.workdir / "summaries" / (spec.id + ".json")
+        receipt = Path(spec.evidence_dir) / ("host-stop-" + spec.id + ".json")
+        for candidate in (path, receipt):
+            if any(p.is_symlink() for p in (candidate, *candidate.parents) if p != self.workdir):
+                raise ValueError("host finalization refuses symlink paths")
+            self.confine(candidate)
+        raw = None
+        summary = None
+        if path.exists():
+            with path.open("rb") as handle:
+                raw = handle.read(128 * 1024 + 1)
+            if len(raw) > 128 * 1024:
+                raise ValueError("native summary too large")
+            try:
+                summary = json.loads(raw)
+            except (ValueError, UnicodeError):
+                pass
+        matches = (isinstance(summary, dict) and summary.get("phase") == spec.phase
+                   and summary.get("target") == spec.target)
+        record = {"spec_id": spec.id, "reason": reason, "summary": str(path),
+                  "before_sha256": hashlib.sha256(raw).hexdigest() if raw is not None else None}
+        if matches and not validate_summary(summary):
+            return {**record, "action": "terminal_summary_preserved", "status": summary["status"]}
+        if raw is not None:
+            archive = Path(private) / ("summary-before-stop-" + spec.id + ".json")
+            with archive.open("xb") as handle:
+                handle.write(raw)
+            record["preserved_draft"] = str(archive)
+        # Keep all assertions and step states in a well-formed draft. Malformed
+        # or wrong-target drafts remain solely in the unmodified archive.
+        blocked = {**summary, "status": "blocked"} if matches else None
+        if blocked is None or validate_summary(blocked):
+            blocked = {**skeleton_summary(spec), "status": "blocked"}
+        receipt.parent.mkdir(parents=True, exist_ok=True)
+        dump(receipt, {"schema": "native-task-interruption/1", **record,
+                       "tool_artifacts": evidence, "artifacts_visibility": "host_private",
+                       "security_validation_claimed": False, "acceptance_claimed": False})
+        blocked["evidence"] = [*blocked["evidence"], {"kind": "host_interruption_receipt", "artifact": str(receipt)}]
+        blocked["host_interruption"] = {"reason": reason, "receipt": str(receipt)}
+        path.parent.mkdir(parents=True, exist_ok=True)
+        dump(path, blocked)
+        return {**record, "action": "blocked_summary_written", "status": "blocked",
+                "receipt": str(receipt), "tool_artifact_count": len(evidence),
+                "after_sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
+
+
+class NativeTasks(TaskRegistry):
+    """Host-rendered native worker contracts; the planner sends task IDs only."""
+
+    def __init__(self, specs, workdir, bindings, *, setup_checks_passed=False):
+        super().__init__(specs, workdir, bindings, setup_checks_passed=setup_checks_passed)
+        self.active_prompt = None
 
     def resolve(self, args):
         # Accept the canonical pointer or the ID in an older rendered prompt.
@@ -145,57 +208,3 @@ class NativeTasks:
                 handle.write(prompt)
         self.active_spec = spec
         self.active_prompt = prompt
-
-    def finalize_active(self, reason, evidence, private):
-        """Preserve draft bytes and actual tool receipts after the worker exits.
-
-        This records interruption, never successful discovery or validation.
-        Terminal valid summaries stay byte-for-byte unchanged. Bad drafts are
-        retained in host-private storage rather than repaired into assertions.
-        """
-        from full_agent_broker import dump
-        spec = self.active_spec
-        path = self.workdir / "summaries" / (spec.id + ".json")
-        receipt = Path(spec.evidence_dir) / ("host-stop-" + spec.id + ".json")
-        for candidate in (path, receipt):
-            if any(p.is_symlink() for p in (candidate, *candidate.parents) if p != self.workdir):
-                raise ValueError("host finalization refuses symlink paths")
-            self.confine(candidate)
-        raw = None
-        summary = None
-        if path.exists():
-            with path.open("rb") as handle:
-                raw = handle.read(128 * 1024 + 1)
-            if len(raw) > 128 * 1024:
-                raise ValueError("native summary too large")
-            try:
-                summary = json.loads(raw)
-            except (ValueError, UnicodeError):
-                pass
-        matches = (isinstance(summary, dict) and summary.get("phase") == spec.phase
-                   and summary.get("target") == spec.target)
-        record = {"spec_id": spec.id, "reason": reason, "summary": str(path),
-                  "before_sha256": hashlib.sha256(raw).hexdigest() if raw is not None else None}
-        if matches and not validate_summary(summary):
-            return {**record, "action": "terminal_summary_preserved", "status": summary["status"]}
-        if raw is not None:
-            archive = Path(private) / ("summary-before-stop-" + spec.id + ".json")
-            with archive.open("xb") as handle:
-                handle.write(raw)
-            record["preserved_draft"] = str(archive)
-        # Keep all assertions and step states in a well-formed draft. Malformed
-        # or wrong-target drafts remain solely in the unmodified archive.
-        blocked = {**summary, "status": "blocked"} if matches else None
-        if blocked is None or validate_summary(blocked):
-            blocked = {**skeleton_summary(spec), "status": "blocked"}
-        receipt.parent.mkdir(parents=True, exist_ok=True)
-        dump(receipt, {"schema": "native-task-interruption/1", **record,
-                       "tool_artifacts": evidence, "artifacts_visibility": "host_private",
-                       "security_validation_claimed": False, "acceptance_claimed": False})
-        blocked["evidence"] = [*blocked["evidence"], {"kind": "host_interruption_receipt", "artifact": str(receipt)}]
-        blocked["host_interruption"] = {"reason": reason, "receipt": str(receipt)}
-        path.parent.mkdir(parents=True, exist_ok=True)
-        dump(path, blocked)
-        return {**record, "action": "blocked_summary_written", "status": "blocked",
-                "receipt": str(receipt), "tool_artifact_count": len(evidence),
-                "after_sha256": hashlib.sha256(path.read_bytes()).hexdigest()}

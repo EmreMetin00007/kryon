@@ -141,3 +141,74 @@ def test_unparseable_provider_response_is_not_a_transport_or_usage_error(broker,
     with pytest.raises(BudgetError) as caught:
         broker.completion(request_body())
     assert_retained_failure(broker, "response_json_invalid", caught)
+
+
+def test_shared_provider_transport_and_tool_executor_work_via_narrow_interfaces(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    from full_agent_budget import SharedBudget
+    from full_agent_executor import HostBroker, HostToolExecutor
+    from full_agent_provider import MeteredProviderTransport
+
+    private, work = tmp_path / "private", tmp_path / "work"
+    private.mkdir()
+    work.mkdir()
+
+    class Executor:
+        timeout_seconds = 900
+        def __init__(self):
+            self.calls = []
+            self.terminated = 0
+        def __call__(self, task):
+            self.calls.append(task)
+            return {"actual_request_cost": 1, "result": {"output": '{"ok": true}'}}
+        def terminate(self):
+            self.terminated += 1
+
+    engine = SimpleNamespace(
+        _is_known_tool=lambda _name: True,
+        tool_capability=lambda name: {"network": name == "kali-tools_curl_request"},
+        validate_tool_invocation=lambda *_a, **_kw: {"allowed": True, "reason": "allowed"},
+    )
+    host = HostBroker(
+        budget=SharedBudget(http=3, tokens=30000),
+        engine=engine,
+        executor=Executor(),
+        workdir=work,
+        private=private,
+        provider="https://provider.invalid/v1",
+        models={"model"},
+        api_key="host-only-sentinel",
+    )
+    assert isinstance(host.provider_transport, MeteredProviderTransport)
+    assert isinstance(host.tool_executor, HostToolExecutor)
+    assert not hasattr(host, "gate")
+    assert not hasattr(host, "dispatch")
+    assert not hasattr(host, "record_task_completion")
+
+    mock_provider(monkeypatch, host, {
+        "choices": [{"message": {"role": "assistant", "content": "ok"}, "finish_reason": "stop"}],
+        "usage": {"prompt_tokens": 11, "completion_tokens": 4, "total_tokens": 15},
+    })
+    response = host.provider_transport.complete(request_body())
+    assert response["choices"][0]["message"]["content"] == "ok"
+    assert host.budget.used["tokens"] == 15
+    assert host.calls == 1
+
+    emitted = host.call_tool("kali-tools", "curl_request", {"url": "http://127.0.0.1:8765/"})
+    assert emitted["isError"] is False
+    assert host.budget.used["http"] == 1
+    host.close()
+    assert host.executor.terminated >= 1
+
+
+def test_native_compat_broker_reuses_shared_provider_and_executor_without_duplicating_engines(broker):
+    from full_agent_executor import HostBroker
+    from full_agent_native_compat import LOCAL_TOOLS, NativeBrokerCompat, make_server, runtime_request
+    import full_agent_broker as compat_facade
+
+    assert isinstance(broker, HostBroker)
+    assert isinstance(broker, NativeBrokerCompat)
+    assert compat_facade.Broker is NativeBrokerCompat
+    assert compat_facade.LOCAL_TOOLS is LOCAL_TOOLS
+    assert callable(make_server)
+    assert callable(runtime_request)

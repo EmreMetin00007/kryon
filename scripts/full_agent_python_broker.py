@@ -13,8 +13,12 @@ import sys
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from full_agent_broker import Broker, dump, runtime_request
-from full_agent_budget import BudgetError, completion_request, prompt_bound, provider_json
+from full_agent_budget import (BudgetError, compact_tools, completion_request,
+                               prompt_bound, provider_json)
+from full_agent_executor import HostBroker
+from full_agent_provider import (PYTHON_ALLOWANCE_INSTRUCTION,
+                                 TOOL_DESCRIPTION_LIMIT, dump,
+                                 runtime_allowance_request)
 from full_agent_runtime_policy import (MAX_CONTEXT_BYTES, MAX_PROMPT_TOKENS,
                                        MIN_OUTPUT_TOKENS, PHASE_WEIGHTS, RuntimePolicy)
 from orchestration_spec import COMPILED_WORKFLOW_TOOL
@@ -162,7 +166,7 @@ class PythonRuntimePolicy(RuntimePolicy):
                 "host_finalizing": sorted(self.host_finalizing)}
 
 
-class PythonBroker(Broker):
+class PythonBroker(HostBroker):
     """Call MCP directly; native dispatch/gate/file-writing are not model APIs."""
 
     def __init__(self, *, workflow_sender=None, **kwargs):
@@ -298,10 +302,58 @@ class PythonBroker(Broker):
 
     def completion(self, body):
         self.advertised_tools = None
-        content_type, raw = super().completion(body, native_context=False)
-        if content_type != "application/json":
+        if isinstance(body, dict) and body.get("stream"):
             raise ValueError("Python solver requires buffered JSON")
-        return json.loads(raw)
+        tools = body.get("tools") if isinstance(body, dict) else None
+        worker_call = (
+            isinstance(tools, list)
+            and bool(tools)
+            and not any(row.get("function", {}).get("name") == "task" for row in tools)
+        )
+        if isinstance(body, dict) and "tools" in body:
+            body = {
+                **body,
+                "tools": compact_tools(
+                    body["tools"],
+                    description_limit=TOOL_DESCRIPTION_LIMIT,
+                    strip_annotations=True,
+                ),
+            }
+
+        def prepare_request(req_body, metrics):
+            active = getattr(getattr(self, "tasks", None), "active_spec", None)
+            projection = None
+            if worker_call:
+                req_body, runtime_info, projection = self.project_runtime_context(
+                    req_body, active, None
+                )
+            else:
+                runtime_info = self.runtime_policy.prepare(
+                    None, prompt_bound(provider_json(req_body))[0]
+                )
+            if projection is not None:
+                metrics["context_projection"] = projection
+            wire = runtime_allowance_request(
+                req_body, runtime_info, instruction=PYTHON_ALLOWANCE_INSTRUCTION
+            )
+            if (
+                len(provider_json(wire["messages"])) > MAX_CONTEXT_BYTES
+                or prompt_bound(provider_json(wire))[0] > MAX_PROMPT_TOKENS
+            ):
+                raise BudgetError("context_limit_exhausted")
+            return wire, runtime_info, runtime_info["request_token_allowance"]
+
+        return self.provider_transport.complete(
+            body,
+            prepare_request=prepare_request,
+            runtime_policy=self.runtime_policy,
+            task_spec_id=getattr(
+                getattr(getattr(self, "tasks", None), "active_spec", None),
+                "id",
+                None,
+            ),
+            minimum_output_tokens=MIN_OUTPUT_TOKENS,
+        )
 
     def project_runtime_context(self, body, spec, info):
         """Fit a host context before one provider dispatch, retaining its archive.
@@ -403,7 +455,9 @@ class PythonBroker(Broker):
             candidate['tools'] = [row for row in candidate['tools']
                                   if row['function']['name'] in allowed]
             info = self.runtime_policy.prepare(spec, prompt_bound(provider_json(candidate))[0])
-            wire = runtime_request(candidate, info, native_context=False)
+            wire = runtime_allowance_request(
+                candidate, info, instruction=PYTHON_ALLOWANCE_INSTRUCTION
+            )
             try:
                 if (len(provider_json(wire['messages'])) > MAX_CONTEXT_BYTES
                         or prompt_bound(provider_json(wire))[0] > MAX_PROMPT_TOKENS):
