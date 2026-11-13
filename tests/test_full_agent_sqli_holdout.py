@@ -11,6 +11,14 @@ import pytest
 
 import full_agent_holdout as holdout
 import full_agent_launcher as launcher
+from fixtures.holdout_references import (
+    bind_prior_runs,
+    collect_prior_evidence_paths,
+    collect_prior_hashes,
+    ensure_api_reference_run,
+    reference_probed_files,
+    register_reference_run,
+)
 from full_agent_broker import dump
 from test_full_agent_api_holdout import APIProvider, PREPARE, assert_native_api_family, bindings_from
 from test_full_agent_integration import (
@@ -20,22 +28,21 @@ from test_full_agent_integration import (
 
 pytestmark = pytest.mark.integration
 FAMILY = "readonly-sql-injection"
-CANONICAL_API_RUN = Path("/tmp/cco-work/full-agent-integration/handoff_closure-evm2s4uv/runs/native-05qvquai")
 
 
 class SQLProvider(APIProvider):
     vector = "injection-sqli"
     prepare_script = PREPARE.replace("'bola'", "'sql_injection'").replace("'authz-idor'", "'injection-sqli'")
+    prior_reference_runs: tuple[Path, ...] = ()
 
-    def __init__(self, directory, source, scenario, api_key, previous_runs=()):
+    def __init__(self, directory, source, scenario, api_key, previous_runs=(), *, prior_reference_runs=None):
         # Only paths cross to the isolation probe, never prior result bytes.
         super().__init__(directory, source, scenario, api_key, previous_runs)
-        self.previous_evidence_paths += [str(path) for root in (
-            CANONICAL_API_RUN / "private/evaluator", CANONICAL_API_RUN / "private/state/validations",
-        ) for path in root.glob("*") if path.is_file()]
-        self.previous_evidence_paths += [str(CANONICAL_API_RUN / "solver" / name)
-                                         for name in ("closure.json", "attempts.jsonl")
-                                         if (CANONICAL_API_RUN / "solver" / name).is_file()]
+        refs = self.prior_reference_runs if prior_reference_runs is None else prior_reference_runs
+        self.previous_evidence_paths = list(dict.fromkeys([
+            *self.previous_evidence_paths,
+            *collect_prior_evidence_paths(refs),
+        ]))
 
     def respond(self, body):
         self.previous_evidence_paths += [str(ROOT / "scripts/lab/readonly_sqli_holdout.py")]
@@ -106,21 +113,34 @@ def test_native_independent_readonly_sqli_family(integration_run, record_testsui
     monkeypatch.syspath_prepend(str(ROOT / "mcp-servers/mcp-validator"))
     from cco_validator_core.evidence import artifact_is_valid
 
-    prior = [path for root in (CANONICAL_API_RUN / "solver", CANONICAL_API_RUN / "private/evaluator",
-                              CANONICAL_API_RUN / "private/state/validations")
-             for path in root.rglob("*") if path.is_file()]
-    hashes = {str(path): holdout.digest(path) for path in prior}
-    first = assert_native_api_family(integration_run, record_testsuite_property,
-                                    seed=314159265358979, family=FAMILY, provider_class=SQLProvider)
-    second = assert_native_api_family(integration_run, record_testsuite_property,
-                                     seed=141421356237309, family=FAMILY, provider_class=SQLProvider)
+    api_ref = ensure_api_reference_run(
+        integration_run,
+        record_testsuite_property,
+        runner=assert_native_api_family,
+        provider_class=APIProvider,
+    )
+    prior, hashes = collect_prior_hashes((api_ref["run_dir"],), digest_fn=holdout.digest)
+    sql_provider = bind_prior_runs(SQLProvider, (api_ref["run_dir"],))
+    first = assert_native_api_family(
+        integration_run,
+        record_testsuite_property,
+        seed=314159265358979,
+        family=FAMILY,
+        provider_class=sql_provider,
+    )
+    register_reference_run(FAMILY, first)
+    second = assert_native_api_family(
+        integration_run,
+        record_testsuite_property,
+        seed=141421356237309,
+        family=FAMILY,
+        provider_class=sql_provider,
+    )
     assert set(first["manifest"]["native_session_ids"]).isdisjoint(second["manifest"]["native_session_ids"])
+    probed_api_paths = reference_probed_files(api_ref["run_dir"])
     for run in (first, second):
-        for path in [CANONICAL_API_RUN / "solver/closure.json", CANONICAL_API_RUN / "solver/attempts.jsonl",
-                     *list((CANONICAL_API_RUN / "private/evaluator").glob("*")),
-                     *list((CANONICAL_API_RUN / "private/state/validations").glob("*.json"))]:
-            if path.is_file():
-                assert str(path) in run["isolation"]["denied"]
+        for path in probed_api_paths:
+            assert str(path) in run["isolation"]["denied"]
         for case in run["metrics"]["cases"]:
             assert case["family"] == FAMILY and case["evidence"]
         wire = read_json(run["private"] / "evaluator/wire.json")
