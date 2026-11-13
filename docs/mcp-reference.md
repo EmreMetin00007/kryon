@@ -1,19 +1,21 @@
 # MCP Referansı
 
-> README'den taşındı: sunucu/araç kataloğu, RAG, reasoning, hunter, validator.
+> Sunucu/araç kataloğu, RAG, reasoning, hunter ve validator referansı.
 
-## ⚙️ 16 MCP Server — 291 Tool
+## ⚙️ 16 MCP Server — 292 Tool
 
 > Sayıların tek kaynağı: `python3 scripts/tool_counts.py` (MCP tool dekoratörleri).
-> Bu toplam kaynakta bildirilen araçları sayar. Etkin profil ve araç grupları
-> oturumda yüklenen araç sayısını belirler.
+> Bu toplam kaynakta bildirilen araçları sayar. Envanter ve profiller
+> [config/mcp-servers.json](../config/mcp-servers.json) ile
+> [config/profiles.json](../config/profiles.json) içinde tanımlıdır; çalışan Python
+> solver'ı ayrıca kendi açık, sınırlı araç kataloğunu kullanır.
 
 | Server | Tool | Öne Çıkanlar |
 |--------|---|--------------|
 | `kali-tools` | 93 | `nmap_scan_structured`, `sqlmap_test_structured`, `ffuf`, `nuclei`, `hydra`, `qwen_analyze`, `generate_exploit_poc`, `parallel_llm_analyze`, `swarm_dispatch`, `interactsh_*` |
 | `web-advanced` | 30 | GraphQL injection, JWT attacks, OAuth/SAML, HTTP smuggling, cache poisoning, prototype pollution, WebSocket fuzz, IDOR matrix, `generate_stealth_curl` |
 | `ctf-platform` | 14 | `ctfd_list_challenges`, `htb_submit_flag`, `thm_get_room`, decode/hash yardımcıları |
-| `validator` 🆕 | 26 | **Deterministik exploit doğrulama (XBOW-tarzı):** `validate_sqli` (differential boolean), `validate_ssti` (aritmetik oracle), `validate_command_injection` (echo+timing), `validate_path_traversal`, `validate_xss_reflection`, `validate_open_redirect`, `validate_ssrf_oob`+`confirm_oob_callback` (imzalı kolektör doğrulaması; sonuç henüz inconclusive), `validate_xxe`, `validate_auth_bypass`, `validate_idor`, `validate_finding`, `generate_validation_report` |
+| `validator` 🆕 | 27 | **Deterministik exploit doğrulama (XBOW-tarzı):** `validate_sqli` (differential boolean), `validate_ssti` (aritmetik oracle), `validate_command_injection` (echo+timing), `validate_path_traversal`, `validate_xss_reflection`, `validate_open_redirect`, `validate_ssrf_oob`+`confirm_oob_callback` (imzalı kolektör doğrulaması; sonuç henüz inconclusive), `validate_xxe`, `validate_auth_bypass`, `validate_idor`, `validate_finding`, `generate_validation_report` |
 | `ad-tools` | 12 | Kerberos (AS-REP/Kerberoast), SMB enum, NTLM, BloodHound veri toplama |
 | `memory-server` | 15 | `store_finding`, `store_credential`, `query_attack_paths`, `suggest_next_action` |
 | `container-tools` | 10 | Container escape, K8s RBAC, secret dump, privileged pod, Helm analizi |
@@ -27,9 +29,9 @@
 | `agent-browse` | 2 | Guardrailed agentic browser (browser-use, self-hosted) |
 | `otp` | 1 | `get_latest_otp` — IMAP'taki son OTP kodu |
 
-> OpenCode sunucuları `opencode.json` üzerinden kaydeder; etkin sunucular
-> seçilen profile bağlıdır. Claude Code kurulum yolu [tarihsel rehberde](history/claude-code-readme.md)
-> korunur. `browser` için Playwright gerekir. RAG bilgi tabanı, ayrı ve kontrollü
+> Sunucular [config/mcp-servers.json](../config/mcp-servers.json) ve profiller
+> [config/profiles.json](../config/profiles.json) içinde tanımlıdır. `browser` için
+> Playwright gerekir. RAG bilgi tabanı ayrı ve kontrollü
 > `python3 scripts/rag-bootstrap.py` akışıyla doldurulur.
 
 ### Yerel kanıt checkpoint'i
@@ -42,7 +44,7 @@ sonuç `check_exit=0, sealed=true` içerir. Araç ham bir payload imzalamaz.
 Sandbox kapanışı salt okunur açık anahtarla doğrular; özel anahtar açılmaz.
 Son işçi görevinde araç `tool_justification` ile ayrıca seçilir.
 
-Geçiş ve sınırlar: [ikinci dilim raporu](ledger-integrity-2026-10-29.md).
+Operasyon ve kapanış komutları: [operations.md](operations.md).
 
 ### RAG v2 bootstrap ve kurtarma
 
@@ -132,12 +134,12 @@ Hepsi deterministik çekirdek (offline test edilir); LLM varsa H1/H3 zenginleşi
 | **`hunt_variants`** | Doğrulanan bir bug'ı kardeş param/endpoint/method/content-type/konum/subdomain'de **sistematik çoğaltır** | Tek bug → sürü; bug bounty avcısının elle yaptığı çoğaltmanın otomasyonu |
 | **`coverage_report`** | Bilinen hedef/metot/sınıf/parametre ve planlı kimlik hücreleri için kanıta bağlı matris; son imzalı koşu | `enqueue_gaps=True` ve `campaign_id` ile uygun boşluklar tekil görevlere dönüşür; `max_attempts=3` (1–3) ilk deneme sınırını belirler. Oturum sonrası devam aynı görev ve kalan bütçeyle yapılır |
 | **`coverage_report_run`** | `target` ve `run_id` ile belirli koşunun kanıta bağlı matrisini gösterir | Koşuların test sonuçları birbirine karışmaz; envanter günceldir |
-| **`run_web_loop`** | Yetkili keşif, istek bağlamlı fuzz ve sahipliği belirtilen GET authz doğrulaması | Seçmeli `gap_ref` yalnız bir kapsam boyutunu doğrular; [kampanya köprüsü](coverage-campaign-bridge-2026-10-31.md) ve [oturum sözleşmesi](authenticated-web-api-2026-10-30.md) |
+| **`run_web_loop`** | Yetkili keşif, istek bağlamlı fuzz ve sahipliği belirtilen GET authz doğrulaması | Seçmeli `gap_ref` yalnız bir kapsam boyutunu doğrular; bütçe ve oturum sınırları [operations.md](operations.md) içinde özetlenir |
 
 Yerel native kampanyada desteklenen Hunter/HTTP validator/tek kullanımlık
 browser yolları aynı görev rezervasyonunu kullanır. Bağımsız araçlarda ortak
-çıkış garantisi bu tablo üzerinden varsayılmamalıdır; desteklenen yürütme
-yolları [ortak bütçe notunda](shared-wire-budget-2026-10-31.md) belirtilir.
+çıkış garantisi bu tablo üzerinden varsayılmamalıdır; ortak bütçe kuralları
+`scripts/wire_budget.py` tarafından uygulanır.
 | **`auto_fanout_variants`** 🆕 | Doğrulanan bug'ın varyantlarını **otomatik çalıştırılabilir** yapar: PLAN modu `mcp__kali-tools__curl_request` + `mcp__validator__*` çağrıları döndürür; LIVE modu GET-tabanlı güvenli varyantları gerçekten gönderip hızlı triage oracle uygular → umut verenler validator'a devredilir | Variant analizini **otomasyona** bağlar (kali-tools köprüsü) — tek bug'dan sürüye, elle koşturmadan |
 | **`enrich_with_rag`** 🆕 | `predict_vulnerabilities` çıktısını **rag-engine**'e besler: tahmin CVE'lerini çıkarır, RAG'da inline semantic arama yapıp eşleşen **PoC/exploit**'leri çeker + `rag_ingest_cve`/`rag_ingest_exploitdb`/`rag_search` ingest planı üretir | "Stack tahmini → **somut PoC**" zincirini otomatikleştirir |
 
@@ -163,8 +165,7 @@ kıyas kanıtıydı**. v3.2 bunu iki parçayla kapatır:
 değerlendirir (differential boolean SQLi, aritmetik SSTI, echo-token/timing cmdi,
 dosya-imzası LFI/XXE, Location-header open redirect...). OOB kolektör imzası
 yalnız olayın kolektör tarafından imzalandığını doğrular; kaynak atfı olmadan
-SSRF sonucu `INCONCLUSIVE` kalır. [OOB sözleşmesi](oob-collector-provenance-2026-10-31.md)
-gerçek kolektör entegrasyonu için önkoşulları açıklar.
+SSRF sonucu `INCONCLUSIVE` kalır.
 Her doğrulama `~/.cco/validations/` altına **reproducible audit-trail** olarak yazılır.
 
 ```
@@ -192,8 +193,6 @@ kanıtı vs LLM iddiası), (3) **reprodüksiyon metadata** (mode/model/git_commi
 + per-challenge transcript, (4) mock scorecard'a **"SELF-TEST — kanıt değil"
 watermark**'ı (mock skoru XBOW ile kıyaslanmaz). Yayınlanabilir kanıt = `--repo`
 (docker) koşusu.
-
-Detaylı metodoloji: `workflows/benchmark-workflow.md`.
 
 ---
 

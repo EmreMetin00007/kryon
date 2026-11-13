@@ -1,21 +1,19 @@
-# Benchmark Skor Kartı
+# Benchmark ve Doğrulama Kartı
 
-Tekrarlanabilir loopback doğrulama sonuçları. Gerçek hedefe dokunulmaz;
-hedef yalnızca `127.0.0.1` üzerindeki kasıtlı-zafiyetli lab'dır
+Tekrarlanabilir loopback doğrulama ve regresyon kontrolleri. Gerçek hedeflere
+dokunulmaz; hedef yalnızca `127.0.0.1` üzerindeki kasıtlı-zafiyetli lab'dır
 (`scripts/lab/vuln_lab.py`).
 
-## Son koşu
+## Son doğrulanmış koşu özeti
 
 | Alan | Değer |
 |---|---|
-| Tarih (UTC) | 2026-10-17T14:33Z |
-| Commit | `fbdbd4b` + mimari faz düzeltmeleri (çalışma ağacı) |
-| Komut | `python3 scripts/lab-validate.py --skip-rag --quiet --json` |
-| Sonuç | **48/48 passed** (`all_passed: true`) |
-| Birim testler | `python3 -m pytest tests -q` → **653 passed** |
-| Negatif kontrol | `python3 scripts/negative-control.py` → **fp_rate 0.0 (0/6)** |
-| Kapsam | 16 MCP server / 275 tool (`python3 scripts/tool_counts.py`) |
-| Ortam | `CCO_GRAPH_BACKEND=networkx` (CI ile aynı) |
+| Tarih | 2026-11-13 |
+| Birim test paketi | `python3 -m pytest tests -q -m 'not integration' --ignore=tests/test_full_agent_e6_benchmark.py` → **3365 passed, 37 skipped, 34 deselected** |
+| Lab doğrulaması | `python3 scripts/lab-validate.py --skip-rag --quiet --json` → **48/48 passed** |
+| Negatif kontrol | `python3 scripts/negative-control.py --rounds 1 --json` → **6/6 passed (`fp_rate: 0.0`)** |
+| MCP kapsamı | `python3 scripts/tool_counts.py` → **16 MCP server, 292 tool** |
+| Bağımlılık kilidi | `python3 scripts/release_artifacts.py check-lock` → **103 paket doğrulandı** |
 
 ## Kapsanan kontroller (özet)
 
@@ -30,18 +28,19 @@ hedef yalnızca `127.0.0.1` üzerindeki kasıtlı-zafiyetli lab'dır
 
 `scripts/negative-control.py`, lab'in sertleştirilmiş `/safe/*` ikizlerine
 6 kontrol koşar (SQLi, XSS, IDOR, auth bypass, open redirect, BOLA oracle).
-CONFIRMED = false-positive sayılır. Son koşu: **0/6 FP, fp_rate 0.0**
-(tüm kontroller UNCONFIRMED; ERROR yokluğu testte ayrıca doğrulanır).
-CI'da her koşuda tekrarlanır.
+CONFIRMED = false-positive sayılır; tüm kontroller UNCONFIRMED dönmelidir.
 
 ## Tekrar üretme
 
 ```bash
-CCO_GRAPH_BACKEND=networkx python3 -m pytest tests -q
+python3 -m pytest tests/test_python_engine.py tests/test_full_agent_python_solver.py -q
+python3 -m pytest tests/test_p9_integration.py tests/test_module_boundaries.py -q
 python3 scripts/lab-validate.py --skip-rag --quiet --json
 python3 scripts/negative-control.py --rounds 1 --json
 python3 scripts/tool_counts.py
+python3 scripts/release_check.py --list
+python3 scripts/check_repo_layout.py
 ```
 
-> Not: Bu kart lab/loopback kanıtıdır; gerçek program kabulü veya saha
-> başarısı iddiası taşımaz. XBOW tarzi harici benchmark koşusu ayrı iştir.
+> Not: Bu kart lab/loopback ve yerel birim testi kanıtıdır; gerçek program kabulü
+> veya harici saha başarısı iddiası taşımaz.
