@@ -306,6 +306,68 @@ class ObservedLinks(HTMLParser):
             self.links.append(href)
 
 
+# Native file tools the host always adds to a worker TaskSpec catalog.
+NATIVE_FILE_TOOLS = {"read", "write", "edit", "bash"}
+# Closing contract mirrored from RuntimePolicy.allowed_tools in
+# scripts/full_agent_runtime_policy.py: once a task is finalizing, only these
+# host tools may remain advertised (plus bash in the report phase).
+CLOSING_TOOLS = {"read", "write", "edit", "validator_session_vault_check",
+                 "kali-tools_ledger_prepare_handoff", "kali-tools_ledger_attempt_add_batch",
+                 "kali-tools_ledger_coverage", "hunter_coverage_report",
+                 "kali-tools_ledger_checkpoint"}
+
+
+def runtime_allowance(body):
+    """Return the last host runtime allowance (info, full message text)."""
+    for row in reversed(body.get("messages", [])):
+        content = message_text(row.get("content", ""))
+        prefix = "Host runtime allowance: "
+        start = content.find(prefix)
+        if start < 0:
+            continue
+        try:
+            info, _ = json.JSONDecoder().raw_decode(content[start + len(prefix):])
+        except (ValueError, TypeError):
+            return None, content
+        return (info if isinstance(info, dict) else None), content
+    return None, ""
+
+
+def validate_worker_catalog(available, expected, body):
+    """Assert the advertised worker catalog matches the host phase contract.
+
+    Ordinary phases must advertise the full TaskSpec catalog. Only a genuine
+    host finalization (allowance ``finalizing`` plus the FINALIZE NOW marker)
+    may advertise the closing subset, and it must match that subset exactly.
+    """
+    info, allowance_text = runtime_allowance(body)
+    finalizing = bool(info and info.get("finalizing") is True
+                      and "FINALIZE NOW" in allowance_text)
+    if not finalizing:
+        missing = expected - available
+        assert not missing, "Native MCP catalog incomplete: " + ", ".join(sorted(missing))
+        assert available == expected | NATIVE_FILE_TOOLS, (
+            "Native worker catalog mismatch: " + ", ".join(sorted(available)))
+        return
+    closing = set(CLOSING_TOOLS)
+    if info.get("phase") == "report":
+        closing.add("bash")
+    disabled = set(info.get("disabled_tools") or [])
+    want = ((expected | NATIVE_FILE_TOOLS) & closing) - disabled
+    extra = available - closing
+    assert not extra, "Non-closing tools advertised during closing finalization: " + ", ".join(sorted(extra))
+    assert available == want, (
+        "Closing catalog mismatch during closing finalization: advertised "
+        + ", ".join(sorted(available)) + " != contract " + ", ".join(sorted(want)))
+
+
+def assert_calls_advertised(calls, available):
+    for call in calls:
+        name = call["function"]["name"]
+        assert name in available, (
+            f"Returned tool call not advertised: {name}; advertised: {sorted(available)}")
+
+
 class ScriptedProvider:
     """OpenAI chat completions, including native tool_calls and exact usage.
 
@@ -392,9 +454,7 @@ class ScriptedProvider:
                     contract_read = True
                 else:
                     expected = {part.strip() for part in match.group(1).split(',')}
-                    missing = expected - available
-                    assert not missing, "Native MCP catalog incomplete: " + ", ".join(sorted(missing))
-                    assert available == expected | {"read", "write", "edit", "bash"}
+                    validate_worker_catalog(available, expected, body)
                     assert "Commands:" in text, "Host must render the actual native worker prompt"
             # The native prompt carries the exact dynamically allocated lab URL
             # and solver directory. Worker task prompts retain these references.
@@ -472,8 +532,7 @@ class ScriptedProvider:
                            "evidence": [str(work / "isolation-proof.json")], "findings": [], "next": "enum-2"}
                 calls = [tool_call("it-summary", "write", {
                     "filePath": str(work / "summaries/recon-1.json"), "content": json.dumps(summary)})]
-            for call in calls:
-                assert call["function"]["name"] in available, (call["function"]["name"], sorted(available))
+            assert_calls_advertised(calls, available)
         else:
             content = "Local integration"
         with self.lock:

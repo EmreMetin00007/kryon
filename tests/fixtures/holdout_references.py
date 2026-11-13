@@ -186,6 +186,10 @@ def collect_prior_hashes(
                 if path.is_symlink():
                     raise ValueError(f"reference artifact must not be a symlink: {path}")
                 if path.is_file():
+                    # Zero-byte lock placeholders carry no evidence and are
+                    # not run artifacts; every real artifact stays fail-closed.
+                    if path.suffix == ".lock" and path.stat().st_size == 0:
+                        continue
                     prior.append(_validated_run_file(root, path))
     if not prior:
         raise ValueError("no prior reference artifacts found")
