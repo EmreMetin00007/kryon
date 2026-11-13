@@ -1,6 +1,6 @@
 # Python motoru: mimari, geçiş ve eksikler
 
-Tarih: 2026-11-12. Kaynak: çalışan Python kodu ve yerel testler. Bu belge eski
+Tarih: 2026-11-14. Kaynak: çalışan Python kodu ve yerel testler. Bu belge eski
 mimari belgelerindeki iddiaları devralmaz. Bulgu bulma gücünde ölçülmemiş bir
 artış veya tüm P1–P9 işlerinin otomatik bağlandığı iddiası yoktur.
 
@@ -324,6 +324,16 @@ operatör yetkisi gerektirir (`paid_model_generalization: not_evaluated`).
   `scripts/full_agent_launcher.py` (`python_loop`) native uyumluluk
   modüllerini yüklemez ve `opencode.json` / `LOCAL_TOOLS` / `native-gates.json`
   üretmez.
+- Tarihsel istemci testlerinin ajan tanımları yalnız
+  `tests/fixtures/native_compat/` arşivinde tutulur; Python snapshot'ına veya
+  kurulu motorun zorunlu başlangıcına taşınmaz. SDK v2 araç/mesaj biçimleri,
+  doğrulanmış özel host receipt'lerinden bağlam projeksiyonu ve taşınabilir
+  önceki-koşu test yükleyicileri açık uyumluluk sınırındadır. Native test
+  sağlayıcısı host'un gerçek kapanış kataloğunu kabul eder; üretim aşama,
+  token, süre, istek ve rate sınırları genişletilmedi.
+- API, SQL, SSTI ve path-traversal tarihsel holdout testleri gerçek sahip olunan
+  loopback/istemci koşularıyla, atlamasız geçti. Tam release koşusunda da
+  uyumluluk testleri geçti; bunlar gerçek ücretli model recall kanıtı değildir.
 
 ### E8 — Kalan 34 vakanın onarımı ve kalite kapısı
 
@@ -370,42 +380,47 @@ iddiası oluşturmaz.
 
 ### E9 — İsteğe bağlı çalışma araçları ve ölçüm ortamı
 
-**Öncelik: orta.** Gelişmiş JS ayrıştırma Node/Babel gerektirebilir. Eksik
-ayrıştırıcıda statik fallback kullanılması tam JS yüzeyi çıkarıldığı anlamına
-gelmez. Tip kontrolü için Mypy ve bağımlılıkları `requirements.lock` hash
-kayıtlarından repo dışındaki geçici bir dizine kuruldu. Policy ve tool-count
-modüllerinin tip kontrolü geçti; bu araçlar çalışma motorunun zorunlu
-bağımlılığı değildir.
+**Durum: kapandı (2026-11-14).**
 
-**Kabul:** İsteğe bağlı parser bağımsız standart dizin veya açık ayarla bulunur;
-eksik parser açık diagnostic/coverage eksiği üretir. CI'da tip kontrolü çalışır
-ve başarısızlık kalite kapısına yansır.
+- **Dürüst parser kapsamı:** `cco_js_core/parsers.py` ve `client_logic.py`,
+  eksik Node/Babel, ayrıştırma hatası, geçersiz JSON/sonuç biçimi, açık statik
+  seçim, kaynak kesilmesi ve source-map özgün kaynak eksiklerini sınırlı
+  diagnostic ile makinece okunabilir `coverage_gaps` / `status: NOT TESTED`
+  olarak taşır. Statik fallback tam JS kapsamı değildir; başarılı Babel AST
+  çıkarımı da tam güvenlik kapsamı iddiası üretmez. Sağlayıcı/parser stderr'i
+  modele veya tanıya ham olarak aktarılmaz. Parser yalnız kaynak ayrıştırır,
+  hedef JavaScript'ini yürütmez.
+- **İsteğe bağlı bağımlılık sınırı:** Parser, açık `CCO_JS_PARSER_PATH` /
+  `NODE_PATH` veya standart repo dışı Node dizinlerinden bulunur. Checkout'a
+  otomatik `node_modules` kurulmaz; Node/Babel Python motorunun zorunlu
+  bağımlılığı değildir.
+- **Tip kontrolü:** Merkezi `pyproject.toml` listesi iki dosyadan **33 çekirdek
+  Python dosyasına** genişletildi: provider/executor, Python broker/solver,
+  bütçe, TaskSpec, launcher/preflight, checkpoint, evidence ve wire-policy
+  girişleri dahildir. `check_untyped_defs=true`; genel hata bastırma yoktur.
+  Sınır: `follow_imports=skip` nedeniyle listelenmeyen modüller ve tarihsel
+  native adaptörün tamamı statik tip doğrulaması kapsamı sayılmaz; yalnız
+  `jsonschema` stub eksikliği dar bir override ile ele alınır.
+- **Ruff ratchet ve CI:** Önceki `E9/F63/F7/F82` kümesine
+  `F541/F841/E722/F601/F602/F621/F622` eklendi; uyarılar giderilirken yan etkili
+  çağrılar korunur. CI merkezi kuralları daraltan `--select` kullanmaz.
+  `release_check.py` Ruff ve Mypy'yi çalıştırır; eksik kalite kapısı veya ilk
+  başarısız gate sıfır olmayan çıkış üretir. Negatif regresyonlar bunu sınar.
+- **Ortam ve gerçek yerel doğrulama:** `/opt/kryon-venv`, değiştirilmemiş
+  `requirements.lock` hash'leriyle hizalandı; `pip check` temiz. Lazy graph
+  proxy'sinin attribute silme/monkeypatch geri alma hatası regresyonla
+  onarıldı. Gerçek HTTP/Chromium acceptance **37 geçti, 0 atlandı**; beş seed'in
+  her biri 300 tavanı altında 272 istek kullandı. Önceki kaynak geliş sırası,
+  istek rezervasyonu, fallback yasağı ve NOT TESTED kontrolleri korunur.
 
-**Geçmiş ortam tanısı (son sıralı koşuda kapandı):** Bu onarımın önceki gerçek
-Chromium doğrulamasında ayrıca bir ortam sınırı ölçülmüştü:
-`tests/test_http_chromium_lab.py::test_native_browser_resources_exhaust_budget_without_fallback`
-30 saniyelik worker sınırında `TimeoutError` ile kapanmıştı. Doğrudan aynı
-program/scope ve üç istek bütçesiyle yapılan tanıda import **12,639 s**, browser
-başlatma yaklaşık **19,675 s**, toplam araç süresi **41,663 s** oldu. Sunucu
-yalnız `/allowed/resources`, `/allowed/api/a`, `/allowed/api/b` isteklerini aldı;
-gate üçte durdu ve HTTP fallback oluşmadı. Öldürülen child'ın sonucu host'ta
-`request_count_known=false`, üç istek rezervasyonu korunmuş ve
-`INCONCLUSIVE/NOT TESTED` olarak kalır. Bu durum başarılı test gibi sayılmaz;
-motorun veya testin süre tavanı artırılmadı.
-
-Yeniden üretim (yalnız testin sahip olduğu loopback sunucuları):
-
-```bash
-CCO_RUN_WIRE_LAB=1 python3 -m pytest tests/test_http_chromium_lab.py::test_native_browser_resources_exhaust_budget_without_fallback -q --tb=short
-```
-
-Geçmiş tanı: `/root/cco-work/regression-repair-20261112/resource-diag.log`.
-Son sıralı koşuda kalan hata, paralel `/allowed/api/a` ve `/allowed/api/b`
-isteklerinin sunucuya geliş sırasını sabit kabul eden assertion'dı. Assertion
-tam kaynak kümesini doğrular; üç istek sayısı, bütçe tükenmesi ve fallback
-oluşmaması kontrolleri korunur. Tam opt-in lab **32/32 geçti**; süre veya istek
-tavanı artırılmadı. Bu sonuç E1–E7 için canlı çalışma hazırlığı veya gerçek
-model recall ölçümü değildir.
+**Tam kalite kaydı:** `python3 scripts/release_check.py` çıkış **0**;
+**3483 geçti, 38 isteğe bağlı test atlandı**, üçüncü taraf ChromaDB deprecation
+uyarısı görünür kaldı (`4945.80s`). Ruff, 33 dosyalı Mypy, bütün pytest paketi,
+synthetic soak, lock, yerel lab, çevrimdışı örnek config, governance ve repo
+düzeni kapıları geçti. `--list` aynı merkezi kapıları gösterir. Bu kayıt
+`3162bb5` kodunda `/root/cco-work/wf-0c7324cc/e9-complete-release/` altında
+saklıdır. Atlanan testler veya başarılı yerel lab, gerçek model genellemesi ya
+da tam güvenlik kapsamı olarak sayılmaz.
 
 ## Kullanım
 
