@@ -1964,11 +1964,11 @@ def generate_stealth_curl(url: str, method: str = "GET", data: str = "") -> str:
     
     headers = [
         f"-H 'User-Agent: {ua}'",
-        f"-H 'Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8'",
-        f"-H 'Accept-Language: en-US,en;q=0.9'",
-        f"-H 'Accept-Encoding: gzip, deflate, br'",
-        f"-H 'Connection: keep-alive'",
-        f"-H 'Cache-Control: max-age=0'",
+        "-H 'Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8'",
+        "-H 'Accept-Language: en-US,en;q=0.9'",
+        "-H 'Accept-Encoding: gzip, deflate, br'",
+        "-H 'Connection: keep-alive'",
+        "-H 'Cache-Control: max-age=0'",
         f"-H 'X-Forwarded-For: {fake_ip}'",
         f"-H 'X-Real-IP: {fake_ip}'"
     ]
@@ -1986,7 +1986,7 @@ def generate_stealth_curl(url: str, method: str = "GET", data: str = "") -> str:
     stealth_cmd = " ".join(cmd_parts)
     
     lines = [
-        f"🎯 Stealth Curl Komutu (WAF Atlatma Teknikli):",
+        "🎯 Stealth Curl Komutu (WAF Atlatma Teknikli):",
         "-" * 50,
         stealth_cmd,
         "-" * 50,

@@ -109,7 +109,6 @@ def _load_filter_file(path: str | Path | None) -> dict:
 
 def _iter_files(root: Path, include_runtime: bool):
     for current, dirs, files in os.walk(root):
-        rel_dir = Path(current).relative_to(root)
         dirs[:] = [
             d for d in dirs
             if d not in SKIP_DIRS and (include_runtime or d not in RUNTIME_DIRS)

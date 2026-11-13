@@ -76,18 +76,69 @@ scripts = ["*.sh", "lab/*.py", "xbow_bench_fixtures/**/*.json"]
 [tool.ruff]
 target-version = "py312"
 
-# Ratchet: CI blocking set is intentionally narrow (syntax/pyflakes-critical).
-# Widen `select` only after the wider findings are cleaned per package.
+# Ratchet: CI blocking set uses central pyproject config across the repository.
 [tool.ruff.lint]
-select = ["E9", "F63", "F7", "F82"]
+select = [
+  "E9",
+  "F63",
+  "F7",
+  "F82",
+  "F541",
+  "F841",
+  "E722",
+  "F601",
+  "F602",
+  "F621",
+  "F622",
+]
 
 [tool.mypy]
 python_version = "3.12"
-mypy_path = "scripts"
+mypy_path = ["scripts", "mcp-servers/mcp-validator", "mcp-servers/mcp-memory-server"]
+check_untyped_defs = true
 warn_unused_ignores = false
 # The CI core gate checks its explicit entrypoints. MCP runtime imports are
 # tested separately and can be loaded as both package and standalone modules.
 follow_imports = "skip"
+files = [
+  "scripts/agent_cli.py",
+  "scripts/attempt_ledger.py",
+  "scripts/authz_matrix.py",
+  "scripts/chain_transport.py",
+  "scripts/check_repo_layout.py",
+  "scripts/egress_policy.py",
+  "scripts/egress_watchdog.py",
+  "scripts/evidence_trust.py",
+  "scripts/full_agent_broker.py",
+  "scripts/full_agent_budget.py",
+  "scripts/full_agent_e6_benchmark.py",
+  "scripts/full_agent_executor.py",
+  "scripts/full_agent_history.py",
+  "scripts/full_agent_launcher.py",
+  "scripts/full_agent_preflight.py",
+  "scripts/full_agent_provider.py",
+  "scripts/full_agent_python_broker.py",
+  "scripts/full_agent_python_solver.py",
+  "scripts/full_agent_runtime_policy.py",
+  "scripts/full_agent_summary_feedback.py",
+  "scripts/full_agent_tasks.py",
+  "scripts/llm_config.py",
+  "scripts/orchestration_spec.py",
+  "scripts/policy_engine.py",
+  "scripts/policy_gate_cli.py",
+  "scripts/python_workflow_binding.py",
+  "scripts/release_check.py",
+  "scripts/runtime_paths.py",
+  "scripts/session_store.py",
+  "scripts/task_spec.py",
+  "scripts/tool_counts.py",
+  "scripts/wire_budget.py",
+  "scripts/workflow_checkpoint.py",
+]
+
+[[tool.mypy.overrides]]
+module = ["jsonschema", "jsonschema.*"]
+ignore_missing_imports = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
@@ -97,6 +148,8 @@ addopts = "-q"
 [tool.cco]
 product = "policy-supervised autonomous security operator"
 quality_gate = [
+  "python3 -m ruff check .",
+  "python3 -m mypy",
   "python3 -m pytest tests -q",
   "python3 scripts/worker_soak.py --tasks 16 --workers 4 --stale-claims 2 --executor synthetic --max-tasks 16 --json",
   "python3 scripts/release_artifacts.py check-lock",

@@ -381,7 +381,6 @@ def execute_web_loop(
 
         for item in queue:
             vclass = str(item.get("vuln_class") or "")
-            url = item.get("url") or ""
             context = _pipeline_context(item, identity, run_id)
             context["access_dimensions"] = protocol_access(item)
             if vclass in OOB_AUTO:

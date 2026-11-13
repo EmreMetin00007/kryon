@@ -52,7 +52,7 @@ def test_auth_bypass_single_identity_and_bfla():
         calls.append(item["vuln_class"])
         return {"verdict": "CONFIRMED"}
 
-    out = execute_web_loop(
+    execute_web_loop(
         "http://t.local", live=True,
         fuzz=_fuzz_of({"vuln_class": "authentication_bypass", "url": "http://t.local/admin"},
                       {"vuln_class": "bfla", "url": "http://t.local/admin/users"}),

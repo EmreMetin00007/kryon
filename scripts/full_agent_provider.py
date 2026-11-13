@@ -11,6 +11,7 @@ import os
 from pathlib import Path
 import tempfile
 import threading
+from typing import Any
 
 from full_agent_budget import (
     BudgetError,
@@ -55,7 +56,7 @@ def runtime_allowance_request(body, info, *, instruction):
 def provider_usage_diagnostics(response):
     """Retain bounded accounting shape, never model text or arbitrary values."""
     def count(value):
-        result = {
+        result: dict[str, Any] = {
             "type": type(value).__name__
             if type(value) in {int, float, bool, str, list, dict, type(None)}
             else "other"

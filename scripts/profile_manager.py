@@ -163,7 +163,7 @@ def main():
             print(f"  Description: {result['description']}")
             print(f"  Enabled servers: {result['enabled_servers']}")
             print(f"  Estimated tokens: ~{result['estimated_tokens']:,}")
-            print(f"\n→ Profile applies to MCP inventory; the Python solver retains its bounded tool catalog")
+            print("\n→ Profile applies to MCP inventory; the Python solver retains its bounded tool catalog")
 
         elif args.action == "detect":
             if not args.task:

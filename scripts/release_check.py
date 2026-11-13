@@ -11,7 +11,7 @@ from pathlib import Path
 try:
     from .runtime_paths import runtime_root
 except ImportError:
-    from runtime_paths import runtime_root
+    from runtime_paths import runtime_root  # type: ignore[no-redef]
 
 
 REPO_ROOT = runtime_root()
@@ -27,6 +27,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--list", action="store_true", help="print configured gates and exit")
     args = parser.parse_args(argv)
     gates = _quality_gate()
+    if not gates:
+        print("[release-check] no quality gates configured", file=sys.stderr)
+        return 1
     if args.list:
         for gate in gates:
             print(gate)

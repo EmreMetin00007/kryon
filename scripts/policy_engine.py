@@ -21,7 +21,7 @@ from urllib.parse import parse_qsl, urlencode, unquote, urlparse, urlsplit, urlu
 try:
     from .runtime_paths import runtime_root
 except ImportError:
-    from runtime_paths import runtime_root
+    from runtime_paths import runtime_root  # type: ignore[no-redef]
 
 
 def _canonical_scope_url(raw: str) -> str:
@@ -84,6 +84,8 @@ def _load_stuck_evaluator():
 
         path = Path(__file__).with_name("stuck_detector.py")
         spec = importlib.util.spec_from_file_location("cco_stuck_detector", path)
+        if spec is None or spec.loader is None:
+            return None
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
         return module.evaluate_probe
@@ -106,6 +108,8 @@ def _load_js_queue_evaluator():
 
         path = Path(__file__).with_name("js_route_queue.py")
         spec = importlib.util.spec_from_file_location("cco_js_route_queue", path)
+        if spec is None or spec.loader is None:
+            return None
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
         return module.evaluate
@@ -129,6 +133,8 @@ def _load_egress_helpers():
 
         path = Path(__file__).with_name("egress_policy.py")
         spec = importlib.util.spec_from_file_location("cco_egress_policy", path)
+        if spec is None or spec.loader is None:
+            return None
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
         return module
@@ -1880,7 +1886,7 @@ class PolicyEngine:
             try:
                 from .orchestration_spec import validate_worker_prompt
             except ImportError:
-                from orchestration_spec import validate_worker_prompt
+                from orchestration_spec import validate_worker_prompt  # type: ignore[no-redef]
             errors = validate_worker_prompt("\n".join(prompts))
         except Exception:
             return "worker TaskSpec validator unavailable"

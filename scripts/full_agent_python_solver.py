@@ -13,6 +13,7 @@ import time
 import uuid
 from itertools import combinations
 from pathlib import Path
+from typing import Any
 from urllib.parse import parse_qsl, urljoin, urlsplit
 
 from jsonschema.exceptions import SchemaError, ValidationError
@@ -273,7 +274,8 @@ class PythonSolver:
             return []
         pending = list(combinations(names, 2))
         priorities = {"cross_tenant_user": 0, "same_tenant_other_user": 1, "different_role": 2}
-        pairs, covered = [], set()
+        pairs = []
+        covered: set[str] = set()
         while pending:
             # Within a category, cover new identities before repeating one.
             pair = min(pending, key=lambda pair: (
@@ -464,8 +466,8 @@ class PythonSolver:
                 result.pop('text')
                 result['text_archived'] = True
             recent_views.append({'tool': row['tool'], 'result': result, 'content_ref': row['content_ref']})
-        index = [{"tool": row["tool"], "content_ref": row["content_ref"]} for row in old]
-        archive = self.broker.archive(index, "index") if index else None
+        older_index = [{"tool": row["tool"], "content_ref": row["content_ref"]} for row in old]
+        archive = self.broker.archive(older_index, "index") if older_index else None
         remaining, _, _ = self.broker.runtime_policy.allowance(spec)
         previous = self.summaries.get(spec.depends_on[-1]) if spec.depends_on else None
         # Never send an ever-growing previous inventory or archive index.
@@ -484,7 +486,7 @@ class PythonSolver:
                    "reserved_validation_tool_calls": self.broker.runtime_policy.validation_reserves.get(spec.id, 0),
                    "reserved_checkpoint_tool_calls": self.broker.runtime_policy.checkpoint_reserves.get(spec.id, 0),
                    "recent_results": recent_views,
-                   "older_results": index[-8:], "older_index_ref": archive,
+                   "older_results": older_index[-8:], "older_index_ref": archive,
                    "summary_feedback": feedback}
         context["protocol_feedback"] = self.protocol_feedback.get(spec.id)
         if spec.references:
@@ -589,7 +591,11 @@ class PythonSolver:
         for key in ("status", "next", "steps"):
             if key in submitted:
                 summary[key] = submitted[key]
-        routes, params, probes, tested, formats = [], [], [], [], []
+        routes: list[Any] = []
+        params: list[Any] = []
+        probes: list[dict[str, Any]] = []
+        tested: list[dict[str, Any]] = []
+        formats: list[dict[str, Any]] = []
         evidence, observed_records = [], []
         for row in self.broker.results:
             if row["spec_id"] != spec.id or row["tool"] == READ_TOOL:
@@ -666,7 +672,8 @@ class PythonSolver:
             # Formats describe observed path segments, never ownership or
             # generated candidate values. Preserve placeholders as placeholders.
             for route in routes:
-                text = route if isinstance(route, str) else route.get("url", route.get("path", "")) if isinstance(route, dict) else ""
+                raw_text = route if isinstance(route, str) else route.get("url", route.get("path", "")) if isinstance(route, dict) else ""
+                text = raw_text if isinstance(raw_text, str) else ""
                 parts = [part for part in urlsplit(text).path.split("/") if part]
                 for index, part in enumerate(parts):
                     if re.fullmatch(r"v\d+", part, re.IGNORECASE) or not (re.search(r"\d", part) or ":id" in part):
@@ -824,7 +831,7 @@ class PythonSolver:
             return []
         outcomes = self.broker.validation_attempts(spec)
         origin = urlsplit(spec.target)
-        catalogs = {}
+        catalogs: dict[str, Any] = {}
         records = self.summaries.get("enum-2", {}).get("surface", {}).get("records", [])
         observed = {urlsplit(row.get("url", ""))._replace(query="", fragment="").geturl() for row in records}
         for record in records:
@@ -1128,8 +1135,9 @@ class PythonSolver:
                           failure_phase=self.broker.tasks.active_spec.id if self.broker.tasks.active_spec else None)
             if isinstance(exc, WorkflowError):
                 result.update(summary_errors=exc.errors, failed_summary_ref=exc.summary_ref)
-            if getattr(exc, "evidence_ref", None) is not None:
-                result["failed_tool_ref"] = exc.evidence_ref
+            evidence_ref = getattr(exc, "evidence_ref", None)
+            if evidence_ref is not None:
+                result["failed_tool_ref"] = evidence_ref
             dump(self.broker.private / "workflow-failure.json", {
                 key: result.get(key) for key in ("status", "error", "stop_reason", "failure_phase", "summary_errors", "failed_summary_ref", "failed_tool_ref")})
             if self._checkpoint_active:

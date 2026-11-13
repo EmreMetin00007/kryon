@@ -243,8 +243,6 @@ def main() -> int:
     lines = ["# Discovery experiment — matched comparison", "",
              "| Akış | Tekrar | Pozitif | FP iddiası | Model raporu | Yapılandırılmış rapor | İstek | LLM token | Süre (sn) |",
              "|---|---|---|---|---|---|---|---|---|"]
-    by = {(r["kind"], r["repeat"]): r for r in runs}
-    full = {("host", rep): json.loads((out / f"run-host-{rep}.json").read_text()) if (out / f"run-host-{rep}.json").exists() else None for rep in range(1, args.repeats + 1)}
     for r in runs:
         raw = json.loads((out / f"run-{r['kind']}-{r['repeat']}.json").read_text())
         s = raw["score"]

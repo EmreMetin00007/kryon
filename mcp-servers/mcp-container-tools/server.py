@@ -505,7 +505,6 @@ def k8s_pod_escape(
         return json.dumps({"error": "K8s API server bulunamadı"})
 
     pod_name = "cco-escape-" + str(os.getpid())
-    node_selector = {"kubernetes.io/hostname": node_name} if node_name else {}
 
     pod_manifest = {
         "apiVersion": "v1",
@@ -667,7 +666,7 @@ def helm_chart_scan(chart_path: str) -> str:
             fpath = os.path.join(root, fname)
             try:
                 with open(fpath) as f:
-                    content = f.read()
+                    f.read()
                 rel_path = os.path.relpath(fpath, chart_path)
 
                 for check_name, pattern in patterns.items():

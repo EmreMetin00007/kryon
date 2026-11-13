@@ -440,7 +440,7 @@ def launch_seed(prepared, *, seed, output, provider, api_key, bwrap=None, openco
     except Exception as exc:
         manifest.update(status="launch_failed", error=type(exc).__name__)
     finally:
-        if lab_thread is not None:
+        if lab_thread is not None and lab is not None:
             lab.shutdown()
             lab_thread.join(timeout=5)
         if lab is not None:

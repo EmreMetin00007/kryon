@@ -5,6 +5,7 @@ import json
 import hashlib
 from pathlib import Path
 import re
+from typing import Any
 
 from brain import next_spec
 from orchestration_spec import (TaskSpec, render_task_prompt, skeleton_summary,
@@ -21,7 +22,7 @@ class TaskRegistry:
         self.specs = [TaskSpec.from_dict(spec.to_dict()) for spec in specs]
         self.bindings = json.loads(json.dumps(bindings))
         self.setup_checks_passed = setup_checks_passed
-        self.active_spec = None
+        self.active_spec: TaskSpec | None = None
         self.normalizations = []
         errors = validate_chain(self.specs)
         if errors or any(spec.tool_profile != "broker" for spec in self.specs):
@@ -94,6 +95,8 @@ class TaskRegistry:
         """
         from full_agent_provider import dump
         spec = self.active_spec
+        if spec is None:
+            raise ValueError("no active task spec")
         path = self.workdir / "summaries" / (spec.id + ".json")
         receipt = Path(spec.evidence_dir) / ("host-stop-" + spec.id + ".json")
         for candidate in (path, receipt):
@@ -101,7 +104,7 @@ class TaskRegistry:
                 raise ValueError("host finalization refuses symlink paths")
             self.confine(candidate)
         raw = None
-        summary = None
+        summary: Any = None
         if path.exists():
             with path.open("rb") as handle:
                 raw = handle.read(128 * 1024 + 1)
@@ -111,12 +114,15 @@ class TaskRegistry:
                 summary = json.loads(raw)
             except (ValueError, UnicodeError):
                 pass
-        matches = (isinstance(summary, dict) and summary.get("phase") == spec.phase
-                   and summary.get("target") == spec.target)
+        summary_dict: dict[str, Any] | None = (
+            summary
+            if isinstance(summary, dict) and summary.get("phase") == spec.phase and summary.get("target") == spec.target
+            else None
+        )
         record = {"spec_id": spec.id, "reason": reason, "summary": str(path),
                   "before_sha256": hashlib.sha256(raw).hexdigest() if raw is not None else None}
-        if matches and not validate_summary(summary):
-            return {**record, "action": "terminal_summary_preserved", "status": summary["status"]}
+        if summary_dict is not None and not validate_summary(summary_dict):
+            return {**record, "action": "terminal_summary_preserved", "status": summary_dict["status"]}
         if raw is not None:
             archive = Path(private) / ("summary-before-stop-" + spec.id + ".json")
             with archive.open("xb") as handle:
@@ -124,7 +130,7 @@ class TaskRegistry:
             record["preserved_draft"] = str(archive)
         # Keep all assertions and step states in a well-formed draft. Malformed
         # or wrong-target drafts remain solely in the unmodified archive.
-        blocked = {**summary, "status": "blocked"} if matches else None
+        blocked = {**summary_dict, "status": "blocked"} if summary_dict is not None else None
         if blocked is None or validate_summary(blocked):
             blocked = {**skeleton_summary(spec), "status": "blocked"}
         receipt.parent.mkdir(parents=True, exist_ok=True)

@@ -132,7 +132,7 @@ def test_chain_validation_catches_bad_dependencies():
 
 
 def test_brain_next_gates_dispatch_on_summaries():
-    ts = _load("orchestration_spec")
+    _load("orchestration_spec")
     brain = _load("brain")
     specs = brain.build_plan("http://127.0.0.1:8899", "/tmp/run")
     assert [s.depends_on for s in specs] == [[], ["recon-1"], ["enum-2"], ["access-3"]]
