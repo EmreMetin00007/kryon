@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import json
-import os
 from collections import Counter
 from pathlib import Path
 import sys
@@ -12,41 +11,48 @@ import pytest
 
 import full_agent_holdout as holdout
 import full_agent_launcher as launcher
+from fixtures.holdout_references import (
+    API_FAMILY,
+    SQL_FAMILY,
+    bind_prior_runs,
+    collect_prior_evidence_paths,
+    collect_prior_hashes,
+    ensure_api_and_sql_reference_runs,
+    load_reference_metrics,
+    reference_probed_files,
+)
 from full_agent_broker import dump
 from test_full_agent_api_holdout import APIProvider, PREPARE, assert_native_api_family, bindings_from
 from test_full_agent_integration import (
     ROOT, ObservedLinks, integration_run, kernel_support, acceptance_evidence,
     read_json, read_result_json, returned_json, tool_call,
 )
+from test_full_agent_sqli_holdout import SQLProvider
 
 pytestmark = pytest.mark.integration
 FAMILY = "readonly-path-traversal"
-CANONICAL_API_RUN = Path(os.environ.get("CCO_CANONICAL_API_RUN",
-    "/tmp/cco-work/full-agent-integration/handoff_closure-_fr1_xxw/runs/native-syatrbwk"))
-
-
-CANONICAL_SQL_RUN = Path(os.environ.get("CCO_CANONICAL_SQL_RUN",
-    "/tmp/cco-work/full-agent-integration/handoff_closure-j4r1hjq1/runs/native-s9mtc5u3"))
 
 
 class TraversalProvider(APIProvider):
     vector = "file-access"
     prepare_script = PREPARE.replace("'bola'", "'path_traversal'").replace("'authz-idor'", "'file-access'")
+    prior_reference_runs: tuple[Path, ...] = ()
 
-    def __init__(self, directory, source, scenario, api_key, previous_runs=()):
+    def __init__(self, directory, source, scenario, api_key, previous_runs=(), *, prior_reference_runs=None):
         # Only paths cross to the isolation probe, never prior result bytes.
         super().__init__(directory, source, scenario, api_key, previous_runs)
-        self.previous_evidence_paths += [str(path) for previous in previous_runs
-            for path in (previous / "private/state").glob("holdout-program-policy.json")]
-        self.previous_evidence_paths += [str(path) for root in (
-            CANONICAL_SQL_RUN / "private/evaluator", CANONICAL_SQL_RUN / "private/state/validations",
-
-            CANONICAL_API_RUN / "private/evaluator", CANONICAL_API_RUN / "private/state/validations",
-        ) for path in root.glob("*") if path.is_file()]
-        self.previous_evidence_paths += [str(CANONICAL_SQL_RUN / "solver" / name) for name in ("closure.json", "attempts.jsonl")]
-        self.previous_evidence_paths += [str(CANONICAL_API_RUN / "solver" / name)
-                                         for name in ("closure.json", "attempts.jsonl")
-                                         if (CANONICAL_API_RUN / "solver" / name).is_file()]
+        refs = self.prior_reference_runs if prior_reference_runs is None else prior_reference_runs
+        policy_paths = [
+            str(path)
+            for previous in previous_runs
+            for path in (Path(previous) / "private/state").glob("holdout-program-policy.json")
+            if path.is_file() and not path.is_symlink()
+        ]
+        self.previous_evidence_paths = list(dict.fromkeys([
+            *self.previous_evidence_paths,
+            *policy_paths,
+            *collect_prior_evidence_paths(refs, include_policy=True),
+        ]))
 
     def respond(self, body):
         self.previous_evidence_paths += [str(ROOT / "scripts/lab/readonly_traversal_holdout.py")]
@@ -121,30 +127,41 @@ def test_native_independent_readonly_traversal_family(integration_run, record_te
     monkeypatch.syspath_prepend(str(ROOT / "mcp-servers/mcp-validator"))
     from cco_validator_core.evidence import artifact_is_valid
 
-    prior = [path for previous in (CANONICAL_API_RUN, CANONICAL_SQL_RUN)
-             for root in (previous / "solver", previous / "private/evaluator", previous / "private/state/validations")
-             for path in root.rglob("*") if path.is_file()]
-    assert prior and all((previous / "private/evaluator/metrics.json").is_file()
-                         for previous in (CANONICAL_API_RUN, CANONICAL_SQL_RUN))
-    hashes = {str(path): holdout.digest(path) for path in prior}
-    first = assert_native_api_family(integration_run, record_testsuite_property,
-        seed=173205080756887, family=FAMILY, provider_class=TraversalProvider)
+    api_ref, sql_ref = ensure_api_and_sql_reference_runs(
+        integration_run,
+        record_testsuite_property,
+        runner=assert_native_api_family,
+        api_provider_class=APIProvider,
+        sql_provider_class=SQLProvider,
+    )
+    prior_runs = (api_ref["run_dir"], sql_ref["run_dir"])
+    prior, hashes = collect_prior_hashes(prior_runs, digest_fn=holdout.digest)
+    traversal_provider = bind_prior_runs(TraversalProvider, prior_runs)
+    first = assert_native_api_family(
+        integration_run,
+        record_testsuite_property,
+        seed=173205080756887,
+        family=FAMILY,
+        provider_class=traversal_provider,
+    )
     # Capture exactly the files that exist BEFORE the second read-denial probe.
     first_probed = [first["work"] / "closure.json", first["work"] / "attempts.jsonl",
                     *list((first["private"] / "evaluator").glob("*")),
                     *list((first["private"] / "state/validations").glob("*.json")),
                     first["private"] / "state/holdout-program-policy.json"]
     first_hashes = {str(path): holdout.digest(path) for path in first_probed if path.is_file()}
-    second = assert_native_api_family(integration_run, record_testsuite_property,
-        seed=223606797749978, family=FAMILY, provider_class=TraversalProvider)
+    second = assert_native_api_family(
+        integration_run,
+        record_testsuite_property,
+        seed=223606797749978,
+        family=FAMILY,
+        provider_class=traversal_provider,
+    )
     assert set(first["manifest"]["native_session_ids"]).isdisjoint(second["manifest"]["native_session_ids"])
+    probed_prior_paths = [path for canon in prior_runs for path in reference_probed_files(canon)]
     for run in (first, second):
-        for previous in (CANONICAL_API_RUN, CANONICAL_SQL_RUN):
-            for path in [previous / "solver/closure.json", previous / "solver/attempts.jsonl",
-                         *list((previous / "private/evaluator").glob("*")),
-                         *list((previous / "private/state/validations").glob("*.json"))]:
-                if path.is_file():
-                    assert str(path) in run["isolation"]["denied"]
+        for path in probed_prior_paths:
+            assert str(path) in run["isolation"]["denied"]
         assert read_json(run["private"] / "fixture-policy-verification.json")["before_traffic"]
         public_policy = read_json(run["private"].parent / "runtime/.codex/program-policy.json")
         assert "path_traversal" not in public_policy
@@ -179,9 +196,14 @@ def test_native_independent_readonly_traversal_family(integration_run, record_te
             assert artifact_is_valid(artifact) == valid
     with pytest.raises(ValueError, match="repeated independent family"):
         holdout.aggregate([first["metrics"], second["metrics"]], first["metrics"]["contract"])
-    metrics_paths = [previous / "private/evaluator/metrics.json" for previous in (CANONICAL_API_RUN, CANONICAL_SQL_RUN)]
-    aggregate = holdout.aggregate([*[read_json(path) for path in metrics_paths], first["metrics"]],
-                                  first["metrics"]["contract"])
+    api_metrics, sql_metrics = load_reference_metrics(
+        prior_runs,
+        expected_families=(API_FAMILY, SQL_FAMILY),
+    )
+    aggregate = holdout.aggregate(
+        [api_metrics, sql_metrics, first["metrics"]],
+        first["metrics"]["contract"],
+    )
     assert aggregate["status"] == "passed" and len(aggregate["families"]) == 3
     assert aggregate["positives"] == aggregate["negatives"] == 24
     assert aggregate["false_positives"] == {"numerator": 0, "denominator": 24}

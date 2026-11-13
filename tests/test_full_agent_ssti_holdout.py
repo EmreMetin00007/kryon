@@ -11,33 +11,41 @@ import pytest
 
 import full_agent_holdout as holdout
 import full_agent_launcher as launcher
+from fixtures.holdout_references import (
+    API_FAMILY,
+    SQL_FAMILY,
+    bind_prior_runs,
+    collect_prior_evidence_paths,
+    collect_prior_hashes,
+    ensure_api_and_sql_reference_runs,
+    load_reference_metrics,
+    reference_probed_files,
+)
 from full_agent_broker import dump
 from test_full_agent_api_holdout import APIProvider, PREPARE, assert_native_api_family, bindings_from
 from test_full_agent_integration import (
     ROOT, ObservedLinks, integration_run, kernel_support, acceptance_evidence,
     read_json, read_result_json, returned_json, tool_call,
 )
+from test_full_agent_sqli_holdout import SQLProvider
 
 pytestmark = pytest.mark.integration
 FAMILY = "readonly-template-injection"
-CANONICAL_API_RUN = Path("/tmp/cco-work/full-agent-integration/handoff_closure-evm2s4uv/runs/native-05qvquai")
-CANONICAL_SQL_RUN = Path("/tmp/cco-work/full-agent-integration/handoff_closure-4k3e2x0_/runs/native-wmcurvqp")
 
 
 class SSTIProvider(APIProvider):
     vector = "injection-ssti"
     prepare_script = PREPARE.replace("'bola'", "'ssti'").replace("'authz-idor'", "'injection-ssti'")
+    prior_reference_runs: tuple[Path, ...] = ()
 
-    def __init__(self, directory, source, scenario, api_key, previous_runs=()):
+    def __init__(self, directory, source, scenario, api_key, previous_runs=(), *, prior_reference_runs=None):
+        # Only paths cross to the isolation probe, never prior result bytes.
         super().__init__(directory, source, scenario, api_key, previous_runs)
-        for canon in (CANONICAL_API_RUN, CANONICAL_SQL_RUN):
-            if canon.is_dir():
-                self.previous_evidence_paths += [str(path) for root in (
-                    canon / "private/evaluator", canon / "private/state/validations",
-                ) for path in root.glob("*") if path.is_file()]
-                self.previous_evidence_paths += [str(canon / "solver" / name)
-                                                 for name in ("closure.json", "attempts.jsonl")
-                                                 if (canon / "solver" / name).is_file()]
+        refs = self.prior_reference_runs if prior_reference_runs is None else prior_reference_runs
+        self.previous_evidence_paths = list(dict.fromkeys([
+            *self.previous_evidence_paths,
+            *collect_prior_evidence_paths(refs),
+        ]))
 
     def respond(self, body):
         self.previous_evidence_paths += [str(ROOT / "scripts/lab/readonly_ssti_holdout.py")]
@@ -108,23 +116,35 @@ def test_native_independent_readonly_ssti_family(integration_run, record_testsui
     monkeypatch.syspath_prepend(str(ROOT / "mcp-servers/mcp-validator"))
     from cco_validator_core.evidence import artifact_is_valid
 
-    prior = [path for canon in (CANONICAL_API_RUN, CANONICAL_SQL_RUN)
-             for root in (canon / "solver", canon / "private/evaluator", canon / "private/state/validations")
-             if root.is_dir() for path in root.rglob("*") if path.is_file()]
-    hashes = {str(path): holdout.digest(path) for path in prior}
-    first = assert_native_api_family(integration_run, record_testsuite_property,
-                                     seed=271828182845904, family=FAMILY, provider_class=SSTIProvider)
-    second = assert_native_api_family(integration_run, record_testsuite_property,
-                                      seed=161803398874989, family=FAMILY, provider_class=SSTIProvider)
+    api_ref, sql_ref = ensure_api_and_sql_reference_runs(
+        integration_run,
+        record_testsuite_property,
+        runner=assert_native_api_family,
+        api_provider_class=APIProvider,
+        sql_provider_class=SQLProvider,
+    )
+    prior_runs = (api_ref["run_dir"], sql_ref["run_dir"])
+    prior, hashes = collect_prior_hashes(prior_runs, digest_fn=holdout.digest)
+    ssti_provider = bind_prior_runs(SSTIProvider, prior_runs)
+    first = assert_native_api_family(
+        integration_run,
+        record_testsuite_property,
+        seed=271828182845904,
+        family=FAMILY,
+        provider_class=ssti_provider,
+    )
+    second = assert_native_api_family(
+        integration_run,
+        record_testsuite_property,
+        seed=161803398874989,
+        family=FAMILY,
+        provider_class=ssti_provider,
+    )
     assert set(first["manifest"]["native_session_ids"]).isdisjoint(second["manifest"]["native_session_ids"])
+    probed_prior_paths = [path for canon in prior_runs for path in reference_probed_files(canon)]
     for run in (first, second):
-        for canon in (CANONICAL_API_RUN, CANONICAL_SQL_RUN):
-            if canon.is_dir():
-                for path in [canon / "solver/closure.json", canon / "solver/attempts.jsonl",
-                             *list((canon / "private/evaluator").glob("*")),
-                             *list((canon / "private/state/validations").glob("*.json"))]:
-                    if path.is_file():
-                        assert str(path) in run["isolation"]["denied"]
+        for path in probed_prior_paths:
+            assert str(path) in run["isolation"]["denied"]
         for case in run["metrics"]["cases"]:
             assert case["family"] == FAMILY and case["evidence"]
         wire = read_json(run["private"] / "evaluator/wire.json")
@@ -160,8 +180,10 @@ def test_native_independent_readonly_ssti_family(integration_run, record_testsui
         holdout.aggregate([first["metrics"], second["metrics"]], first["metrics"]["contract"])
 
     # Full aggregate evaluation across all 3 independent holdout families
-    api_metrics = read_json(CANONICAL_API_RUN / "private/evaluator/metrics.json")
-    sql_metrics = read_json(CANONICAL_SQL_RUN / "private/evaluator/metrics.json")
+    api_metrics, sql_metrics = load_reference_metrics(
+        prior_runs,
+        expected_families=(API_FAMILY, SQL_FAMILY),
+    )
     ssti_metrics = first["metrics"]
     full_summary = holdout.aggregate([api_metrics, sql_metrics, ssti_metrics], first["metrics"]["contract"])
     assert full_summary["status"] == "passed"
