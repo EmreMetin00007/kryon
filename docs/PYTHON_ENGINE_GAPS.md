@@ -268,7 +268,10 @@ yapıldığı doğrulandı.
 
 ### E6 — Bulgu gücünü gerçek modelle ölçme
 
-**Durum: ölçüm ve önce/sonra kıyaslama altyapısı tamamlandı (2026-11-13); canlı ücretli model koşusu operatör onayı bekler.**
+**Durum: gerçek model ölçümü ve ortak-tavan önce/sonra değerlendirmesi yapıldı
+(2026-11-14); bulgu gücü kabulü hâlâ açık.** Her iki canlı cohort da
+`aggregate_status: incomplete`, `paid_model_generalization: evaluated_incomplete`
+üretti. Ölçümün tamamlanması başarılı recall veya güvenlik kapsamı demek değildir.
 `scripts/full_agent_e6_benchmark.py`, `scripts/full_agent_holdout.py:audit_run_status`,
 `scripts/full_agent_preflight.py --http-budget` ve `scripts/agent_cli.py benchmark`
 üzerinden E6 ölçüm ve önce/sonra kıyaslama yolu eklendi; runtime snapshot
@@ -295,13 +298,93 @@ haritası (`preflight.runtime_file`) bu dosyaları model erişiminden ayrı tuta
   `--authorize-live-provider` hem de boş olmayan `--live-authorization-reason`
   olmadan fail-closed engellenir.
 
-**Doğrulama (yerel loopback lab):** `tests/test_full_agent_e6_benchmark.py` (**6 geçti**):
+**Altyapı doğrulaması (2026-11-13, yerel loopback lab):** `tests/test_full_agent_e6_benchmark.py` (**6 geçti**):
 3 aile gereksinimi, snapshot izolasyonu, canlı sağlayıcı yetki kapısı,
 bilinmeyen maliyet politikası, başarısız koşu oranı/kurcalama reddi ve ortak
 tavanda (`250 HTTP / 150k token / 260 s`) 3 bağımsız ailede (`readonly-api-access-control`,
 `readonly-sql-injection`, `readonly-template-injection`) uçtan uca gerçek yerel
-HTTP/MCP önce/sonra kıyaslaması geçti. Ücretli uzak gerçek LLM koşusu ayrıca açık
-operatör yetkisi gerektirir (`paid_model_generalization: not_evaluated`).
+HTTP/MCP önce/sonra kıyaslaması geçti. Bu tarihsel yerel sonuç gerçek model
+recall kanıtı değildir; aşağıdaki canlı ölçüm ayrıca açık kullanıcı yetkisiyle
+yapıldı.
+
+#### Gerçek model ölçümü — 2026-11-14
+
+Önce `agent_cli.py check-config --provider-config config/llm.json` çevrimdışı
+olarak `cco-llm/1` ve `meta/muse-spark-1.3-contributor` seçimini doğruladı
+(`credential_read=false`, `network_requests=0`). Her iki `benchmark plan`
+koşusu da **0 LLM / 0 hedef isteği** üretti. Canlı sağlayıcı `api.meta.ai`;
+anahtar yalnız `META_API_KEY` ortam referansından runtime tarafından kullanıldı.
+Değeri ajan tarafından incelenmedi, gösterilmedi veya konfigürasyona yazılmadı.
+
+Her iki canlı komut açık `--execute --authorize-live-provider` ve
+`--live-authorization-reason "User-authorized E6 live benchmark using meta/muse-spark-1.3-contributor"`
+ile çalıştı. Hedefler yalnız host'un oluşturduğu, kapsamı/onayı doğrulanmış
+sahip olunan loopback laboratuvarlarıydı; uzak bounty hedefine trafik yoktu.
+Üç aile ve seed eşleşmesi aynı tutuldu:
+`readonly-api-access-control:314159`, `readonly-sql-injection:271828`,
+`readonly-template-injection:141421`. **Seed başına ortak tavan: 250 HTTP /
+150000 LLM token / 900 saniye**; karşılaştırıcı bu tavanların eşitliğini doğruladı.
+
+| Metrik | Önce (`be20099`) | Deneysel aday (`1cb7760`) |
+|---|---:|---:|
+| Recall | 0/24 (%0) | 0/24 (%0) |
+| False positives | 0/0 — oran bilinmiyor | 0/0 — oran bilinmiyor |
+| Negative coverage | 0/24 (%0) | 0/24 (%0) |
+| Failed run rate | 1/3 (%33,33) | 2/3 (%66,67) |
+| Requests / verified finding | `None` | `None` |
+| Tokens / verified finding | `None` | `None` |
+| Gerçek sağlayıcı çağrısı | 31 | 34 |
+| Gerçek hedef HTTP isteği (cohort toplamı) | 31 | 253 |
+| Ölçülen toplam token | 91380 | 107811 |
+| Ölçülen çalışma süresi (s) | 249,016 | 679,898 |
+| USD maliyet | `None` | `None` |
+
+Hiç doğrulanmış bulgu olmadığı için bulgu başına oranlar tanımsızdır; sıfır
+yazılmaz. FP paydası da sıfırdır: **0 FP, temiz negatif kapsam veya %0 FP oranı
+kanıtı değildir.** Maliyet bilinmiyor (`unknown_cost_is_zero=false`). CLI çıkış
+0, benchmark/audit komutunun tamamlandığını gösterir; kabulün geçtiğini değil.
+İlk koşuda SQL/SSTI kapanışları doğrulandı, API kapanışı eksik kaldı; adayda
+yalnız SSTI kapanışı doğrulandı. Doğrulanmış kapanış, tamamlanmış güvenlik
+kapsamıyla karıştırılmadı; başarısız koşular 24 pozitif/24 negatif paydasında kaldı.
+
+**Tanı ve deney kararı:** İlk model çıktılarında enum gerçek crawler çağırmak
+yerine arşiv okumalarına takıldı; API enum'da reddedilen artifact okuması sonrası
+bloklandı. Aday yalnız genel discovery/validation ayrımını ve ilan edilmiş
+araçlara/aşama bütçesine bağlı kısa yönlendirmeyi değiştirdi. P5 `live=false`,
+P7/P8 `binding_ref`, summary-only kapanış ve özel TaskSpec adımları korundu;
+hedefe/seed'e özel rota, cevap, evaluator truth veya genişletilmiş bütçe yoktu.
+Adayın 9 yeni sözleşme testi ve **174 testlik Python motoru/solver paketi** geçti.
+
+Yeniden ölçümde crawler gerçekten çağrıldı: SQL/SSTI enum özetlerinde 21'er
+rota ve birer parametre gözlendi; API yalnız bir rota ve sıfır parametrede kaldı.
+Ancak gözlemden doğru deterministik doğrulama seçimine geçiş yeterli olmadı;
+model doğrudan ilgili validator'ları seçmedi ve host fallback sonuçları güncel
+raporlanabilir kontrol kanıtı üretmedi. SQL report aşamasında ayrıca
+`tool_arguments_schema_invalid` kaydı görüldü. Recall artmadı, istek/token
+harcaması ve bu küçük örnekte başarısız koşu sayısı arttı. **Bu yüzden aday
+başarı artışı olarak sunulmadı ve üretimden geri alındı**; runtime önceki
+doğrulanmış davranışa döndü. Deney `a7488d6` / `1cb7760` Git geçmişinde,
+ölçümler ise aşağıdaki dış dizinlerde korunur. Tek seed/aile ve tek yeniden
+değerlendirme, nedensellik veya genel model başarısı iddiasına yetmez.
+
+**Açık kabul işi:** Gerçek gözlem → validator seçimi/coverage ve doğru terminal
+summary yolunu önce çevrimdışı adversarial/negatif kontrollerle güçlendirmek,
+sonra aynı tavanlarla daha geniş, bağımsız seed setinde yeniden ölçmek gerekir.
+Bu görevde ek ücretli denemelerle sonuç zorlanmadı.
+
+**NOT TESTED / genelleme sınırları:** `readonly_get_only`,
+`synthetic_fixture_boundaries`, `out_of_band_and_multi_step_business_logic`,
+`incomplete_run_before_closure`, `missed_positive_controls`,
+`untested_negative_controls`. Üç read-only sentetik aile, genel bounty/P1–P9
+kapsamı veya gerçek kullanıcı nesneleri üzerinde başarı kanıtı değildir.
+
+Kanıtlar repo dışında `/root/cco-work/wf-0c7324cc/` altında:
+`e6-offline/`, `e6-meta-before/{cohort-report.json,cohort-report.md,execution.json}`,
+`e6-meta-after/{cohort-report.json,cohort-report.md,execution.json}` ve
+`e6-comparison/{comparison.json,comparison.md}`. Raporlar bağımsız offline
+audit üzerinden imza/hash referanslarını ve gerçek kullanım muhasebesini taşır.
+Son zorunlu doğrulama komutları/logları `final-verification/results.json` ve
+aynı dizindeki ayrı gate loglarında saklanır.
 
 ### E7 — Ortak modüllerde kalan tarihsel native kod
 
