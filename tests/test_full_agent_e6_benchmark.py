@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
+import os
 from pathlib import Path
 import tempfile
 import threading
@@ -342,7 +343,9 @@ def test_failed_run_audit_counts_failure_rate_and_rejects_evaluator_tampering(ba
 @pytest.mark.integration
 def test_e6_before_after_comparison_across_three_families_under_shared_ceilings(baseline, tmp_path, monkeypatch):
     monkeypatch.setenv("CCO_BENCHMARK_API_KEY", "host-only-local-fixture")
-    work_root = Path(tempfile.mkdtemp(prefix="e6-bench-", dir="/tmp/cco-work" if Path("/tmp/cco-work").exists() else str(tmp_path.parent)))
+    work_base = Path(os.environ.get("CCO_WORKDIR", str(tmp_path.parent))).expanduser().resolve()
+    work_base.mkdir(parents=True, exist_ok=True)
+    work_root = Path(tempfile.mkdtemp(prefix="e6-bench-", dir=str(work_base)))
     shared_ceilings = {"http_budget": 250, "token_budget": 150000, "seconds_budget": 260}
 
     before_srv = ThreadingHTTPServer(("127.0.0.1", 0), _make_fake_provider("before", fail_families={"ssti"}))
@@ -363,7 +366,9 @@ def test_e6_before_after_comparison_across_three_families_under_shared_ceilings(
         )
         after_path, after_report = e6.run_cohort(
             "after-candidate", baseline=baseline, provider_config=after_cfg,
-            output_dir=after_dir, execute=True, **shared_ceilings,
+            output_dir=after_dir, execute=True,
+            treatment={"name": "after-candidate", "role": "treatment", "changed_dimensions": ["provider_config"]},
+            **shared_ceilings,
         )
 
         # Verify CLI compare subcommand works via cco-agent entrypoint cleanly.
@@ -377,6 +382,10 @@ def test_e6_before_after_comparison_across_three_families_under_shared_ceilings(
         comparison = json.loads((cmp_dir / "comparison.json").read_text())
         markdown = (cmp_dir / "comparison.md").read_text()
 
+        assert comparison["strict_paired"] is True
+        assert comparison["reaudited_from_artifacts"] is True
+        assert comparison["comparison_mode"] == "strict_paired"
+        assert comparison["treatment"]["allowed_differences"] == ["provider_config"]
         assert comparison["ceilings_matched"] is True
         assert comparison["families"] == sorted(e6.DEFAULT_FAMILIES)
         assert comparison["models"] == {"before": ["owned/before-model"], "after": ["owned/after-model"]}
