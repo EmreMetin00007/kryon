@@ -223,7 +223,12 @@ def member_solver(broker, monkeypatch, count=4):
     broker.tasks.bindings = {f"synthetic-{index}": {"target": spec.target, "role": "member",
                             "test_data_only": True, "owned_objects_private": True} for index in range(count)}
     solver = PythonSolver(broker, model="model")
-    solver.summaries["enum-2"] = {"surface": {"records": [{"url": spec.target}]}}
+    source = broker.tasks.specs[1]
+    view = broker.view({"records": [{"url": spec.target}]})
+    broker.results.append({"spec_id": source.id, "tool": "kali-tools_crawl_web_surface",
+                           "arguments": {"target": spec.target}, **view})
+    solver.summaries[source.id] = solver.compile_summary(source, terminal(source))
+    broker.catalog["hunter"] = [{"name": "run_web_loop", "inputSchema": {"type": "object"}}]
     broker.tasks.active_spec = spec
     monkeypatch.setattr(broker, "_check_handoff", lambda _spec: None)
     return solver, spec
@@ -455,7 +460,11 @@ def test_cross_tenant_bola_signed_loopback_and_budget_coverage(python_broker, mo
 
 def parameter_solver(broker, monkeypatch):
     solver, spec = member_solver(broker, monkeypatch, count=1)
-    ref = broker.archive({'links': ['/lookup/catalog/a?id=1', '/lookup/catalog/b?id=1']})
+    spec.vector = 'injection-sqli'
+    view = broker.view({'links': ['/lookup/catalog/a?id=1', '/lookup/catalog/b?id=1']})
+    ref = view['content_ref']
+    broker.results.append({'spec_id': broker.tasks.specs[1].id, 'tool': 'kali-tools_crawl_web_surface',
+                           'arguments': {'target': spec.target}, **view})
     records = [{'url': spec.target + path, 'method': 'GET', 'source_artifact': ref['path'],
                 'source_sha256': ref['sha256']} for path in (
                     'lookup/catalog', 'lookup/catalog/a?id=1', 'lookup/catalog/b?id=1')]
@@ -470,7 +479,9 @@ def test_parameter_continuation_requires_each_current_signed_control(python_brok
     solver, spec, _ref = parameter_solver(python_broker, monkeypatch)
     def attempt(suffix, oracle='differential_boolean'):
         return {'vector': 'injection-sqli', 'record': {'target': spec.target + suffix,
-            'oracle': oracle, 'execution_context': {'param': 'id', 'method': 'GET', 'carrier': 'query'}}}
+            'validation_id': suffix, 'oracle': oracle, 'execution_context': {
+                'param': 'id', 'method': 'GET', 'carrier': 'query', 'identity': 'synthetic-0'}},
+                'source_artifact': 'test-control', 'source_sha256': 'test-control'}
     one = attempt('lookup/catalog/a?id=1')
     other = attempt('lookup/catalog/b?id=1')
     monkeypatch.setattr(python_broker, 'validation_attempts', lambda _spec: [one])
@@ -656,8 +667,8 @@ def test_repeated_read_does_not_grow_model_context_or_reset_accounting(python_br
     for _ in range(8):
         python_broker.invoke("read_artifact", {"path": ref["path"]})
     context = solver.context(python_broker.tasks.active_spec)
-    assert len(context["recent_results"]) == 1 and not context["older_results"]
-    assert context["recent_results"][0]["result"]["text"]
+    assert len(context["recent_results"]) == 2 and not context["older_results"]
+    assert context["recent_results"][-1]["result"]["reason_code"] == "archive_read_no_progress"
     assert len(python_broker.results) == 8
     assert python_broker.runtime_policy.tool_calls["recon-1"] == 8
 
@@ -980,7 +991,7 @@ def test_session_check_schema_and_context_use_registered_target(python_broker):
     assert schema["properties"]["identity"]["enum"] == ["admin-a", "member-a"]
     assert set(schema["required"]) == {"target", "identity"}
     context = solver.context(spec)
-    assert context["handoff"]["omitted"]
+    assert context["handoff"] is None  # Unsealed files cannot manufacture a dependency handoff.
     assert context["registered_session_checks"] == [
         {"target": spec.target, "identity": "admin-a"}, {"target": spec.target, "identity": "member-a"}]
     assert "must-not-enter-context" not in provider_json(context).decode()
@@ -1491,7 +1502,7 @@ def test_four_phase_real_subprocess_signed_closure_and_tamper(monkeypatch, basel
     from evidence_trust import canonical_bytes, verify
     from full_agent_python_solver import PythonSolver
     from full_agent_python_broker import PythonBroker
-    artifacts = Path("/tmp/cco-work/full-agent-python-integration")
+    artifacts = Path(os.environ["CCO_WORKDIR"]) / "full-agent-python-integration"
     artifacts.mkdir(parents=True, exist_ok=True)
     tmp_path = Path(tempfile.mkdtemp(prefix="run-", dir=artifacts))
     captured = []
@@ -1547,7 +1558,10 @@ def test_four_phase_real_subprocess_signed_closure_and_tamper(monkeypatch, basel
                 if results:
                     page = results[-1]["result"]
                     assert results[-1]["tool"] == "read_artifact"
-                    assert len(page["text"]) == 3000 and page["next_offset"] == 3000 and not page["eof"]
+                    if page.get("reason_code") == "archive_read_no_progress":
+                        assert "text" not in page
+                    else:
+                        assert len(page["text"]) == 3000 and page["next_offset"] == 3000 and not page["eof"]
                 # The full read wrapper exceeded 3000 bytes in the paid run.
                 # A stubborn provider repeats that exact range until the host
                 # switches to summary-only tools without raising any budget.

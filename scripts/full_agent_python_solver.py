@@ -29,6 +29,8 @@ from full_agent_python_broker import (CRAWL_TOOL, COVERAGE_TOOL, PHASE_CALL_LIMI
 from full_agent_summary_feedback import summary_feedback
 from orchestration_spec import COMPILED_WORKFLOW_TOOL, TaskSpec, skeleton_summary, surface_errors, validate_chain
 from workflow_checkpoint import WorkflowCheckpoint, SCHEMA as CHECKPOINT_SCHEMA, file_ref
+from python_candidate_runtime import (PROFILES, candidate, compact_cards, compact_gaps, dedup_gaps, funnel, gap,
+                                      matches_model_call, parameter_candidates, parser_gaps, upstream_ids)
 
 SCHEMA = "python-workflow-v1"
 PHASE_IDS = ("recon-1", "enum-2", "access-3", "report-4")
@@ -86,21 +88,20 @@ class PythonSolver:
         self.loop_events = []
         self._observations = {}
         self.access_dispatches = set()
-        enum = next((spec for spec in broker.tasks.specs if spec.phase == "enum"), None)
-        if enum and "kali-tools_ledger_prepare_handoff" in enum.tools:
-            broker.runtime_policy.reserve_handoff(enum, len(broker.session_checks(enum)))
-        access = next((spec for spec in broker.tasks.specs if spec.phase == "access"
-                       and not spec.references and not spec.compiled_workflows), None)
-        self.access_batches = self.member_batches(access) if access else []
-        if access and "hunter_run_web_loop" in access.tools:
-            # Preserve the bounded host reserve; extra comparisons use only
-            # remaining physical slots, never a larger call/request allowance.
-            identities = set().union(*(set(batch) for batch in self.access_batches))
-            broker.runtime_policy.validation_reserves[access.id] = min(
-                access.max_calls, PHASE_CALL_LIMITS[access.phase], max(1, (len(identities) + 1) // 2))
-        report = next((spec for spec in broker.tasks.specs if spec.phase == 'report'), None)
-        if report and 'kali-tools_ledger_checkpoint' in report.tools:
-            broker.runtime_policy.checkpoint_reserves[report.id] = 1
+        self.batches_by_task = {}
+        self.candidates_by_task = {}
+        self.coverage_gaps = {}
+        for spec in broker.tasks.specs:
+            if spec.phase == "enum" and "kali-tools_ledger_prepare_handoff" in spec.tools:
+                broker.runtime_policy.reserve_handoff(spec, len(broker.session_checks(spec)))
+            if spec.phase == "access" and not spec.references and not spec.compiled_workflows:
+                batches = self.batches_by_task[spec.id] = self.member_batches(spec)
+                if any(tool == "hunter_run_web_loop" or tool.startswith("validator_validate_") for tool in spec.tools):
+                    identities = set().union(*(set(batch) for batch in batches))
+                    broker.runtime_policy.validation_reserves[spec.id] = min(
+                        spec.max_calls, PHASE_CALL_LIMITS[spec.phase], max(1, (len(identities) + 1) // 2))
+            if spec.phase == 'report' and 'kali-tools_ledger_checkpoint' in spec.tools:
+                broker.runtime_policy.checkpoint_reserves[spec.id] = 1
         dump(broker.private / "runtime-policy.json", broker.runtime_policy.snapshot())
         self._authorization_context = copy.deepcopy(self.authorization_context())
 
@@ -129,6 +130,9 @@ class PythonSolver:
                  'repairs': self.repairs, 'protocol_repairs': self.protocol_repairs,
                  'loop_events': self.loop_events, 'observations': self._observations,
                  'access_dispatches': sorted(self.access_dispatches),
+                 'batches_by_task': self.batches_by_task, 'candidates_by_task': self.candidates_by_task,
+                 'coverage_gaps': self.coverage_gaps, 'branch_handoffs': broker.branch_handoffs,
+                 'read_progress': broker.read_progress,
                  'policy': {key: (sorted(value) if isinstance(value, set) else value)
                             for key, value in vars(policy).items()
                             if key not in {'budget', 'tool_failures'}},
@@ -183,6 +187,11 @@ class PythonSolver:
             setattr(self, name, state[name])
         self._observations = state['observations']
         self.access_dispatches = set(state['access_dispatches'])
+        self.batches_by_task = state.get('batches_by_task', self.batches_by_task)
+        self.candidates_by_task = state.get('candidates_by_task', {})
+        self.coverage_gaps = state.get('coverage_gaps', {})
+        self.broker.branch_handoffs = state.get('branch_handoffs', {})
+        self.broker.read_progress = state.get('read_progress', {})
         policy = self.broker.runtime_policy
         for key, value in state['policy'].items():
             setattr(policy, key, set(value) if isinstance(getattr(policy, key), set) else value)
@@ -286,6 +295,210 @@ class PythonSolver:
             covered.update(pair)
         return [{name: members[name] for name in pair} for pair in pairs]
 
+    @property
+    def access_batches(self):
+        """Compatibility view of the active task, not first-access initialization."""
+        spec = self.broker.tasks.active_spec
+        return self.batches_by_task.get(spec.id, []) if spec else []
+
+    @access_batches.setter
+    def access_batches(self, value):
+        self.batches_by_task[self.broker.tasks.active_spec.id] = value
+
+    def add_gap(self, spec, reason, category="prerequisites", row=None, provenance=None):
+        item = gap(reason, category=category, task=spec.id,
+                   candidate=row["candidate_id"] if row else "", provenance=provenance or (row or {}).get("provenance"))
+        self.coverage_gaps[spec.id] = dedup_gaps([*self.coverage_gaps.get(spec.id, []), item])
+        if row is not None:
+            row.update(validation_state="NOT TESTED", reason_code=reason)
+
+    def discovery(self, spec):
+        """Reparse hash-bound host results from declared discovery ancestors only."""
+        records, gaps = [], []
+        registry = {item.id: item for item in self.broker.tasks.specs}
+        for ident in upstream_ids(spec, self.broker.tasks.specs):
+            source = registry[ident]
+            if source.phase not in {"recon", "enum"} or ident not in self.summaries:
+                continue
+            for row in self.broker.results:
+                if row["spec_id"] != ident or row["tool"] not in {
+                        CRAWL_TOOL, "kali-tools_curl_request", "kali-tools_compose_js_routes",
+                        "browser_browser_extract_links", "browser_browser_capture_requests",
+                        "browser_browser_runtime_observe"}:
+                    continue
+                try:
+                    value = self.broker.read_reference(row["content_ref"])
+                except ValueError:
+                    raise WorkflowError("prior_phase_evidence_changed") from None
+                if not isinstance(value, dict) or value.get("error") or value.get("execution_failed"):
+                    continue
+                parsed = self.surface_records(value, row["arguments"], spec, row["content_ref"])
+                for record in parsed:
+                    record["source_spec_id"] = ident
+                records.extend(parsed)
+                gaps.extend(parser_gaps(value, spec.id, row["content_ref"]))
+        return {"records": [json.loads(raw) for raw in dict.fromkeys(provider_json(row).decode() for row in records)],
+                "coverage_gaps": dedup_gaps(gaps)}
+
+    def plan_candidates(self, spec):
+        if spec.phase != "access" or spec.references or spec.compiled_workflows:
+            return []
+        discovered = self.discovery(spec)
+        records = discovered["records"]
+        self.coverage_gaps[spec.id] = dedup_gaps([*self.coverage_gaps.get(spec.id, []), *discovered["coverage_gaps"]])
+        bindings = {item["identity"]: {key: value for key, value in
+            self.broker.tasks.bindings[item["identity"]].items()
+            if key in {"target", "role", "test_data_only", "owned_objects_private"}}
+            for item in sorted(self.broker.session_checks(spec), key=lambda item:
+                self.broker.tasks.bindings[item["identity"]].get("role") != "member")}
+        planned = parameter_candidates(spec, records, bindings)
+        provenance = [{key: record[key] for key in ("source_spec_id", "source_artifact", "source_sha256")}
+                      for record in records]
+        provenance = [json.loads(raw) for raw in dict.fromkeys(provider_json(row).decode() for row in provenance)]
+        if records and spec.vector in ("", "access", "access-idor", "authz-idor"):
+            for batch in self.batches_by_task.get(spec.id, []):
+                args = {"target": spec.target, "live": True, "crawl": False,
+                        "blind_discovery": True, "blind_max_requests": 24, "max_validations": 16,
+                        "fuzz_limit": 0, "candidate_sample_limit": 0, "sleep_s": 0.2,
+                        "session_bindings": provider_json(batch).decode()}
+                planned.append(candidate(spec.id, route=spec.target, identity=list(batch), vector="access-idor",
+                    tool="hunter_run_web_loop", arguments=args, provenance=provenance,
+                    reason="validator_not_declared" if "hunter_run_web_loop" not in spec.tools else ""))
+        if not records:
+            self.add_gap(spec, "missing_declared_upstream_observations")
+        elif not planned:
+            self.add_gap(spec, "missing_parameter_or_synthetic_identity_pair", provenance=provenance)
+        if not self.batches_by_task.get(spec.id) or spec.vector not in ("", "access", "access-idor", "authz-idor"):
+            for record in records:
+                if record.get("method", "GET") == "GET" and not record.get("params"):
+                    self.add_gap(spec, "missing_parameter_or_synthetic_identity_pair", provenance=[{
+                        key: record[key] for key in ("source_spec_id", "source_artifact", "source_sha256")}])
+        # Keep the existing synthetic identity-pair validation ahead of generic
+        # parameters; additional capabilities must not starve the P0 reserve.
+        planned.sort(key=lambda row: row["vector"] != "access-idor")
+        state = self.candidates_by_task.setdefault(spec.id, {})
+        for row in planned:
+            if row["candidate_id"] not in state:
+                state[row["candidate_id"]] = row
+            else:
+                current = state[row["candidate_id"]]
+                current["provenance"] = [json.loads(raw) for raw in dict.fromkeys(
+                    provider_json(item).decode() for item in [*current["provenance"], *row["provenance"]])]
+            if row["reason_code"]:
+                self.add_gap(spec, row["reason_code"], row=state[row["candidate_id"]])
+        self.refresh_candidate_evidence(spec)
+        return list(state.values())
+
+    def refresh_candidate_evidence(self, spec):
+        outcomes = self.broker.validation_attempts(spec)
+        for row in self.candidates_by_task.get(spec.id, {}).values():
+            if not row["eligible"]:
+                continue
+            for execution in self.broker.tools:
+                if (execution.get("task_spec_id") != spec.id or execution["tool"] != row["tool"]
+                        or execution.get("origin") != "solver"):
+                    continue
+                receipt = json.loads(Path(execution["artifact"]).read_bytes())
+                args = receipt.get("arguments", {})
+                expected = row["arguments"]
+                fields = ("target", "validation_profile", "blind_discovery", "session_bindings") if row["tool"] == "hunter_run_web_loop" else ("target_url", "param", "method", "carrier")
+                def equal(key):
+                    if key == "session_bindings":
+                        return json.loads(args.get(key, "{}")) == json.loads(expected.get(key, "{}"))
+                    return args.get(key, {"method": "GET", "carrier": "query", "blind_discovery": False}.get(key)) == expected.get(key, {"method": "GET", "carrier": "query", "blind_discovery": False}.get(key))
+                if all(equal(key) for key in fields):
+                    row.update(admitted=True, executed=True)
+            accepted = []
+            if row["vector"] == "access-idor":
+                batch: dict[str, Any] = next((batch for batch in self.batches_by_task.get(spec.id, [])
+                              if list(batch) == row["identity_ref"]), {})
+                if batch and self.completed_member_batch(spec, batch):
+                    accepted = [item for item in outcomes if item["record"].get("execution_context", {}).get("identity") in batch
+                                and item["record"].get("execution_context", {}).get("resource_owner") in batch]
+            else:
+                oracle = next((value[2] for value in PROFILES.values() if value[0] == row["vector"]), None)
+                accepted = [item for item in outcomes if item["vector"] == row["vector"]
+                    and item.get("tool", row["tool"]) == row["tool"]
+                    and item["record"]["target"] == row["route"] and item["record"].get("oracle") == oracle
+                    and item.get("execution_context", item["record"].get("execution_context", {})).get("param") == row["param"]
+                    and item.get("execution_context", item["record"].get("execution_context", {})).get("method") == "GET"
+                    and item.get("execution_context", item["record"].get("execution_context", {})).get("carrier") == "query"
+                    and (row["identity_ref"] == "anon" and item.get("execution_context", item["record"].get("execution_context", {})).get("identity", "anon") in {"anon", "anonymous"}
+                         or isinstance(row["identity_ref"], list) and item.get("execution_context", item["record"].get("execution_context", {})).get("identity") in row["identity_ref"])]
+            row["evidence_accepted"] = bool(accepted)
+            if accepted:
+                row.update(admitted=True, executed=True, validation_state="TESTED", reason_code="",
+                           evidence_refs=[{"validation_id": item["record"]["validation_id"],
+                                           "source_artifact": item["source_artifact"],
+                                            "source_sha256": item["source_sha256"]} for item in accepted])
+                self.coverage_gaps[spec.id] = [item for item in self.coverage_gaps.get(spec.id, [])
+                                               if item.get("candidate_id") != row["candidate_id"]]
+            elif row["executed"]:
+                row["evidence_refs"] = []
+                self.add_gap(spec, "invalid_or_missing_signed_evidence", "evidence", row)
+
+    def observed_session_block(self, spec, row):
+        """A host-observed stale primary session blocks repeats until refreshed."""
+        bindings = json.loads(row["arguments"].get("session_bindings", "{}"))
+        if not bindings:
+            return ""
+        primary = next(iter(bindings))
+        for previous in reversed(self.broker.results):
+            if previous["spec_id"] != spec.id:
+                continue
+            if (previous["tool"] == "validator_session_vault_check"
+                    and previous["arguments"].get("identity") == primary):
+                check = self.broker.read_reference(previous["content_ref"])
+                if isinstance(check, dict) and check.get("status") == "fresh":
+                    return ""
+            if previous["tool"] != "hunter_run_web_loop":
+                continue
+            supplied = json.loads(previous["arguments"].get("session_bindings", "{}"))
+            if not isinstance(supplied, dict) or not supplied or next(iter(supplied)) != primary:
+                continue
+            value = self.broker.read_reference(previous["content_ref"])
+            if not isinstance(value, dict) or not isinstance(value.get("skipped", []), list):
+                continue
+            if any(item.get("reason_code") == "session_not_recently_verified"
+                   for item in value.get("skipped", []) if isinstance(item, dict)):
+                return "session_not_recently_verified"
+        return ""
+
+    def admit_candidate(self, spec, row):
+        if not row["eligible"]:
+            return False
+        session_reason = self.observed_session_block(spec, row)
+        if session_reason:
+            self.add_gap(spec, session_reason, "prerequisites", row)
+            return False
+        policy = self.broker.runtime_policy
+        reason = None
+        if policy.tool_allowance(spec) == 0:
+            reason = "phase_tool_budget_exhausted"
+        elif self.broker.budget.available("http") == 0:
+            reason = "http_budget_exhausted"
+        elif not self.broker.budget.remaining_seconds():
+            reason = "wall_clock_budget_exhausted"
+        elif self.broker.budget.available("tokens") == 0:
+            reason = "token_budget_exhausted"
+        if reason:
+            self.add_gap(spec, reason, "admission_budget", row)
+            return False
+        try:
+            self.broker._check_handoff(spec)
+            if row["tool"] not in policy.allowed_tools(spec):
+                raise ValueError("candidate tool unavailable")
+            schemas = {tool["function"]["name"]: tool["function"]["parameters"] for tool in self.tool_schemas(spec)}
+            self.parse_calls([{"function": {"name": row["tool"], "arguments": provider_json(row["arguments"]).decode()}}], schemas)
+            decision = self.broker.engine.validate_tool_invocation(row["tool"], row["arguments"], _policy_preflight=True)
+            if not decision["allowed"]:
+                raise ValueError("candidate policy denied")
+        except (ValueError, KeyError):
+            self.add_gap(spec, "candidate_prerequisite_or_admission_denied", "prerequisites", row)
+            return False
+        row["admitted"] = True
+        return True
+
     def member_pair_categories(self, pair):
         """P4 facts rank comparisons, not access expectations or finding verdicts."""
         actors = [self.broker.tasks.bindings[name] for name in pair]
@@ -349,7 +562,7 @@ class PythonSolver:
                 continue
             if supplied != bindings:
                 continue
-            report = json.loads((self.broker.workdir / row["content_ref"]["path"]).read_bytes())
+            report = self.broker.read_reference(row["content_ref"])
             discovery = report.get("identity_discovery", {})
             if (not report.get("ok") or discovery.get("status") != "ready" or discovery.get("reasons")
                     or discovery.get("budget_limited") or report.get("errors")):
@@ -473,10 +686,10 @@ class PythonSolver:
         # Never send an ever-growing previous inventory or archive index.
         previous_view = self.broker.view(previous, "previous-summary") if previous is not None else None
         handoff = None
-        if spec.phase in {"access", "report"} and not spec.references and (
-                tuple(row['id'] for row in self.base_specs) == PHASE_IDS or (self.broker.workdir / 'handoff.json').exists()):
-            raw = (self.broker.workdir / "handoff.json").read_bytes()
-            handoff = self.broker.view(json.loads(raw), "handoff")
+        if spec.phase in {"access", "report"} and not spec.references:
+            sources = upstream_ids(spec, self.broker.tasks.specs)
+            receipts = [row for row in self.broker.branch_handoffs.values() if row["producer_spec_id"] in sources]
+            handoff = self.broker.view(receipts, "handoff") if receipts else None
         context = {"schema": SCHEMA, "task_spec": spec.to_dict(), "previous_summary": previous_view,
                    "handoff": handoff, "registered_session_checks": self.broker.session_checks(spec),
                    "remaining_phase_tokens": remaining,
@@ -492,8 +705,15 @@ class PythonSolver:
         if spec.references:
             context['planning_only'] = True
             context['goal'] = 'Plan only the referenced P5 hypothesis dimension with hunter_run_web_loop live=false.'
-        discovery = self.summaries.get("enum-2", {}).get("surface")
+        discovery = self.discovery(spec) if spec.phase in {"access", "report"} else None
         context["discovery"] = self.broker.view(discovery, "discovery") if spec.phase in {"access", "report"} and discovery else None
+        candidates = self.plan_candidates(spec)
+        context["candidate_cards"] = compact_cards(candidates)
+        context["candidate_count"] = len(candidates)
+        gaps = self.coverage_gaps.get(spec.id, [])
+        context["coverage_gaps"] = compact_gaps(gaps)
+        context["coverage_gap_count"] = len(gaps)
+        context["coverage_gap_archive_ref"] = self.broker.archive({"coverage_gaps": gaps}, "coverage-gaps") if gaps else None
         context["session_bindings"] = {item["identity"]: {key: value for key, value in
             self.broker.tasks.bindings[item["identity"]].items()
             if key in {"target", "role", "test_data_only", "owned_objects_private"}}
@@ -601,12 +821,14 @@ class PythonSolver:
             if row["spec_id"] != spec.id or row["tool"] == READ_TOOL:
                 continue
             ref = row["content_ref"]
-            value = json.loads((self.broker.workdir / ref["path"]).read_bytes())
+            value = self.broker.read_reference(ref)
             evidence.append({"kind": "host_tool_result", "tool": row["tool"], "artifact": ref["path"], "sha256": ref["sha256"]})
             if not isinstance(value, dict) or value.get("execution_failed") or value.get("error"):
                 continue
             args = row["arguments"]
             observed_records.extend(self.surface_records(value, args, spec, ref))
+            self.coverage_gaps[spec.id] = dedup_gaps([*self.coverage_gaps.get(spec.id, []),
+                                                    *parser_gaps(value, spec.id, ref)])
             url = args.get("url")
             status = value.get("status_code", value.get("status"))
             if url and type(status) is int and 100 <= status <= 599:
@@ -645,7 +867,6 @@ class PythonSolver:
                             if isinstance(record.get("params"), list):
                                 params.extend(record["params"])
             if isinstance(args.get("param"), str):
-                tested.append({"tool": row["tool"], "parameter": args["param"], "artifact": ref["path"]})
                 params.append(args["param"])
         for record in observed_records:
             routes.append(record["url"])
@@ -698,6 +919,16 @@ class PythonSolver:
         if spec.phase == "access":
             import hypothesis_ledger as hypotheses
             outcomes = self.broker.validation_attempts(spec)
+            tested = [{"parameter": item.get("execution_context", item["record"].get("execution_context", {})).get("param"),
+                        "validation_id": item["record"]["validation_id"], "artifact": item["source_artifact"]}
+                       for item in outcomes if item.get("execution_context", item["record"].get("execution_context", {})).get("param")]
+            summary["tested_parameters"] = tested
+            candidates = self.plan_candidates(spec)
+            for row in candidates:
+                if not row["evidence_accepted"] and not row["reason_code"]:
+                    self.add_gap(spec, "invalid_or_missing_signed_evidence" if row["executed"] else "candidate_not_executed",
+                                 "evidence" if row["executed"] else "admission_budget", row)
+            summary["validation_funnel"] = funnel(candidates)
             summary["validation_outcomes"] = [{"vector": item["vector"],
                 "validation_id": item["record"]["validation_id"], "verdict": item["record"]["verdict"],
                 "url": item["record"]["target"], "source_artifact": item["source_artifact"],
@@ -724,6 +955,9 @@ class PythonSolver:
                 if summary.get("status") == "done" and any(row.get("status") != "done" for row in steps):
                     summary["status"] = "partial"
         if spec.phase == "report":
+            sources = set(upstream_ids(spec, self.broker.tasks.specs))
+            summary["validation_funnels"] = {ident: previous["validation_funnel"] for ident, previous in self.summaries.items()
+                                             if ident in sources and "validation_funnel" in previous}
             reports = [row for row in self.broker.results if row["spec_id"] == spec.id and row["tool"] == COVERAGE_TOOL]
             if reports:
                 row = reports[-1]
@@ -733,12 +967,12 @@ class PythonSolver:
             # Completion of the review is distinct from unfinished probes.
             # This host-owned step can only preserve/downgrade claimed coverage.
             unfinished = [{"phase": ident, "step": step["id"], "status": step["status"]}
-                          for ident, previous in self.summaries.items() if ident != spec.id
+                           for ident, previous in self.summaries.items() if ident in sources
                           for step in previous.get("steps", []) if step["status"] in {"blocked", "not_tested"}]
             summary["unfinished_work"] = unfinished
             for field in ("identity_comparisons", "identity_comparison_dimensions"):
                 summary[field] = [{"phase": ident, **row} for ident, previous in self.summaries.items()
-                                  if ident != spec.id for row in previous.get(field, [])
+                                  if ident in sources for row in previous.get(field, [])
                                   if row["status"] == "NOT TESTED"]
             steps = summary["steps"]
             if all(isinstance(step, dict) for step in steps):
@@ -746,6 +980,9 @@ class PythonSolver:
                 summary["steps"].append({"id": REPORT_CARRYOVER_STEP, "status": "not_tested" if unfinished else "done"})
                 if unfinished and summary.get("status") == "done":
                     summary["status"] = "partial"
+        inherited_gaps = [row for ident in upstream_ids(spec, self.broker.tasks.specs)
+                          for row in self.summaries.get(ident, {}).get("coverage_gaps", [])]
+        summary["coverage_gaps"] = dedup_gaps([*inherited_gaps, *self.coverage_gaps.get(spec.id, [])])
         return summary
 
     def dispatch_access_validation(self, spec):
@@ -753,125 +990,63 @@ class PythonSolver:
         if spec.phase != "access" or spec.references or spec.compiled_workflows or spec.id in self.access_dispatches:
             return False
         policy = self.broker.runtime_policy
-        if "hunter_run_web_loop" not in spec.tools:
-            return False
-        self.access_dispatches.add(spec.id)
-        surface = self.summaries.get("enum-2", {}).get("surface", {})
-        prior = any(row["spec_id"] == spec.id and (row["tool"].startswith("validator_validate_")
-                    or row["tool"] == "hunter_run_web_loop") for row in self.broker.results)
-        batches = self.access_batches
-        parameter_batches = self.pending_parameter_batches(spec) if not batches else []
-        if not surface.get("records") or (not batches and prior and not parameter_batches):
-            policy.validation_reserves.pop(spec.id, None)
-            return False
-        self.broker._check_handoff(spec)
-        pending = [batch for batch in batches if not self.completed_member_batch(spec, batch)]
-        if not batches:
-            pending = parameter_batches or [None]
+        candidates = self.plan_candidates(spec)
+        pending = [row for row in candidates if row["eligible"] and not row["executed"] and not row["evidence_accepted"]]
         dispatched = False
         policy.host_finalizing.add(spec.id)
         try:
-            for index, batch in enumerate(pending):
-                reason = None
-                if policy.tool_allowance(spec) == 0:
-                    reason = "phase_tool_budget_exhausted"
-                elif self.broker.budget.available("http") == 0:
-                    reason = "http_budget_exhausted"
-                elif not self.broker.budget.remaining_seconds():
-                    reason = "wall_clock_budget_exhausted"
-                elif prior and not self.wait_access_rate_window(spec):
-                    reason = "insufficient_time_for_rate_window"
-                if reason:
+            for index, row in enumerate(pending):
+                if row["executed"] or row["evidence_accepted"]:
+                    continue
+                if not self.admit_candidate(spec, row):
+                    reason = row["reason_code"]
+                    if reason in {"candidate_prerequisite_or_admission_denied", "session_not_recently_verified"}:
+                        continue
+                    for remaining in pending[index:]:
+                        self.add_gap(spec, reason, "admission_budget", remaining)
                     view = self.broker.view({"status": "not_tested", "reason_code": reason,
-                                             "pending_batches": [list(item or {}) for item in pending[index:]]})
+                                             "pending_batches": [item["identity_ref"] for item in pending[index:]]})
                     self.broker.results.append({"spec_id": spec.id, "tool": "host_access_batch", "arguments": {}, **view})
                     dump(self.broker.private / "python-tool-results.json", self.broker.results)
                     break
-                args = {"target": spec.target, "live": True, "crawl": False,
-                        "fuzz_limit": 4, "max_validations": 4, "candidate_sample_limit": 2, "sleep_s": 0.2}
-                parameter_batch = batch is not None and "validation_profile" in batch
-                bindings = batch if batch is not None and not parameter_batch else self.context(spec)["session_bindings"]
-                if parameter_batch:
-                    args.update(batch)
-                elif batch is not None:
-                    args.update(blind_discovery=True, blind_max_requests=24, max_validations=16,
-                                fuzz_limit=0, candidate_sample_limit=0)
-                if bindings:
-                    args["session_bindings"] = provider_json(bindings).decode()
+                # Reuse the existing rate-window backoff; it never changes rate
+                # policy. All actual requests still pass the same wire gates.
+                if dispatched and not self.wait_access_rate_window(spec):
+                    for remaining in pending[index:]:
+                        self.add_gap(spec, "insufficient_time_for_rate_window", "admission_budget", remaining)
+                    break
+                # Durable pre-dispatch intent. If interrupted, run() leaves the
+                # entire running TaskSpec inconclusive; resume never replays it.
+                row["dispatch_started"] = True
+                self.save_checkpoint()
+                before = len(self.broker.tools)
                 try:
-                    self.broker.invoke("hunter_run_web_loop", args)
+                    self.broker.invoke(row["tool"], row["arguments"])
+                except BudgetError:
+                    self.add_gap(spec, "validator_execution_budget_exhausted", "admission_budget", row)
+                    raise
                 except ValueError:
-                    view = self.broker.view({"error": "host access validation denied"})
-                    self.broker.results.append({"spec_id": spec.id, "tool": "hunter_run_web_loop", "arguments": {}, **view})
-                    dump(self.broker.private / "python-tool-results.json", self.broker.results)
+                    self.add_gap(spec, "validator_execution_denied", "prerequisites", row)
+                finally:
+                    row["executed"] = len(self.broker.tools) > before
+                    self.refresh_candidate_evidence(spec)
+                    if not row["evidence_accepted"] and not row["reason_code"]:
+                        self.add_gap(spec, "invalid_or_missing_signed_evidence", "evidence", row)
+                    self.save_checkpoint()
                 dispatched = True
-                prior = True
                 if policy.consecutive_failures.get(spec.id, 0) >= 2:
                     raise BudgetError("consecutive_tool_failure_limit")
         finally:
+            self.access_dispatches.add(spec.id)
             policy.host_finalizing.discard(spec.id)
             policy.validation_reserves.pop(spec.id, None)
             dump(self.broker.private / "runtime-policy.json", policy.snapshot())
         return dispatched
 
     def pending_parameter_batches(self, spec):
-        """Continue an executed read-only profile over observed GET parameters.
-
-        The model selects a profile, never the evaluator family or case truth.
-        Current signed outcomes are required to skip any discovered parameter.
-        The existing tool/HTTP/time ceilings bound the remaining catalog calls.
-        """
-        profiles = {"readonly_sqli_boolean": "injection-sqli",
-                    "readonly_ssti_arithmetic": "injection-ssti"}
-        selected = list(dict.fromkeys(row["arguments"].get("validation_profile")
-            for row in self.broker.results if row["spec_id"] == spec.id
-            and row["tool"] == "hunter_run_web_loop" and row["arguments"].get("live") is True
-            and row["arguments"].get("validation_profile") in profiles))
-        if not selected:
-            return []
-        outcomes = self.broker.validation_attempts(spec)
-        origin = urlsplit(spec.target)
-        catalogs: dict[str, Any] = {}
-        records = self.summaries.get("enum-2", {}).get("surface", {}).get("records", [])
-        observed = {urlsplit(row.get("url", ""))._replace(query="", fragment="").geturl() for row in records}
-        for record in records:
-            url = record.get("url", "")
-            parsed = urlsplit(url)
-            if (record.get("method", "GET") != "GET" or parsed.username is not None
-                    or (parsed.scheme, parsed.netloc) != (origin.scheme, origin.netloc)):
-                continue
-            params = {name for name, _ in parse_qsl(parsed.query, keep_blank_values=True)}
-            if not params:
-                continue
-            # Retain the source binding; arbitrary summary strings cannot
-            # manufacture a new target for the host's continuation.
-            ref = self.broker.references.get(record.get("source_artifact"))
-            if not ref or ref["sha256"] != record.get("source_sha256"):
-                raise WorkflowError("prior_phase_evidence_changed")
-            raw = (self.broker.workdir / ref["path"]).read_bytes()
-            if hashlib.sha256(raw).hexdigest() != ref["sha256"]:
-                raise WorkflowError("prior_phase_evidence_changed")
-            catalog = parsed._replace(path=parsed.path.rsplit("/", 1)[0] or "/", query="", fragment="").geturl()
-            if catalog not in observed:
-                catalog = url
-            catalogs.setdefault(catalog, set()).update((url, name) for name in params)
-        pending = []
-        for profile in selected:
-            tested = {(item["record"]["target"], item["record"].get("execution_context", {}).get("param"))
-                      for item in outcomes if item["vector"] == profiles[profile]
-                      and item["record"].get("oracle") == {
-                          "readonly_sqli_boolean": "differential_boolean",
-                          "readonly_ssti_arithmetic": "arithmetic_eval"}[profile]
-                      and item["record"].get("execution_context", {}).get("method") == "GET"
-                      and item["record"].get("execution_context", {}).get("carrier") == "query"}
-            for target, parameters in catalogs.items():
-                if parameters <= tested:
-                    continue
-                # Larger catalogs remain bounded; unresolved parameters keep
-                # their NOT TESTED status instead of widening per-call limits.
-                pending.append({"target": target, "validation_profile": profile,
-                                "fuzz_limit": 4, "max_validations": 16, "candidate_sample_limit": 16})
-        return pending
+        """Host-selected parameter candidates; no previous model profile required."""
+        return [row["arguments"] for row in self.plan_candidates(spec)
+                if row["param"] and row["eligible"] and not row["evidence_accepted"] and not row["executed"]]
 
     def parse_calls(self, calls, advertised):
         """Validate the entire model batch before executing any part of it."""
@@ -981,9 +1156,21 @@ class PythonSolver:
                     if name == SUMMARY_TOOL:
                         submitted = args
                     else:
+                        if (spec.phase == "access" and not spec.references and not spec.compiled_workflows
+                                and name in {"validator_validate_sqli", "validator_validate_ssti", "hunter_run_web_loop"}
+                                and args.get("live", True) is not False):
+                            options = self.plan_candidates(spec)
+                            selected = next((row for row in options if matches_model_call(row, name, args)), None)
+                            if selected is None or not self.admit_candidate(spec, selected):
+                                self.add_gap(spec, "model_call_outside_admitted_candidate", "prerequisites")
+                                self.loop_event(spec, "model_call_outside_admitted_candidate")
+                                continue
+                            # Defaults in third-party tool signatures are not
+                            # authorization. Execute the full bounded host slice.
+                            args = copy.deepcopy(selected["arguments"])
                         fingerprint = hashlib.sha256(provider_json([spec.id, name, args])).hexdigest()
                         previous = self._observations.get(fingerprint)
-                        if previous and previous[1] >= 2:
+                        if name != READ_TOOL and previous and previous[1] >= 2:
                             # Two identical observations are retained. A third
                             # identical model request cannot spend more HTTP.
                             # Validator-internal controls and host batches are
@@ -993,6 +1180,9 @@ class PythonSolver:
                             break
                         try:
                             view = self.broker.invoke(name, args)
+                            if name == READ_TOOL and view.get("result", {}).get("reason_code") == "archive_read_no_progress":
+                                self.add_gap(spec, "archive_read_no_progress", "archive", provenance=[view["result"]["content_ref"]])
+                                self.loop_event(spec, "archive_read_no_progress")
                             if name != READ_TOOL and isinstance(view, dict):
                                 digest = view.get("content_ref", {}).get("sha256")
                                 if digest:
@@ -1007,6 +1197,8 @@ class PythonSolver:
                             view = self.broker.view(error)
                             self.broker.results.append({"spec_id": spec.id, "tool": name, "arguments": {}, **view})
                             dump(self.broker.private / "python-tool-results.json", self.broker.results)
+                        if spec.phase == "access" and not spec.references and not spec.compiled_workflows:
+                            self.plan_candidates(spec)
                         if self.broker.runtime_policy.consecutive_failures.get(spec.id, 0) >= 2:
                             raise BudgetError("consecutive_tool_failure_limit")
             else:
@@ -1097,6 +1289,7 @@ class PythonSolver:
                         self.broker._check_handoff(spec)
                     except ValueError:
                         self.task_states[spec.id] = 'blocked'
+                        self.add_gap(spec, 'missing_declared_handoff_prerequisite')
                         self.loop_event(spec, 'host_handoff_prerequisite_unavailable_NOT_TESTED')
                         self.save_checkpoint()
                         continue
@@ -1135,6 +1328,18 @@ class PythonSolver:
                           failure_phase=self.broker.tasks.active_spec.id if self.broker.tasks.active_spec else None)
             if isinstance(exc, WorkflowError):
                 result.update(summary_errors=exc.errors, failed_summary_ref=exc.summary_ref)
+            active = self.broker.tasks.active_spec
+            if active:
+                reason = getattr(exc, "code", None) or "invalid_or_missing_signed_evidence"
+                if isinstance(exc, BudgetError) and not getattr(exc, "code", None):
+                    text = str(exc)
+                    reason = ({"http budget exhausted": "http_budget_exhausted",
+                               "wall clock budget exhausted": "wall_clock_budget_exhausted",
+                               "tokens budget exhausted": "token_budget_exhausted"}.get(text)
+                              or (text if text in {"context_limit_exhausted", "phase_call_budget_exhausted",
+                                  "phase_tool_budget_exhausted", "consecutive_tool_failure_limit"}
+                                  else "budget_admission_or_measurement_failed"))
+                self.add_gap(active, reason, "admission_budget" if isinstance(exc, BudgetError) else "evidence")
             evidence_ref = getattr(exc, "evidence_ref", None)
             if evidence_ref is not None:
                 result["failed_tool_ref"] = evidence_ref
@@ -1144,6 +1349,12 @@ class PythonSolver:
                 self.broker.finalize_task(result["status"])
         finally:
             try:
+                for spec in self.broker.tasks.specs:
+                    if self.task_states.get(spec.id) != "completed":
+                        self.add_gap(spec, "task_incomplete_or_indeterminate_no_replay")
+                    for row in self.candidates_by_task.get(spec.id, {}).values():
+                        if not row["evidence_accepted"] and not row["reason_code"]:
+                            self.add_gap(spec, "candidate_not_executed", "admission_budget", row)
                 if self._checkpoint_active:
                     self.save_checkpoint()
             except (ValueError, OSError, TypeError):
@@ -1157,7 +1368,9 @@ class PythonSolver:
                           protocol_repair_count=sum(self.protocol_repairs.values()),
                           loop_events=self.loop_events,
                           completed_phases=list(self.summaries), task_states=dict(self.task_states),
-                          run_id=self.run_id, checkpoint=str(self.checkpoint.path),
+                           run_id=self.run_id, checkpoint=str(self.checkpoint.path),
+                           coverage_gaps=dedup_gaps([row for rows in self.coverage_gaps.values() for row in rows]),
+                           validation_funnels={ident: funnel(list(rows.values())) for ident, rows in self.candidates_by_task.items()},
                           budget=self.broker.budget.snapshot())
             dump(self.broker.private.parent / "run-result.json", result)
             dump(self.broker.private.parent / "budget.json", self.broker.budget.snapshot())
