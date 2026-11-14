@@ -1,11 +1,10 @@
 {
-  "engagement": "User-owned web lab (authorized, 2026-10-26)",
-  "declared_by": "user (2026-10-26)",
-  "authorization": "User-owned lab instance; fully blackbox assessment requested with process visibility.",
+  "engagement": "Local loopback web lab example",
+  "authorization": "Localhost loopback lab only (127.0.0.1). Non-destructive testing only.",
   "approval": "Exact host:port only (no wildcard). Non-destructive testing only.",
   "status": "READY",
-  "in_scope": [{"asset": "http://31.58.250.147:8080", "type": "web-lab", "note": "Single lab edge, exact host:port only"}],
-  "targets": ["31.58.250.147"],
+  "in_scope": [{"asset": "http://127.0.0.1:8080", "type": "web-lab", "note": "Local loopback lab edge only"}],
+  "targets": ["127.0.0.1"],
   "out_of_scope": ["all other hosts, ports and subdomains", "third-party services", "destructive testing", "DoS / load testing", "brute-force login", "real-user data exfiltration"],
-  "rules": {"passive_first": true, "max_rps": 5, "rate_limit": "conservative", "auth_max_per_min": 10, "pii_exfiltration": false, "dos_testing": false, "social_engineering": false, "destructive_prohibited": ["DELETE", "DROP", "TRUNCATE", "DoS", "brute_force_unbounded", "real_user_data_exfil"], "evidence_standard": "deterministic_validator_or_minimal_repro", "notes": ["own lab - non-destructive, minimal blackbox", "browser-like request headers only", "create ONE own test account only", "log every phase summary; keep repo clean, work under CCO_WORKDIR"]}
+  "rules": {"passive_first": true, "max_rps": 5, "rate_limit": "conservative", "auth_max_per_min": 10, "pii_exfiltration": false, "dos_testing": false, "social_engineering": false, "destructive_prohibited": ["DELETE", "DROP", "TRUNCATE", "DoS", "brute_force_unbounded", "real_user_data_exfil"], "evidence_standard": "deterministic_validator_or_minimal_repro", "notes": ["local loopback lab - non-destructive, minimal blackbox", "browser-like request headers only", "create ONE synthetic test account only", "keep repo clean; write runtime outputs under CCO_WORKDIR"]}
 }
