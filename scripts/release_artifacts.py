@@ -344,7 +344,7 @@ def _artifact_paths(output_dir: Path) -> list[Path]:
 
 def _stage_release_source(staging: Path) -> None:
     staging.mkdir(parents=True, exist_ok=True)
-    for name in ("README.md", "pyproject.toml", "requirements.lock", "MANIFEST.in"):
+    for name in ("LICENSE", "README.md", "pyproject.toml", "requirements.lock", "MANIFEST.in"):
         source = REPO_ROOT / name
         if source.is_symlink() or not source.is_file():
             raise ValueError(f"release source file missing: {name}")
@@ -410,7 +410,7 @@ def audit_release_archives(artifacts: list[Path]) -> dict:
         if parts[0] not in wheel_roots:
             raise ValueError(f"wheel contains a non-allowlisted path: {name}")
     allowed_source_roots = {
-        "README.md", "pyproject.toml", "requirements.lock", "MANIFEST.in",
+        "LICENSE", "README.md", "pyproject.toml", "requirements.lock", "MANIFEST.in",
         "PKG-INFO", "setup.cfg", "scripts", "config", "mcp-servers", "hackagent.egg-info",
     }
     for name in source_names:

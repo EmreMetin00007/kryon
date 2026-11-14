@@ -4,6 +4,7 @@
 ### Policy-Supervised, Signed-Evidence Autonomous Python + LLM Security Operator
 
 [![Python 3.12+](https://img.shields.io/badge/Python-3.12%2B-3776AB?logo=python&logoColor=white)](#installation)
+[![License: Apache-2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
 [![MCP Ecosystem](https://img.shields.io/badge/MCP-16%20Servers%20%C2%B7%20292%20Tools-0A7EA4)](#mcp-tool-ecosystem-16-servers--292-tools)
 [![Evidence Integrity](https://img.shields.io/badge/Evidence-Ed25519%20Signed-2EA043)](#core-design-guarantees)
 [![Execution Policy](https://img.shields.io/badge/Policy-Deny--by--Default-D97706)](#security-and-workspace-boundaries)
@@ -206,3 +207,9 @@ python3 scripts/release_check.py --list
 | MCP Server & Tool Reference | [docs/mcp-reference.md](docs/mcp-reference.md) |
 | Lab & Negative-Control Scorecard | [docs/benchmark-scorecard.md](docs/benchmark-scorecard.md) |
 | P5–P9 Capability Guides | [docs/README.md](docs/README.md) (P5 Hypothesis Queue, P6 Web Experiments, P7 Business Logic, P8 Chaining, P9 Agent Integration) |
+
+---
+
+## License
+
+Licensed under the **Apache License, Version 2.0** — see [LICENSE](LICENSE) for full terms.

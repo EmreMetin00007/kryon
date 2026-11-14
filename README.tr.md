@@ -4,6 +4,7 @@
 ### Politika Denetimli, İmzalı Kanıt Odaklı Otonom Python + LLM Güvenlik Motoru
 
 [![Python 3.12+](https://img.shields.io/badge/Python-3.12%2B-3776AB?logo=python&logoColor=white)](#kurulum)
+[![License: Apache-2.0](https://img.shields.io/badge/Lisans-Apache%202.0-blue.svg)](LICENSE)
 [![MCP Ecosystem](https://img.shields.io/badge/MCP-16%20Servers%20%C2%B7%20292%20Tools-0A7EA4)](#mcp-araç-ekosistemi-16-sunucu--292-araç)
 [![Evidence Integrity](https://img.shields.io/badge/Evidence-Ed25519%20Signed-2EA043)](#temel-tasarım-garantileri)
 [![Execution Policy](https://img.shields.io/badge/Policy-Deny--by--Default-D97706)](#güvenlik-ve-çalışma-sınırları)
@@ -204,3 +205,9 @@ python3 scripts/release_check.py --list
 | MCP Araç Kataloğu | [docs/mcp-reference.md](docs/mcp-reference.md) |
 | Lab ve Negatif Kontrol Kartı | [docs/benchmark-scorecard.md](docs/benchmark-scorecard.md) |
 | P5–P9 Yetenek Belgeleri | [docs/README.md](docs/README.md) (P5 Hypothesis Queue, P6 Web Experiments, P7 Business Logic, P8 Chaining, P9 Agent Integration) |
+
+---
+
+## Lisans
+
+**Apache License, Version 2.0** ile lisanslanmıştır — tüm koşullar için [LICENSE](LICENSE) dosyasına bakın.

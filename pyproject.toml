@@ -8,7 +8,8 @@ version = "0.1.0"
 description = "Policy-supervised Python and LLM security operator"
 readme = "README.md"
 requires-python = ">=3.12"
-license = "LicenseRef-Proprietary"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
 authors = [{ name = "CCO Maintainers" }]
 dependencies = ["chromadb>=1.5,<2", "cryptography>=46,<50", "grpcio-reflection>=1.82,<2", "jsonschema>=4.26,<5", "mcp>=1.27,<2", "networkx>=3.6,<4", "referencing>=0.37,<1", "requests>=2.33,<3", "pyyaml>=6,<7"]
 
