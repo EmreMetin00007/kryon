@@ -1776,3 +1776,189 @@ def test_four_phase_real_subprocess_signed_closure_and_tamper(monkeypatch, basel
         server.shutdown()
         thread.join(timeout=5)
         server.server_close()
+
+
+def test_system_distinguishes_discovery_from_archive_paging_and_keeps_live_true():
+    from full_agent_python_solver import SYSTEM
+
+    lower = SYSTEM.lower()
+    assert "discovery creates live observations" in lower
+    assert "read_artifact" in SYSTEM and "not discovery" in lower
+    assert "hunter_run_web_loop(live=true)" in SYSTEM
+    assert "live=false" in lower
+    assert "observed candidates" in lower and "exact refs" in lower
+    assert "phase_guidance" in SYSTEM and "summary-only" in lower
+    for forbidden in ("sqli", "ssti", "bola", "idor", "xss", "/templates", "/lookup"):
+        assert forbidden not in lower
+
+
+def test_custom_step_commands_preserved_in_context(python_broker):
+    from orchestration_spec import Step
+
+    dump(python_broker.workdir / "handoff.json", {})
+    solver = PythonSolver(python_broker, model="model")
+    for spec, custom in zip(
+        python_broker.tasks.specs,
+        [
+            "Fetch custom entry path",
+            "Enumerate custom API docs",
+            "Validate custom candidate vector",
+            "Review custom evidence ledger",
+        ],
+    ):
+        spec.steps = [Step(id=spec.steps[0].id, command=custom, optional=False)]
+        context = solver.context(spec)
+        assert context["task_spec"]["steps"][0]["goal"] == custom
+    compiled_spec = python_broker.tasks.specs[2]
+    compiled_spec.steps = [Step(id="compiled", command="workflow", optional=False)]
+    assert solver.context(compiled_spec)["task_spec"]["steps"][0]["goal"] == "workflow"
+    base = launcher.bootstrap_plan("http://127.0.0.1:18765/", python_broker.workdir, solver_mode="python_loop")
+    assert base[0].steps[0].command == "Fetch the scoped entry point and retain its HTTP response"
+
+
+def test_enum_phase_guidance_session_checks_conditional(python_broker):
+    python_broker.load_catalog(python_broker.private / "state")
+    spec = python_broker.tasks.specs[1]
+    solver = PythonSolver(python_broker, model="model")
+
+    no_checks = solver.context(spec)
+    assert not no_checks["registered_session_checks"]
+    guidance_no_checks = no_checks["phase_guidance"]
+    assert "kali-tools_crawl_web_surface" in guidance_no_checks
+    assert "session_target" not in guidance_no_checks
+    assert "not discovery" in guidance_no_checks.lower()
+
+    session_check_setup(python_broker)
+    with_checks = solver.context(spec)
+    assert with_checks["registered_session_checks"]
+    guidance_with_checks = with_checks["phase_guidance"]
+    assert "kali-tools_crawl_web_surface" in guidance_with_checks
+    assert "session_target/identity" in guidance_with_checks
+    assert "registered_session_checks" in guidance_with_checks
+
+
+def test_enum_phase_guidance_without_crawler_falls_back_to_admitted_discovery_tools(python_broker):
+    spec = python_broker.tasks.specs[1]
+    solver = PythonSolver(python_broker, model="model")
+
+    guidance = solver.context(spec)["phase_guidance"]
+    assert "kali-tools_crawl_web_surface" not in guidance
+    assert "kali-tools_curl_request" in guidance
+    assert "not discovery" in guidance.lower()
+
+    spec.tools = ["read_artifact"]
+    no_discovery = solver.context(spec)["phase_guidance"]
+    assert "kali-tools_crawl_web_surface" not in no_discovery
+    assert "kali-tools_curl_request" not in no_discovery
+    assert SUMMARY_TOOL in no_discovery
+
+
+def test_phase_guidance_summary_only_on_repair_finalizing_and_runtime_narrowing(python_broker, monkeypatch):
+    from full_agent_python_solver import SYSTEM
+
+    python_broker.load_catalog(python_broker.private / "state")
+    spec = python_broker.tasks.specs[1]
+    solver = PythonSolver(python_broker, model="model")
+
+    for state in ("repairing", "finalizing"):
+        getattr(python_broker.runtime_policy, state).add(spec.id)
+        guidance = solver.context(spec)["phase_guidance"]
+        assert SUMMARY_TOOL in guidance and "summary-only" in guidance.lower()
+        assert "kali-tools_crawl_web_surface" not in guidance
+        getattr(python_broker.runtime_policy, state).clear()
+
+    python_broker.runtime_policy.finalizing.add(spec.id)
+    python_broker.runtime_policy.host_finalizing.add(spec.id)
+    host_fin = solver.context(spec)["phase_guidance"]
+    assert "kali-tools_crawl_web_surface" in host_fin
+    python_broker.runtime_policy.finalizing.clear()
+    python_broker.runtime_policy.host_finalizing.clear()
+
+    # Runtime preparation narrowing AFTER context() is built still sees explicit deferral.
+    python_broker.tasks.active_spec = spec
+    python_broker.runtime_policy.calls[spec.id] = PHASE_CALL_LIMITS[spec.phase] - 2
+    context = solver.context(spec)
+    assert "obey narrowed tools/allowance/summary-only" in context["phase_guidance"].lower()
+    assert "summary-only" in context["phase_guidance"].lower()
+    sink = {}
+    mock_provider(monkeypatch, python_broker, {"choices": [{"message": {"content": "{}"}}],
+                  "usage": {"prompt_tokens": 100, "completion_tokens": 20, "total_tokens": 120}}, request_sink=sink)
+    python_broker.completion({
+        "model": "model", "max_tokens": 4096, "tools": solver.tool_schemas(spec),
+        "messages": [{"role": "system", "content": SYSTEM},
+                     {"role": "user", "content": provider_json(context).decode()}],
+    })
+    assert [t["function"]["name"] for t in sink["payload"]["tools"]] == [SUMMARY_TOOL]
+    assert sink["payload"]["messages"][-1]["content"].startswith("Host runtime allowance:")
+
+
+def test_compiled_workflow_phase_guidance_only_binding_ref(tmp_path, monkeypatch):
+    from test_p7_business_logic import bound_p7
+
+    broker, spec, _ref, graph, _, _prep = bound_p7(tmp_path, monkeypatch)
+    try:
+        solver = PythonSolver(broker, model="local")
+        guidance = solver.context(spec)["phase_guidance"]
+        assert "workflow_execute_compiled" in guidance
+        assert "binding_ref" in guidance
+        assert "hunter_run_web_loop" not in guidance
+        assert "never construct HTTP chains" in guidance
+    finally:
+        graph.close()
+
+
+def test_p5_references_phase_guidance_enforces_live_false(python_broker):
+    from orchestration_spec import Step
+
+    python_broker.load_catalog(python_broker.private / "state")
+    solver = PythonSolver(python_broker, model="model")
+    spec = python_broker.tasks.specs[2]
+    spec.references = {"hypothesis_ref": "hyp-1", "dimension": {"identity": "member-a"}}
+    spec.steps = [Step(id="plan-p5", command="Plan observed P5 hypothesis dimension", optional=False)]
+
+    context = solver.context(spec)
+    assert context["planning_only"] is True
+    assert context["task_spec"]["steps"][0]["goal"] == "Plan observed P5 hypothesis dimension"
+    guidance = context["phase_guidance"]
+    assert "hunter_run_web_loop(live=false)" in guidance
+    assert "live=true" not in guidance
+
+    spec.tools = ["kali-tools_curl_request"]
+    no_hunter = solver.context(spec)["phase_guidance"]
+    assert "hunter_run_web_loop" not in no_hunter
+    assert "live=true" not in no_hunter and "plan-only" in no_hunter
+
+
+def test_access_phase_guidance_hunter_live_true_only_when_advertised(python_broker):
+    dump(python_broker.workdir / "handoff.json", {})
+    spec = python_broker.tasks.specs[2]
+    solver = PythonSolver(python_broker, model="model")
+
+    without_hunter = solver.context(spec)["phase_guidance"]
+    assert "hunter_run_web_loop" not in without_hunter
+    assert "kali-tools_curl_request" in without_hunter
+
+    python_broker.load_catalog(python_broker.private / "state")
+    with_hunter = solver.context(spec)["phase_guidance"]
+    assert "hunter_run_web_loop(live=true)" in with_hunter
+    assert "observed candidates/exact refs" in with_hunter.lower()
+
+
+def test_phase_guidance_bounded_context_and_admitted_tools_unchanged(python_broker):
+    dump(python_broker.workdir / "handoff.json", {})
+    python_broker.load_catalog(python_broker.private / "state")
+    session_check_setup(python_broker)
+    solver = PythonSolver(python_broker, model="model")
+    before_limits = dict(PHASE_CALL_LIMITS)
+
+    for spec in python_broker.tasks.specs:
+        expected_allowed = python_broker.runtime_policy.allowed_tools(spec)
+        schemas = solver.tool_schemas(spec)
+        context = solver.context(spec)
+        guidance = context["phase_guidance"]
+        assert isinstance(guidance, str) and 40 <= len(guidance) < 250
+        assert spec.target not in guidance
+        assert len(provider_json(context)) < 8500
+        assert python_broker.runtime_policy.allowed_tools(spec) == expected_allowed
+        assert {t["function"]["name"] for t in schemas} <= expected_allowed
+    assert PHASE_CALL_LIMITS == before_limits
