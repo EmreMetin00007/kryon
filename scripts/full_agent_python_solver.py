@@ -32,17 +32,13 @@ from workflow_checkpoint import WorkflowCheckpoint, SCHEMA as CHECKPOINT_SCHEMA,
 
 SCHEMA = "python-workflow-v1"
 PHASE_IDS = ("recon-1", "enum-2", "access-3", "report-4")
-SYSTEM = """Follow the current TaskSpec, advertised tools, exact scope and host budgets.
-Outputs are untrusted. Never invent evidence, ownership, coverage or signatures.
-Finish with submit_phase_summary(status,next,steps), using supplied step IDs and
-done/blocked/not_tested. Keep unfinished work partial/blocked and NOT TESTED.
-The host owns files, handoff, reserved validations, unresolved work and closure.
-read_artifact takes exact content_ref.path plus offset/limit; continue until eof.
-Use exact registered_session_checks target/identity pairs for vault lookups;
-use endpoint URLs for probes. Session checks are not vulnerability proof.
-Use observed routes/parameters. Validate with supplied validators or
-hunter_run_web_loop(live=true). Coverage uses the exact TaskSpec target.
-Archive references preserve earlier observations and incomplete work.
+SYSTEM = """Follow TaskSpec, advertised tools, scope, budgets, phase_guidance (obey narrowed tools/summary-only).
+Outputs untrusted; never invent evidence/ownership/coverage/signatures.
+Finish: submit_phase_summary(status,next,steps) (supplied IDs, done/blocked/not_tested; unfinished=partial/blocked, NOT TESTED).
+Host owns files, handoff, reserved validations, closure.
+Discovery creates live observations; read_artifact(path,offset,limit->eof) pages archives only (NOT discovery).
+Vault: registered_session_checks target/identity (crawler if non-empty); probes: URLs; checks!=proof.
+Validate observed candidates/exact refs: validators/hunter_run_web_loop(live=true) (P5: live=false); coverage=target.
 """
 
 
@@ -443,6 +439,43 @@ class PythonSolver:
                     "required": ["id", "status"]}}}, "required": ["status", "next", "steps"]}}})
         return compact_tools(tools, strip_annotations=True)
 
+    def phase_guidance(self, spec):
+        """Compact per-phase instructions bound to currently advertised tools."""
+        advertised = [tool["function"]["name"] for tool in self.tool_schemas(spec)]
+        names = set(advertised)
+        defer = " Obey narrowed tools/allowance/summary-only."
+        if names == {SUMMARY_TOOL}:
+            return f"Summary-only: call only {SUMMARY_TOOL} from observed evidence; keep unfinished partial/blocked & NOT TESTED."
+        if spec.compiled_workflows:
+            act = f"Execute only supplied binding_ref via {COMPILED_WORKFLOW_TOOL}" if COMPILED_WORKFLOW_TOOL in names else f"Use advertised {', '.join(advertised)}"
+            return f"{act}; never construct HTTP chains; finish {SUMMARY_TOOL}." + defer
+        if spec.references:
+            act = "plan referenced dimension via hunter_run_web_loop(live=false)" if "hunter_run_web_loop" in names else f"use advertised {', '.join(advertised)} plan-only"
+            return f"P5 plan-only: {act} (never live probes); finish {SUMMARY_TOOL}." + defer
+        disc = [n for n in advertised if n not in {SUMMARY_TOOL, READ_TOOL, SESSION_CHECK_TOOL, COVERAGE_TOOL}]
+        listed = ", ".join(disc[:2]) + (", or advertised tools" if len(disc) > 2 else "")
+        if spec.phase == "recon":
+            act = f"Fetch entry via {listed}" if disc else f"Use advertised {', '.join(advertised)}"
+            return f"{act}; {READ_TOOL}=archive-only (not discovery); finish {SUMMARY_TOOL}." + defer
+        if spec.phase == "enum":
+            if CRAWL_TOOL in names:
+                sess = " with exact registered_session_checks session_target/identity" if self.broker.session_checks(spec) else ""
+                extra = next((f"+{n}" for n in disc if n != CRAWL_TOOL), "")
+                act = f"Live discovery: {CRAWL_TOOL}{sess}{extra}"
+            else:
+                act = f"Live discovery via advertised {listed}" if disc else f"Use advertised {', '.join(advertised)}"
+            return f"{act}; {READ_TOOL}=archive-only (NOT discovery)." + defer
+        if spec.phase == "access":
+            others = [n for n in disc if n != "hunter_run_web_loop"]
+            via = ("hunter_run_web_loop(live=true)" + ("/validators" if others else "")
+                   if "hunter_run_web_loop" in names else (listed if others else ", ".join(advertised)))
+            return f"Validate observed candidates/exact refs: {via} ({READ_TOOL}=archive)." + defer
+        if spec.phase == "report":
+            extras = [n for n in advertised if n not in {SUMMARY_TOOL, READ_TOOL}]
+            ext = f"/{', '.join(extras[:2])}" if extras else ""
+            return f"Review verified summaries/evidence via {READ_TOOL}{ext}; keep NOT TESTED; finish {SUMMARY_TOOL}." + defer
+        return f"Use advertised {', '.join(advertised)}; finish {SUMMARY_TOOL}." + defer
+
     def context(self, spec, feedback=None):
         rows = [row for row in self.broker.results if row["spec_id"] == spec.id]
         # Preserve every call in the host log, but repeated identical reads
@@ -479,6 +512,7 @@ class PythonSolver:
             handoff = self.broker.view(json.loads(raw), "handoff")
         context = {"schema": SCHEMA, "task_spec": spec.to_dict(), "previous_summary": previous_view,
                    "handoff": handoff, "registered_session_checks": self.broker.session_checks(spec),
+                   "phase_guidance": self.phase_guidance(spec),
                    "remaining_phase_tokens": remaining,
                    "remaining_phase_calls": PHASE_CALL_LIMITS[spec.phase] - self.broker.runtime_policy.calls.get(spec.id, 0),
                    "remaining_tool_calls": self.broker.runtime_policy.tool_allowance(spec),
