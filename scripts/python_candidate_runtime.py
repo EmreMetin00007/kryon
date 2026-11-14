@@ -4,6 +4,7 @@ from __future__ import annotations
 import hashlib
 import json
 import copy
+import re
 from typing import Any
 from urllib.parse import parse_qsl, urlsplit
 
@@ -14,6 +15,43 @@ PROFILES = {
 STAGES = ("observed", "eligible", "admitted", "executed", "evidence_accepted")
 CARD_LIMIT = 8
 CARD_BYTES = 2000
+
+
+def query_parameters(url: str) -> dict[str, str]:
+    """Reject ambiguous carriers before a dict can silently collapse duplicates."""
+    raw = urlsplit(url).query
+    if re.search(r"%(?![0-9a-fA-F]{2})", raw) or ";" in raw:
+        raise ValueError("malformed_observed_query")
+    try:
+        pairs = parse_qsl(raw, keep_blank_values=True, strict_parsing=True, errors="strict", max_num_fields=256)
+    except ValueError:
+        raise ValueError("malformed_observed_query") from None
+    names = [name for name, _ in pairs]
+    if any(not valid_parameter_name(name) for name in names):
+        raise ValueError("malformed_observed_parameter")
+    if len(set(names)) != len(names):
+        raise ValueError("ambiguous_duplicate_parameter")
+    return dict(pairs)
+
+
+def valid_parameter_name(value: Any) -> bool:
+    return isinstance(value, str) and re.fullmatch(r"[A-Za-z0-9_.:\[\]-]{1,96}", value) is not None
+
+
+def parameter_declarations(value: Any) -> list[dict[str, Any]]:
+    if not isinstance(value, list) or any(not isinstance(item, dict)
+            or not valid_parameter_name(item.get("name")) or not isinstance(item.get("in", "query"), str)
+            for item in value):
+        raise ValueError("malformed_parameter_declaration")
+    if len({item["name"] for item in value}) != len(value):
+        raise ValueError("ambiguous_duplicate_parameter")
+    return copy.deepcopy(value)
+
+
+def card_route(url: str) -> str:
+    """Cards are semantic pointers, not a second credential-bearing query archive."""
+    parsed = urlsplit(url)
+    return parsed._replace(query="", fragment="").geturl()
 
 
 def upstream_ids(spec: Any, specs: list[Any]) -> list[str]:
@@ -123,14 +161,29 @@ def parameter_candidates(spec: Any, records: list[dict[str, Any]],
         binding_reason = "missing_synthetic_owned_session_prerequisite"
     for record in records:
         url = record["url"]
-        provenance = [{key: record[key] for key in
-                       ("source_spec_id", "source_artifact", "source_sha256")}]
-        params = dict(parse_qsl(urlsplit(url).query, keep_blank_values=True))
+        keys = ("source_spec_id", "source_artifact", "source_sha256")
+        provenance = [{key: record[key] for key in keys}] if (all(isinstance(record.get(key), str)
+            and record[key] for key in keys) and re.fullmatch(r"[0-9a-f]{64}", record["source_sha256"])) else []
+        reason = record.get("candidate_reason", "")
+        if not provenance:
+            reason = "missing_discovery_provenance"
+        try:
+            params = query_parameters(url)
+            declarations = parameter_declarations(record.get("params", []))
+        except ValueError as exc:
+            reason = reason or str(exc)
+            params, declarations = {}, []
+        identity = record.get("identity_ref", "anon")
+        if identity not in ("anon", "anonymous") and (not isinstance(identity, str) or identity not in bindings):
+            reason = reason or "missing_observed_identity_binding"
+        if reason:
+            output.append(candidate(spec.id, route=url, provenance=provenance, reason=reason))
+            continue
         if record.get("method", "GET") != "GET":
             output.append(candidate(spec.id, route=url, provenance=provenance,
                                     reason="unsupported_readonly_method"))
             continue
-        declared = {item["name"]: item.get("in", "query") for item in record.get("params", [])}
+        declared = {item["name"]: item.get("in", "query") for item in declarations}
         for param in dict.fromkeys([*params, *declared]):
             for profile, (vector, direct, _) in PROFILES.items():
                 if spec.vector not in ("", "access", vector):
@@ -170,6 +223,7 @@ def compact_cards(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
         # Complete provenance remains in the discovery archive and candidate
         # state. A card needs one exact pointer, not every repeated source.
         card["provenance"] = row["provenance"][:1]
+        card["route"] = card_route(row["route"])
         if len(json.dumps([*cards, card]).encode()) > CARD_BYTES or len(cards) == CARD_LIMIT:
             break
         cards.append(card)

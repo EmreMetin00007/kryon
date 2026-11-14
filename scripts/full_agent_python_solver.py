@@ -25,12 +25,13 @@ from full_agent_provider import dump
 from authz_matrix import identity_fact, same_principal
 from full_agent_budget import BudgetError, compact_tools, provider_json
 from full_agent_python_broker import (CRAWL_TOOL, COVERAGE_TOOL, PHASE_CALL_LIMITS, READ_TOOL, REPORT_CARRYOVER_STEP,
-                                    SESSION_CHECK_TOOL, SUMMARY_TOOL, SessionBindingError)
+                                    SESSION_CHECK_TOOL, SUMMARY_TOOL, ArchiveSizeError, SessionBindingError)
 from full_agent_summary_feedback import summary_feedback
 from orchestration_spec import COMPILED_WORKFLOW_TOOL, TaskSpec, skeleton_summary, surface_errors, validate_chain
 from workflow_checkpoint import WorkflowCheckpoint, SCHEMA as CHECKPOINT_SCHEMA, file_ref
 from python_candidate_runtime import (PROFILES, candidate, compact_cards, compact_gaps, dedup_gaps, funnel, gap,
-                                      matches_model_call, parameter_candidates, parser_gaps, upstream_ids)
+                                      matches_model_call, parameter_candidates, parameter_declarations,
+                                      parser_gaps, query_parameters, upstream_ids)
 
 SCHEMA = "python-workflow-v1"
 PHASE_IDS = ("recon-1", "enum-2", "access-3", "report-4")
@@ -384,12 +385,37 @@ class PythonSolver:
                 current = state[row["candidate_id"]]
                 current["provenance"] = [json.loads(raw) for raw in dict.fromkeys(
                     provider_json(item).decode() for item in [*current["provenance"], *row["provenance"]])]
+                if not row["eligible"]:
+                    # A later contradictory declaration must not leave the
+                    # earlier same-key candidate eligible for host dispatch.
+                    current["eligible"] = False
             if row["reason_code"]:
                 self.add_gap(spec, row["reason_code"], row=state[row["candidate_id"]])
         self.refresh_candidate_evidence(spec)
         return list(state.values())
 
     def refresh_candidate_evidence(self, spec):
+        # Never leave a cached TESTED claim visible if reference verification
+        # itself fails. Dispatch history remains; current acceptance is revoked.
+        for row in self.candidates_by_task.get(spec.id, {}).values():
+            if row["evidence_accepted"]:
+                row.update(evidence_accepted=False, evidence_refs=[], validation_state="NOT TESTED")
+        sources = set(upstream_ids(spec, self.broker.tasks.specs))
+        checked = set()
+        for row in self.candidates_by_task.get(spec.id, {}).values():
+            for provenance in row["provenance"]:
+                key = (provenance.get("source_artifact"), provenance.get("source_sha256"))
+                if provenance.get("source_spec_id") not in sources:
+                    raise WorkflowError("prior_phase_evidence_changed")
+                if key not in checked:
+                    ref = self.broker.references.get(key[0])
+                    if ref is None or ref["sha256"] != key[1]:
+                        raise WorkflowError("prior_phase_evidence_changed")
+                    try:
+                        self.broker.read_reference(ref)
+                    except (ValueError, OSError, TypeError):
+                        raise WorkflowError("prior_phase_evidence_changed") from None
+                    checked.add(key)
         outcomes = self.broker.validation_attempts(spec)
         for row in self.candidates_by_task.get(spec.id, {}).values():
             if not row["eligible"]:
@@ -496,7 +522,8 @@ class PythonSolver:
         except (ValueError, KeyError):
             self.add_gap(spec, "candidate_prerequisite_or_admission_denied", "prerequisites", row)
             return False
-        row["admitted"] = True
+        # A preview does not attest that dispatch passed the checks again. The
+        # actual host executor receipt owns admitted/executed funnel transitions.
         return True
 
     def member_pair_categories(self, pair):
@@ -795,12 +822,18 @@ class PythonSolver:
             parsed = urlsplit(url)
             if (parsed.scheme, parsed.netloc) != (origin.scheme, origin.netloc) or parsed.username is not None:
                 continue
-            params = [item for item in record.get("params", []) if isinstance(item, dict) and isinstance(item.get("name"), str)]
+            reason = ""
+            try:
+                params = parameter_declarations(record.get("params", []))
+                query = query_parameters(url)
+            except ValueError as exc:
+                reason, params, query = str(exc), [], {}
             names = {item["name"] for item in params}
-            params.extend({"name": key, "in": "query", "sample": val} for key, val in
-                          parse_qsl(parsed.query, keep_blank_values=True) if key not in names)
+            params.extend({"name": key, "in": "query", "sample": val} for key, val in query.items() if key not in names)
             output.append({"url": url, "method": record.get("method", "GET"), "params": params,
-                           "source_artifact": ref["path"], "source_sha256": ref["sha256"]})
+                           "candidate_reason": reason,
+                           "identity_ref": record.get("identity_ref", record.get("identity", args.get("identity", "anon"))),
+                            "source_artifact": ref["path"], "source_sha256": ref["sha256"]})
         return [json.loads(raw) for raw in dict.fromkeys(provider_json(row).decode() for row in output)]
 
     def compile_summary(self, spec, submitted):
@@ -956,8 +989,11 @@ class PythonSolver:
                     summary["status"] = "partial"
         if spec.phase == "report":
             sources = set(upstream_ids(spec, self.broker.tasks.specs))
-            summary["validation_funnels"] = {ident: previous["validation_funnel"] for ident, previous in self.summaries.items()
-                                             if ident in sources and "validation_funnel" in previous}
+            summary["validation_funnels"] = {}
+            for source in self.broker.tasks.specs:
+                if source.id in sources and source.id in self.candidates_by_task:
+                    self.refresh_candidate_evidence(source)
+                    summary["validation_funnels"][source.id] = funnel(list(self.candidates_by_task[source.id].values()))
             reports = [row for row in self.broker.results if row["spec_id"] == spec.id and row["tool"] == COVERAGE_TOOL]
             if reports:
                 row = reports[-1]
@@ -981,7 +1017,8 @@ class PythonSolver:
                 if unfinished and summary.get("status") == "done":
                     summary["status"] = "partial"
         inherited_gaps = [row for ident in upstream_ids(spec, self.broker.tasks.specs)
-                          for row in self.summaries.get(ident, {}).get("coverage_gaps", [])]
+                          for row in [*self.summaries.get(ident, {}).get("coverage_gaps", []),
+                                      *self.coverage_gaps.get(ident, [])]]
         summary["coverage_gaps"] = dedup_gaps([*inherited_gaps, *self.coverage_gaps.get(spec.id, [])])
         return summary
 
@@ -1025,6 +1062,8 @@ class PythonSolver:
                 except BudgetError:
                     self.add_gap(spec, "validator_execution_budget_exhausted", "admission_budget", row)
                     raise
+                except ArchiveSizeError:
+                    self.add_gap(spec, "archive_size_limit_exceeded", "archive", row)
                 except ValueError:
                     self.add_gap(spec, "validator_execution_denied", "prerequisites", row)
                 finally:
@@ -1193,7 +1232,9 @@ class PythonSolver:
                             # text or credential-bearing parameters in feedback.
                             error = ({"error": "session_binding_mismatch",
                                       "registered_session_checks": self.broker.session_checks(spec)}
-                                     if isinstance(exc, SessionBindingError) else {"error": "tool invocation denied"})
+                                      if isinstance(exc, SessionBindingError) else {"error": "tool invocation denied"})
+                            if isinstance(exc, ArchiveSizeError):
+                                self.add_gap(spec, "archive_size_limit_exceeded", "archive")
                             view = self.broker.view(error)
                             self.broker.results.append({"spec_id": spec.id, "tool": name, "arguments": {}, **view})
                             dump(self.broker.private / "python-tool-results.json", self.broker.results)
@@ -1350,6 +1391,15 @@ class PythonSolver:
         finally:
             try:
                 for spec in self.broker.tasks.specs:
+                    if spec.id in self.candidates_by_task:
+                        try:
+                            self.refresh_candidate_evidence(spec)
+                        except (ValueError, OSError, TypeError) as exc:
+                            # A failed task refresh must not leave later tasks'
+                            # cached acceptance visible in the final run funnel.
+                            self.add_gap(spec, getattr(exc, "code", None) or
+                                         "invalid_or_missing_signed_evidence", "evidence")
+                            result.update(status="python_failed", stop_reason="candidate_evidence_refresh_failed")
                     if self.task_states.get(spec.id) != "completed":
                         self.add_gap(spec, "task_incomplete_or_indeterminate_no_replay")
                     for row in self.candidates_by_task.get(spec.id, {}).values():

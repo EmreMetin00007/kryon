@@ -22,7 +22,7 @@ from full_agent_provider import (PYTHON_ALLOWANCE_INSTRUCTION,
 from full_agent_runtime_policy import (MAX_CONTEXT_BYTES, MAX_PROMPT_TOKENS,
                                        MIN_OUTPUT_TOKENS, PHASE_WEIGHTS, RuntimePolicy)
 from orchestration_spec import COMPILED_WORKFLOW_TOOL
-from python_candidate_runtime import compact_gaps, page_cards, upstream_ids
+from python_candidate_runtime import PROFILES, compact_gaps, page_cards, query_parameters, upstream_ids
 
 PHASE_CALL_LIMITS = {"recon": 12, "enum": 16, "access": 14, "report": 6, "planner": 8}
 SUMMARY_TOOL = "submit_phase_summary"
@@ -786,6 +786,18 @@ class PythonBroker(HostBroker):
                         continue
                     if not context and row["tool"] in {"validator_validate_sqli", "validator_validate_ssti"}:
                         context = self.direct_request_context(record, args)
+                    if row["tool"] in {"validator_validate_sqli", "validator_validate_ssti"}:
+                        # Read-only host slices require a complete signed (or
+                        # signed-wire-derived) request context and the selected
+                        # deterministic oracle, not just a valid artifact ID.
+                        profile = ("readonly_sqli_boolean" if row["tool"] == "validator_validate_sqli"
+                                   else "readonly_ssti_arithmetic")
+                        if (args.get("method", "GET") == "GET" and args.get("carrier", "query") == "query"
+                                and (row["tool"] != "validator_validate_sqli" or args.get("boolean_only") is True)):
+                            if (record.get("oracle") != PROFILES[profile][2]
+                                    or not {"param", "method", "carrier", "identity"} <= context.keys()
+                                    or context.get("identity") not in {"anon", "anonymous"}):
+                                continue
                     if (record["target"] != args.get("target_url")
                             or context.get("param", "") != args.get("param", "")
                             or context.get("method", "GET") != args.get("method", "GET")
@@ -809,7 +821,10 @@ class PythonBroker(HostBroker):
     def direct_request_context(self, record, args):
         """Infer a slice only from signed wire traces, not unsigned tool metadata."""
         target = urlsplit(args.get("target_url", ""))
-        baseline = dict(parse_qsl(target.query, keep_blank_values=True))
+        try:
+            baseline = query_parameters(args.get("target_url", ""))
+        except ValueError:
+            return {}
         param = args.get("param")
         if not param or param not in baseline or args.get("method", "GET") != "GET" or args.get("carrier", "query") != "query":
             return {}
@@ -817,7 +832,10 @@ class PythonBroker(HostBroker):
         changed = False
         for probe in probes:
             url = urlsplit(probe.get("request_url", ""))
-            query = dict(parse_qsl(url.query, keep_blank_values=True))
+            try:
+                query = query_parameters(probe.get("request_url", ""))
+            except ValueError:
+                return {}
             if ((url.scheme, url.netloc, url.path) != (target.scheme, target.netloc, target.path)
                     or probe.get("method") != "GET" or not probe.get("transport_ok")
                     or set(query) != set(baseline)

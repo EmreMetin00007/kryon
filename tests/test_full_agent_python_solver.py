@@ -23,6 +23,7 @@ from full_agent_summary_feedback import summary_feedback
 from full_agent_tasks import NativeTasks
 from test_full_agent_preflight import baseline as baseline, mock_provider
 from test_http_chromium_acceptance import evidence as acceptance_evidence
+from fixtures.output_root import output_root
 
 
 @pytest.fixture
@@ -1502,7 +1503,7 @@ def test_four_phase_real_subprocess_signed_closure_and_tamper(monkeypatch, basel
     from evidence_trust import canonical_bytes, verify
     from full_agent_python_solver import PythonSolver
     from full_agent_python_broker import PythonBroker
-    artifacts = Path(os.environ["CCO_WORKDIR"]) / "full-agent-python-integration"
+    artifacts = output_root("full-agent-python-integration")
     artifacts.mkdir(parents=True, exist_ok=True)
     tmp_path = Path(tempfile.mkdtemp(prefix="run-", dir=artifacts))
     captured = []
