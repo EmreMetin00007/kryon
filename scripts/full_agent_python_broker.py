@@ -11,7 +11,7 @@ import json
 import os
 import sys
 from pathlib import Path
-from urllib.parse import urlsplit
+from urllib.parse import parse_qsl, urlsplit
 
 from full_agent_budget import (BudgetError, compact_tools, completion_request,
                                prompt_bound, provider_json)
@@ -22,6 +22,7 @@ from full_agent_provider import (PYTHON_ALLOWANCE_INSTRUCTION,
 from full_agent_runtime_policy import (MAX_CONTEXT_BYTES, MAX_PROMPT_TOKENS,
                                        MIN_OUTPUT_TOKENS, PHASE_WEIGHTS, RuntimePolicy)
 from orchestration_spec import COMPILED_WORKFLOW_TOOL
+from python_candidate_runtime import compact_gaps, page_cards, upstream_ids
 
 PHASE_CALL_LIMITS = {"recon": 12, "enum": 16, "access": 14, "report": 6, "planner": 8}
 SUMMARY_TOOL = "submit_phase_summary"
@@ -30,6 +31,11 @@ SESSION_CHECK_TOOL = "validator_session_vault_check"
 CRAWL_TOOL = "kali-tools_crawl_web_surface"
 COVERAGE_TOOL = "hunter_coverage_report"
 REPORT_CARRYOVER_STEP = "unresolved-work"
+MAX_ARCHIVE_BYTES = 16 * 1024 * 1024
+
+
+class ArchiveSizeError(ValueError):
+    code = "archive_size_limit_exceeded"
 
 
 class SessionBindingError(ValueError):
@@ -177,6 +183,8 @@ class PythonBroker(HostBroker):
         self.advertised_tools = None
         self.workflow_sender = workflow_sender
         self.workflow_bindings = {}
+        self.branch_handoffs = {}
+        self.read_progress = {}
 
     def bind_workflow(self, task_spec_id, manifest, **binding_args):
         """Host API: bind compiled evidence, never accept manifests from the LLM."""
@@ -385,6 +393,7 @@ class PythonBroker(HostBroker):
                         row['result'].pop('text')
                         row['result']['text_archived'] = True
                 if level >= 2:
+                    projected['coverage_gaps'] = compact_gaps(projected.get('coverage_gaps', []))
                     projected['older_results'] = ([*projected.get('older_results', []), *[
                         {'tool': row['tool'], 'content_ref': row['content_ref']}
                         for row in recent[:-1]]])[-8:]
@@ -413,15 +422,50 @@ class PythonBroker(HostBroker):
                         # retain the enum evidence. Avoid a third copy of its
                         # archive reference in the first validation turn.
                         projected.pop('previous_summary', None)
-                    if (recent and recent[-1].get('tool') == READ_TOOL
-                            and 'text' in recent[-1].get('result', {})):
-                        # Keep the fresh evidence page readable. A compact
-                        # workflow tool set leaves room for that page while
-                        # retaining discovery, session checks and validation.
+                    if spec.phase in {'access', 'enum', 'report'}:
+                        # Keep semantic cards and fresh evidence readable. A
+                        # compact workflow tool set retains discovery, session
+                        # checks and validators even before the first read.
                         reading_tools = {READ_TOOL, SUMMARY_TOOL, SESSION_CHECK_TOOL,
-                                         COVERAGE_TOOL, 'hunter_run_web_loop'}
+                                           COVERAGE_TOOL, 'hunter_run_web_loop', CRAWL_TOOL,
+                                           COMPILED_WORKFLOW_TOOL, 'validator_validate_sqli',
+                                           'validator_validate_ssti', 'validator_validate_idor',
+                                           'validator_validate_auth_bypass', 'validator_validate_open_redirect'}
                         candidate['tools'] = [row for row in candidate['tools']
-                                              if row['function']['name'] in reading_tools]
+                                                if row['function']['name'] in reading_tools]
+                    if (recent and recent[-1].get('tool') == READ_TOOL
+                            and len(recent[-1].get('result', {}).get('text', '')) > 1000):
+                        # Page-first projection retains every core capability,
+                        # but removes redundant indexes and optional arguments
+                        # that the host fills canonically for candidate selection.
+                        projected['candidate_cards'] = page_cards(projected.get('candidate_cards', []))
+                        projected.pop('older_results', None)
+                        projected.pop('older_index_ref', None)
+                        # Exact safe binding/check maps remain in the archived
+                        # context. The vault schema still advertises the exact
+                        # lookup target/identities; no session authority changes.
+                        projected.pop('session_bindings', None)
+                        projected.pop('registered_session_checks', None)
+                        candidate['tools'] = [row for row in candidate['tools'] if row['function']['name'] not in
+                                              {'validator_validate_open_redirect', 'validator_validate_auth_bypass'}]
+                        latest = projected['recent_results'][-1]
+                        if latest.get('result', {}).get('content_ref'):
+                            latest.pop('content_ref', None)  # Exact wrapper remains in context_archive_ref.
+                        if not projected.get('coverage_gap_count'):
+                            projected.pop('coverage_gap_archive_ref', None)
+                        if not spec.references and not spec.compiled_workflows:
+                            fields = {'hunter_run_web_loop': {'target', 'live', 'session_bindings', 'validation_profile'},
+                                      COVERAGE_TOOL: {'target', 'campaign_id'},
+                                      'validator_validate_sqli': {'target_url', 'param', 'method', 'carrier', 'boolean_only'},
+                                      'validator_validate_ssti': {'target_url', 'param', 'method', 'carrier'}}
+                            for tool in candidate['tools']:
+                                name = tool['function']['name']
+                                params = tool['function']['parameters']
+                                if name in fields:
+                                    keep = fields[name] | set(params.get('required', []))
+                                    params['properties'] = {key: value for key, value in params.get('properties', {}).items()
+                                                            if key in keep}
+                                    params['additionalProperties'] = False
                 if level == 3:
                     self.runtime_policy.finalizing.add(spec.id)
                     for row in projected['recent_results']:
@@ -440,7 +484,9 @@ class PythonBroker(HostBroker):
                     task['steps'] = [{key: value for key, value in step.items()
                                      if key != 'goal'} for step in task['steps']]
                     projected = {key: projected[key] for key in
-                                 ('schema', 'context_archive_ref', 'recent_results', 'summary_feedback')}
+                                   ('schema', 'context_archive_ref', 'recent_results', 'summary_feedback',
+                                    'candidate_cards', 'candidate_count', 'coverage_gaps',
+                                    'coverage_gap_count', 'coverage_gap_archive_ref') if key in projected}
                     projected['task_spec'] = task
             candidate['messages'][1]['content'] = provider_json(projected).decode()
             closing = {**candidate, 'tools': [row for row in candidate.get('tools', [])
@@ -478,6 +524,8 @@ class PythonBroker(HostBroker):
 
     def archive(self, value, label="tool-result"):
         raw = provider_json(value)
+        if len(raw) > MAX_ARCHIVE_BYTES:
+            raise ArchiveSizeError("archive size limit exceeded")
         digest = hashlib.sha256(raw).hexdigest()
         relative = f"context-archive/{label}-{digest}.json"
         path = self.workdir / relative
@@ -490,6 +538,20 @@ class PythonBroker(HostBroker):
         ref = {"path": relative, "sha256": digest, "bytes": len(raw)}
         self.references[relative] = ref
         return ref
+
+    def read_reference(self, ref):
+        """Bounded hash-checked exact bytes; no mtime-only integrity shortcuts."""
+        if not isinstance(ref, dict) or self.references.get(ref.get("path")) != ref:
+            raise ValueError("unknown artifact reference")
+        path = self.workdir / ref["path"]
+        if (self.workdir not in path.resolve().parents or any(p.is_symlink() for p in (path, *path.parents))
+                or type(ref.get("bytes")) is not int or not 0 <= ref["bytes"] <= MAX_ARCHIVE_BYTES):
+            raise ValueError("invalid artifact reference")
+        with os.fdopen(os.open(path, os.O_RDONLY | os.O_NOFOLLOW), "rb") as handle:
+            raw = handle.read(MAX_ARCHIVE_BYTES + 1)
+        if len(raw) != ref["bytes"] or hashlib.sha256(raw).hexdigest() != ref["sha256"]:
+            raise ValueError("artifact reference changed")
+        return json.loads(raw)
 
     def view(self, value, label="tool-result"):
         ref = self.archive(value, label)
@@ -562,10 +624,11 @@ class PythonBroker(HostBroker):
                 if ref is None:
                     raise ValueError("unknown artifact reference")
                 path = self.workdir / ref["path"]
-                if any(p.is_symlink() for p in (path, *path.parents)):
+                if (self.workdir not in path.resolve().parents or ref["bytes"] > MAX_ARCHIVE_BYTES
+                        or any(p.is_symlink() for p in (path, *path.parents))):
                     raise ValueError("artifact reference is a symlink")
                 with os.fdopen(os.open(path, os.O_RDONLY | os.O_NOFOLLOW), "rb") as handle:
-                    raw = handle.read(16 * 1024 * 1024 + 1)
+                    raw = handle.read(MAX_ARCHIVE_BYTES + 1)
                 if len(raw) != ref["bytes"] or hashlib.sha256(raw).hexdigest() != ref["sha256"]:
                     raise ValueError("artifact reference changed")
                 offset, size = args.get("offset", 0), args.get("limit", 3000)
@@ -574,9 +637,25 @@ class PythonBroker(HostBroker):
                 decoded = raw.decode()
                 chunk = decoded[offset:offset + size]
                 end = min(len(decoded), offset + len(chunk))
-                value = {"content_ref": ref, "offset": offset, "text": chunk,
-                         "next_offset": end if end < len(decoded) else None,
-                         "eof": end >= len(decoded)}
+                key = spec.id + ":" + ref["sha256"]
+                progress = self.read_progress.setdefault(key, {"ranges": [], "stalls": 0})
+                ranges = progress["ranges"]
+                useful = bool(chunk) and not any(start <= offset and end <= stop for start, stop in ranges)
+                progress["stalls"] = 0 if useful else progress["stalls"] + 1
+                if progress["stalls"] >= 2:
+                    value = {"content_ref": ref, "offset": offset, "eof": end >= len(decoded),
+                             "status": "NOT TESTED", "reason_code": "archive_read_no_progress"}
+                else:
+                    ranges.append([offset, end])
+                    merged: list[list[int]] = []
+                    for start, stop in sorted(ranges):
+                        if merged and start <= merged[-1][1]:
+                            merged[-1][1] = max(stop, merged[-1][1])
+                        else:
+                            merged.append([start, stop])
+                    progress["ranges"] = merged
+                    value = {"content_ref": ref, "offset": offset, "text": chunk,
+                             "next_offset": end if end < len(decoded) else None, "eof": end >= len(decoded)}
             except (ValueError, OSError):
                 self.runtime_policy.record_result(spec, tool, None, "invalid_reference")
                 raise ValueError("invalid artifact reference or range") from None
@@ -647,16 +726,38 @@ class PythonBroker(HostBroker):
             sys.path.append(validator_path)
         from cco_validator_core import artifact_is_current, load_validation, normalize_finding_type
         attempts = {}
+        executions = {}
+        owners: dict[str, str] = {}
+        for execution in self.tools:
+            if (execution.get("origin") != "solver" or not execution.get("task_spec_id")
+                    or not (execution["tool"] == "hunter_run_web_loop" or execution["tool"].startswith("validator_validate_"))):
+                continue
+            receipt = json.loads(Path(execution["artifact"]).read_bytes())
+            result = receipt.get("execution") or {}
+            if receipt.get("error") or result.get("execution_failed"):
+                continue
+            value = result.get("result", {}).get("output")
+            if isinstance(value, str):
+                try:
+                    value = json.loads(value)
+                except ValueError:
+                    continue
+            if not isinstance(value, dict):
+                continue
+            key = provider_json([execution["task_spec_id"], execution["tool"], receipt["arguments"], value])
+            executions[key] = True
+            for item in [value, *(value.get("validations") or [])]:
+                if isinstance(item, dict) and isinstance(item.get("validation_id"), str):
+                    owners.setdefault(item["validation_id"], execution["task_spec_id"])
         for row in self.results:
             if row["spec_id"] != spec.id or not (row["tool"] == "hunter_run_web_loop"
                     or row["tool"].startswith("validator_validate_")):
                 continue
             ref = row["content_ref"]
-            raw = (self.workdir / ref["path"]).read_bytes()
-            if hashlib.sha256(raw).hexdigest() != ref["sha256"]:
-                raise ValueError("validation tool evidence changed")
-            value = json.loads(raw)
+            value = self.read_reference(ref)
             if not isinstance(value, dict) or value.get("execution_failed") or value.get("error"):
+                continue
+            if provider_json([spec.id, row["tool"], row["arguments"], value]) not in executions:
                 continue
             candidates = [value, *(value.get("validations") or [])]
             for candidate in candidates:
@@ -672,9 +773,58 @@ class PythonBroker(HostBroker):
                                 (types, *_VALIDATOR_VECTOR_ALIASES.get(key, ()))}), None)
                 if not vector or not artifact_is_current(record, expected_target=spec.target, expected_finding_type=kind):
                     continue
+                # A signed ID still has to describe this executed request, not
+                # an unrelated signed record from another task/parameter.
+                if owners.get(candidate["validation_id"]) != spec.id:
+                    continue
+                context = record.get("execution_context", {})
+                args = row["arguments"]
+                if row["tool"].startswith("validator_validate_"):
+                    expected_kind = row["tool"].removeprefix("validator_validate_")
+                    aliases = {"sqli": "SQL Injection", "ssti": "SSTI"}
+                    if expected_kind in aliases and kind != normalize_finding_type(aliases[expected_kind]):
+                        continue
+                    if not context and row["tool"] in {"validator_validate_sqli", "validator_validate_ssti"}:
+                        context = self.direct_request_context(record, args)
+                    if (record["target"] != args.get("target_url")
+                            or context.get("param", "") != args.get("param", "")
+                            or context.get("method", "GET") != args.get("method", "GET")
+                            or context.get("carrier", "query") != args.get("carrier", "query")):
+                        continue
+                elif candidate is not value:
+                    fields = ("url", "method", "vuln_class", "operation_id", "resource_owner", "identity", "param", "carrier")
+                    if (record["target"] != candidate.get("url") or any(
+                            candidate.get(key) != context.get(key) for key in fields if key in candidate)):
+                        continue
+                else:
+                    # Hunter's evidence contract is its observed validation
+                    # queue, not a top-level scalar copied from another run.
+                    continue
                 attempts[record["validation_id"]] = {"vector": vector, "record": record,
+                    "tool": row["tool"],
+                    "execution_context": context,
                     "source_artifact": ref["path"], "source_sha256": ref["sha256"]}
         return list(attempts.values())
+
+    def direct_request_context(self, record, args):
+        """Infer a slice only from signed wire traces, not unsigned tool metadata."""
+        target = urlsplit(args.get("target_url", ""))
+        baseline = dict(parse_qsl(target.query, keep_blank_values=True))
+        param = args.get("param")
+        if not param or param not in baseline or args.get("method", "GET") != "GET" or args.get("carrier", "query") != "query":
+            return {}
+        probes = record.get("request_evidence", [])
+        changed = False
+        for probe in probes:
+            url = urlsplit(probe.get("request_url", ""))
+            query = dict(parse_qsl(url.query, keep_blank_values=True))
+            if ((url.scheme, url.netloc, url.path) != (target.scheme, target.netloc, target.path)
+                    or probe.get("method") != "GET" or not probe.get("transport_ok")
+                    or set(query) != set(baseline)
+                    or any(query[key] != baseline[key] for key in baseline if key != param)):
+                return {}
+            changed |= query[param] != baseline[param]
+        return {"param": param, "method": "GET", "carrier": "query", "identity": "anon"} if changed else {}
 
     def persist_validation_attempts(self, spec):
         import attempt_ledger as attempts
@@ -697,10 +847,12 @@ class PythonBroker(HostBroker):
                 "note": record["validation_id"]}
             attempts.append_record(attempts.ledger_path(self.workdir), attempt)
 
-    def session_check_evidence(self):
+    def session_check_evidence(self, spec=None):
+        spec = spec or self.tasks.active_spec
+        sources = {spec.id, *upstream_ids(spec, self.tasks.specs)} if spec else set()
         checks = {}
         for row in self.results:
-            if row["spec_id"] == "enum-2" and row["tool"] == SESSION_CHECK_TOOL:
+            if row["spec_id"] in sources and row["tool"] == SESSION_CHECK_TOOL:
                 value = json.loads((self.workdir / row["content_ref"]["path"]).read_bytes())
                 if value.get("status") == "fresh":
                     checks[row["arguments"]["identity"]] = value
@@ -770,33 +922,58 @@ class PythonBroker(HostBroker):
             packet = json.loads((self.workdir / "handoff-access.json").read_text())
             dump(self.workdir / "handoff.json", packet)
             self.archive(packet, "handoff")
+            receipt = copy.deepcopy(self.handoffs["access"])
+            if receipt.get("producer_spec_id") == spec.id:
+                receipt["snapshots"] = {name: self.archive({"exact_text": Path(name).read_text()}, "branch-handoff")
+                                        for name in receipt["files"]}
+                self.branch_handoffs[spec.id] = receipt
         finally:
             self.runtime_policy.host_finalizing.discard(spec.id)
             dump(self.private / "runtime-policy.json", self.runtime_policy.snapshot())
+
+    def _check_handoff(self, spec):
+        if spec.phase not in {"access", "authz"}:
+            return
+        sources = set(upstream_ids(spec, self.tasks.specs))
+        label = spec.vector or spec.phase
+        receipts = [row for ident, row in self.branch_handoffs.items() if ident in sources and label == "access"]
+        if len(receipts) > 1:
+            raise ValueError("ambiguous declared discovery handoff")
+        if receipts:
+            from evidence_trust import atomic_write
+            receipt = copy.deepcopy(receipts[0])
+            # Restore only exact host-sealed bytes for the selected branch. The
+            # ordinary handoff gate rechecks summary/pool/session policy below.
+            for name, ref in receipt.pop("snapshots").items():
+                value = self.read_reference(ref)
+                raw = provider_json(value)
+                # archive JSON serialization differs from ledger formatting;
+                # retain the original digest by storing the original text too.
+                if isinstance(value, dict) and set(value) == {"exact_text"}:
+                    raw = value["exact_text"].encode()
+                if hashlib.sha256(raw).hexdigest() != receipt["files"][name]:
+                    raise ValueError("branch handoff snapshot changed")
+                atomic_write(Path(name), raw)
+            self.handoffs[label] = receipt
+        record = self.handoffs.get(label)
+        if record and record.get("producer_spec_id") not in sources:
+            raise ValueError("handoff producer outside declared dependencies")
+        return super()._check_handoff(spec)
 
     def verified_findings(self, spec):
         """Accept IDs only from actual tools, then use the existing signature gate."""
         from brain import _confirmation_record
         import hypothesis_ledger as hypotheses
         findings = {}
-        for row in self.results:
-            if row["spec_id"] != spec.id:
-                continue
-            value = json.loads((self.workdir / row["content_ref"]["path"]).read_bytes())
-            if not isinstance(value, dict):
-                continue
-            candidates = [value, *value.get("validations", [])] if isinstance(value.get("validations", []), list) else [value]
-            for candidate in candidates:
-                if not isinstance(candidate, dict) or not candidate.get("validation_id"):
-                    continue
-                for vector in hypotheses.DEFAULT_VECTORS:
-                    record, _ = _confirmation_record({"validation_id": candidate["validation_id"]}, vector,
-                                                     {"target": spec.target})
-                    if record is not None:
-                        findings[record["validation_id"]] = {"validation_id": record["validation_id"],
-                            "validation_sha256": record["artifact"]["content_sha256"],
-                            "vector": vector, "verdict": "CONFIRMED"}
-                        break
+        for item in self.validation_attempts(spec):
+            for vector in hypotheses.DEFAULT_VECTORS:
+                record, _ = _confirmation_record({"validation_id": item["record"]["validation_id"]}, vector,
+                                                  {"target": spec.target})
+                if record is not None:
+                    findings[record["validation_id"]] = {"validation_id": record["validation_id"],
+                        "validation_sha256": record["artifact"]["content_sha256"],
+                        "vector": vector, "verdict": "CONFIRMED"}
+                    break
         return list(findings.values())
 
     def seal(self):
@@ -811,7 +988,10 @@ class PythonBroker(HostBroker):
         from brain import _confirmation_record, _confirmation_reference
         import attempt_ledger as attempts
         ledger = hypotheses.load_ledger(self.workdir)
-        summary = self.tasks.read_summary(next(s for s in self.tasks.specs if s.phase == "access"))
+        sources = set(upstream_ids(spec, self.tasks.specs))
+        summaries = [self.tasks.read_summary(s) for s in self.tasks.specs if s.phase == "access" and s.id in sources]
+        summary = {"findings": [row for previous in summaries for row in previous.get("findings", [])],
+                   "not_tested_reasons": [row for previous in summaries for row in previous.get("not_tested_reasons", [])]}
         reasons = {row["vector"]: row for row in summary.get("not_tested_reasons", [])}
         for finding in summary["findings"]:
             vector = finding["vector"]
