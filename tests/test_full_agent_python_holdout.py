@@ -12,6 +12,7 @@ import full_agent_launcher as launcher
 import full_agent_preflight as preflight
 from full_agent_broker import dump
 from full_agent_python_broker import SUMMARY_TOOL
+from fixtures.output_root import output_root
 from test_full_agent_python_solver import baseline as baseline, acceptance_evidence as acceptance_evidence
 
 
@@ -23,7 +24,7 @@ from test_full_agent_python_solver import baseline as baseline, acceptance_evide
     ('parameter_batches', 141421, 'readonly-template-injection', 'readonly_ssti_arithmetic'),
 ])
 def test_python_independent_holdout_scores_only_current_signed_wire(baseline, record_testsuite_property, provider_mode, seed, family, profile):
-    parent = Path('/tmp/cco-work/full-agent-python-holdout')
+    parent = output_root('full-agent-python-holdout')
     parent.mkdir(parents=True, exist_ok=True)
     directory = Path(tempfile.mkdtemp(prefix='authcoverage-', dir=parent))
     decisions = []
