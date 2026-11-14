@@ -542,7 +542,8 @@ def test_accumulated_gaps_fit_closing_byte_fallback_with_exact_archive(python_br
     solver = PythonSolver(broker, model="model")
     ref = observe(broker, solver, source, [{"url": f"/catalog/{number}?q=1"} for number in range(20)])
     for row in solver.plan_candidates(spec):
-        row["provenance"] = [dict(ref)] * 8
+        row["provenance"] = [{"source_spec_id": source.id, "source_artifact": ref["path"],
+                              "source_sha256": ref["sha256"]}] * 8
         solver.add_gap(spec, "invalid_or_missing_signed_evidence", "evidence", row)
     context = solver.context(spec)
     gaps = solver.coverage_gaps[spec.id]
@@ -708,3 +709,239 @@ def test_declared_branch_handoff_restores_only_exact_selected_snapshot(python_br
     broker.branch_handoffs[source.id]["snapshots"][str(pool)]["sha256"] = "changed"
     with pytest.raises(ValueError):
         broker._check_handoff(spec)
+
+
+@pytest.mark.parametrize("query", ["q=1&q=2", "%71=1&q=2", "q=%ZZ", "q=%ff", "=value", "q", "q=1;other=2"])
+def test_ambiguous_or_malformed_query_never_becomes_eligible(python_broker, query):
+    broker = python_broker
+    catalog(broker)
+    source, spec = broker.tasks.specs[1:3]
+    solver = PythonSolver(broker, model="model")
+    observe(broker, solver, source, [{"url": "/check?" + query}])
+    rows = solver.plan_candidates(spec)
+    assert rows and not any(row["eligible"] for row in rows)
+    assert not solver.dispatch_access_validation(spec) and not broker.executor.tasks
+
+
+@pytest.mark.parametrize("params", [None, {"name": "q"}, [{"name": ""}], [{"name": "q", "in": []}],
+    [{"name": "q", "in": "query"}, {"name": "q", "in": "body"}]])
+def test_malformed_parameter_declarations_are_gaps_not_authority(python_broker, params):
+    broker = python_broker
+    catalog(broker)
+    source, spec = broker.tasks.specs[1:3]
+    solver = PythonSolver(broker, model="model")
+    observe(broker, solver, source, [{"url": "/check?q=1", "params": params}])
+    rows = solver.plan_candidates(spec)
+    assert rows and not any(row["eligible"] for row in rows)
+    assert not broker.executor.tasks
+
+
+def test_candidate_cards_never_project_query_or_fragment_values(python_broker):
+    from python_candidate_runtime import page_cards
+    broker = python_broker
+    catalog(broker)
+    source, spec = broker.tasks.specs[1:3]
+    solver = PythonSolver(broker, model="model")
+    observe(broker, solver, source, [{"url": "/check?q=synthetic-query-canary&token=synthetic-key-canary#synthetic-fragment-canary"}])
+    rows = solver.plan_candidates(spec)
+    cards = compact_cards(rows)
+    assert cards
+    for projected in (cards, page_cards(cards)):
+        raw = json.dumps(projected)
+        assert not any(value in raw for value in ("synthetic-query-canary", "synthetic-key-canary", "synthetic-fragment-canary"))
+        assert all(not urlsplit(row["route"]).query and not urlsplit(row["route"]).fragment for row in projected)
+
+
+def test_missing_identity_or_provenance_cannot_fall_back_to_anonymous(python_broker):
+    from python_candidate_runtime import parameter_candidates
+    broker = python_broker
+    catalog(broker)
+    source, spec = broker.tasks.specs[1:3]
+    solver = PythonSolver(broker, model="model")
+    observe(broker, solver, source, [{"url": "/check?q=1", "identity": "missing-owned-session"}])
+    assert not any(row["eligible"] for row in solver.plan_candidates(spec))
+    rows = parameter_candidates(spec, [{"url": spec.target + "check?q=1"}], {})
+    assert rows and all(row["reason_code"] == "missing_discovery_provenance" for row in rows)
+
+
+def test_admission_preflight_is_not_a_checked_dispatch(python_broker, monkeypatch):
+    broker = python_broker
+    catalog(broker)
+    source, spec = broker.tasks.specs[1:3]
+    solver = PythonSolver(broker, model="model")
+    observe(broker, solver, source, [{"url": "/check?q=1"}])
+    broker.tasks.active_spec = spec
+    monkeypatch.setattr(broker, "_check_handoff", lambda _spec: None)
+    row = solver.plan_candidates(spec)[0]
+    assert solver.admit_candidate(spec, row)
+    assert not row["admitted"] and not row["executed"]
+    monkeypatch.setattr(broker.engine, "validate_tool_invocation", lambda *_a, **_kw: {"allowed": False})
+    solver.dispatch_access_validation(spec)
+    assert not row["admitted"] and not row["executed"] and not broker.executor.tasks
+
+
+def test_oversize_executed_tool_retains_usage_and_explicit_archive_gap(python_broker, monkeypatch):
+    import full_agent_python_broker as module
+    broker = python_broker
+    catalog(broker)
+    source, spec = broker.tasks.specs[1:3]
+    solver = PythonSolver(broker, model="model")
+    observe(broker, solver, source, [{"url": "/check?q=1"}])
+    broker.tasks.active_spec = spec
+    monkeypatch.setattr(broker, "_check_handoff", lambda _spec: None)
+    monkeypatch.setattr(broker.engine, "tool_capability", lambda _tool: {"network": True})
+    monkeypatch.setattr(module, "MAX_ARCHIVE_BYTES", 2048)
+    def execute(self, task):
+        self.tasks.append(task)
+        return {"actual_request_cost": 3, "result": {"output": {"text": "\u20ac" * 1500}}}
+    monkeypatch.setattr(type(broker.executor), "__call__", execute)
+    assert solver.dispatch_access_validation(spec)
+    assert broker.budget.used["http"] == 6
+    assert len(broker.executor.tasks) == 2
+    assert any(row["reason_code"] == "archive_size_limit_exceeded" for row in solver.coverage_gaps[spec.id])
+    assert not any(row["evidence_accepted"] for row in solver.plan_candidates(spec))
+
+
+def test_utf8_archive_bounds_are_bytes_in_both_directions(python_broker, monkeypatch):
+    import full_agent_python_broker as module
+    broker = python_broker
+    monkeypatch.setattr(module, "MAX_ARCHIVE_BYTES", 32)
+    ref = broker.archive("\u20ac" * 10)
+    assert ref["bytes"] == 32 and broker.read_reference(ref) == "\u20ac" * 10
+    with pytest.raises(ArchiveSizeError):
+        broker.archive("\u20ac" * 11)
+    # A forged registered size is rejected at read time too, before JSON decoding.
+    (broker.workdir / ref["path"]).write_bytes(provider_json("\u20ac" * 11))
+    ref["bytes"] = 35
+    with pytest.raises(ValueError):
+        broker.read_reference(ref)
+
+
+@pytest.mark.parametrize("change", ["wrong_oracle", "partial_context", "inconclusive"])
+def test_signed_but_unbound_or_inconclusive_outcomes_never_become_tested(replay_lab, monkeypatch, change):
+    from cco_validator_core import load_validation
+    from cco_validator_core.evidence import persist_result
+    broker, target, wire = replay_lab
+    source, spec = broker.tasks.specs[1:3]
+    solver = PythonSolver(broker, model="model")
+    observe(broker, solver, source, FROZEN["parameter_pages"][:1])
+    broker.tasks.active_spec = spec
+    row = next(row for row in solver.plan_candidates(spec) if row["vector"] == "injection-sqli")
+    original = type(broker.executor).__call__
+    def execute(self, task):
+        execution = original(self, task)
+        value = execution["result"]["output"]
+        record = load_validation(value["validation_id"])
+        if change == "wrong_oracle":
+            record["oracle"] = "unrelated_oracle"
+        elif change == "partial_context":
+            record["execution_context"] = {"param": "term"}
+        else:
+            record["verdict"] = "INCONCLUSIVE"
+        record = persist_result(record, str(Path(record["artifact"]["path"]).parent))
+        execution["result"]["output"] = record
+        return execution
+    monkeypatch.setattr(type(broker.executor), "__call__", execute)
+    broker.invoke(row["tool"], row["arguments"])
+    assert wire
+    summary = solver.compile_summary(spec, terminal(spec))
+    assert not summary["tested_parameters"] and not summary["findings"]
+    assert not summary["validation_outcomes"] and not summary["validation_funnel"]["evidence_accepted"]
+
+
+def test_report_rechecks_current_evidence_instead_of_promoting_old_snapshot(replay_lab, monkeypatch):
+    import cco_validator_core
+    broker, target, wire = replay_lab
+    source, spec = broker.tasks.specs[1:3]
+    solver = PythonSolver(broker, model="model")
+    observe(broker, solver, source, FROZEN["parameter_pages"][:1])
+    broker.tasks.active_spec = spec
+    row = next(row for row in solver.plan_candidates(spec) if row["vector"] == "injection-sqli")
+    broker.invoke(row["tool"], row["arguments"])
+    solver.summaries[spec.id] = solver.compile_summary(spec, terminal(spec))
+    assert solver.summaries[spec.id]["validation_funnel"]["evidence_accepted"] == 1
+    monkeypatch.setattr(cco_validator_core, "artifact_is_current", lambda *_a, **_kw: False)
+    report_spec = broker.tasks.specs[3]
+    report = solver.compile_summary(report_spec, terminal(report_spec))
+    assert report["validation_funnels"][spec.id]["evidence_accepted"] == 0
+    assert any(item["reason_code"] == "invalid_or_missing_signed_evidence" for item in report["coverage_gaps"])
+    # The earlier summary is an immutable historical snapshot, not today's proof.
+    assert solver.summaries[spec.id]["validation_funnel"]["evidence_accepted"] == 1
+
+
+def test_changed_discovery_clears_current_funnel_without_dispatch(python_broker):
+    broker = python_broker
+    catalog(broker)
+    source, spec = broker.tasks.specs[1:3]
+    solver = PythonSolver(broker, model="model")
+    ref = observe(broker, solver, source, [{"url": "/check?q=1"}])
+    solver.plan_candidates(spec)
+    (broker.workdir / ref["path"]).write_text("{}")
+    with pytest.raises(ValueError):
+        solver.dispatch_access_validation(spec)
+    assert not broker.executor.tasks and not broker.budget.used["http"]
+
+
+def test_conflicting_discovery_carriers_cannot_leave_same_candidate_eligible(python_broker):
+    broker = python_broker
+    catalog(broker)
+    source, spec = broker.tasks.specs[1:3]
+    solver = PythonSolver(broker, model="model")
+    observe(broker, solver, source, [
+        {"url": "/check?q=1", "params": [{"name": "q", "in": "query"}]},
+        {"url": "/check?q=1", "params": [{"name": "q", "in": "body"}]}])
+    rows = solver.plan_candidates(spec)
+    assert rows and not any(row["eligible"] for row in rows)
+    assert not solver.dispatch_access_validation(spec) and not broker.executor.tasks
+
+
+def test_changed_discovery_revokes_acceptance_even_with_current_signed_oracle(replay_lab):
+    broker, target, wire = replay_lab
+    source, spec = broker.tasks.specs[1:3]
+    solver = PythonSolver(broker, model="model")
+    ref = observe(broker, solver, source, FROZEN["parameter_pages"][:1])
+    broker.tasks.active_spec = spec
+    row = next(row for row in solver.plan_candidates(spec) if row["vector"] == "injection-sqli")
+    broker.invoke(row["tool"], row["arguments"])
+    solver.refresh_candidate_evidence(spec)
+    assert row["evidence_accepted"]
+    (broker.workdir / ref["path"]).write_text("{}")
+    with pytest.raises(ValueError):
+        solver.refresh_candidate_evidence(spec)
+    assert not row["evidence_accepted"] and row["validation_state"] == "NOT TESTED"
+
+
+def test_final_refresh_failure_revokes_all_task_acceptance(replay_lab, monkeypatch):
+    from full_agent_python_solver import WorkflowError
+    broker, _target, wire = replay_lab
+    source, spec = broker.tasks.specs[1:3]
+    branch = TaskSpec.from_dict(spec.to_dict())
+    branch.id = "independent-access"
+    broker.tasks.specs.append(branch)
+    solver = PythonSolver(broker, model="model")
+    ref = observe(broker, solver, source, FROZEN["parameter_pages"][:1])
+    summary_path = broker.tasks.summary_path(source)
+    summary_path.parent.mkdir(parents=True, exist_ok=True)
+    summary_path.write_text(json.dumps(solver.summaries[source.id]))
+    for task in (spec, branch):
+        broker.tasks.active_spec = task
+        row = next(row for row in solver.plan_candidates(task) if row["vector"] == "injection-sqli")
+        broker.invoke(row["tool"], row["arguments"])
+        solver.refresh_candidate_evidence(task)
+        assert row["evidence_accepted"]
+    assert wire
+    before = len(wire)
+    (broker.workdir / ref["path"]).write_text("{}")
+    def stop(_spec):
+        raise WorkflowError("offline_diagnostic_stop")
+    monkeypatch.setattr(solver, "phase", stop)
+    result = solver.run()
+    assert result["status"] == "python_failed"
+    assert result["stop_reason"] == "candidate_evidence_refresh_failed"
+    assert len(wire) == before
+    for task in (spec, branch):
+        assert result["validation_funnels"][task.id]["evidence_accepted"] == 0
+        assert all(not row["evidence_accepted"] and row["validation_state"] == "NOT TESTED"
+                   for row in result["validation_funnels"][task.id]["candidates"])
+        assert any(gap["task_spec_id"] == task.id and gap["reason_code"] == "prior_phase_evidence_changed"
+                   for gap in result["coverage_gaps"])

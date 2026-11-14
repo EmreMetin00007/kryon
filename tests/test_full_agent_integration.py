@@ -34,6 +34,7 @@ import pytest
 import full_agent_launcher as launcher
 import full_agent_preflight as preflight
 from fixtures.native_compat import stage_native_compat_assets
+from fixtures.output_root import output_root
 from full_agent_broker import CATALOG, dump
 from orchestration_spec import TaskSpec, render_task_prompt, validate_worker_prompt
 from test_http_chromium_acceptance import evidence as acceptance_evidence
@@ -41,7 +42,7 @@ from test_http_chromium_acceptance import evidence as acceptance_evidence
 
 pytestmark = pytest.mark.integration
 ROOT = Path(__file__).resolve().parents[1]
-ARTIFACT_ROOT = Path("/tmp/cco-work/full-agent-integration")
+ARTIFACT_ROOT = output_root("full-agent-integration")
 MODELS = {"planner": "integration/planner", "worker": "integration/worker",
           "worker_selection": "explicit",
           "credentials": "provider runtime only; never stored in benchmark artifacts"}
