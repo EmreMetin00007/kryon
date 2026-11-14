@@ -8,6 +8,8 @@
 [![Evidence Integrity](https://img.shields.io/badge/Evidence-Ed25519%20Signed-2EA043)](#neden-hackagent-kryon)
 [![Execution Policy](https://img.shields.io/badge/Policy-Deny--by--Default-D97706)](#güvenlik-ve-çalışma-sınırları)
 
+🇹🇷 **Türkçe** · [🇬🇧 **English**](README.en.md)
+
 **Model yalnızca veri ve hipotez üretir; aşama geçişlerini, araç izinlerini, wire bütçesini, deterministik doğrulamayı ve kapanış kararını Python host katmanı yönetir.**
 
 [Mimari](#mimari-ve-kontrol-akışı) · [MCP Ekosistemi](#mcp-araç-ekosistemi-16-sunucu--292-araç) · [Kurulum](#kurulum) · [Hızlı Başlangıç](#hızlı-başlangıç) · [Doğrulama Kartı](#doğrulama-ve-kalite-kapıları) · [Dokümantasyon](#dokümantasyon-haritası)
