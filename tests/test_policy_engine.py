@@ -805,22 +805,31 @@ def test_coupang_scope_and_profile_integration(tmp_path, monkeypatch):
     monkeypatch.setenv("HACKERONE_HANDLE", "tester")
     monkeypatch.setenv("CCO_STUCK_ENABLED", "0")
     module = _load_policy_engine()
+    scope_path = _write_scope(
+        tmp_path,
+        {
+            "in_scope": (
+                [{"asset": "shop.tw.program-a.example", "type": "web"}]
+                + [{"asset": f"host-{i}.tw.program-a.example", "type": "web"} for i in range(44)]
+            ),
+        },
+    )
     engine = module.PolicyEngine(
         cco_home=str(tmp_path / ".cco"), repo_root=str(tmp_path),
-        scope_file=str(REPO_ROOT / ".codex" / "scope.coupang.json"),
+        scope_file=str(scope_path),
         program_policy_file=str(REPO_ROOT / "config" / "program-profiles" / "strict-bounty-coupang.json"),
     )
     assert len(engine.scope["targets"]) == 45
-    engine.grant_approval("*", "*.coupang.com", ttl_seconds=600, reason="test")
+    engine.grant_approval("*", "*.program-a.example", ttl_seconds=600, reason="test")
     bare = engine.validate_tool_invocation(
-        "bash", {"command": "curl -s https://shop.tw.coupang.com/"})
+        "bash", {"command": "curl -s https://shop.tw.program-a.example/"})
     assert bare["allowed"] is False
     assert bare["reason"] == "blocked_missing_headers"
     headed = engine.validate_tool_invocation(
-        "bash", {"command": "curl -s -H 'X-HackerOne-Researcher: tester' https://shop.tw.coupang.com/"})
+        "bash", {"command": "curl -s -H 'X-HackerOne-Researcher: tester' https://shop.tw.program-a.example/"})
     assert headed["allowed"] is True
     unlisted = engine.validate_tool_invocation(
-        "bash", {"command": "curl -s -H 'X-HackerOne-Researcher: tester' https://evil.tw.coupang.com/"})
+        "bash", {"command": "curl -s -H 'X-HackerOne-Researcher: tester' https://evil.tw.program-a.example/"})
     assert unlisted["allowed"] is False
     assert unlisted["reason"] == "blocked_scope"
 
@@ -829,26 +838,36 @@ def test_anduril_scope_and_profile_integration(tmp_path, monkeypatch):
     monkeypatch.setenv("HACKERONE_HANDLE", "tester")
     monkeypatch.setenv("CCO_STUCK_ENABLED", "0")
     module = _load_policy_engine()
+    scope_path = _write_scope(
+        tmp_path,
+        {
+            "in_scope": [
+                {"asset": "*.program-b.example", "type": "domain-wildcard"},
+                {"asset": "program-b.example", "type": "domain"},
+            ],
+            "excluded_assets": ["gear.program-b.example"],
+        },
+    )
     engine = module.PolicyEngine(
         cco_home=str(tmp_path / ".cco"), repo_root=str(tmp_path),
-        scope_file=str(REPO_ROOT / ".codex" / "scope.anduril.json"),
+        scope_file=str(scope_path),
         program_policy_file=str(REPO_ROOT / "config" / "program-profiles" / "strict-bounty-anduril.json"),
     )
-    assert "anduril.com" in engine.scope["domains"]
-    assert "andurilgear.com" in engine.scope["excluded"]
-    engine.grant_approval("*", "*anduril*", ttl_seconds=600, reason="test")
+    assert "program-b.example" in engine.scope["domains"]
+    assert "gear.program-b.example" in engine.scope["excluded"]
+    engine.grant_approval("*", "*program-b.example*", ttl_seconds=600, reason="test")
     bare = engine.validate_tool_invocation(
-        "bash", {"command": "curl -s https://www.anduril.com/"})
+        "bash", {"command": "curl -s https://www.program-b.example/"})
     assert bare["allowed"] is False
     assert bare["reason"] == "blocked_missing_headers"
     headed = engine.validate_tool_invocation(
-        "bash", {"command": "curl -s -H 'X-HackerOne-Research: tester' https://www.anduril.com/"})
+        "bash", {"command": "curl -s -H 'X-HackerOne-Research: tester' https://www.program-b.example/"})
     assert headed["allowed"] is True
     apex = engine.validate_tool_invocation(
-        "bash", {"command": "curl -s -H 'X-HackerOne-Research: tester' https://anduril.com/"})
+        "bash", {"command": "curl -s -H 'X-HackerOne-Research: tester' https://program-b.example/"})
     assert apex["allowed"] is True
     gear = engine.validate_tool_invocation(
-        "bash", {"command": "curl -s -H 'X-HackerOne-Research: tester' https://andurilgear.com/"})
+        "bash", {"command": "curl -s -H 'X-HackerOne-Research: tester' https://gear.program-b.example/"})
     assert gear["allowed"] is False
     assert gear["reason"] == "blocked_scope"
 
@@ -857,23 +876,33 @@ def test_rapyd_scope_and_profile_integration(tmp_path, monkeypatch):
     monkeypatch.setenv("HACKERONE_HANDLE", "tester")
     monkeypatch.setenv("CCO_STUCK_ENABLED", "0")
     module = _load_policy_engine()
+    scope_path = _write_scope(
+        tmp_path,
+        {
+            "in_scope": [
+                {"asset": "dashboard.program-c.example", "type": "web"},
+                {"asset": "*.program-c.example", "type": "domain-wildcard"},
+            ],
+            "excluded_assets": ["support.program-c.example", "ghost.program-c.example"],
+        },
+    )
     engine = module.PolicyEngine(
         cco_home=str(tmp_path / ".cco"), repo_root=str(tmp_path),
-        scope_file=str(REPO_ROOT / ".codex" / "scope.rapyd.json"),
+        scope_file=str(scope_path),
         program_policy_file=str(REPO_ROOT / "config" / "program-profiles" / "strict-bounty-rapyd.json"),
     )
-    assert "rapyd.net" in engine.scope["domains"]
-    assert "support.rapyd.net" in engine.scope["excluded"]
-    engine.grant_approval("*", "*rapyd*", ttl_seconds=600, reason="test")
+    assert "program-c.example" in engine.scope["domains"]
+    assert "support.program-c.example" in engine.scope["excluded"]
+    engine.grant_approval("*", "*program-c.example*", ttl_seconds=600, reason="test")
     bare = engine.validate_tool_invocation(
-        "bash", {"command": "curl -s https://dashboard.rapyd.net/"})
+        "bash", {"command": "curl -s https://dashboard.program-c.example/"})
     assert bare["allowed"] is False
     assert bare["reason"] == "blocked_missing_headers"
     headed = engine.validate_tool_invocation(
-        "bash", {"command": "curl -s -H 'X-Bugcrowd: Bugcrowd-tester' https://dashboard.rapyd.net/"})
+        "bash", {"command": "curl -s -H 'X-Bugcrowd: Bugcrowd-tester' https://dashboard.program-c.example/"})
     assert headed["allowed"] is True
     ghost = engine.validate_tool_invocation(
-        "bash", {"command": "curl -s -H 'X-Bugcrowd: Bugcrowd-tester' https://ghost.rapyd.net/"})
+        "bash", {"command": "curl -s -H 'X-Bugcrowd: Bugcrowd-tester' https://ghost.program-c.example/"})
     assert ghost["allowed"] is False
     assert ghost["reason"] == "blocked_scope"
 

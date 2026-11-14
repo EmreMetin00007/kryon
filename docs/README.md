@@ -1,6 +1,6 @@
 # Dokümantasyon dizini
 
-Başlangıç noktası [ana README](../README.md). Bu dizin yalnızca güncel Python + LLM
+Başlangıç noktası [English README](../README.md) · [Türkçe README](../README.tr.md). Bu dizin yalnızca güncel Python + LLM
 motoru ve P5–P9 yetenek belgelerini içerir.
 
 ## Güncel rehberler
