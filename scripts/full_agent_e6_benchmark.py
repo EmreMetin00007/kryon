@@ -16,6 +16,7 @@ from datetime import datetime, timezone
 import hashlib
 import io
 import json
+import math
 import os
 from pathlib import Path
 import sqlite3
@@ -430,8 +431,181 @@ def _aggregate_cohort_fingerprints(unit_fingerprints: list[dict[str, Any]]) -> d
     }
 
 
+def _validate_experiment_manifest_consistency(
+    exp_manifest: dict[str, Any],
+    exp_manifest_path: Path | None = None,
+) -> dict[str, dict[str, Any]]:
+    """Validate internal grid, ceiling, treatment, acceptance, and unit invariants of an experiment manifest."""
+    families = exp_manifest.get("families")
+    if (not isinstance(families, list) or len(families) < MINIMUM_FAMILIES
+            or len(set(families)) != len(families) or any(f not in holdout.FAMILIES for f in families)):
+        raise ValueError("experiment manifest has invalid or insufficient independent families")
+    seeds_by_family = _normalize_family_seeds(families, exp_manifest.get("seeds_by_family"))
+    repetitions = exp_manifest.get("repetitions")
+    if type(repetitions) is not int or repetitions < 1:
+        raise ValueError("experiment manifest has invalid repetitions")
+    ceilings = _normalize_ceilings(exp_manifest.get("ceilings"))
+    if ceilings is None or ceilings["http_requests_per_seed"] > preflight.MAX_REQUESTS or ceilings["seconds_per_seed"] > preflight.MAX_SECONDS:
+        raise ValueError("experiment manifest has invalid ceilings")
+    treatment = normalize_treatment(exp_manifest.get("treatment"))
+    if exp_manifest.get("treatment") != treatment:
+        raise ValueError("experiment manifest treatment must be canonical")
+    acceptance_criteria = normalize_acceptance_criteria(exp_manifest.get("acceptance_criteria"))
+    if exp_manifest.get("acceptance_criteria") != acceptance_criteria:
+        raise ValueError("experiment manifest acceptance_criteria must be canonical")
+    models = exp_manifest.get("models")
+    if not isinstance(models, dict) or not isinstance(models.get("planner"), str) or not isinstance(models.get("worker"), str):
+        raise ValueError("experiment manifest is missing models")
+    if exp_manifest.get("provider_kind") not in {"loopback", "remote"} or not isinstance(exp_manifest.get("provider_host"), str):
+        raise ValueError("experiment manifest has invalid provider metadata")
+    fps = exp_manifest.get("fingerprints")
+    if not isinstance(fps, dict) or set(fps) != {"runtime", "evaluator", "prompt_catalog", "provider_config"}:
+        raise ValueError("experiment manifest is missing required fingerprints")
+    if any(not isinstance(fps[k], str) or not fps[k] for k in fps):
+        raise ValueError("experiment manifest has empty fingerprint")
+
+    raw_units = exp_manifest.get("units")
+    if not isinstance(raw_units, list) or not raw_units:
+        raise ValueError("experiment manifest is missing units")
+    expected_keys = {
+        (family, seed, rep)
+        for family in families
+        for seed in seeds_by_family[family]
+        for rep in range(1, repetitions + 1)
+    }
+    units_by_id: dict[str, dict[str, Any]] = {}
+    seen_keys: set[tuple[str, int, int]] = set()
+    req_str_fields = (
+        "experiment_id", "family", "preflight", "preflight_sha256",
+        "contract", "contract_sha256", "runtime_index", "runtime_index_sha256",
+        "holdout_selection_sha256",
+    )
+    for unit in raw_units:
+        if not isinstance(unit, dict):
+            raise ValueError("experiment manifest unit must be a mapping")
+        if any(not isinstance(unit.get(field), str) or not unit.get(field) for field in req_str_fields):
+            raise ValueError("experiment manifest unit is missing required frozen artifact fields")
+        fam = unit["family"]
+        seed = unit.get("seed")
+        rep = unit.get("repetition")
+        if type(seed) is not int or type(rep) is not int:
+            raise ValueError("experiment manifest unit has invalid seed or repetition")
+        expected_id = f"{fam}:{seed}:rep{rep}"
+        if unit["experiment_id"] != expected_id:
+            raise ValueError(f"experiment manifest unit id mismatch: {unit['experiment_id']!r} != {expected_id!r}")
+        key = (fam, seed, rep)
+        if key in seen_keys or unit["experiment_id"] in units_by_id:
+            raise ValueError(f"duplicate unit in experiment manifest: {expected_id}")
+        seen_keys.add(key)
+        units_by_id[unit["experiment_id"]] = unit
+    if seen_keys != expected_keys:
+        raise ValueError("experiment manifest units do not match declared families x seeds x repetitions grid")
+
+    if exp_manifest_path is not None:
+        suite_plan_path = exp_manifest_path.parent / "suite-plan.json"
+        if suite_plan_path.is_symlink():
+            raise ValueError("suite-plan.json cannot be a symlink")
+        if suite_plan_path.is_file():
+            suite_plan = json.loads(suite_plan_path.read_text(encoding="utf-8"))
+            if not isinstance(suite_plan, dict) or suite_plan.get("schema") != SCHEMA_SUITE:
+                raise ValueError("invalid suite-plan.json beside experiment manifest")
+            if (
+                suite_plan.get("status") != "plan_only"
+                or suite_plan.get("executed") is not False
+                or suite_plan.get("llm_calls") != 0
+                or suite_plan.get("target_requests") != 0
+            ):
+                raise ValueError("pre-execution suite-plan.json must be an unexecuted plan_only artifact")
+            plan_exp_ref = suite_plan.get("experiment_manifest")
+            if (
+                not isinstance(plan_exp_ref, str)
+                or Path(plan_exp_ref).expanduser().is_symlink()
+                or Path(plan_exp_ref).expanduser().resolve(strict=True) != exp_manifest_path
+            ):
+                raise ValueError("suite-plan.json does not reference this experiment manifest")
+            if suite_plan.get("experiment_manifest_sha256") != holdout.digest(exp_manifest_path):
+                raise ValueError("experiment manifest does not match pre-execution suite-plan.json digest")
+            for field in (
+                "acceptance_criteria",
+                "treatment",
+                "ceilings",
+                "fingerprints",
+                "families",
+                "seeds_by_family",
+                "repetitions",
+                "models",
+                "provider_kind",
+                "provider_host",
+            ):
+                if suite_plan.get(field) != exp_manifest.get(field):
+                    raise ValueError(f"experiment manifest {field!r} diverges from pre-execution suite-plan.json")
+            plan_rows = suite_plan.get("runs")
+            if not isinstance(plan_rows, list) or any(not isinstance(row, dict) for row in plan_rows):
+                raise ValueError("suite-plan.json runs must be a list of objects")
+            plan_tuples = [
+                (
+                    row.get("experiment_id"),
+                    row.get("family"),
+                    row.get("seed"),
+                    row.get("repetition"),
+                    row.get("preflight"),
+                    row.get("preflight_sha256"),
+                )
+                for row in plan_rows
+            ]
+            manifest_tuples = [
+                (
+                    u["experiment_id"],
+                    u["family"],
+                    u["seed"],
+                    u["repetition"],
+                    u["preflight"],
+                    u["preflight_sha256"],
+                )
+                for u in raw_units
+            ]
+            if plan_tuples != manifest_tuples:
+                raise ValueError("experiment manifest units diverge from pre-execution suite-plan.json")
+    return units_by_id
+
+
+def _verify_prepared_matches_unit(
+    prepared: dict[str, Any],
+    unit: dict[str, Any],
+    exp_manifest: dict[str, Any],
+) -> dict[str, Any]:
+    """Verify a prepared preflight directory on disk matches its frozen experiment-manifest unit."""
+    preflight_path = Path(unit["preflight"]).expanduser().resolve(strict=True)
+    if holdout.digest(preflight_path) != unit["preflight_sha256"]:
+        raise ValueError(f"preflight digest mismatch for {unit['experiment_id']}")
+    manifest = prepared["manifest"]
+    contract = prepared["contract"]
+    if manifest.get("contract_sha256") != unit["contract_sha256"]:
+        raise ValueError(f"contract digest mismatch for {unit['experiment_id']}")
+    if (manifest.get("runtime_snapshot") or {}).get("index_sha256") != unit["runtime_index_sha256"]:
+        raise ValueError(f"runtime-index digest mismatch for {unit['experiment_id']}")
+    selected = contract.get("holdout_run")
+    if not isinstance(selected, dict) or _canonical_sha256(selected) != unit["holdout_selection_sha256"]:
+        raise ValueError(f"holdout selection digest mismatch for {unit['experiment_id']}")
+    if selected.get("family") != unit["family"] or selected.get("seed") != unit["seed"]:
+        raise ValueError(f"frozen preflight holdout selection mismatch for {unit['experiment_id']}")
+    if contract.get("models") != exp_manifest.get("models"):
+        raise ValueError(f"frozen models mismatch for {unit['experiment_id']}")
+    if _normalize_ceilings(contract.get("limits")) != _normalize_ceilings(exp_manifest.get("ceilings")):
+        raise ValueError(f"frozen ceilings mismatch for {unit['experiment_id']}")
+    settings = llm_config.provider_settings(prepared["runtime"] / "config/llm.json", contract["models"])
+    host = urlsplit(settings["url"]).hostname or ""
+    kind = "loopback" if host in LOOPBACK_HOSTS else "remote"
+    if kind != exp_manifest.get("provider_kind") or host != exp_manifest.get("provider_host"):
+        raise ValueError(f"frozen provider routing mismatch for {unit['experiment_id']}")
+    return _compute_unit_fingerprints(prepared)
+
+
 def _verify_experiment_manifest(manifest_path: str | Path) -> tuple[Path, dict[str, Any]]:
-    path = Path(manifest_path).expanduser().resolve(strict=True)
+    raw_path = Path(manifest_path).expanduser()
+    if raw_path.is_symlink():
+        raise ValueError("experiment manifest cannot be a symlink")
+    path = raw_path.resolve(strict=True)
     data = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(data, dict) or data.get("schema") != SCHEMA_EXPERIMENT_MANIFEST:
         raise ValueError("expected a full-agent-e6-experiment-manifest/1 file")
@@ -439,6 +613,7 @@ def _verify_experiment_manifest(manifest_path: str | Path) -> tuple[Path, dict[s
     payload = {k: v for k, v in data.items() if k != "manifest_digest"}
     if not isinstance(recorded_digest, str) or _canonical_sha256(payload) != recorded_digest:
         raise ValueError("experiment manifest digest mismatch (tampered experiment manifest)")
+    _validate_experiment_manifest_consistency(data, path)
     return path, data
 
 
@@ -481,11 +656,16 @@ def prepare_cohort(label: str, *, baseline: str | Path, provider_config: str | P
             args.extend(["--model", model])
         if worker_model:
             args.extend(["--worker-model", worker_model])
+        existing_manifests = set(preflight_root.glob("preflight-*/preflight.json"))
         rc = preflight.main(args)
         if rc != 0:
             raise ValueError(f"preflight failed for family {item['family']} seed {item['seed']} (exit {rc})")
-        manifests = sorted(preflight_root.glob("preflight-*/preflight.json"), key=lambda p: p.stat().st_mtime_ns)
-        latest = manifests[-1].resolve(strict=True)
+        new_manifests = sorted(set(preflight_root.glob("preflight-*/preflight.json")) - existing_manifests)
+        if len(new_manifests) != 1:
+            raise ValueError(
+                f"expected exactly 1 new preflight manifest for family {item['family']} seed {item['seed']}, found {len(new_manifests)}"
+            )
+        latest = new_manifests[0].resolve(strict=True)
         prepared = launcher.prepared_run(latest)
         unit_fingerprints.append(_compute_unit_fingerprints(prepared))
         holdout_contract = prepared["contract"]["holdout"]
@@ -596,13 +776,21 @@ def run_cohort(label: str, *, baseline: str | Path, provider_config: str | Path,
         return plan_path, plan
     output = plan_path.parent
     exp_manifest_path, exp_manifest = _verify_experiment_manifest(plan["experiment_manifest"])
+    prepared_by_id: dict[str, dict[str, Any]] = {}
+    pre_unit_fingerprints: list[dict[str, Any]] = []
+    for unit in exp_manifest["units"]:
+        prepared = launcher.prepared_run(unit["preflight"])
+        pre_unit_fingerprints.append(_verify_prepared_matches_unit(prepared, unit, exp_manifest))
+        prepared_by_id[unit["experiment_id"]] = prepared
+    if _aggregate_cohort_fingerprints(pre_unit_fingerprints) != exp_manifest["fingerprints"]:
+        raise ValueError("pre-execution fingerprints do not match frozen experiment manifest")
     runs_dir = output / "runs"
     runs_dir.mkdir(exist_ok=True)
     api_key = os.environ[auth["api_key_env"]]
     manifest_paths: list[Path] = []
     unit_runs: list[dict[str, Any]] = []
     for unit in exp_manifest["units"]:
-        prepared = launcher.prepared_run(unit["preflight"])
+        prepared = prepared_by_id[unit["experiment_id"]]
         provider = launcher.provider_settings(provider_config, prepared["contract"]["models"])
         manifest_path, _ = launcher.launch_seed(
             prepared, seed=unit["seed"], output=runs_dir,
@@ -654,7 +842,106 @@ def _unknown_funnel() -> dict[str, Any]:
     }
 
 
-def _normalize_funnel_dict(raw: dict[str, Any]) -> dict[str, Any]:
+def _safe_run_path(root: Path, rel: str, *, label: str) -> Path:
+    if not isinstance(rel, str) or not rel.strip():
+        raise ValueError(f"{label} path must be a non-empty string")
+    if rel.startswith("~"):
+        raise ValueError(f"{label} path cannot start with '~': {rel!r}")
+    rel_path = Path(rel)
+    if rel_path.is_absolute() or not rel_path.parts or ".." in rel_path.parts:
+        raise ValueError(f"{label} path must stay inside run directory: {rel!r}")
+    resolved_root = root.resolve(strict=True)
+    candidate = root
+    for part in rel_path.parts:
+        candidate = candidate / part
+        if candidate.is_symlink():
+            raise ValueError(f"{label} artifact cannot be a symlink: {rel}")
+    resolved = candidate.resolve(strict=False)
+    try:
+        resolved.relative_to(resolved_root)
+    except ValueError as exc:
+        raise ValueError(f"{label} path escapes run directory: {rel}") from exc
+    return candidate
+
+
+def _validate_funnel_candidate_row(
+    row: Any,
+    *,
+    work: Path | None = None,
+    ledger_hashes: dict[str, str] | None = None,
+    checkpoint_evidence_hashes: dict[str, str] | None = None,
+    expected_candidate_id: str | None = None,
+) -> dict[str, bool]:
+    if not isinstance(row, dict):
+        raise ValueError("host funnel candidate entry must be a dict")
+    cid = row.get("candidate_id", expected_candidate_id)
+    if not isinstance(cid, str) or not cid.strip():
+        raise ValueError("host funnel candidate entry is missing valid candidate_id")
+    if expected_candidate_id is not None and "candidate_id" in row and row["candidate_id"] != expected_candidate_id:
+        raise ValueError(f"host funnel candidate_id mismatch: {row['candidate_id']!r} != {expected_candidate_id!r}")
+    flags: dict[str, bool] = {}
+    for stage in FUNNEL_STAGES:
+        val = row.get(stage)
+        if type(val) is not bool:
+            raise ValueError(f"host funnel candidate {cid!r} has non-boolean stage {stage}: {val!r}")
+        flags[stage] = val
+    for idx in range(len(FUNNEL_STAGES) - 1):
+        earlier, later = FUNNEL_STAGES[idx], FUNNEL_STAGES[idx + 1]
+        if not flags[earlier] and flags[later]:
+            raise ValueError(
+                f"host funnel candidate {cid!r} has non-monotonic flags: {later}=True without {earlier}=True"
+            )
+    has_state = "validation_state" in row
+    if has_state and not isinstance(row.get("validation_state"), str):
+        raise ValueError(f"host funnel candidate {cid!r} has invalid validation_state")
+    if has_state and row.get("validation_state") != "TESTED" and flags["evidence_accepted"]:
+        raise ValueError(f"host funnel candidate {cid!r} cannot mark evidence_accepted when validation_state != TESTED")
+    if has_state and row.get("validation_state") == "TESTED" and not flags["evidence_accepted"]:
+        raise ValueError(f"host funnel candidate {cid!r} cannot mark validation_state='TESTED' without evidence_accepted")
+    if flags["evidence_accepted"]:
+        if row.get("validation_state") != "TESTED":
+            raise ValueError(f"host funnel candidate {cid!r} requires validation_state='TESTED' for evidence_accepted")
+        refs = row.get("evidence_refs")
+        if not isinstance(refs, list) or not refs:
+            raise ValueError(f"host funnel candidate {cid!r} requires non-empty evidence_refs for evidence_accepted")
+        for ref in refs:
+            if not isinstance(ref, dict):
+                raise ValueError(f"host funnel candidate {cid!r} has non-dict evidence_ref")
+            vid = ref.get("validation_id")
+            src_art = ref.get("source_artifact")
+            src_sha = ref.get("source_sha256")
+            if not isinstance(vid, str) or not vid.strip() or not isinstance(src_art, str) or not src_art.strip():
+                raise ValueError(f"host funnel candidate {cid!r} has malformed evidence_ref")
+            if not isinstance(src_sha, str) or len(src_sha) != 64 or any(c not in "0123456789abcdef" for c in src_sha.lower()):
+                raise ValueError(f"host funnel candidate {cid!r} has invalid evidence source_sha256")
+            if work is not None:
+                art_path = _safe_run_path(work, src_art, label="funnel evidence")
+                if not art_path.is_file():
+                    raise ValueError(f"host funnel candidate {cid!r} references missing artifact: {src_art}")
+                actual_sha = holdout.digest(art_path)
+                if actual_sha != src_sha:
+                    raise ValueError(f"host funnel candidate {cid!r} evidence digest mismatch: {src_art}")
+                if ledger_hashes and src_art in ledger_hashes and ledger_hashes[src_art] != actual_sha:
+                    raise ValueError(f"host funnel candidate {cid!r} evidence conflicts with attempt-ledger: {src_art}")
+                solver_rel = f"solver/{src_art}"
+                if checkpoint_evidence_hashes and solver_rel in checkpoint_evidence_hashes and checkpoint_evidence_hashes[solver_rel] != actual_sha:
+                    raise ValueError(f"host funnel candidate {cid!r} evidence conflicts with checkpoint: {solver_rel}")
+    elif "evidence_refs" in row and not isinstance(row["evidence_refs"], list):
+        raise ValueError(f"host funnel candidate {cid!r} has malformed evidence_refs")
+    return flags
+
+
+def _normalize_funnel_dict(
+    raw: dict[str, Any],
+    *,
+    work: Path | None = None,
+    ledger_hashes: dict[str, str] | None = None,
+    checkpoint_evidence_hashes: dict[str, str] | None = None,
+) -> dict[str, Any]:
+    if "schema" in raw and raw["schema"] != "python-validation-funnel/1":
+        raise ValueError(f"unexpected host funnel schema: {raw['schema']!r}")
+    if "unit" in raw and raw["unit"] != "deduplicated_task_candidate":
+        raise ValueError(f"unexpected host funnel unit: {raw['unit']!r}")
     aliases = {
         "observed": ("observed", "observed_candidates"),
         "eligible": ("eligible", "eligible_candidates"),
@@ -672,6 +959,46 @@ def _normalize_funnel_dict(raw: dict[str, Any]) -> dict[str, Any]:
         if val is not None and (type(val) is not int or val < 0):
             raise ValueError(f"invalid host funnel count for {stage}: {val!r}")
         counts[stage] = val
+
+    prev_stage: str | None = None
+    prev_val: int | None = None
+    for stage in FUNNEL_STAGES:
+        val = counts[stage]
+        if val is None:
+            continue
+        if prev_stage is not None and prev_val is not None and val > prev_val:
+            raise ValueError(
+                f"host funnel counts are non-monotonic: {stage}={val} > {prev_stage}={prev_val}"
+            )
+        prev_stage = stage
+        prev_val = val
+
+    if "candidates" in raw:
+        raw_candidates = raw["candidates"]
+        if not isinstance(raw_candidates, list):
+            raise ValueError("host funnel candidates must be a list")
+        seen_ids: set[str] = set()
+        cand_totals = {stage: 0 for stage in FUNNEL_STAGES}
+        for row in raw_candidates:
+            flags = _validate_funnel_candidate_row(
+                row,
+                work=work,
+                ledger_hashes=ledger_hashes,
+                checkpoint_evidence_hashes=checkpoint_evidence_hashes,
+            )
+            cid = str(row["candidate_id"])
+            if cid in seen_ids:
+                raise ValueError(f"duplicate candidate_id in host funnel: {cid!r}")
+            seen_ids.add(cid)
+            for stage in FUNNEL_STAGES:
+                if flags[stage]:
+                    cand_totals[stage] += 1
+        for stage in FUNNEL_STAGES:
+            if counts[stage] is None or counts[stage] != cand_totals[stage]:
+                raise ValueError(
+                    f"host funnel count mismatch against candidates for {stage}: {counts[stage]!r} != {cand_totals[stage]}"
+                )
+
     present = any(counts[stage] is not None for stage in FUNNEL_STAGES)
     complete = all(counts[stage] is not None for stage in FUNNEL_STAGES)
     if not present:
@@ -690,48 +1017,391 @@ def _normalize_funnel_dict(raw: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _funnel_counts_key(funnel: dict[str, Any]) -> tuple[int | None, ...]:
+    return tuple(funnel.get(stage) for stage in FUNNEL_STAGES)
+
+
+def _aggregate_task_funnels(per_task: dict[str, dict[str, Any]]) -> dict[str, Any]:
+    if not per_task:
+        return _normalize_funnel_dict({stage: 0 for stage in FUNNEL_STAGES})
+    totals = {
+        stage: holdout._sum_optional([item[stage] for item in per_task.values()])
+        for stage in FUNNEL_STAGES
+    }
+    return _normalize_funnel_dict(totals)
+
+
+def _normalize_task_funnel_map(
+    raw_map: Any,
+    *,
+    label: str,
+    work: Path | None = None,
+    ledger_hashes: dict[str, str] | None = None,
+    checkpoint_evidence_hashes: dict[str, str] | None = None,
+) -> dict[str, dict[str, Any]]:
+    if not isinstance(raw_map, dict):
+        raise ValueError(f"{label} validation_funnels must be a dict")
+    normalized: dict[str, dict[str, Any]] = {}
+    for task_id, raw_funnel in sorted(raw_map.items()):
+        if not isinstance(task_id, str) or not task_id.strip():
+            raise ValueError(f"{label} validation_funnels has invalid task id: {task_id!r}")
+        if not isinstance(raw_funnel, dict):
+            raise ValueError(f"{label} validation_funnels[{task_id!r}] must be a dict")
+        item = _normalize_funnel_dict(
+            raw_funnel,
+            work=work,
+            ledger_hashes=ledger_hashes,
+            checkpoint_evidence_hashes=checkpoint_evidence_hashes,
+        )
+        if not item.get("funnel_present"):
+            raise ValueError(f"{label} validation_funnels[{task_id!r}] is missing funnel counts")
+        normalized[task_id] = item
+    return normalized
+
+
+def _funnel_from_candidates_by_task(
+    candidates_by_task: Any,
+    *,
+    work: Path,
+    ledger_hashes: dict[str, str],
+    checkpoint_evidence_hashes: dict[str, str],
+) -> tuple[dict[str, dict[str, Any]], dict[str, Any]]:
+    if not isinstance(candidates_by_task, dict):
+        raise ValueError("checkpoint candidates_by_task must be a dict")
+    per_task: dict[str, dict[str, Any]] = {}
+    for task_id, task_rows in sorted(candidates_by_task.items()):
+        if not isinstance(task_id, str) or not task_id.strip():
+            raise ValueError(f"checkpoint candidates_by_task has invalid task id: {task_id!r}")
+        if not isinstance(task_rows, dict):
+            raise ValueError(f"checkpoint candidates_by_task[{task_id!r}] must be a dict")
+        totals = {stage: 0 for stage in FUNNEL_STAGES}
+        for cand_id, row in sorted(task_rows.items()):
+            flags = _validate_funnel_candidate_row(
+                row,
+                work=work,
+                ledger_hashes=ledger_hashes,
+                checkpoint_evidence_hashes=checkpoint_evidence_hashes,
+                expected_candidate_id=cand_id,
+            )
+            for stage in FUNNEL_STAGES:
+                if flags[stage]:
+                    totals[stage] += 1
+        per_task[task_id] = _normalize_funnel_dict({
+            "schema": "python-validation-funnel/1",
+            "unit": "deduplicated_task_candidate",
+            **totals,
+        })
+    return per_task, _aggregate_task_funnels(per_task)
+
+
 def extract_run_funnel(run_dir: Path, manifest: dict[str, Any]) -> dict[str, Any]:
     """Read audited host runtime funnel metrics if present, leaving missing historical funnel unknown."""
+    import evidence_trust
+
     work = run_dir / "solver"
+    private_dir = run_dir / "private"
+    private_state = private_dir / "state"
+    for dir_path, label in (
+        (work, "solver directory"),
+        (private_dir, "private directory"),
+        (private_state, "private/state directory"),
+    ):
+        if dir_path.is_symlink():
+            raise ValueError(f"host {label} cannot be a symlink")
+
     ledger_hashes: dict[str, str] = {}
     attempt_ledger_path = work / "attempt-ledger.json"
-    if attempt_ledger_path.is_file():
+    if attempt_ledger_path.is_symlink():
+        raise ValueError("host attempt-ledger.json cannot be a symlink")
+    if manifest.get("status") == "python_finished_verified" and not attempt_ledger_path.is_file():
+        raise ValueError("verified python run is missing host attempt-ledger.json")
+    has_ledger = attempt_ledger_path.is_file()
+    if has_ledger:
         signed = json.loads(attempt_ledger_path.read_text(encoding="utf-8"))
-        for ref in signed.get("payload", {}).get("workflow_files", []):
+        if not isinstance(signed, dict):
+            raise ValueError("invalid host attempt-ledger.json")
+        payload = signed.get("payload")
+        if not isinstance(payload, dict) or payload.get("schema") != "python-attempt-ledger/1" or payload.get("producer") != "host":
+            raise ValueError("invalid host attempt-ledger.json payload")
+        trust_bundle = private_state / "public-trust/verification.json"
+        if trust_bundle.is_symlink() or not trust_bundle.is_file():
+            raise ValueError("host attempt-ledger.json is missing public trust verification bundle")
+        with launcher.host_environment(private_state, work, run_dir / "runtime"):
+            if not evidence_trust.verify(evidence_trust.canonical_bytes(payload), signed, "python-attempt-ledger"):
+                raise ValueError("host attempt-ledger.json signature verification failed")
+        for ref in payload.get("workflow_files", []):
             if isinstance(ref, dict) and isinstance(ref.get("path"), str) and isinstance(ref.get("sha256"), str):
                 ledger_hashes[ref["path"]] = ref["sha256"]
 
-    summary_funnels: list[dict[str, Any]] = []
+    checkpoint_evidence_hashes: dict[str, str] = {}
+    cp_by_task: dict[str, dict[str, Any]] | None = None
+    cp_agg: dict[str, Any] | None = None
+    checkpoint_path = work / "checkpoint.json"
+    if checkpoint_path.is_symlink():
+        raise ValueError("host checkpoint.json cannot be a symlink")
+    if checkpoint_path.is_file():
+        cp_raw = json.loads(checkpoint_path.read_text(encoding="utf-8"))
+        if not isinstance(cp_raw, dict):
+            raise ValueError("invalid host checkpoint.json")
+        if has_ledger and "checkpoint.json" in ledger_hashes and holdout.digest(checkpoint_path) != ledger_hashes["checkpoint.json"]:
+            raise ValueError("host checkpoint.json digest conflicts with attempt-ledger")
+        is_signed_checkpoint = (
+            "payload" in cp_raw
+            or "signature" in cp_raw
+            or cp_raw.get("purpose") == "python-workflow-checkpoint"
+            or cp_raw.get("schema") == "python-workflow-checkpoint/1"
+        )
+        if is_signed_checkpoint:
+            cp_payload = cp_raw.get("payload")
+            if not isinstance(cp_payload, dict) or cp_payload.get("schema") != "python-workflow-checkpoint/1":
+                raise ValueError("invalid host checkpoint.json payload")
+            trust_bundle = private_state / "public-trust/verification.json"
+            if trust_bundle.is_symlink() or not trust_bundle.is_file():
+                raise ValueError("host checkpoint.json is missing public trust verification bundle")
+            with launcher.host_environment(private_state, work, run_dir / "runtime"):
+                if not evidence_trust.verify(
+                    evidence_trust.canonical_bytes(cp_payload),
+                    cp_raw,
+                    "python-workflow-checkpoint",
+                ):
+                    raise ValueError("host checkpoint.json signature verification failed")
+            if (isinstance(manifest.get("run_id"), str) and isinstance(cp_payload.get("run_id"), str)
+                    and cp_payload["run_id"] != manifest["run_id"]):
+                raise ValueError("host checkpoint.json run_id does not match launch manifest")
+            state_ref = cp_payload.get("state_ref")
+            evidence_list = cp_payload.get("evidence")
+            if not isinstance(state_ref, dict) or not isinstance(evidence_list, list) or state_ref not in evidence_list:
+                raise ValueError("host checkpoint.json state_ref lacks evidence binding")
+            for ref in evidence_list:
+                if not isinstance(ref, dict) or not isinstance(ref.get("path"), str) or not isinstance(ref.get("sha256"), str):
+                    raise ValueError("host checkpoint.json contains malformed evidence reference")
+                ev_path = _safe_run_path(run_dir, ref["path"], label="checkpoint evidence")
+                if not ev_path.is_file():
+                    raise ValueError(f"host checkpoint evidence artifact missing: {ref['path']}")
+                raw_bytes = ev_path.read_bytes()
+                digest = hashlib.sha256(raw_bytes).hexdigest()
+                if digest != ref["sha256"] or (
+                    ref.get("bytes") is not None and (type(ref.get("bytes")) is not int or len(raw_bytes) != ref["bytes"])
+                ):
+                    raise ValueError(f"host checkpoint evidence integrity mismatch: {ref['path']}")
+                checkpoint_evidence_hashes[ref["path"]] = digest
+            state_path = _safe_run_path(run_dir, state_ref["path"], label="checkpoint state")
+            state_data = json.loads(state_path.read_text(encoding="utf-8"))
+            if not isinstance(state_data, dict):
+                raise ValueError("host checkpoint state artifact must be a dict")
+            if "candidates_by_task" in state_data:
+                cp_by_task, cp_agg = _funnel_from_candidates_by_task(
+                    state_data["candidates_by_task"],
+                    work=work,
+                    ledger_hashes=ledger_hashes,
+                    checkpoint_evidence_hashes=checkpoint_evidence_hashes,
+                )
+        elif "candidates_by_task" in cp_raw:
+            raise ValueError("unsigned checkpoint.json cannot assert candidates_by_task")
+
+    summary_by_task: dict[str, dict[str, Any]] = {}
     summaries_dir = work / "summaries"
+    if summaries_dir.is_symlink():
+        raise ValueError("host summaries directory cannot be a symlink")
     if summaries_dir.is_dir():
         for summary_path in sorted(summaries_dir.glob("*.json")):
+            if summary_path.is_symlink():
+                raise ValueError(f"host summary artifact cannot be a symlink: summaries/{summary_path.name}")
             rel = f"summaries/{summary_path.name}"
+            verified_run = manifest.get("status") == "python_finished_verified"
+            if verified_run and has_ledger and rel not in ledger_hashes:
+                raise ValueError(f"unverified host summary artifact not covered by attempt-ledger: {rel}")
             if rel in ledger_hashes and holdout.digest(summary_path) != ledger_hashes[rel]:
                 raise ValueError(f"host summary artifact changed: {rel}")
+            cp_rel = f"solver/{rel}"
+            if cp_rel in checkpoint_evidence_hashes and holdout.digest(summary_path) != checkpoint_evidence_hashes[cp_rel]:
+                raise ValueError(f"host summary artifact conflicts with checkpoint: {rel}")
             data = json.loads(summary_path.read_text(encoding="utf-8"))
-            if isinstance(data, dict):
-                raw = data.get("validation_funnel", data.get("funnel"))
-                if isinstance(raw, dict):
-                    summary_funnels.append(_normalize_funnel_dict(raw))
+            if not isinstance(data, dict):
+                raise ValueError(f"host summary artifact must be a dict: {rel}")
+            has_funnel_claim = (
+                "validation_funnels" in data
+                or data.get("validation_funnel") is not None
+                or data.get("funnel") is not None
+            )
+            if has_funnel_claim and (has_ledger or checkpoint_evidence_hashes) and rel not in ledger_hashes and cp_rel not in checkpoint_evidence_hashes:
+                raise ValueError(f"unverified host summary funnel not covered by signed ledger or checkpoint: {rel}")
+            if "validation_funnels" in data:
+                mapped = _normalize_task_funnel_map(
+                    data["validation_funnels"],
+                    label=rel,
+                    work=work,
+                    ledger_hashes=ledger_hashes,
+                    checkpoint_evidence_hashes=checkpoint_evidence_hashes,
+                )
+                for task_id, task_funnel in mapped.items():
+                    if task_id in summary_by_task and _funnel_counts_key(summary_by_task[task_id]) != _funnel_counts_key(task_funnel):
+                        raise ValueError(f"contradictory duplicate summary validation_funnels entry for task {task_id!r}")
+                    summary_by_task.setdefault(task_id, task_funnel)
+            raw = data.get("validation_funnel", data.get("funnel"))
+            if isinstance(raw, dict):
+                norm = _normalize_funnel_dict(
+                    raw,
+                    work=work,
+                    ledger_hashes=ledger_hashes,
+                    checkpoint_evidence_hashes=checkpoint_evidence_hashes,
+                )
+                if norm.get("funnel_present"):
+                    raw_tid = data.get("task_id")
+                    task_id = raw_tid if isinstance(raw_tid, str) and raw_tid.strip() else summary_path.stem
+                    if task_id in summary_by_task and _funnel_counts_key(summary_by_task[task_id]) != _funnel_counts_key(norm):
+                        raise ValueError(f"contradictory duplicate summary validation_funnel entry for task {task_id!r}")
+                    summary_by_task.setdefault(task_id, norm)
+            elif raw is not None:
+                raise ValueError(f"malformed validation_funnel in {rel}")
 
-    if summary_funnels:
-        totals = {
-            stage: holdout._sum_optional([item[stage] for item in summary_funnels])
-            for stage in FUNNEL_STAGES
-        }
-        return _normalize_funnel_dict(totals)
+    def _read_result_funnels(candidate: Path, label: str) -> tuple[dict[str, dict[str, Any]] | None, dict[str, Any] | None]:
+        if candidate.is_symlink():
+            raise ValueError(f"host funnel artifact cannot be a symlink: {label}")
+        if not candidate.is_file():
+            return None, None
+        rel = candidate.relative_to(run_dir).as_posix()
+        if rel in checkpoint_evidence_hashes and holdout.digest(candidate) != checkpoint_evidence_hashes[rel]:
+            raise ValueError(f"host funnel artifact conflicts with checkpoint: {label}")
+        if candidate.parent == work and "run-result.json" in ledger_hashes and holdout.digest(candidate) != ledger_hashes["run-result.json"]:
+            raise ValueError(f"host funnel artifact conflicts with attempt-ledger: {label}")
+        data = json.loads(candidate.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            raise ValueError(f"invalid host funnel artifact: {label}")
+        if (isinstance(manifest.get("run_id"), str) and isinstance(data.get("run_id"), str)
+                and data["run_id"] != manifest["run_id"]):
+            raise ValueError(f"host funnel artifact {label} run_id does not match launch manifest")
+        if data.get("schema") == "python-workflow-v1" and isinstance(data.get("checkpoint"), str):
+            if Path(data["checkpoint"]).name != "checkpoint.json":
+                raise ValueError(f"host funnel artifact {label} references unexpected checkpoint")
+        task_map: dict[str, dict[str, Any]] | None = None
+        if "validation_funnels" in data:
+            task_map = _normalize_task_funnel_map(
+                data["validation_funnels"],
+                label=label,
+                work=work,
+                ledger_hashes=ledger_hashes,
+                checkpoint_evidence_hashes=checkpoint_evidence_hashes,
+            )
+        singular_raw = data.get("validation_funnel", data.get("funnel"))
+        singular_norm: dict[str, Any] | None = None
+        if isinstance(singular_raw, dict):
+            candidate_norm = _normalize_funnel_dict(
+                singular_raw,
+                work=work,
+                ledger_hashes=ledger_hashes,
+                checkpoint_evidence_hashes=checkpoint_evidence_hashes,
+            )
+            if candidate_norm.get("funnel_present"):
+                singular_norm = candidate_norm
+        elif singular_raw is not None:
+            raise ValueError(f"malformed validation_funnel in {label}")
+        if task_map is not None and singular_norm is not None:
+            agg_map = _aggregate_task_funnels(task_map)
+            if _funnel_counts_key(agg_map) != _funnel_counts_key(singular_norm):
+                raise ValueError(f"contradictory singular and plural funnel counts in {label}")
+        return task_map, singular_norm
 
-    for candidate in (work / "run-result.json",):
-        if candidate.is_file():
-            data = json.loads(candidate.read_text(encoding="utf-8"))
-            if isinstance(data, dict):
-                raw_run_funnel = data.get("validation_funnel", data.get("funnel"))
-                if isinstance(raw_run_funnel, dict):
-                    return _normalize_funnel_dict(raw_run_funnel)
+    root_task_map, root_singular = _read_result_funnels(run_dir / "run-result.json", "run-result.json")
+    solver_task_map, solver_singular = _read_result_funnels(work / "run-result.json", "solver/run-result.json")
 
+    for src_map, alt_map, err in (
+        (root_task_map, solver_task_map, "run-result.json and solver/run-result.json validation_funnels contradict"),
+    ):
+        if src_map is not None and alt_map is not None:
+            if set(src_map) != set(alt_map) or any(
+                _funnel_counts_key(src_map[tid]) != _funnel_counts_key(alt_map[tid]) for tid in src_map
+            ):
+                raise ValueError(err)
+    effective_result_map = root_task_map if root_task_map is not None else solver_task_map
+    effective_result_singular = root_singular if root_singular is not None else solver_singular
+    if root_singular is not None and solver_singular is not None and _funnel_counts_key(root_singular) != _funnel_counts_key(solver_singular):
+        raise ValueError("run-result.json and solver/run-result.json singular funnels contradict")
+
+    manifest_task_map: dict[str, dict[str, Any]] | None = None
+    if "validation_funnels" in manifest:
+        manifest_task_map = _normalize_task_funnel_map(
+            manifest["validation_funnels"],
+            label="launch manifest",
+            work=work,
+            ledger_hashes=ledger_hashes,
+            checkpoint_evidence_hashes=checkpoint_evidence_hashes,
+        )
     raw_manifest_funnel = manifest.get("validation_funnel", manifest.get("funnel"))
+    manifest_singular: dict[str, Any] | None = None
     if isinstance(raw_manifest_funnel, dict):
-        return _normalize_funnel_dict(raw_manifest_funnel)
+        cand_manifest = _normalize_funnel_dict(
+            raw_manifest_funnel,
+            work=work,
+            ledger_hashes=ledger_hashes,
+            checkpoint_evidence_hashes=checkpoint_evidence_hashes,
+        )
+        if cand_manifest.get("funnel_present"):
+            manifest_singular = cand_manifest
+    elif raw_manifest_funnel is not None:
+        raise ValueError("malformed validation_funnel in launch manifest")
+    if manifest_task_map is not None and manifest_singular is not None:
+        if _funnel_counts_key(_aggregate_task_funnels(manifest_task_map)) != _funnel_counts_key(manifest_singular):
+            raise ValueError("contradictory singular and plural funnel counts in launch manifest")
+
+    if cp_by_task is not None and cp_agg is not None:
+        for tid, s_funnel in summary_by_task.items():
+            if tid not in cp_by_task:
+                raise ValueError(f"summary validation funnel references task {tid!r} missing from signed checkpoint")
+            if _funnel_counts_key(s_funnel) != _funnel_counts_key(cp_by_task[tid]):
+                raise ValueError(f"summary validation funnel for {tid!r} contradicts signed checkpoint")
+        for label_name, t_map in (
+            ("run-result.json", effective_result_map),
+            ("launch manifest", manifest_task_map),
+        ):
+            if t_map is not None:
+                if set(t_map) != set(cp_by_task) or any(
+                    _funnel_counts_key(t_map[tid]) != _funnel_counts_key(cp_by_task[tid]) for tid in t_map
+                ):
+                    raise ValueError(f"{label_name} validation_funnels contradict signed checkpoint")
+        for label_name, s_norm in (
+            ("run-result.json", effective_result_singular),
+            ("launch manifest", manifest_singular),
+        ):
+            if s_norm is not None and _funnel_counts_key(s_norm) != _funnel_counts_key(cp_agg):
+                raise ValueError(f"{label_name} validation_funnel contradicts signed checkpoint")
+        return cp_agg
+
+    if effective_result_map is not None and manifest_task_map is not None:
+        if set(effective_result_map) != set(manifest_task_map) or any(
+            _funnel_counts_key(effective_result_map[tid]) != _funnel_counts_key(manifest_task_map[tid])
+            for tid in effective_result_map
+        ):
+            raise ValueError("run-result.json and launch manifest validation_funnels contradict")
+
+    authoritative_map = effective_result_map if effective_result_map is not None else manifest_task_map
+    if authoritative_map is not None:
+        for tid, s_funnel in summary_by_task.items():
+            if tid not in authoritative_map:
+                raise ValueError(f"summary validation funnel references task {tid!r} missing from run-result")
+            if _funnel_counts_key(s_funnel) != _funnel_counts_key(authoritative_map[tid]):
+                raise ValueError(f"summary validation funnel for {tid!r} contradicts run-result")
+        agg = _aggregate_task_funnels(authoritative_map)
+        for s_norm in (effective_result_singular, manifest_singular):
+            if s_norm is not None and _funnel_counts_key(s_norm) != _funnel_counts_key(agg):
+                raise ValueError("singular validation_funnel contradicts validation_funnels")
+        return agg
+
+    if summary_by_task:
+        agg = _aggregate_task_funnels(summary_by_task)
+        for s_norm in (effective_result_singular, manifest_singular):
+            if s_norm is not None and _funnel_counts_key(s_norm) != _funnel_counts_key(agg):
+                raise ValueError("summary validation_funnel contradicts run-result or manifest")
+        return agg
+
+    if effective_result_singular is not None:
+        if manifest_singular is not None and _funnel_counts_key(effective_result_singular) != _funnel_counts_key(manifest_singular):
+            raise ValueError("run-result.json validation_funnel contradicts launch manifest")
+        return effective_result_singular
+
+    if manifest_singular is not None:
+        return manifest_singular
+
     return _unknown_funnel()
 
 
@@ -845,6 +1515,204 @@ def _load_archived_prepared_run(path: str | Path) -> dict[str, Any]:
     }
 
 
+def _verify_run_manifest_and_artifacts(
+    directory: Path,
+    manifest: dict[str, Any],
+    prepared: dict[str, Any],
+    truth: list[dict[str, Any]],
+    *,
+    verified_run: bool,
+    wire: list[dict[str, Any]] | None = None,
+) -> None:
+    """Verify launch manifest fields, staged runtime-index, truth counts, and budget limits against frozen preflight."""
+    selected = prepared["contract"]["holdout_run"]
+    expected_solver_mode = prepared["contract"].get("solver_mode", "native")
+    if manifest.get("solver_mode", "native") != expected_solver_mode:
+        raise ValueError("launch manifest solver_mode does not match frozen preflight")
+    expected_ceilings = _normalize_ceilings(prepared["contract"]["limits"])
+    actual_ceilings = _normalize_ceilings(manifest.get("effective_limits"))
+    if expected_ceilings is None or actual_ceilings != expected_ceilings:
+        raise ValueError("launch manifest effective_limits do not match frozen preflight ceilings")
+    if expected_solver_mode == "python_loop" and verified_run:
+        for req_key in (
+            "models",
+            "independent_family",
+            "lab_version",
+            "provider_kind",
+            "runtime_index",
+            "runtime_index_sha256",
+        ):
+            if req_key not in manifest:
+                raise ValueError(f"verified python_loop launch manifest is missing required field {req_key!r}")
+    if "models" in manifest and manifest["models"] != prepared["contract"]["models"]:
+        raise ValueError("launch manifest models do not match frozen preflight")
+    if "independent_family" in manifest and manifest["independent_family"] != selected["family"]:
+        raise ValueError("launch manifest independent_family does not match frozen preflight")
+    if "lab_version" in manifest and manifest["lab_version"] != selected["lab_version"]:
+        raise ValueError("launch manifest lab_version does not match frozen preflight")
+    if expected_solver_mode == "python_loop":
+        settings = llm_config.provider_settings(prepared["runtime"] / "config/llm.json", prepared["contract"]["models"])
+        host = urlsplit(settings["url"]).hostname or ""
+        expected_kind = "loopback" if host in LOOPBACK_HOSTS else "remote"
+        if "provider_kind" in manifest and manifest["provider_kind"] != expected_kind:
+            raise ValueError("launch manifest provider_kind does not match frozen provider config")
+        if verified_run and manifest.get("status") != "python_finished_verified":
+            raise ValueError("python_loop verified audit requires python_finished_verified status")
+    raw_cost = manifest.get("llm_cost_usd")
+    if raw_cost is not None:
+        if isinstance(raw_cost, bool) or not isinstance(raw_cost, (int, float)) or not math.isfinite(raw_cost) or raw_cost < 0:
+            raise ValueError("launch manifest llm_cost_usd is invalid")
+    for int_counter in ("llm_calls", "target_requests"):
+        if int_counter in manifest and manifest[int_counter] is not None:
+            raw_val = manifest[int_counter]
+            if isinstance(raw_val, bool) or not isinstance(raw_val, int) or raw_val < 0:
+                raise ValueError(f"launch manifest {int_counter} is invalid")
+    if "wall_clock_seconds" in manifest and manifest["wall_clock_seconds"] is not None:
+        raw_wall = manifest["wall_clock_seconds"]
+        if (
+            isinstance(raw_wall, bool)
+            or not isinstance(raw_wall, (int, float))
+            or not math.isfinite(raw_wall)
+            or raw_wall < 0
+        ):
+            raise ValueError("launch manifest wall_clock_seconds is invalid")
+
+    pos = sum(1 for row in truth if row.get("expected") == "positive")
+    neg = sum(1 for row in truth if row.get("expected") == "negative")
+    if (len(truth) < 16 or pos < 8 or neg < 8 or pos + neg != len(truth)
+            or any(row.get("family", selected["family"]) != selected["family"] for row in truth)):
+        raise ValueError("evaluator truth counts or family labels are invalid")
+    expected_counts_path = directory / "private/evaluator/expected-counts.json"
+    if expected_counts_path.is_symlink():
+        raise ValueError("evaluator expected-counts.json cannot be a symlink")
+    if expected_counts_path.is_file():
+        expected_counts = json.loads(expected_counts_path.read_text(encoding="utf-8"))
+        if expected_counts != {"positive": pos, "negative": neg}:
+            raise ValueError("evaluator truth does not match expected-counts.json")
+
+    staged_index_path = directory / "runtime-index.json"
+    if staged_index_path.is_symlink():
+        raise ValueError("staged runtime-index.json cannot be a symlink")
+    require_staged_runtime = bool(verified_run and expected_solver_mode == "python_loop")
+    if require_staged_runtime or manifest.get("runtime_index") or staged_index_path.is_file():
+        if not staged_index_path.is_file() or staged_index_path.is_symlink():
+            raise ValueError("staged runtime-index.json is missing or a symlink")
+        if "runtime_index" in manifest:
+            raw_idx = Path(manifest["runtime_index"])
+            if raw_idx.is_symlink() or raw_idx.resolve(strict=True) != staged_index_path.resolve(strict=True):
+                raise ValueError("launch manifest runtime_index points outside run directory")
+        if "runtime_index_sha256" in manifest and holdout.digest(staged_index_path) != manifest["runtime_index_sha256"]:
+            raise ValueError("staged runtime-index.json digest mismatch")
+        staged_idx = json.loads(staged_index_path.read_text(encoding="utf-8"))
+        if (staged_idx.get("schema") != "full-agent-runtime-snapshot/1"
+                or staged_idx.get("source_index_sha256") != prepared["manifest"]["runtime_snapshot"]["index_sha256"]
+                or staged_idx.get("models") != prepared["contract"]["models"]):
+            raise ValueError("staged runtime-index.json does not match frozen preflight snapshot")
+        staged_runtime = directory / "runtime"
+        if not staged_runtime.is_dir() or staged_runtime.is_symlink():
+            raise ValueError("staged runtime directory is missing or a symlink")
+        allowed_generated = {".codex/scope.json", ".codex/program-policy.json"}
+        if expected_solver_mode != "python_loop":
+            allowed_generated.add("opencode.json")
+        prepared_hashes = {
+            row["path"]: row["sha256"]
+            for row in prepared["index"].get("files", [])
+            if isinstance(row, dict) and isinstance(row.get("path"), str) and isinstance(row.get("sha256"), str)
+        }
+        staged_hashes: dict[str, str] = {}
+        for row in staged_idx.get("files", []):
+            if not isinstance(row, dict) or not isinstance(row.get("path"), str) or not isinstance(row.get("sha256"), str):
+                raise ValueError("invalid staged runtime-index.json entry")
+            rel = Path(row["path"])
+            if not rel.parts or rel.is_absolute() or ".." in rel.parts or row["path"] in staged_hashes:
+                raise ValueError("invalid staged runtime file path")
+            target = staged_runtime / rel
+            if target.is_symlink() or any(
+                parent.is_symlink() for parent in target.parents if parent != staged_runtime and staged_runtime in parent.parents
+            ):
+                raise ValueError("staged runtime contains a symlink")
+            if not target.is_file() or preflight.sha256(target) != row["sha256"]:
+                raise ValueError("staged runtime file changed since launch")
+            if row["path"] not in allowed_generated and prepared_hashes.get(row["path"]) != row["sha256"]:
+                raise ValueError(f"staged runtime file {row['path']!r} diverges from frozen preflight snapshot")
+            staged_hashes[row["path"]] = row["sha256"]
+        actual_staged: set[str] = set()
+        for target in staged_runtime.rglob("*"):
+            if target.is_symlink():
+                raise ValueError("staged runtime contains a symlink")
+            if target.is_file():
+                actual_staged.add(target.relative_to(staged_runtime).as_posix())
+        if actual_staged != set(staged_hashes):
+            raise ValueError("staged runtime inventory does not match runtime-index.json")
+        if {p for p in staged_hashes if p not in allowed_generated} != {
+            p for p in prepared_hashes if p not in allowed_generated
+        }:
+            raise ValueError("staged runtime files do not match frozen preflight snapshot")
+
+    budget_path = directory / "private/budget.json"
+    if budget_path.is_symlink():
+        raise ValueError("private/budget.json cannot be a symlink")
+    if verified_run and not budget_path.is_file():
+        raise ValueError("verified run is missing private/budget.json")
+    if budget_path.is_file():
+        budget_data = json.loads(budget_path.read_text(encoding="utf-8"))
+        if not isinstance(budget_data, dict) or not isinstance(budget_data.get("limits"), dict):
+            raise ValueError("private/budget.json is missing valid limits")
+        b_limits = budget_data["limits"]
+        if (b_limits.get("http") != expected_ceilings["http_requests_per_seed"]
+                or b_limits.get("tokens") != expected_ceilings["llm_tokens_per_seed"]):
+            raise ValueError("budget.json limits do not match frozen preflight ceilings")
+        if "used" in budget_data:
+            b_used = budget_data["used"]
+            if (
+                not isinstance(b_used, dict)
+                or type(b_used.get("http")) is not int
+                or b_used["http"] < 0
+                or type(b_used.get("tokens")) is not int
+                or b_used["tokens"] < 0
+            ):
+                raise ValueError("private/budget.json used counters must be nonnegative integers")
+        elif verified_run:
+            raise ValueError("verified run private/budget.json is missing used counters")
+        if "events" in budget_data:
+            b_events = budget_data["events"]
+            if not isinstance(b_events, list) or any(not isinstance(ev, dict) for ev in b_events):
+                raise ValueError("private/budget.json events must be a list of dicts")
+            for idx, ev in enumerate(b_events):
+                for ev_field in ("reserved", "charged"):
+                    if ev_field in ev and ev[ev_field] is not None:
+                        ev_val = ev[ev_field]
+                        if (
+                            isinstance(ev_val, bool)
+                            or not isinstance(ev_val, (int, float))
+                            or not math.isfinite(ev_val)
+                            or ev_val < 0
+                        ):
+                            raise ValueError(f"private/budget.json events[{idx}].{ev_field} is invalid")
+                if "measurement_valid" in ev and not isinstance(ev["measurement_valid"], bool):
+                    raise ValueError(f"private/budget.json events[{idx}].measurement_valid must be bool")
+                if "usage" in ev and ev["usage"] is not None:
+                    ev_usage = ev["usage"]
+                    if not isinstance(ev_usage, dict):
+                        raise ValueError(f"private/budget.json events[{idx}].usage must be dict")
+                    for tok_key in ("prompt_tokens", "completion_tokens", "reasoning_tokens", "total_tokens"):
+                        if tok_key in ev_usage and ev_usage[tok_key] is not None:
+                            tok_val = ev_usage[tok_key]
+                            if isinstance(tok_val, bool) or not isinstance(tok_val, int) or tok_val < 0:
+                                raise ValueError(f"private/budget.json events[{idx}].usage.{tok_key} is invalid")
+        if verified_run and wire is not None:
+            if not isinstance(budget_data.get("used"), dict) or budget_data["used"].get("http") != len(wire):
+                raise ValueError("budget.json HTTP usage does not match wire accounting")
+    if "budget" in manifest:
+        m_budget = manifest["budget"]
+        if not isinstance(m_budget, dict) or not isinstance(m_budget.get("limits"), dict):
+            raise ValueError("launch manifest budget is malformed")
+        mb_limits = m_budget["limits"]
+        if (mb_limits.get("http") != expected_ceilings["http_requests_per_seed"]
+                or mb_limits.get("tokens") != expected_ceilings["llm_tokens_per_seed"]):
+            raise ValueError("launch manifest budget limits do not match frozen preflight ceilings")
+
+
 def _audit_run_readonly(manifest_path: str | Path) -> tuple[dict[str, Any], dict[str, Any]]:
     """Read-only equivalent of holdout.audit_run_status that never writes into the audited directory."""
     import attempt_ledger
@@ -859,6 +1727,9 @@ def _audit_run_readonly(manifest_path: str | Path) -> tuple[dict[str, Any], dict
     selected = prepared["contract"]["holdout_run"]
     holdout.replay(selected, manifest["seed"])
     evaluator = private / "evaluator"
+    for ev_file in ("selection.json", "lab-source.py", "truth.json", "wire.json"):
+        if (evaluator / ev_file).is_symlink():
+            raise ValueError(f"evaluator {ev_file} cannot be a symlink")
     if json.loads((evaluator / "selection.json").read_text(encoding="utf-8")) != selected:
         raise ValueError("lab selection does not match frozen preflight")
     if holdout.digest(evaluator / "lab-source.py") != selected["lab_sha256"]:
@@ -866,8 +1737,13 @@ def _audit_run_readonly(manifest_path: str | Path) -> tuple[dict[str, Any], dict
     truth = json.loads((evaluator / "truth.json").read_text(encoding="utf-8"))
     wire_file = evaluator / "wire.json"
 
-    if manifest.get("status") not in {"python_finished_verified", "native_finished_unverified"}:
+    solver_mode = prepared["contract"].get("solver_mode", "native")
+    verified_statuses = {"python_finished_verified"} if solver_mode == "python_loop" else {
+        "python_finished_verified", "native_finished_unverified"
+    }
+    if manifest.get("status") not in verified_statuses:
         wire = json.loads(wire_file.read_text(encoding="utf-8")) if wire_file.is_file() else []
+        _verify_run_manifest_and_artifacts(directory, manifest, prepared, truth, verified_run=False, wire=wire)
         target = manifest.get("target") or "http://127.0.0.1/"
         run_id = manifest.get("run_id") or f"failed-{manifest['seed']}"
         metrics = holdout.evaluate(truth, wire, [], target=target, run_id=run_id, verify_artifact=lambda _r: False)
@@ -906,6 +1782,7 @@ def _audit_run_readonly(manifest_path: str | Path) -> tuple[dict[str, Any], dict
         return metrics, holdout.aggregate([metrics], prepared["contract"]["holdout"])
 
     wire = json.loads(wire_file.read_text(encoding="utf-8"))
+    _verify_run_manifest_and_artifacts(directory, manifest, prepared, truth, verified_run=True, wire=wire)
     live = json.loads((work / "access/live-result.json").read_text(encoding="utf-8"))
     tool_index = json.loads((private / "tool-index.json").read_text(encoding="utf-8"))
     live_tools = [
@@ -1220,6 +2097,12 @@ def _aggregate_cohort_metrics(run_metrics: list[dict[str, Any]],
     }
 
 
+def _strict_int(value: Any, field: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"{field} must be an integer, got {value!r}")
+    return value
+
+
 def audit_cohort(label: str, manifest_paths: Sequence[str | Path], *,
                  expected_ceilings: dict[str, int] | None = None,
                  authorization: dict[str, Any] | None = None,
@@ -1233,24 +2116,61 @@ def audit_cohort(label: str, manifest_paths: Sequence[str | Path], *,
     paths = [Path(path).resolve(strict=True) for path in manifest_paths]
     if len(paths) < MINIMUM_FAMILIES:
         raise ValueError("E6 cohort audit requires at least 3 independent family runs")
+    if len(set(paths)) != len(paths):
+        raise ValueError("duplicate launch manifest paths in cohort")
 
     exp_manifest_path: Path | None = None
     exp_manifest: dict[str, Any] | None = None
     expected_units_by_id: dict[str, dict[str, Any]] = {}
+    units_by_pair: dict[tuple[str, int], list[dict[str, Any]]] = {}
     if experiment_manifest is not None:
         exp_manifest_path, exp_manifest = _verify_experiment_manifest(experiment_manifest)
         for u in exp_manifest.get("units", []):
             expected_units_by_id[u["experiment_id"]] = u
+            units_by_pair.setdefault((u["family"], int(u["seed"])), []).append(u)
+        for pair_units in units_by_pair.values():
+            pair_units.sort(key=lambda item: int(item["repetition"]))
         if len(paths) != len(expected_units_by_id):
             raise ValueError("audited manifest count does not match frozen experiment manifest")
 
+    effective_unit_runs = unit_runs
+    if effective_unit_runs is None and exp_manifest_path is not None:
+        unit_runs_file = exp_manifest_path.parent / "unit-runs.json"
+        if unit_runs_file.is_symlink():
+            raise ValueError("unit-runs.json cannot be a symlink")
+        if unit_runs_file.is_file():
+            loaded_unit_runs = json.loads(unit_runs_file.read_text(encoding="utf-8"))
+            candidate_rows = loaded_unit_runs.get("units") if isinstance(loaded_unit_runs, dict) else None
+            if not isinstance(candidate_rows, list) or loaded_unit_runs.get("schema") != "full-agent-e6-unit-runs/1":
+                raise ValueError("invalid unit-runs.json beside experiment manifest")
+            effective_unit_runs = candidate_rows
+
     unit_by_manifest: dict[str, dict[str, Any]] = {}
-    if unit_runs is not None:
-        for row in unit_runs:
-            resolved = str(Path(row["manifest"]).resolve(strict=True))
-            if "manifest_sha256" in row and holdout.digest(resolved) != row["manifest_sha256"]:
+    seen_unit_ids: set[str] = set()
+    if effective_unit_runs is not None:
+        if len(effective_unit_runs) != len(paths):
+            raise ValueError("unit_runs count does not match audited manifest count")
+        for row in effective_unit_runs:
+            if not isinstance(row, dict) or not isinstance(row.get("manifest"), str) or not isinstance(row.get("experiment_id"), str):
+                raise ValueError("invalid unit_runs entry")
+            raw_manifest = Path(row["manifest"])
+            if raw_manifest.is_symlink() or not raw_manifest.is_file():
+                raise ValueError("unit_runs manifest is missing or a symlink")
+            resolved = str(raw_manifest.resolve(strict=True))
+            if resolved in unit_by_manifest:
+                raise ValueError(f"duplicate manifest entry in unit_runs: {resolved}")
+            exp_id = str(row["experiment_id"])
+            if exp_id in seen_unit_ids:
+                raise ValueError(f"duplicate experiment_id in unit_runs: {exp_id}")
+            seen_unit_ids.add(exp_id)
+            manifest_digest = row.get("manifest_sha256")
+            if not isinstance(manifest_digest, str) or not manifest_digest:
+                raise ValueError(f"unit_runs entry for {exp_id} is missing manifest_sha256")
+            if holdout.digest(resolved) != manifest_digest:
                 raise ValueError(f"launch manifest digest changed for {row.get('experiment_id')}")
             unit_by_manifest[resolved] = row
+        if set(unit_by_manifest) != {str(p) for p in paths}:
+            raise ValueError("unit_runs does not match audited manifest paths")
 
     auditor = _audit_run_readonly if readonly else holdout.audit_run_status
     prepared_loader = _load_archived_prepared_run if readonly else launcher.prepared_run
@@ -1261,6 +2181,7 @@ def audit_cohort(label: str, manifest_paths: Sequence[str | Path], *,
     run_evidence: list[dict[str, Any]] = []
     seen_pairs: set[tuple[str, int]] = set()
     seen_units: set[tuple[str, int, int]] = set()
+    assigned_exp_ids: set[str] = set()
 
     for path in paths:
         metrics, _ = auditor(path)
@@ -1269,22 +2190,48 @@ def audit_cohort(label: str, manifest_paths: Sequence[str | Path], *,
             raise ValueError(f"missing normalized ceiling limits in {path}")
         launch = json.loads(path.read_text(encoding="utf-8"))
         prepared = prepared_loader(launch["preflight"])
+        if not readonly:
+            run_dir_check = path.parent
+            evaluator_dir = run_dir_check / "private/evaluator"
+            truth = json.loads((evaluator_dir / "truth.json").read_text(encoding="utf-8"))
+            wire_file = evaluator_dir / "wire.json"
+            wire = json.loads(wire_file.read_text(encoding="utf-8")) if wire_file.is_file() else []
+            solver_mode = prepared["contract"].get("solver_mode", "native")
+            verified_statuses = {"python_finished_verified"} if solver_mode == "python_loop" else {
+                "python_finished_verified", "native_finished_unverified"
+            }
+            _verify_run_manifest_and_artifacts(
+                run_dir_check, launch, prepared, truth,
+                verified_run=launch.get("status") in verified_statuses, wire=wire,
+            )
         contracts.append(prepared["contract"]["holdout"])
         unit_fingerprints.append(_compute_unit_fingerprints(prepared))
         run_ceilings.append(ceilings)
         run_metrics.append(metrics)
 
         family = metrics["family"]
-        seed = int(launch["seed"])
+        seed = _strict_int(launch["seed"], "launch.seed")
         resolved_str = str(path)
         if resolved_str in unit_by_manifest:
             unit_meta = unit_by_manifest[resolved_str]
-            if unit_meta["family"] != family or int(unit_meta["seed"]) != seed:
+            if unit_meta["family"] != family or _strict_int(unit_meta["seed"], "unit_meta.seed") != seed:
                 raise ValueError(f"unit metadata mismatch for {path}")
-            rep = int(unit_meta["repetition"])
+            rep = _strict_int(unit_meta["repetition"], "unit_meta.repetition")
             experiment_id = str(unit_meta["experiment_id"])
+            if experiment_id != f"{family}:{seed}:rep{rep}":
+                raise ValueError(f"invalid experiment_id {experiment_id!r} for {family}:{seed}:rep{rep}")
+        elif exp_manifest is not None:
+            next_unit = next(
+                (item for item in units_by_pair.get((family, seed), [])
+                 if item["experiment_id"] not in assigned_exp_ids),
+                None,
+            )
+            if next_unit is None:
+                raise ValueError(f"unexpected or duplicate (family, seed) ({family}, {seed}) vs frozen experiment manifest")
+            rep = _strict_int(next_unit["repetition"], "experiment_unit.repetition")
+            experiment_id = str(next_unit["experiment_id"])
         else:
-            if (family, seed) in seen_pairs and exp_manifest is None:
+            if (family, seed) in seen_pairs:
                 raise ValueError(
                     f"duplicate (family, seed) ({family}, {seed}) requires frozen experiment manifest repetitions"
                 )
@@ -1292,6 +2239,7 @@ def audit_cohort(label: str, manifest_paths: Sequence[str | Path], *,
             rep = 1
             experiment_id = f"{family}:{seed}:rep{rep}"
 
+        assigned_exp_ids.add(experiment_id)
         unit_key = (family, seed, rep)
         if unit_key in seen_units:
             raise ValueError(f"duplicate experiment unit {experiment_id}")
@@ -1306,6 +2254,7 @@ def audit_cohort(label: str, manifest_paths: Sequence[str | Path], *,
                 raise ValueError(f"experiment unit identity mismatch for {experiment_id}")
             if holdout.digest(launch["preflight"]) != frozen_unit["preflight_sha256"]:
                 raise ValueError(f"preflight digest mismatch for {experiment_id}")
+            _verify_prepared_matches_unit(prepared, frozen_unit, exp_manifest)
 
         run_dir = path.parent
         funnel = extract_run_funnel(run_dir, launch)
@@ -1317,6 +2266,18 @@ def audit_cohort(label: str, manifest_paths: Sequence[str | Path], *,
         budget_file = run_dir / "private/budget.json"
         if budget_file.is_file():
             evidence_refs["budget"] = {"path": str(budget_file), "sha256": holdout.digest(budget_file)}
+        runtime_index_file = run_dir / "runtime-index.json"
+        if runtime_index_file.is_file():
+            evidence_refs["runtime_index"] = {
+                "path": str(runtime_index_file),
+                "sha256": holdout.digest(runtime_index_file),
+            }
+        attempt_ledger_file = run_dir / "solver/attempt-ledger.json"
+        if attempt_ledger_file.is_file():
+            evidence_refs["attempt_ledger"] = {
+                "path": str(attempt_ledger_file),
+                "sha256": holdout.digest(attempt_ledger_file),
+            }
 
         run_evidence.append({
             "experiment_id": experiment_id,
@@ -1469,6 +2430,9 @@ def _verify_report_digest(data: dict[str, Any]) -> None:
 def _reaudit_cohort_report(data: dict[str, Any]) -> dict[str, Any]:
     """Re-audit a frozen paired cohort report read-only from its underlying manifests and artifacts."""
     _verify_report_digest(data)
+    created_at = data.get("created_at")
+    if not isinstance(created_at, str) or not created_at.strip():
+        raise ValueError("cohort report is missing created_at timestamp")
     provenance = data.get("provenance")
     if not isinstance(provenance, dict) or provenance.get("mode") != "frozen_paired_experiment":
         raise ValueError("strict paired comparison requires frozen_paired_experiment provenance")
@@ -1477,9 +2441,32 @@ def _reaudit_cohort_report(data: dict[str, Any]) -> dict[str, Any]:
     exp_ref = provenance.get("experiment_manifest")
     if not isinstance(exp_ref, dict) or not exp_ref.get("path") or not exp_ref.get("sha256"):
         raise ValueError("cohort report is missing experiment manifest reference")
+    if Path(exp_ref["path"]).is_symlink():
+        raise ValueError("cohort experiment manifest path cannot be a symlink")
     exp_path = Path(exp_ref["path"]).resolve(strict=True)
     if holdout.digest(exp_path) != exp_ref["sha256"]:
         raise ValueError("experiment manifest file digest mismatch")
+    exp_manifest_data = json.loads(exp_path.read_text(encoding="utf-8"))
+    auth_block = data.get("authorization")
+    if auth_block is None and exp_manifest_data.get("provider_kind") == "remote":
+        raise ValueError("remote cohort report is missing authorization metadata")
+    if auth_block is not None:
+        if not isinstance(auth_block, dict) or set(auth_block) != {
+            "provider_kind", "provider_host", "live_provider_authorized", "live_authorization_reason",
+        }:
+            raise ValueError("cohort report authorization metadata is malformed")
+        if auth_block.get("provider_kind") != exp_manifest_data.get("provider_kind"):
+            raise ValueError("cohort report authorization provider_kind diverges from experiment manifest")
+        if auth_block.get("provider_host") != exp_manifest_data.get("provider_host"):
+            raise ValueError("cohort report authorization provider_host diverges from experiment manifest")
+        if not isinstance(auth_block.get("live_provider_authorized"), bool):
+            raise ValueError("cohort report authorization live_provider_authorized must be boolean")
+        if exp_manifest_data.get("provider_kind") == "remote":
+            reason = auth_block.get("live_authorization_reason")
+            if auth_block.get("live_provider_authorized") is not True or not isinstance(reason, str) or not reason.strip():
+                raise ValueError("remote cohort report lacks valid live_provider_authorized metadata")
+        elif auth_block.get("live_provider_authorized") is not False or auth_block.get("live_authorization_reason") is not None:
+            raise ValueError("non-remote cohort report cannot claim live provider authorization")
 
     runs = data.get("runs")
     if not isinstance(runs, list) or len(runs) < MINIMUM_FAMILIES:
@@ -1488,51 +2475,89 @@ def _reaudit_cohort_report(data: dict[str, Any]) -> dict[str, Any]:
     manifest_paths: list[Path] = []
     unit_runs: list[dict[str, Any]] = []
     for row in runs:
+        if not isinstance(row, dict):
+            raise ValueError("cohort report run entry must be a dict")
         refs = row.get("evidence_refs") or {}
         mref = refs.get("manifest")
         if not isinstance(mref, dict) or not mref.get("path") or not mref.get("sha256"):
             raise ValueError("cohort run is missing verifiable launch manifest reference")
+        if Path(mref["path"]).is_symlink():
+            raise ValueError("cohort launch manifest path cannot be a symlink")
         mpath = Path(mref["path"]).resolve(strict=True)
         if holdout.digest(mpath) != mref["sha256"]:
             raise ValueError(f"launch manifest digest mismatch for {row.get('experiment_id', row.get('family'))}")
         for ref_key, ref_val in refs.items():
             if ref_key == "validation_artifacts_count" or not isinstance(ref_val, dict):
                 continue
-            rpath = Path(ref_val["path"]).resolve(strict=True)
-            if holdout.digest(rpath) != ref_val["sha256"]:
+            ref_path_raw = ref_val.get("path")
+            ref_sha = ref_val.get("sha256")
+            if not isinstance(ref_path_raw, str) or not ref_path_raw or not isinstance(ref_sha, str) or not ref_sha:
+                raise ValueError(f"evidence artifact reference malformed ({ref_key}) in {row.get('experiment_id')}")
+            if Path(ref_path_raw).is_symlink():
+                raise ValueError(f"evidence artifact path cannot be a symlink ({ref_key})")
+            rpath = Path(ref_path_raw).resolve(strict=True)
+            if holdout.digest(rpath) != ref_sha:
                 raise ValueError(f"evidence artifact digest mismatch ({ref_key}) in {row.get('experiment_id')}")
         manifest_paths.append(mpath)
         unit_runs.append({
             "experiment_id": row["experiment_id"],
             "family": row["family"],
-            "seed": row["seed"],
-            "repetition": row["repetition"],
+            "seed": _strict_int(row["seed"], "run.seed"),
+            "repetition": _strict_int(row["repetition"], "run.repetition"),
             "manifest": str(mpath),
             "manifest_sha256": mref["sha256"],
         })
+
+    unit_runs_file = exp_path.parent / "unit-runs.json"
+    if unit_runs_file.is_symlink():
+        raise ValueError("unit-runs.json cannot be a symlink")
+    if unit_runs_file.is_file():
+        recorded_units_doc = json.loads(unit_runs_file.read_text(encoding="utf-8"))
+        recorded_units = recorded_units_doc.get("units") if isinstance(recorded_units_doc, dict) else None
+        if not isinstance(recorded_units, list):
+            raise ValueError("invalid unit-runs.json beside experiment manifest")
+        expected_recorded = {
+            row["experiment_id"]: {
+                "family": row["family"],
+                "seed": _strict_int(row["seed"], "unit_runs.seed"),
+                "repetition": _strict_int(row["repetition"], "unit_runs.repetition"),
+                "manifest": str(Path(row["manifest"]).resolve(strict=True)),
+                "manifest_sha256": row.get("manifest_sha256"),
+            }
+            for row in recorded_units
+        }
+        actual_reported = {
+            row["experiment_id"]: {
+                "family": row["family"],
+                "seed": _strict_int(row["seed"], "unit_runs.seed"),
+                "repetition": _strict_int(row["repetition"], "unit_runs.repetition"),
+                "manifest": row["manifest"],
+                "manifest_sha256": row["manifest_sha256"],
+            }
+            for row in unit_runs
+        }
+        if actual_reported != expected_recorded:
+            raise ValueError("cohort run manifests do not match executed unit-runs.json")
 
     reaudited = audit_cohort(
         data["label"],
         manifest_paths,
         expected_ceilings=data.get("ceilings"),
-        authorization=data.get("authorization"),
+        authorization=auth_block,
         experiment_manifest=exp_path,
         unit_runs=unit_runs,
         readonly=True,
-        created_at=data.get("created_at"),
+        created_at=created_at,
     )
-    immutable_keys = (
-        "ceilings", "families", "seeds_by_family", "repetitions", "models",
-        "positives", "negatives", "verified_findings", "recall", "false_positives",
-        "negative_coverage", "failed_run_rate", "requests_per_verified_finding",
-        "tokens_per_verified_finding", "usage", "funnel", "aggregate_status", "checks",
-        "fingerprints", "treatment", "acceptance_criteria", "acceptance",
-    )
-    for key in immutable_keys:
-        if reaudited.get(key) != data.get(key):
-            raise ValueError(f"cohort report field {key!r} does not match re-audited artifacts")
-    if reaudited["provenance"]["evidence_bundle_digest"] != provenance.get("evidence_bundle_digest"):
-        raise ValueError("cohort evidence bundle digest does not match re-audited artifacts")
+    if {k: v for k, v in data.items() if k != "report_digest"} != {
+        k: v for k, v in reaudited.items() if k != "report_digest"
+    }:
+        for key in reaudited:
+            if key == "report_digest":
+                continue
+            if reaudited.get(key) != data.get(key):
+                raise ValueError(f"cohort report field {key!r} does not match re-audited artifacts")
+        raise ValueError("cohort report contains unexpected fields not produced by re-audit")
     return reaudited
 
 
@@ -1543,7 +2568,10 @@ def reaudit_legacy_cohort(report_path: str | Path, *, label: str | None = None) 
     manifests/preflights. Never fabricates fingerprints or promotes a legacy report to
     strict_paired_eligible=True.
     """
-    source_path = Path(report_path).expanduser().resolve(strict=True)
+    raw_source_path = Path(report_path).expanduser()
+    if raw_source_path.is_symlink():
+        raise ValueError("legacy report path cannot be a symlink")
+    source_path = raw_source_path.resolve(strict=True)
     legacy = json.loads(source_path.read_text(encoding="utf-8"))
     if not isinstance(legacy, dict) or legacy.get("schema") != SCHEMA_COHORT:
         raise ValueError("expected a legacy full-agent-e6-cohort/1 report")
@@ -1555,23 +2583,33 @@ def reaudit_legacy_cohort(report_path: str | Path, *, label: str | None = None) 
     manifest_paths: list[Path] = []
     unit_runs: list[dict[str, Any]] = []
     for idx, row in enumerate(runs):
+        if not isinstance(row, dict):
+            raise ValueError(f"legacy cohort runs[{idx}] must be an object")
         refs = row.get("evidence_refs") or {}
+        if not isinstance(refs, dict):
+            raise ValueError(f"legacy cohort runs[{idx}].evidence_refs must be an object")
         mref = refs.get("manifest")
         if not isinstance(mref, dict) or not mref.get("path") or not mref.get("sha256"):
             raise ValueError("legacy run entry is missing launch manifest evidence reference")
-        mpath = Path(mref["path"]).resolve(strict=True)
+        raw_mpath = Path(mref["path"]).expanduser()
+        if raw_mpath.is_symlink():
+            raise ValueError("legacy launch manifest path cannot be a symlink")
+        mpath = raw_mpath.resolve(strict=True)
         if holdout.digest(mpath) != mref["sha256"]:
             raise ValueError(f"legacy launch manifest digest mismatch for {row.get('family')}:{row.get('seed')}")
         for ref_key, ref_val in refs.items():
             if ref_key == "validation_artifacts_count" or not isinstance(ref_val, dict):
                 continue
-            rpath = Path(ref_val["path"]).resolve(strict=True)
+            raw_rpath = Path(ref_val["path"]).expanduser()
+            if raw_rpath.is_symlink():
+                raise ValueError(f"legacy evidence artifact path cannot be a symlink ({ref_key})")
+            rpath = raw_rpath.resolve(strict=True)
             if holdout.digest(rpath) != ref_val["sha256"]:
                 raise ValueError(f"legacy evidence artifact digest mismatch ({ref_key})")
         manifest_paths.append(mpath)
-        rep = int(row.get("repetition", 1))
+        rep = _strict_int(row.get("repetition", 1), "legacy.repetition")
         family = row["family"]
-        seed = int(row["seed"])
+        seed = _strict_int(row.get("seed"), "legacy.seed")
         unit_runs.append({
             "experiment_id": row.get("experiment_id") or f"{family}:{seed}:rep{rep}",
             "family": family,
@@ -1591,12 +2629,58 @@ def reaudit_legacy_cohort(report_path: str | Path, *, label: str | None = None) 
         created_at=legacy.get("created_at"),
     )
     for key in (
-        "ceilings", "families", "positives", "negatives", "verified_findings",
+        "ceilings", "families", "models", "provider_kinds", "paid_provider_calls",
+        "positives", "negatives", "verified_findings",
         "recall", "false_positives", "negative_coverage", "failed_run_rate",
         "usage", "aggregate_status", "checks",
     ):
         if reaudited.get(key) != legacy.get(key):
             raise ValueError(f"legacy report field {key!r} does not match read-only re-audited artifacts")
+    for opt_key in (
+        "requests_per_verified_finding", "tokens_per_verified_finding", "paid_model_generalization",
+    ):
+        if opt_key in legacy and reaudited.get(opt_key) != legacy.get(opt_key):
+            raise ValueError(f"legacy report field {opt_key!r} does not match read-only re-audited artifacts")
+    if "per_family" in legacy:
+        legacy_pf = legacy.get("per_family")
+        if not isinstance(legacy_pf, dict) or set(legacy_pf) != set(reaudited["per_family"]):
+            raise ValueError("legacy report per_family keys do not match read-only re-audited artifacts")
+        for fam, fam_expected in reaudited["per_family"].items():
+            fam_actual = legacy_pf.get(fam)
+            if not isinstance(fam_actual, dict):
+                raise ValueError(f"legacy report per_family entry for {fam} is invalid")
+            for subkey in (
+                "recall", "negative_coverage", "false_positives",
+                "verified_findings", "failed", "closure_verified",
+                "http_requests", "tokens_used", "cost_usd",
+            ):
+                if fam_actual.get(subkey) != fam_expected.get(subkey):
+                    raise ValueError(
+                        f"legacy report per_family[{fam!r}][{subkey!r}] does not match read-only re-audited artifacts"
+                    )
+            for opt_subkey in (
+                "failed_runs", "run_count",
+                "requests_per_verified_finding", "tokens_per_verified_finding", "failure_reason",
+            ):
+                if opt_subkey in fam_actual and fam_actual.get(opt_subkey) != fam_expected.get(opt_subkey):
+                    raise ValueError(
+                        f"legacy report per_family[{fam!r}][{opt_subkey!r}] does not match read-only re-audited artifacts"
+                    )
+    if len(runs) != len(reaudited["runs"]):
+        raise ValueError("legacy report run count does not match read-only re-audited artifacts")
+    for idx, (legacy_row, expected_row) in enumerate(zip(runs, reaudited["runs"])):
+        if not isinstance(legacy_row, dict):
+            raise ValueError(f"legacy report runs[{idx}] is malformed")
+        for rkey in ("family", "seed", "status", "failed", "failure_reason", "closure_verified", "usage"):
+            if legacy_row.get(rkey) != expected_row.get(rkey):
+                raise ValueError(
+                    f"legacy report runs[{idx}].{rkey} does not match read-only re-audited artifacts"
+                )
+        for opt_rkey in ("recall", "negative_coverage", "false_positives", "verified_findings", "funnel"):
+            if opt_rkey in legacy_row and legacy_row.get(opt_rkey) != expected_row.get(opt_rkey):
+                raise ValueError(
+                    f"legacy report runs[{idx}].{opt_rkey} does not match read-only re-audited artifacts"
+                )
 
     unrecoverable_provenance = [
         "no_pre_execution_experiment_manifest",
@@ -1711,6 +2795,35 @@ def _build_funnel_comparison(b_funnel: dict[str, Any], a_funnel: dict[str, Any])
     return {"before": b_funnel, "after": a_funnel, "deltas": deltas}
 
 
+def _verify_legacy_derived_report(raw: dict[str, Any]) -> dict[str, Any]:
+    """Re-verify a saved legacy_derived report against its source report and re-audited archive."""
+    _verify_report_digest(raw)
+    src = raw.get("source_report")
+    if not isinstance(src, dict) or not src.get("path") or not src.get("sha256"):
+        raise ValueError("derived legacy report is missing source_report reference")
+    raw_src_path = Path(src["path"]).expanduser()
+    if raw_src_path.is_symlink():
+        raise ValueError("derived legacy report source_report path cannot be a symlink")
+    src_path = raw_src_path.resolve(strict=True)
+    if holdout.digest(src_path) != src["sha256"]:
+        raise ValueError("derived legacy report source_report digest mismatch")
+    recomputed = reaudit_legacy_cohort(src_path, label=raw.get("label"))
+    if set(raw) != set(recomputed):
+        raise ValueError("derived legacy report contains unexpected or missing top-level keys")
+    for key in (
+        "schema", "label", "created_at", "source_report", "authorization",
+        "ceilings", "families", "seeds_by_family", "repetitions", "models", "provider_kinds",
+        "paid_provider_calls", "positives", "negatives", "verified_findings", "recall",
+        "false_positives", "negative_coverage", "failed_run_rate", "requests_per_verified_finding",
+        "tokens_per_verified_finding", "usage", "funnel", "aggregate_status", "checks",
+        "paid_model_generalization", "per_family", "runs", "provenance", "not_tested_dimensions",
+        "unrecoverable_provenance", "fingerprints", "treatment", "acceptance_criteria", "acceptance",
+    ):
+        if raw.get(key) != recomputed.get(key):
+            raise ValueError(f"derived legacy report field {key!r} does not match re-audited legacy archive")
+    return recomputed
+
+
 def compare_cohorts(before: dict[str, Any] | str | Path,
                     after: dict[str, Any] | str | Path,
                     *, mode: str = "strict") -> dict[str, Any]:
@@ -1729,7 +2842,11 @@ def compare_cohorts(before: dict[str, Any] | str | Path,
 
     if raw_b.get("ceilings") is None or raw_b.get("ceilings") != raw_a.get("ceilings"):
         raise ValueError("before/after cohorts must share identical token, HTTP, and duration ceilings")
-    if set(raw_b.get("families", [])) != set(raw_a.get("families", [])) or len(raw_b["families"]) < MINIMUM_FAMILIES:
+    b_families = raw_b.get("families")
+    a_families = raw_a.get("families")
+    if (not isinstance(b_families, list) or not isinstance(a_families, list)
+            or len(set(b_families)) != len(b_families) or len(set(a_families)) != len(a_families)
+            or set(b_families) != set(a_families) or len(b_families) < MINIMUM_FAMILIES):
         raise ValueError("before/after cohorts must cover the same >=3 independent families")
     if mode == "strict":
         if _is_legacy_input(raw_b) or _is_legacy_input(raw_a):
@@ -1737,10 +2854,21 @@ def compare_cohorts(before: dict[str, Any] | str | Path,
                 "unverifiable or legacy cohort report cannot be used in strict paired comparison; "
                 "use mode='descriptive' after read-only legacy re-audit"
             )
-    for family in raw_b["families"]:
-        bf, af = raw_b["per_family"][family], raw_a["per_family"][family]
-        if (bf["recall"]["denominator"] != af["recall"]["denominator"]
-                or bf["negative_coverage"]["denominator"] != af["negative_coverage"]["denominator"]):
+    b_pf = raw_b.get("per_family")
+    a_pf = raw_a.get("per_family")
+    if not isinstance(b_pf, dict) or not isinstance(a_pf, dict):
+        raise ValueError("before/after cohorts are missing per_family breakdown")
+    for family in b_families:
+        bf, af = b_pf.get(family), a_pf.get(family)
+        if not isinstance(bf, dict) or not isinstance(af, dict):
+            raise ValueError(f"missing per_family entry for {family}")
+        b_recall, a_recall = bf.get("recall"), af.get("recall")
+        b_neg, a_neg = bf.get("negative_coverage"), af.get("negative_coverage")
+        if (not isinstance(b_recall, dict) or not isinstance(a_recall, dict)
+                or not isinstance(b_neg, dict) or not isinstance(a_neg, dict)):
+            raise ValueError(f"malformed per_family metrics for {family}")
+        if (b_recall.get("denominator") != a_recall.get("denominator")
+                or b_neg.get("denominator") != a_neg.get("denominator")):
             if mode == "strict":
                 raise ValueError(f"before/after positive/negative counts mismatch for {family}")
     if mode == "strict":
@@ -1748,8 +2876,7 @@ def compare_cohorts(before: dict[str, Any] | str | Path,
         a = _reaudit_cohort_report(raw_a)
     else:
         if raw_b.get("schema") == SCHEMA_LEGACY_DERIVED:
-            _verify_report_digest(raw_b)
-            b = reaudit_legacy_cohort(raw_b["source_report"]["path"], label=raw_b.get("label"))
+            b = _verify_legacy_derived_report(raw_b)
         elif _is_legacy_input(raw_b):
             if path_b is None:
                 raise ValueError("descriptive legacy re-audit requires a file path to cohort-report.json")
@@ -1758,8 +2885,7 @@ def compare_cohorts(before: dict[str, Any] | str | Path,
             b = _reaudit_cohort_report(raw_b)
 
         if raw_a.get("schema") == SCHEMA_LEGACY_DERIVED:
-            _verify_report_digest(raw_a)
-            a = reaudit_legacy_cohort(raw_a["source_report"]["path"], label=raw_a.get("label"))
+            a = _verify_legacy_derived_report(raw_a)
         elif _is_legacy_input(raw_a):
             if path_a is None:
                 raise ValueError("descriptive legacy re-audit requires a file path to cohort-report.json")
@@ -1767,8 +2893,10 @@ def compare_cohorts(before: dict[str, Any] | str | Path,
         else:
             a = _reaudit_cohort_report(raw_a)
 
-    b_units = {(r["family"], int(r["seed"]), int(r["repetition"])): r for r in b["runs"]}
-    a_units = {(r["family"], int(r["seed"]), int(r["repetition"])): r for r in a["runs"]}
+    b_units = {(r["family"], _strict_int(r.get("seed"), "before.seed"), _strict_int(r.get("repetition"), "before.repetition")): r for r in b["runs"]}
+    a_units = {(r["family"], _strict_int(r.get("seed"), "after.seed"), _strict_int(r.get("repetition"), "after.repetition")): r for r in a["runs"]}
+    if len(b_units) != len(b["runs"]) or len(a_units) != len(a["runs"]):
+        raise ValueError("duplicate (family, seed, repetition) unit in re-audited cohort runs")
     b_fp = b["fingerprints"]
     a_fp = a["fingerprints"]
     if b_fp["evaluator"] != a_fp["evaluator"]:
