@@ -269,7 +269,8 @@ yapıldığı doğrulandı.
 ### E6 — Bulgu gücünü gerçek modelle ölçme
 
 **Durum: gerçek model ölçümü ve ortak-tavan önce/sonra değerlendirmesi yapıldı
-(2026-11-14); bulgu gücü kabulü hâlâ açık.** Her iki canlı cohort da
+(2026-11-14 ve 2026-11-15); bulgu gücü kabulü hâlâ açık.** Hem ilk cohort hem
+P0/P1 birleşimi (`main@a385231`) sonrasındaki yeniden ölçüm cohort'u
 `aggregate_status: incomplete`, `paid_model_generalization: evaluated_incomplete`
 üretti. Ölçümün tamamlanması başarılı recall veya güvenlik kapsamı demek değildir.
 `scripts/full_agent_e6_benchmark.py`, `scripts/full_agent_holdout.py:audit_run_status`,
@@ -385,6 +386,53 @@ Kanıtlar repo dışında `/root/cco-work/wf-0c7324cc/` altında:
 audit üzerinden imza/hash referanslarını ve gerçek kullanım muhasebesini taşır.
 Son zorunlu doğrulama komutları/logları `final-verification/results.json` ve
 aynı dizindeki ayrı gate loglarında saklanır.
+
+#### Gerçek model yeniden ölçümü — 2026-11-15 (P0/P1 birleşimi sonrası, `main@a385231`)
+
+P0/P1 doğrulama hunisi ve açık proje/tip projeksiyonu düzeltmeleri `main` dalına
+(`a385231`) birleştirildikten sonra, güncel kaynaktan `0` LLM / `0` hedef isteğiyle
+yenilenen eşleştirilmiş manifest üzerinden
+([experiment-manifest.json](file:///root/cco-work/wf-eb9f69a9/live-e6-plan-v2/manifest/experiment-manifest.json))
+tek seferlik kullanıcı onaylı canlı koşu çalıştırıldı (`config/llm.json`,
+`meta/muse-spark-1.3-contributor`, `api.meta.ai`, anahtar yalnız çalışma anında
+bellekteki `META_API_KEY` üzerinden kullanıldı; `--execute --authorize-live-provider`).
+Aynı üç aile, aynı tohumlar (`readonly-api-access-control:314159`,
+`readonly-sql-injection:271828`, `readonly-template-injection:141421`), 1 tekrar ve
+seed başına `250 HTTP / 150000 token / 900 sn` ortak tavanı korundu; tüm hedefler
+host'un oluşturduğu salt-okunur loopback laboratuvarlarıydı.
+
+| Metrik | Önce (`e6-meta-before`, `be20099`) | Sonra (`e6-meta-after-v2`, `a385231`) |
+|---|---:|---:|
+| Recall (toplam) | `0/24` (%0) | `0/24` (%0 — API `0/8`, SQL `0/8`, SSTI `0/8`) |
+| False positives | `0/0` (`null` — oran bilinmiyor) | `0/0` (`null` — oran bilinmiyor) |
+| Negative coverage (toplam) | `0/24` (%0) | `0/24` (%0 — API `0/8`, SQL `0/8`, SSTI `0/8`) |
+| Failed run rate | `1/3` (%33,33) | `3/3` (%100,0 — `1.0`) |
+| Kapanış doğrulaması | SQL/SSTI `true`, API `false` | 3/3 `false` (`unresolved_tasks_remain_NOT_TESTED`) |
+| Requests / verified finding | `None` | `None` |
+| Tokens / verified finding | `None` | `None` |
+| Gerçek sağlayıcı çağrısı | `31` | `29` |
+| Gerçek hedef HTTP isteği | `31` (API `5`, SQL `13`, SSTI `13`) | `10` (API `6`, SQL `2`, SSTI `2`) |
+| Ölçülen toplam token | `91380` | `87992` (`72888` prompt + `15104` completion) |
+| Ölçülen çalışma süresi (s) | `249,016` | `173,541` |
+| USD maliyet | `None` | `None` (`unknown_cost_is_zero=false`) |
+| Doğrulama hunisi (`funnel`) | `missing_runtime_funnel_metrics` | `observed=0, eligible=0, admitted=0, executed=0, evidence_accepted=0` (`complete`) |
+
+**Ölçülen tanı ve hata nedenleri:**
+- **SSTI (`141421`) ve SQLi (`271828`):** Model `recon-1` içinde `kali-tools_curl_request` ile `/` sayfasını aldıktan sonra `enum-2` aşamasında crawler/keşif isteği yapmak yerine arşivlenen ilk sonucu aynı `offset=0` parametresiyle defalarca `read_artifact` üzerinden okumaya takıldı (`archive_read_no_progress`, sırasıyla `2` ve `4` olay). Motorun fail-closed ilerleme kilidi ek token israfını durdurdu (`enum-2` blocked → `access-3` ve `report-4` blocked, `task_incomplete_or_indeterminate_no_replay`).
+- **API erişim kontrolü (`314159`):** Model `enum-2` içinde route/yüzey gözlemi üretmeden `validator_session_vault_check` ve `kali-tools_ledger_prepare_handoff` çağrılarıyla `enum-2`'yi tamamladı (`observed=0`); bu nedenle `access-3` aşaması beklenen şekilde `missing_declared_upstream_observations` önkoşul kapısıyla bloklandı.
+- **Karşılaştırma kapısı:** `compare --mode strict` tarihi `e6-meta-before` raporunu eşleştirilmiş manifest/huni eksikliği nedeniyle reddetti (`exit 2`, `strict_paired_eligible: false`). `compare --mode descriptive` (`legacy-before.json` vs `cohort/cohort-report.json`) delta'ları dürüstçe raporladı (`recall` delta `0.0`, `negative_coverage` delta `0.0`, `failed_run_rate` delta `+0.6667`, `http_requests` delta `-21`, `tokens_used` delta `-3388`). Not: `benchmark audit` tarafından üretilen ham çıktı `authorization: null` yazdığı için uzak kohort kıyaslamasında yetkilendirme üstverisi `cohort/cohort-report.json` üzerinden doğrulandı.
+
+**Kalan `NOT TESTED` sınırları:** `readonly_get_only`,
+`synthetic_fixture_boundaries`, `out_of_band_and_multi_step_business_logic`,
+`incomplete_run_before_closure`, `missed_positive_controls`,
+`untested_negative_controls`, `multi_seed_generalization`,
+`multi_repetition_stability`, `paired_pre_execution_manifest`,
+`non_strict_descriptive_comparison`. Kabul kriterlerinin tamamı (recall ≥ 0.7, aile recall ≥ 0.5, negatif kapsam ≥ 0.9, `failed_run_rate == 0.0`, kapanış doğrulaması) açık kalmaya devam eder; otomatik ücretli tekrar çalıştırılmadı.
+
+Dış kanıtlar: `/root/cco-work/wf-eb9f69a9/live-e6-plan-v2/` ve
+`/root/cco-work/wf-eb9f69a9/e6-meta-after-v2/` (`cohort/cohort-report.json`,
+`reaudit/cohort-report.json`, `descriptive-comparison/comparison.json`,
+`logs/live-cohort.log`).
 
 ### E7 — Ortak modüllerde kalan tarihsel native kod
 

@@ -13,7 +13,10 @@ import termios
 import time
 from pathlib import Path
 
-import paramiko
+try:
+    import paramiko
+except ImportError:  # pragma: no cover - optional SSH probe dependency
+    paramiko = None  # type: ignore[assignment]
 
 import meta_functional_probe as meta
 
@@ -59,11 +62,19 @@ def hidden_input(label: str) -> str:
     return value
 
 
-class PinnedHostKey(paramiko.MissingHostKeyPolicy):
+_HOST_KEY_BASE = paramiko.MissingHostKeyPolicy if paramiko is not None else object
+_SSH_EXCEPTIONS: tuple[type[BaseException], ...] = (
+    (paramiko.SSHException,) if paramiko is not None else ()
+)
+
+
+class PinnedHostKey(_HOST_KEY_BASE):
     def __init__(self, path: Path):
         self.pin = json.loads(path.read_text())
 
     def missing_host_key(self, client, hostname, key):
+        if paramiko is None:
+            raise RuntimeError("paramiko is required for SSH host key verification.")
         if (hostname != HOST or key.get_name() != self.pin["algorithm"]
                 or base64.b64encode(key.asbytes()).decode() != self.pin["public_key"]):
             raise paramiko.SSHException("Previously pinned SSH host key does not match.")
@@ -72,6 +83,8 @@ class PinnedHostKey(paramiko.MissingHostKeyPolicy):
 
 class LabSSH:
     def __init__(self, directory: Path, password: str):
+        if paramiko is None:
+            raise RuntimeError("paramiko is required for LabSSH.")
         self.directory = directory
         self.password = password
         self.client = paramiko.SSHClient()
@@ -392,7 +405,7 @@ def main() -> int:
             measurement = Measurement(provider, worker, args.transient_only)
             measurement.run()
     except (meta.ProbeStopped, RuntimeError, OSError, ValueError, KeyError, TypeError,
-            paramiko.SSHException, KeyboardInterrupt) as exc:
+            *_SSH_EXCEPTIONS, KeyboardInterrupt) as exc:
         stopped = type(exc).__name__ + ": " + str(exc)
     finally:
         password = ""

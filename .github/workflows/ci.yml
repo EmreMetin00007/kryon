@@ -23,6 +23,9 @@ jobs:
           python -m pip install --require-hashes -r requirements.lock
           python -m pip install --no-deps --no-build-isolation -e .
 
+      - name: Install Playwright Chromium browser
+        run: python -m playwright install --with-deps chromium
+
       - name: Validate dependency lock
         run: python3 scripts/release_artifacts.py check-lock
 
@@ -41,9 +44,10 @@ jobs:
       - name: Run unit tests (coverage)
         env:
           CCO_GRAPH_BACKEND: networkx
+          COVERAGE_FILE: /tmp/.coverage-ci
         run: |
-          coverage run -m pytest tests -q
-          coverage report --include="scripts/policy_engine.py,scripts/campaign_runtime.py,mcp-servers/mcp-validator/cco_validator_core/*,mcp-servers/mcp-hunter/cco_hunter_core/*,mcp-servers/mcp-reasoning/cco_reasoning_core/*" | tee coverage-core.txt
+          coverage run -m pytest tests -q -m "not integration"
+          coverage report --include="scripts/policy_engine.py,scripts/campaign_runtime.py,mcp-servers/mcp-validator/cco_validator_core/*,mcp-servers/mcp-hunter/cco_hunter_core/*,mcp-servers/mcp-reasoning/cco_reasoning_core/*" | tee /tmp/coverage-core.txt
 
       - name: Run loopback lab validation
         env:
