@@ -22,10 +22,11 @@ from test_full_agent_preflight import mock_provider
 FROZEN = json.loads((Path(__file__).parent / "fixtures/python_runtime_replay/observations.json").read_text())
 
 
-def observe(broker, solver, source, records, *, gaps=()):
+def observe(broker, solver, source, records, *, gaps=(), identity=None):
     value = {"records": records, "coverage_gaps": list(gaps)}
     view = broker.view(value)
-    broker.results.append({"spec_id": source.id, "tool": CRAWL_TOOL, "arguments": {"target": source.target}, **view})
+    args = {"target": source.target, **({"identity": identity} if identity is not None else {})}
+    broker.results.append({"spec_id": source.id, "tool": CRAWL_TOOL, "arguments": args, **view})
     solver.summaries[source.id] = solver.compile_summary(source, terminal(source))
     return view["content_ref"]
 
@@ -350,7 +351,7 @@ def test_authenticated_parameters_require_synthetic_owned_refs(python_broker, ch
     broker.tasks.bindings = {"owned": {"target": spec.target, "role": "member", "test_data_only": True,
                                       "owned_objects_private": True, **change}}
     solver = PythonSolver(broker, model="model")
-    observe(broker, solver, source, [{"url": "/search?term=hello"}])
+    observe(broker, solver, source, [{"url": "/search?term=hello"}], identity="owned")
     rows = solver.plan_candidates(spec)
     assert len(rows) == 2 and all(not row["eligible"] for row in rows)
     assert {row["reason_code"] for row in rows} == {"missing_synthetic_owned_session_prerequisite"}
@@ -516,7 +517,7 @@ def test_real_catalog_and_candidate_cards_fit_offline_byte_fallback(python_broke
                                   "owned_objects_private": True} for name, role in (
         ("admin-a", "admin"), ("member-a", "member"), ("member-b", "member"))}
     solver = PythonSolver(broker, model="model")
-    observe(broker, solver, source, [{"url": f"/catalog/{number}?q=1"} for number in range(20)])
+    observe(broker, solver, source, [{"url": f"/catalog/{number}?q=1"} for number in range(20)], identity="member-a")
     context = solver.context(spec)
     assert context["candidate_cards"] and context["candidate_count"] == 41
     parameter = next(row for row in solver.plan_candidates(spec) if row["param"])
@@ -609,7 +610,7 @@ def test_host_stale_session_observation_blocks_repeats_until_primary_refresh(pyt
                                    "owned_objects_private": True} for name in ("first", "second")}
     broker.catalog["validator"].append({"name": "session_vault_check", "inputSchema": {"type": "object"}})
     solver = PythonSolver(broker, model="model")
-    observe(broker, solver, source, [{"url": "/search?q=1"}, {"url": "/render?name=hello"}])
+    observe(broker, solver, source, [{"url": "/search?q=1"}, {"url": "/render?name=hello"}], identity="first")
     broker.tasks.active_spec = spec
     monkeypatch.setattr(broker, "_check_handoff", lambda _spec: None)
     monkeypatch.setattr(solver, "wait_access_rate_window", lambda _spec: pytest.fail("known stale session cannot be retried"))

@@ -679,7 +679,7 @@ def test_native_v2_system_boilerplate_compacts_without_touching_policy_or_user_m
 
 
 def test_native_v2_write_result_projects_to_positive_saved_bytes_and_strips_v2_wire_bloat(tmp_path, monkeypatch):
-    broker = _compat_broker(tmp_path)
+    broker = _compat_broker(tmp_path, tokens=150000)
     recon_spec = next(spec for spec in broker.tasks.specs if spec.id == "recon-1")
     res = broker.gate({
         "tool": "subagent",

@@ -8,9 +8,11 @@ import io
 import json
 import math
 import re
+import sqlite3
 import sys
 import time
 import uuid
+from datetime import datetime, timedelta, timezone
 from itertools import combinations
 from pathlib import Path
 from typing import Any
@@ -52,9 +54,31 @@ Archive references preserve earlier observations and incomplete work.
 class WorkflowError(ValueError):
     """Stable protocol failure codes, without provider/credential text."""
 
-    def __init__(self, code, *, errors=None, summary_ref=None):
+    def __init__(self, code, *, errors=None, summary_ref=None, schema_diagnostic=None):
         super().__init__(code.replace("_", " "))
         self.code, self.errors, self.summary_ref = code, errors, summary_ref
+        self.schema_diagnostic = schema_diagnostic
+
+
+def _safe_schema_diagnostic(tool_name: str, args: Any, exc: Exception) -> dict[str, Any]:
+    """Return value-free schema rejection metadata without argument values or credentials."""
+    is_unresolvable = isinstance(exc, Unresolvable)
+    raw_path = () if is_unresolvable else (getattr(exc, "path", ()) or ())
+    raw_schema_path = () if is_unresolvable else (getattr(exc, "schema_path", ()) or ())
+    validator = (
+        "unresolvable_ref"
+        if is_unresolvable
+        else str(getattr(exc, "validator", None) or type(exc).__name__)
+    )
+    return {
+        "tool": str(tool_name),
+        "validator": validator,
+        "path": [item if isinstance(item, int) and not isinstance(item, bool) else str(item) for item in raw_path],
+        "schema_path": [
+            item if isinstance(item, int) and not isinstance(item, bool) else str(item) for item in raw_schema_path
+        ],
+        "argument_keys": sorted(str(key) for key in args.keys()) if isinstance(args, dict) else [],
+    }
 
 
 class PythonSolver:
@@ -123,6 +147,7 @@ class PythonSolver:
         if not self._checkpoint_active:
             return
         from evidence_trust import atomic_write
+        from python_identity_discovery import checkpoint_context, checkpoint_evidence
         broker, budget, policy = self.broker, self.broker.budget, self.broker.runtime_policy
         if self.authorization_context() != self._authorization_context:
             raise ValueError('workflow authorization context changed')
@@ -133,7 +158,10 @@ class PythonSolver:
                  'access_dispatches': sorted(self.access_dispatches),
                  'batches_by_task': self.batches_by_task, 'candidates_by_task': self.candidates_by_task,
                  'coverage_gaps': self.coverage_gaps, 'branch_handoffs': broker.branch_handoffs,
-                 'read_progress': broker.read_progress,
+                  'read_progress': broker.read_progress,
+                  # HOST-PRIVATE signed/hash-bound state; never a model archive.
+                  'private_discovery_sources': broker.private_discovery_sources,
+                  'private_discovery_context': checkpoint_context() if broker.private_discovery_sources else {},
                  'policy': {key: (sorted(value) if isinstance(value, set) else value)
                             for key, value in vars(policy).items()
                             if key not in {'budget', 'tool_failures'}},
@@ -154,6 +182,7 @@ class PythonSolver:
         paths.update((broker.workdir / 'validator-artifacts').glob('*.json'))
         paths.update((broker.private / 'state' / 'validations').rglob('*.json'))
         paths.update(Path(row['artifact']) for row in broker.tools)
+        paths.update(checkpoint_evidence(broker, broker.private_discovery_sources))
         import attempt_ledger
         ledger = attempt_ledger.ledger_path(broker.workdir)
         if ledger.exists():
@@ -193,6 +222,10 @@ class PythonSolver:
         self.coverage_gaps = state.get('coverage_gaps', {})
         self.broker.branch_handoffs = state.get('branch_handoffs', {})
         self.broker.read_progress = state.get('read_progress', {})
+        from python_identity_discovery import restore_checkpoint_sources
+        self.broker.private_discovery_sources = restore_checkpoint_sources(
+            self.broker, state.get('private_discovery_sources', {}), state.get('private_discovery_context', {}),
+            {self.broker.workdir.parent / ref['path'] for ref in payload['evidence']})
         policy = self.broker.runtime_policy
         for key, value in state['policy'].items():
             setattr(policy, key, set(value) if isinstance(getattr(policy, key), set) else value)
@@ -434,6 +467,29 @@ class PythonSolver:
                     return args.get(key, {"method": "GET", "carrier": "query", "blind_discovery": False}.get(key)) == expected.get(key, {"method": "GET", "carrier": "query", "blind_discovery": False}.get(key))
                 if all(equal(key) for key in fields):
                     row.update(admitted=True, executed=True)
+                elif row["param"] and row["tool"] == "hunter_run_web_loop":
+                    result = ((receipt.get("execution") or {}).get("result") or {}).get("output")
+                    if isinstance(result, str):
+                        try:
+                            result = json.loads(result)
+                        except ValueError:
+                            result = None
+                    if isinstance(result, dict) and str(execution["artifact"]) in getattr(self.broker, "private_discovery_sources", {}):
+                        try:
+                            result = self.broker.private_discovery_report_for_execution(spec, execution["artifact"], result)
+                        except (ValueError, OSError, TypeError, KeyError):
+                            continue
+                    if isinstance(result, dict) and args.get("validation_profile") == expected.get("validation_profile") and equal("session_bindings"):
+                        def leaf(item):
+                            return (isinstance(item, dict) and item.get("url") == row["route"]
+                                    and item.get("param") == row["param"] and item.get("method") == "GET"
+                                    and item.get("carrier") == "query")
+                        if any(leaf(item) for item in result.get("validation_queue", [])):
+                            # A queue can outlive an interrupted validator. Keep
+                            # its intent without claiming execution or replaying.
+                            row.update(admitted=True, dispatch_started=True)
+                        if any(leaf(item) for item in result.get("validations", [])):
+                            row.update(admitted=True, executed=True)
             accepted = []
             if row["vector"] == "access-idor":
                 batch: dict[str, Any] = next((batch for batch in self.batches_by_task.get(spec.id, [])
@@ -449,8 +505,9 @@ class PythonSolver:
                     and item.get("execution_context", item["record"].get("execution_context", {})).get("param") == row["param"]
                     and item.get("execution_context", item["record"].get("execution_context", {})).get("method") == "GET"
                     and item.get("execution_context", item["record"].get("execution_context", {})).get("carrier") == "query"
-                    and (row["identity_ref"] == "anon" and item.get("execution_context", item["record"].get("execution_context", {})).get("identity", "anon") in {"anon", "anonymous"}
-                         or isinstance(row["identity_ref"], list) and item.get("execution_context", item["record"].get("execution_context", {})).get("identity") in row["identity_ref"])]
+                     and (isinstance(row["identity_ref"], str) and (row["identity_ref"] == "anon" and item.get("execution_context", item["record"].get("execution_context", {})).get("identity", "anon") in {"anon", "anonymous"}
+                          or row["identity_ref"] != "anon" and item.get("execution_context", item["record"].get("execution_context", {})).get("identity") == row["identity_ref"])
+                          or isinstance(row["identity_ref"], list) and item.get("execution_context", item["record"].get("execution_context", {})).get("identity") in row["identity_ref"])]
             row["evidence_accepted"] = bool(accepted)
             if accepted:
                 row.update(admitted=True, executed=True, validation_state="TESTED", reason_code="",
@@ -590,32 +647,157 @@ class PythonSolver:
             if supplied != bindings:
                 continue
             report = self.broker.read_reference(row["content_ref"])
+            sealed_report = False
+            if hasattr(self.broker, "private_discovery_report"):
+                try:
+                    report = self.broker.private_discovery_report(spec, row["content_ref"])
+                    sealed_report = True
+                except ValueError:
+                    if getattr(self.broker, "private_discovery_sources", None):
+                        continue
             discovery = report.get("identity_discovery", {})
             if (not report.get("ok") or discovery.get("status") != "ready" or discovery.get("reasons")
                     or discovery.get("budget_limited") or report.get("errors")):
                 continue
             queue = report.get("validation_queue", [])
             validations = report.get("validations", [])
-            def key(item):
-                return tuple(item.get(name) for name in ("url", "method", "vuln_class", "operation_id",
+            use_url_digest = not sealed_report and any(isinstance(item, dict) and "url_sha256" in item for item in queue)
+            def key(item, *, include_digest=use_url_digest):
+                fields = ("url", "url_sha256") if include_digest else ("url",)
+                return tuple(item.get(name) for name in (*fields, "method", "vuln_class", "operation_id",
                                                          "resource_owner", "identity"))
-            completed = {key(item) for item in validations
-                         if item.get("validation_id") in trusted
-                         and trusted[item["validation_id"]]["target"] == item.get("url")
-                         and key(trusted[item["validation_id"]].get("execution_context", {})) == key(item)}
-            if (queue and {item.get("resource_owner") for item in queue} == set(bindings)
-                    and all({item.get("resource_owner"), item.get("identity")} == set(bindings) for item in queue)
+            def matches_trusted(item):
+                from python_identity_discovery import public_export
+                vid = item.get("validation_id")
+                record = trusted.get(vid)
+                if record is not None:
+                    ctx = record.get("execution_context", {})
+                    if record["target"] == item.get("url") and key(ctx, include_digest=False) == key(item, include_digest=False):
+                        return True
+                elif not sealed_report and not getattr(self.broker, "private_discovery_sources", None):
+                    record = next((candidate for candidate_id, candidate in trusted.items()
+                                   if public_export({"validation_queue": [], "validation_id": candidate_id})["validation_id"] == vid), None)
+                if (record is not None and not sealed_report
+                        and not getattr(self.broker, "private_discovery_sources", None)
+                        and isinstance(item.get("url_sha256"), str)
+                        and hashlib.sha256(str(record["target"]).encode()).hexdigest() == item["url_sha256"]):
+                    ctx = record.get("execution_context", {})
+                    if public_export({"validation_queue": [], "url": record["target"]})["url"] != item.get("url"):
+                        return False
+                    public_ctx = public_export({"validation_queue": [], **ctx, "url": ctx.get("url", record["target"])})
+                    return key(public_ctx, include_digest=True) == key(item, include_digest=True)
+                return False
+            completed = {key(item) for item in validations if matches_trusted(item)}
+            expected_bindings = set(bindings)
+            if not sealed_report and not getattr(self.broker, "private_discovery_sources", None):
+                from python_identity_discovery import public_export
+                expected_bindings = {public_export({"validation_queue": [], "resource_owner": name})["resource_owner"]
+                                     for name in bindings}
+            if (queue and {item.get("resource_owner") for item in queue} == expected_bindings
+                    and all({item.get("resource_owner"), item.get("identity")} == expected_bindings for item in queue)
                     and all(key(item) in completed for item in queue)):
                 return True
         return False
 
+    def _engine_utc_now(self) -> datetime:
+        engine = self.broker.engine
+        module = sys.modules.get(type(engine).__module__)
+        utc_now = getattr(module, "_utc_now", None) if module is not None else None
+        if callable(utc_now):
+            now = utc_now()
+            if isinstance(now, datetime):
+                return now if now.tzinfo is not None else now.replace(tzinfo=timezone.utc)
+        return datetime.now(timezone.utc)
+
+    def _tool_rate_block_wait_seconds(self, tool_name: str, conn: Any, now_utc: datetime,
+                                      needed_weight: int | None = None) -> float:
+        """Return remaining window seconds before a blocked rate-limit key can accept weight."""
+        engine = self.broker.engine
+        window_seconds, max_calls = engine._rate_limit_for(tool_name)
+        window_seconds = max(0, int(window_seconds))
+        max_calls = max(0, int(max_calls))
+        if window_seconds <= 0:
+            return 0.0
+        cap = engine.tool_capability(tool_name) if callable(getattr(engine, "tool_capability", None)) else {}
+        default_weight = max(1, int((cap or {}).get("request_multiplier") or 1))
+        if needed_weight is None:
+            needed_weight = default_weight
+        else:
+            needed_weight = max(default_weight, min(max_calls, int(needed_weight)) if max_calls > 0 else int(needed_weight))
+        cutoff = (now_utc - timedelta(seconds=window_seconds)).isoformat()
+        try:
+            rows = conn.execute(
+                "SELECT timestamp, weight FROM rate_limit_reservations "
+                "WHERE tool_name=? AND timestamp>? ORDER BY timestamp ASC, id ASC",
+                (tool_name, cutoff),
+            ).fetchall()
+        except sqlite3.OperationalError:
+            return 0.0
+        used = sum(int(weight) for _, weight in rows)
+        if not rows or used + needed_weight <= max_calls:
+            return 0.0
+        target_used = max(0, max_calls - needed_weight)
+        wait_until: datetime | None = None
+        for ts_text, weight in rows:
+            used -= int(weight)
+            parsed_ts = datetime.fromisoformat(str(ts_text))
+            if parsed_ts.tzinfo is None:
+                parsed_ts = parsed_ts.replace(tzinfo=timezone.utc)
+            wait_until = parsed_ts + timedelta(seconds=window_seconds)
+            if used <= target_used:
+                break
+        if wait_until is None:
+            return 0.0
+        return max(0.0, float((wait_until - now_utc).total_seconds()))
+
+    def _blocking_rate_wait_seconds(self, spec: TaskSpec) -> float:
+        """Wait only for the remaining window of actually blocking rate-limit keys."""
+        default_tools = (
+            "hunter_run_web_loop",
+            "validator_validate_idor",
+            "validator_validate_auth_bypass",
+            "kali-tools_curl_request",
+            "kali-tools_discover_web_surface",
+        )
+        pending_tools = getattr(self, "_pending_rate_tools", None)
+        pending_entry = pending_tools.get(spec.id) if isinstance(pending_tools, dict) else None
+        if isinstance(pending_entry, tuple):
+            pending_tool, pending_weight = pending_entry
+            check_specs: tuple[tuple[str, int | None], ...] = ((pending_tool, pending_weight),)
+        elif isinstance(pending_entry, str) and pending_entry:
+            check_specs = ((pending_entry, None),)
+        else:
+            check_specs = tuple((tool, None) for tool in default_tools)
+        engine = self.broker.engine
+        connect = getattr(engine, "_connect", None)
+        audit_db = getattr(engine, "audit_db", None)
+        if not callable(connect) and not audit_db:
+            return float(max(engine._rate_limit_for(tool)[0] for tool, _ in check_specs))
+        conn = connect() if callable(connect) else sqlite3.connect(str(audit_db))
+        try:
+            now_utc = self._engine_utc_now()
+            return max(
+                (self._tool_rate_block_wait_seconds(tool, conn, now_utc, weight) for tool, weight in check_specs),
+                default=0.0,
+            )
+        finally:
+            conn.close()
+
     def wait_access_rate_window(self, spec):
-        """Let existing request reservations expire without changing rate policy."""
-        tools = ("hunter_run_web_loop", "validator_validate_idor", "validator_validate_auth_bypass",
-                 "kali-tools_curl_request", "kali-tools_discover_web_surface")
-        seconds = max(self.broker.engine._rate_limit_for(tool)[0] for tool in tools)
+        """Let actually blocking request reservations expire without changing rate policy."""
+        seconds = self._blocking_rate_wait_seconds(spec)
         start = self.broker.budget.clock()
         self.broker._require_open()
+        waited_map = getattr(self, "_last_rate_wait_elapsed", None)
+        if not isinstance(waited_map, dict):
+            waited_map = {}
+            self._last_rate_wait_elapsed = waited_map
+        if seconds <= 0:
+            waited_map[spec.id] = False
+            view = self.broker.view({"status": "rate_window_elapsed", "window_seconds": 0, "elapsed_seconds": 0})
+            self.broker.results.append({"spec_id": spec.id, "tool": "host_access_backoff", "arguments": {}, **view})
+            dump(self.broker.private / "python-tool-results.json", self.broker.results)
+            return True
         if self.broker.budget.remaining_seconds() <= seconds:
             return False
         deadline = start + seconds
@@ -624,10 +806,63 @@ class PythonSolver:
             self.broker._require_open()
             if not self.broker.budget.remaining_seconds():
                 raise BudgetError("wall clock budget exhausted")
+        waited_map[spec.id] = True
         view = self.broker.view({"status": "rate_window_elapsed", "window_seconds": seconds,
                                  "elapsed_seconds": self.broker.budget.clock() - start})
         self.broker.results.append({"spec_id": spec.id, "tool": "host_access_backoff", "arguments": {}, **view})
         dump(self.broker.private / "python-tool-results.json", self.broker.results)
+        return True
+
+    def refresh_expiring_access_sessions(self, spec, row, *, rate_window_elapsed=False):
+        """Recheck due bound identities, never extend or infer vault freshness."""
+        # Only scheduled capabilities need freshness. Parameter candidates bind
+        # their observed identity (or none for public routes), not the vault.
+        if row.get("vector") not in {"access-idor", *(value[0] for value in PROFILES.values())}:
+            return True
+        bindings = json.loads(row["arguments"].get("session_bindings", "{}"))
+        sources = {spec.id, *upstream_ids(spec, self.broker.tasks.specs)}
+        due = []
+        now = time.time()
+        # Reserve only a still-pending request window before the unchanged
+        # 300-second expiry. Host continuation already waited before this call;
+        # counting that window again spends redundant checks on fresh sessions.
+        # This estimate selects checks; per-request vault guards grant authority.
+        window = 0 if rate_window_elapsed else self.broker.engine._rate_limit_for("hunter_run_web_loop")[0]
+        for identity in bindings:
+            previous = next((item for item in reversed(self.broker.results)
+                if item["spec_id"] in sources and item["tool"] == SESSION_CHECK_TOOL
+                and item["arguments"] == {"target": spec.target, "identity": identity}), None)
+            if previous is None:
+                # No check history is not evidence of freshness. Hunter still
+                # enforces the vault and session guard at execution time.
+                continue
+            value = self.broker.read_reference(previous["content_ref"])
+            if not isinstance(value, dict) or value.get("status") != "fresh":
+                self.add_gap(spec, "session_not_recently_verified", row=row)
+                return False
+            checked = previous.get("session_check_observed_at")
+            if (type(checked) not in (int, float) or not math.isfinite(checked)
+                    or checked > now or now - checked >= max(0, 300 - window)):
+                due.append({"target": spec.target, "identity": identity})
+        if not due:
+            return True
+        policy = self.broker.runtime_policy
+        if SESSION_CHECK_TOOL not in policy.allowed_tools(spec) or policy.tool_allowance(spec) < len(due) + 1:
+            self.add_gap(spec, "session_refresh_unavailable_or_budget_exhausted", "admission_budget", row)
+            return False
+        for args in due:
+            try:
+                view = self.broker.invoke(SESSION_CHECK_TOOL, args)
+            except BudgetError:
+                raise
+            except ValueError:
+                self.add_gap(spec, "session_refresh_denied", row=row)
+                return False
+            value = self.broker.read_reference(view["content_ref"])
+            if (not isinstance(value, dict) or value.get("status") != "fresh"
+                    or value.get("error") or value.get("execution_failed")):
+                self.add_gap(spec, "session_refresh_failed", row=row)
+                return False
         return True
 
     def tool_schemas(self, spec):
@@ -745,6 +980,13 @@ class PythonSolver:
             self.broker.tasks.bindings[item["identity"]].items()
             if key in {"target", "role", "test_data_only", "owned_objects_private"}}
             for item in self.broker.session_checks(spec)}
+        if candidates and not any(row["vector"] == "access-idor" for row in candidates):
+            request_bindings = [json.loads(row["arguments"].get("session_bindings", "{}"))
+                                for row in candidates if row["eligible"]]
+            if request_bindings and all(binding == request_bindings[0] for binding in request_bindings):
+                # A parameter-only turn advertises its actual request context,
+                # not unrelated registered identities or credentials.
+                context["session_bindings"] = request_bindings[0]
         # TaskSpec commands contain legacy helper instructions; use the phase
         # goals while keeping the immutable spec available to the host.
         context["task_spec"] = {key: value for key, value in context["task_spec"].items()
@@ -830,10 +1072,15 @@ class PythonSolver:
                 reason, params, query = str(exc), [], {}
             names = {item["name"] for item in params}
             params.extend({"name": key, "in": "query", "sample": val} for key, val in query.items() if key not in names)
+            has_identity = "identity_ref" in record or "identity" in record or "identity" in args
+            identity = record.get("identity_ref", record.get("identity", args.get("identity")))
+            if not has_identity and "url" in args and not args.get("cookie") and not args.get("headers"):
+                identity = "anon"
+                has_identity = True
             output.append({"url": url, "method": record.get("method", "GET"), "params": params,
-                           "candidate_reason": reason,
-                           "identity_ref": record.get("identity_ref", record.get("identity", args.get("identity", "anon"))),
-                            "source_artifact": ref["path"], "source_sha256": ref["sha256"]})
+                            "candidate_reason": reason,
+                            **({"identity_ref": identity} if has_identity else {}),
+                             "source_artifact": ref["path"], "source_sha256": ref["sha256"]})
         return [json.loads(raw) for raw in dict.fromkeys(provider_json(row).decode() for row in output)]
 
     def compile_summary(self, spec, submitted):
@@ -1022,18 +1269,146 @@ class PythonSolver:
         summary["coverage_gaps"] = dedup_gaps([*inherited_gaps, *self.coverage_gaps.get(spec.id, [])])
         return summary
 
+    def deterministic_unaccepted_slice(self, spec, candidate):
+        """One host validation may follow a measured, completed model attempt.
+
+        Unknown dispatches/reservations and host attempts are never replayed.
+        This only selects work; current prerequisites/admission still apply.
+        """
+        if candidate.get("dispatch_started") or candidate["evidence_accepted"]:
+            return False
+        for execution in reversed(self.broker.tools):
+            if (execution.get("task_spec_id") != spec.id or execution.get("origin") != "solver"
+                    or execution["tool"] != candidate["tool"]):
+                continue
+            receipt = json.loads(Path(execution["artifact"]).read_bytes())
+            result = receipt.get("execution")
+            if receipt.get("arguments") != candidate["arguments"]:
+                continue
+            if (receipt.get("error") or not isinstance(result, dict) or result.get("execution_failed")
+                    or type(result.get("actual_request_cost")) is not int or result["actual_request_cost"] < 0):
+                return False
+            value = result.get("result", {}).get("output")
+            if isinstance(value, str):
+                try:
+                    value = json.loads(value)
+                except ValueError:
+                    return False
+            if not isinstance(value, dict):
+                return False
+            if (value.get("ok") is False or value.get("stopped") or value.get("errors")
+                    or value.get("identity_discovery", {}).get("status") == "blocked"):
+                return False
+            ids = {item.get("validation_id") for item in [value, *(value.get("validations") or [])]
+                   if isinstance(item, dict)}
+            if any(item["record"]["validation_id"] in ids for item in self.broker.validation_attempts(spec)):
+                # Partial accepted work is not a reason to blindly repeat the
+                # entire slice; retain the remaining coverage gap instead.
+                return False
+            return any(row["spec_id"] == spec.id and row["tool"] == candidate["tool"]
+                       and row["arguments"] == candidate["arguments"]
+                       and self.broker.read_reference(row["content_ref"]) == value for row in self.broker.results)
+        return False
+
+    def parameter_slice(self, spec, candidates, target, profile):
+        """Coalesce an observed GET index into Hunter's bounded profile slice.
+
+        Leaf candidates retain their own provenance and signed outcomes. An
+        index is a scheduling pointer, never evidence that its descendants ran.
+        """
+        if profile not in PROFILES or spec.references or spec.compiled_workflows:
+            return None
+        parsed = urlsplit(target)
+        records = self.discovery(spec)["records"]
+        if (parsed.query or parsed.fragment or target not in {spec.target, *(
+                r["url"] for r in records if r.get("method") == "GET" and not r.get("params"))}):
+            return None
+        def below(row):
+            url = urlsplit(row["route"])
+            prefix = parsed.path.rstrip("/")
+            return ((url.scheme, url.netloc) == (parsed.scheme, parsed.netloc)
+                    and (url.path == prefix or url.path.startswith(prefix + "/")))
+        rows = [row for row in candidates if below(row) and row["arguments"].get("validation_profile") == profile]
+        if (not rows or any(not row["eligible"] or row["executed"] and not row["evidence_accepted"]
+                            or row.get("dispatch_started") and not row["evidence_accepted"] for row in rows)):
+            return None
+        pending = [row for row in rows if not row["evidence_accepted"]]
+        if not pending or len(pending) != len(rows) or len({row["param"] for row in rows}) != 1:
+            return None
+        args = {**pending[0]["arguments"], "target": target}
+        if any({**row["arguments"], "target": target} != args for row in rows):
+            return None
+        # Reject malformed/unsupported descendants rather than allowing a broad
+        # prefix to bypass a leaf's eligibility gate.
+        if any(below(row) and not row["eligible"] for row in candidates):
+            return None
+        return {**copy.deepcopy(pending[0]), "arguments": args,
+                "slice_candidate_ids": [row["candidate_id"] for row in pending]}
+
+    def parameter_continuation(self, spec, candidates):
+        """Continue a measured model-selected index profile, not a blind replay."""
+        accepted = {item["record"]["validation_id"] for item in self.broker.validation_attempts(spec)}
+        for execution in reversed(self.broker.tools):
+            if execution.get("task_spec_id") != spec.id or execution.get("origin") != "solver" or execution["tool"] != "hunter_run_web_loop":
+                continue
+            receipt = json.loads(Path(execution["artifact"]).read_bytes())
+            args, result = receipt.get("arguments", {}), receipt.get("execution", {})
+            profile = args.get("validation_profile")
+            if (profile not in PROFILES or urlsplit(args.get("target", "")).query or receipt.get("error")
+                    or not isinstance(result, dict) or result.get("execution_failed")
+                    or type(result.get("actual_request_cost")) is not int or result["actual_request_cost"] < 0):
+                continue
+            view = next((row for row in self.broker.results if row["spec_id"] == spec.id
+                         and row["tool"] == execution["tool"] and row["arguments"] == args), None)
+            value = self.broker.read_reference(view["content_ref"]) if view else None
+            raw = result.get("result", {}).get("output")
+            if isinstance(raw, str):
+                try:
+                    raw = json.loads(raw)
+                except ValueError:
+                    continue
+            if not isinstance(value, dict) or raw != value or not any(
+                    item.get("validation_id") in accepted for item in value.get("validations", []) if isinstance(item, dict)):
+                continue
+            pending = [row for row in candidates if row["eligible"] and not row["executed"] and not row.get("dispatch_started")
+                       and not row["evidence_accepted"] and row["arguments"].get("validation_profile") == profile]
+            slices = []
+            for record in self.discovery(spec)["records"]:
+                sliced = self.parameter_slice(spec, candidates, record["url"], profile)
+                if sliced and 1 < len(sliced["slice_candidate_ids"]) <= sliced["arguments"]["fuzz_limit"]:
+                    slices.append(sliced)
+            selected = []
+            covered: set[str] = set()
+            for sliced in sorted(slices, key=lambda row: len(row["arguments"]["target"]), reverse=True):
+                ids = set(sliced["slice_candidate_ids"])
+                if not ids & covered:
+                    selected.append(sliced)
+                    covered.update(ids)
+            return [*selected, *(row for row in pending if row["candidate_id"] not in covered)]
+        return None
+
     def dispatch_access_validation(self, spec):
         """An early summary cannot bypass the admitted, budgeted validation step."""
         if spec.phase != "access" or spec.references or spec.compiled_workflows or spec.id in self.access_dispatches:
             return False
         policy = self.broker.runtime_policy
         candidates = self.plan_candidates(spec)
-        pending = [row for row in candidates if row["eligible"] and not row["executed"] and not row["evidence_accepted"]]
-        dispatched = False
+        pending = [row for row in candidates if row["eligible"] and not row["evidence_accepted"]
+                   and not row.get("dispatch_started")
+                   and (not row["executed"] or self.deterministic_unaccepted_slice(spec, row))]
+        continuation = self.parameter_continuation(spec, candidates)
+        if continuation is not None:
+            pending = [*(row for row in pending if row["vector"] == "access-idor"), *continuation]
+        # A model-selected slice spent the same rate window as host slices.
+        # Only an actual task-bound executor receipt establishes that history.
+        dispatched = any(row.get("task_spec_id") == spec.id and row.get("origin") == "solver"
+                         and row["tool"] in {"hunter_run_web_loop", "validator_validate_sqli", "validator_validate_ssti"}
+                         for row in self.broker.tools)
+        continued = False
         policy.host_finalizing.add(spec.id)
         try:
             for index, row in enumerate(pending):
-                if row["executed"] or row["evidence_accepted"]:
+                if row["evidence_accepted"]:
                     continue
                 if not self.admit_candidate(spec, row):
                     reason = row["reason_code"]
@@ -1048,13 +1423,55 @@ class PythonSolver:
                     break
                 # Reuse the existing rate-window backoff; it never changes rate
                 # policy. All actual requests still pass the same wire gates.
-                if dispatched and not self.wait_access_rate_window(spec):
-                    for remaining in pending[index:]:
-                        self.add_gap(spec, "insufficient_time_for_rate_window", "admission_budget", remaining)
-                    break
+                rate_waited = dispatched
+                if dispatched:
+                    pending_tools = getattr(self, "_pending_rate_tools", None)
+                    if not isinstance(pending_tools, dict):
+                        pending_tools = {}
+                        self._pending_rate_tools = pending_tools
+                    row_args = row.get("arguments") if isinstance(row.get("arguments"), dict) else {}
+                    estimated_weight: int | None = None
+                    if row["tool"] == "hunter_run_web_loop":
+                        if row_args.get("blind_discovery"):
+                            estimated_weight = max(
+                                int(row_args.get("blind_max_requests") or 24),
+                                int(row_args.get("max_validations") or 0),
+                            )
+                        elif row_args.get("validation_profile"):
+                            max_val = int(row_args.get("max_validations") or 16)
+                            fuzz_lim = int(row_args.get("fuzz_limit") or 4)
+                            estimated_weight = max(36, max_val * 2 + fuzz_lim)
+                            for prev_exec in reversed(self.broker.tools):
+                                if (prev_exec.get("task_spec_id") == spec.id
+                                        and prev_exec.get("tool") == "hunter_run_web_loop"):
+                                    prev_receipt = json.loads(Path(prev_exec["artifact"]).read_bytes())
+                                    prev_cost = (prev_receipt.get("execution") or {}).get("actual_request_cost")
+                                    if type(prev_cost) is int and prev_cost > 0:
+                                        estimated_weight = max(estimated_weight, prev_cost + 6)
+                                        break
+                    pending_tools[spec.id] = (row["tool"], estimated_weight) if estimated_weight else row["tool"]
+                    try:
+                        waited_ok = self.wait_access_rate_window(spec)
+                    finally:
+                        pending_tools.pop(spec.id, None)
+                    if not waited_ok:
+                        for remaining in pending[index:]:
+                            self.add_gap(spec, "insufficient_time_for_rate_window", "admission_budget", remaining)
+                        break
+                    waited_map = getattr(self, "_last_rate_wait_elapsed", None)
+                    if isinstance(waited_map, dict) and spec.id in waited_map:
+                        rate_waited = bool(waited_map.pop(spec.id))
+                if not self.refresh_expiring_access_sessions(spec, row, rate_window_elapsed=rate_waited):
+                    continue
+                if not self.admit_candidate(spec, row):
+                    # Time spent in backoff does not extend session freshness
+                    # or preserve a previous admission preview's authority.
+                    continue
                 # Durable pre-dispatch intent. If interrupted, run() leaves the
                 # entire running TaskSpec inconclusive; resume never replays it.
                 row["dispatch_started"] = True
+                for ident in row.get("slice_candidate_ids", []):
+                    self.candidates_by_task[spec.id][ident]["dispatch_started"] = True
                 self.save_checkpoint()
                 before = len(self.broker.tools)
                 try:
@@ -1073,6 +1490,7 @@ class PythonSolver:
                         self.add_gap(spec, "invalid_or_missing_signed_evidence", "evidence", row)
                     self.save_checkpoint()
                 dispatched = True
+                continued = True
                 if policy.consecutive_failures.get(spec.id, 0) >= 2:
                     raise BudgetError("consecutive_tool_failure_limit")
         finally:
@@ -1080,7 +1498,7 @@ class PythonSolver:
             policy.host_finalizing.discard(spec.id)
             policy.validation_reserves.pop(spec.id, None)
             dump(self.broker.private / "runtime-policy.json", policy.snapshot())
-        return dispatched
+        return continued
 
     def pending_parameter_batches(self, spec):
         """Host-selected parameter candidates; no previous model profile required."""
@@ -1126,18 +1544,35 @@ class PythonSolver:
                 # Only catalog-local references are admissible. Schema
                 # validation must never fetch remote references or coerce args.
                 validator(schema, registry=Registry()).validate(args)
-            except (ValidationError, SchemaError, Unresolvable):
+            except (ValidationError, SchemaError, Unresolvable) as exc:
                 # Validator text may contain credential-bearing argument
-                # values. Keep only a stable code in model feedback and logs.
-                raise WorkflowError("tool_arguments_schema_invalid") from None
+                # values. Keep only a stable code and value-free metadata.
+                raise WorkflowError(
+                    "tool_arguments_schema_invalid",
+                    schema_diagnostic=_safe_schema_diagnostic(name, args, exc),
+                ) from None
             parsed.append((name, args))
         return parsed
 
-    def loop_event(self, spec, code):
+    def _record_schema_diagnostic(self, spec, diagnostic):
+        if not diagnostic:
+            return
+        diagnostics = getattr(self, "schema_diagnostics", None)
+        if diagnostics is None:
+            diagnostics = []
+            self.schema_diagnostics = diagnostics
+        entry = {"spec_id": spec.id, **diagnostic}
+        diagnostics.append(entry)
+        dump(self.broker.private / "python-schema-diagnostics.json", diagnostics)
+
+    def loop_event(self, spec, code, schema_diagnostic=None):
         event = {"spec_id": spec.id, "reason_code": code}
         self.loop_events.append(event)
         dump(self.broker.private / "python-loop-events.json", self.loop_events)
-        self.protocol_feedback[spec.id] = event
+        feedback = dict(event)
+        if schema_diagnostic:
+            feedback["schema_diagnostic"] = schema_diagnostic
+        self.protocol_feedback[spec.id] = feedback
 
     def phase(self, spec):
         from agent_integration import preflight
@@ -1185,10 +1620,14 @@ class PythonSolver:
                     if exc.code not in {"tool_arguments_invalid_json", "tool_arguments_not_object",
                                         "tool_arguments_schema_invalid"}:
                         raise
+                    self._record_schema_diagnostic(spec, exc.schema_diagnostic)
                     if self.protocol_repairs.get(spec.id, 0):
-                        raise WorkflowError("tool_protocol_repair_exhausted") from None
+                        raise WorkflowError(
+                            "tool_protocol_repair_exhausted",
+                            schema_diagnostic=exc.schema_diagnostic,
+                        ) from None
                     self.protocol_repairs[spec.id] = 1
-                    self.loop_event(spec, exc.code)
+                    self.loop_event(spec, exc.code, schema_diagnostic=exc.schema_diagnostic)
                     continue
                 self.protocol_feedback.pop(spec.id, None)
                 for name, args in parsed:
@@ -1200,6 +1639,10 @@ class PythonSolver:
                                 and args.get("live", True) is not False):
                             options = self.plan_candidates(spec)
                             selected = next((row for row in options if matches_model_call(row, name, args)), None)
+                            if selected is None and name == "hunter_run_web_loop":
+                                sliced = self.parameter_slice(spec, options, args.get("target", ""), args.get("validation_profile"))
+                                if sliced and matches_model_call(sliced, name, args):
+                                    selected = sliced
                             if selected is None or not self.admit_candidate(spec, selected):
                                 self.add_gap(spec, "model_call_outside_admitted_candidate", "prerequisites")
                                 self.loop_event(spec, "model_call_outside_admitted_candidate")
@@ -1384,8 +1827,12 @@ class PythonSolver:
             evidence_ref = getattr(exc, "evidence_ref", None)
             if evidence_ref is not None:
                 result["failed_tool_ref"] = evidence_ref
-            dump(self.broker.private / "workflow-failure.json", {
-                key: result.get(key) for key in ("status", "error", "stop_reason", "failure_phase", "summary_errors", "failed_summary_ref", "failed_tool_ref")})
+            failure_payload = {
+                key: result.get(key) for key in ("status", "error", "stop_reason", "failure_phase", "summary_errors", "failed_summary_ref", "failed_tool_ref")
+            }
+            if getattr(self, "schema_diagnostics", None):
+                failure_payload["schema_diagnostics"] = list(self.schema_diagnostics)
+            dump(self.broker.private / "workflow-failure.json", failure_payload)
             if self._checkpoint_active:
                 self.broker.finalize_task(result["status"])
         finally:

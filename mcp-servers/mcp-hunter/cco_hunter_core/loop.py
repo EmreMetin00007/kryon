@@ -6,6 +6,7 @@ Dump/ascan/sqlmap yok. IDOR/SSRF/XXE otomatik değil (ek kimlik/OOB gerekir).
 from __future__ import annotations
 
 import json
+import os
 import re
 from urllib.parse import urlsplit
 
@@ -224,6 +225,44 @@ def _session_request_fields(cookie: str, headers: str, identities: dict) -> dict
     return dict(matches[0])
 
 
+_DISCOVER_QUEUE_BLOAT_KEYS = frozenset({
+    "work_queue", "frontier", "probe", "wordlist_sample",
+    "visited_states", "feature_map", "continuation_queue", "external_sources",
+})
+
+
+def compact_loop_discover(report: dict) -> dict:
+    """Return a shallow copy of report without bulky inline discover or matrix arrays."""
+    if not isinstance(report, dict):
+        return report
+    updated = report
+    discover_row = report.get("discover")
+    if isinstance(discover_row, dict) and any(key in discover_row for key in _DISCOVER_QUEUE_BLOAT_KEYS):
+        trimmed = {key: val for key, val in discover_row.items() if key not in _DISCOVER_QUEUE_BLOAT_KEYS}
+        updated = {**updated, "discover": trimmed}
+    matrix_doc = report.get("identity_matrix")
+    if isinstance(matrix_doc, dict):
+        matrix_rows = matrix_doc.get("matrix") if isinstance(matrix_doc.get("matrix"), list) else []
+        missing_rows = matrix_doc.get("missing_coverage") if isinstance(matrix_doc.get("missing_coverage"), list) else []
+        if len(matrix_rows) + len(missing_rows) > 8:
+            updated = {
+                **updated,
+                "identity_matrix": {
+                    "matrix": [],
+                    "missing_coverage": [],
+                    "count": len(matrix_rows),
+                    "total": len(missing_rows),
+                },
+            }
+    return updated
+
+
+def public_loop_report(report: dict) -> dict:
+    """Project an execute_web_loop report without bloating inline discover queues."""
+    from .request_context import public_discovery_report
+    return public_discovery_report(compact_loop_discover(report))
+
+
 def execute_web_loop(
     target: str,
     *,
@@ -251,6 +290,8 @@ def execute_web_loop(
     run_id="",
     identity="unspecified",
     identity_discover=None,
+    on_discovery_state=None,
+    on_private_report=None,
 ) -> dict:
     """Callable'lar inject edilir (test) veya hunter facade bağlar."""
     plan = loop_plan(target, crawl=crawl, zap=zap)
@@ -282,6 +323,11 @@ def execute_web_loop(
         "errors": [],
         "next": "CONFIRMED paketleri store_validated_finding. Dump yok.",
     }
+    def finish():
+        if on_private_report is not None:
+            import copy
+            on_private_report(copy.deepcopy(report))
+        return public_loop_report(report)
     from authz_matrix import build_identity_matrix
     matrix_objects = [dict(obj, owner_identity=name) for name, actor in (identities or {}).items()
                       if isinstance(actor, dict) for obj in actor.get("resources", actor.get("objects", []))
@@ -289,7 +335,7 @@ def execute_web_loop(
     report["identity_matrix"] = build_identity_matrix(identities or {}, matrix_objects)
     if not live:
         report["next"] = "live=True ile aynı tool zinciri koşar (scope/onay tek grant)."
-        return report
+        return finish()
 
     def record_validation(item, result, row):
         # Diagnostic text is mapped to a fixed reason before report output.
@@ -380,6 +426,14 @@ def execute_web_loop(
                     item["coverage_plan_recorded"] = False
 
         for item in queue:
+            from .request_context import current_policy_gate
+            gate = current_policy_gate()
+            gate_stopped = gate.stop_reason() if gate is not None and callable(getattr(gate, "stop_reason", None)) else ""
+            if gate_stopped:
+                report["ok"] = False
+                report["stopped"] = gate_stopped
+                report["skipped"].append({"step": "remaining", "reason": gate_stopped})
+                break
             vclass = str(item.get("vuln_class") or "")
             context = _pipeline_context(item, identity, run_id)
             context["access_dimensions"] = protocol_access(item)
@@ -483,7 +537,7 @@ def execute_web_loop(
     if not (target or "").strip():
         report["ok"] = False
         report["errors"].append("target gerekli")
-        return report
+        return finish()
 
     discovered_candidates = []
     if identity_discover is not None:
@@ -495,6 +549,16 @@ def execute_web_loop(
             summary = {"status": "blocked", "reasons": ["identity discovery unavailable"]}
             discovered_candidates = []
         report["identity_discovery"] = summary
+        if summary.get("status") == "ready" and not summary.get("reasons") and not summary.get("budget_limited"):
+            from .request_context import capture_state
+            try:
+                private_state = capture_state(identities)
+                report["identity_discovery_state"] = private_state
+                if on_discovery_state is not None:
+                    on_discovery_state(private_state)
+            except ImportError:
+                if os.environ.get("CCO_PYTHON_DISCOVERY_INVOCATION"):
+                    raise
         matrix_objects = [dict(obj, owner_identity=name) for name, actor in identities.items()
                           if isinstance(actor, dict) for obj in actor.get("resources", [])
                           if isinstance(obj, dict) and all(k in obj for k in ("resource_id", "tenant", "family"))]
@@ -504,7 +568,7 @@ def execute_web_loop(
         if summary.get("status") == "blocked":
             report["ok"] = False
             report["skipped"].append({"step": "remaining", "reason": str(reasons[0] if reasons else "identity discovery blocked")})
-            return report
+            return finish()
         report["discovery_operations"] = [{**_pipeline_context(item, identity, run_id),
                                             "sources": ["identity_discovery"]}
                                            for item in discovered_candidates if isinstance(item, dict)]
@@ -515,7 +579,10 @@ def execute_web_loop(
     if discovered_candidates:
         consume_candidates(discovered_candidates)
 
-    if discover is not None:
+    identity_only = (identity_discover is not None and not crawl and not zap and int(fuzz_limit) == 0)
+    if identity_only:
+        report["skipped"].append({"step": "discover", "reason": "identity-only slice has its own observed discovery"})
+    if discover is not None and not identity_only:
         try:
             discovered = _as_dict(discover(target, cookie=cookie, headers=headers))
         except Exception as exc:
@@ -527,7 +594,7 @@ def execute_web_loop(
         if discovered.get("stop_reason"):
             report["ok"] = False
             report["skipped"].append({"step": "remaining", "reason": discovered["stop_reason"]})
-            return report
+            return finish()
     if crawl and crawl_fn is not None:
         try:
             crawled = _as_dict(crawl_fn(target, cookie=cookie, headers=headers))
@@ -540,7 +607,7 @@ def execute_web_loop(
         if crawled.get("stop_reason"):
             report["ok"] = False
             report["skipped"].append({"step": "remaining", "reason": crawled["stop_reason"]})
-            return report
+            return finish()
     elif crawl:
         report["skipped"].append("crawl: no crawl_fn")
     if zap and zap_fn is not None:
@@ -574,7 +641,7 @@ def execute_web_loop(
         report["skipped"].append({"step": "jwt_kid_jku", "reason": "observed_flow_required"})
 
     fuzzed = {}
-    if fuzz is not None:
+    if fuzz is not None and not identity_only:
         try:
             from .candidates import candidate_listener
             with candidate_listener(lambda item: consume_candidates([item])):
@@ -606,7 +673,7 @@ def execute_web_loop(
         if fuzzed.get("stopped"):
             report["ok"] = False
             report["skipped"].append({"step": "remaining", "reason": fuzzed["stopped"]})
-            return report
+            return finish()
         if not fuzzed.get("probes"):
             # Sessiz boş koşu yok: kuyruk boşsa raporda görünür ol
             report["skipped"].append({
@@ -620,4 +687,4 @@ def execute_web_loop(
         report["steps"].append("validate")
     if report["errors"] and not (report["discover"] or report["fuzz"] or report["confirmed"]):
         report["ok"] = False
-    return report
+    return finish()

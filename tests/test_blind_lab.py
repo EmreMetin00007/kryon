@@ -333,10 +333,11 @@ def test_loop_preserves_post_carrier_and_budget_without_exporting_request_contex
     item = {"url": "http://x/safe/a", "method": "POST", "vuln_class": "sql_injection",
             "param": "id", "location": "json", "baseline_json": {"token": "private-value"},
             "request_ref": "private-request-reference"}
-    loop = execute_web_loop("http://x", live=True, crawl=False, run_id="run-test",
+    run_id = "run-0123456789abcdef"
+    loop = execute_web_loop("http://x", live=True, crawl=False, run_id=run_id,
                             fuzz=lambda *a, **kw: {"probes": 1, "validator_queue": [item]},
                             max_validations=0)
-    loop["run_id"] = "run-test"
+    loop["run_id"] = run_id
     telemetry = {key: loop[key] for key in ("validation_candidates", "validation_queue", "skipped")}
     assert "private-value" not in json.dumps(telemetry)
     assert "private-request-reference" not in json.dumps(telemetry)

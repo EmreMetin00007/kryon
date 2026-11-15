@@ -85,17 +85,24 @@ def test_blind_discovery_reaches_signed_authz_validation_without_operator_object
         return Response(url, 403, {"error": "forbidden"})
 
     monkeypatch.setattr(requests, "request", send)
+    from privacy_contract_assertions import assert_route_contract, capture_operational_report
+    operational = capture_operational_report(hunter, monkeypatch)
     raw = hunter.run_web_loop(BASE, live=True, crawl=False, blind_discovery=True,
                               identities=json.dumps(identities), headers='{"X-Research":"researcher"}',
                               sleep_s=0, max_validations=4)
     result = json.loads(raw)
     assert result["identity_discovery"]["status"] == "ready"
     assert result["identity_discovery"]["owned_objects_observed"] == 2
-    assert {row["url"] for row in result["discovery_operations"]} == {
+    # Exact owned-object values are host-only; templates alone must not merge
+    # the two objects or weaken either signed positive/negative control.
+    assert {row["url"] for row in operational["discovery_operations"]} == {
         BASE + "orders/" + IDS["alice"], BASE + "orders/" + IDS["bob"]}
-    rows = {row["url"]: row for row in result["validations"]}
-    assert rows[BASE + "orders/" + IDS["alice"]]["verdict"] == "CONFIRMED"
-    assert rows[BASE + "orders/" + IDS["bob"]]["verdict"] == "UNCONFIRMED"
+    assert_route_contract(result, operational, {
+        BASE + "orders/" + IDS["alice"]: ("alice", "bob", "CONFIRMED"),
+        BASE + "orders/" + IDS["bob"]: ("bob", "alice", "UNCONFIRMED"),
+    }, private_values=(*IDS.values(), "alice-subject", "bob-subject",
+                       "alice-secret", "bob-secret", "alice-marker@lab", "bob-marker@lab"))
+    rows = {row["url_sha256"]: row for row in result["validations"]}
     assert all(row["coverage_recorded"] for row in rows.values())
     assert result["requests_authorized"] == len(seen)
     assert "alice-secret" not in raw and "bob-secret" not in raw and "alice-subject" not in raw
@@ -103,6 +110,9 @@ def test_blind_discovery_reaches_signed_authz_validation_without_operator_object
 
     # The benchmark must consume actual signed coverage, including the safe
     # owner's negative control, instead of inferring clean from no finding.
+    # Scoring is a host consumer: keep its original exact operational input,
+    # truth cases and tamper controls, rather than scoring public templates.
+    result = operational
     payload = benchmark_payload(hunter, result, BASE)
     assert len(payload["verified_coverage"]) == 2
     spec = importlib.util.spec_from_file_location("blind_scoring_integration", ROOT / "scripts/blind-validate.py")
@@ -396,6 +406,8 @@ def test_differential_discovery_confirms_bola_without_explicit_owner(setup):
         return Response(url, 404, {"error": "missing"})
 
     monkeypatch.setattr(requests, "request", send)
+    from privacy_contract_assertions import assert_route_contract, capture_operational_report
+    operational = capture_operational_report(hunter, monkeypatch)
     raw = hunter.run_web_loop(BASE, live=True, crawl=False, blind_discovery=True,
                               blind_differential=True,
                               identities=json.dumps(identities),
@@ -404,9 +416,11 @@ def test_differential_discovery_confirms_bola_without_explicit_owner(setup):
     result = json.loads(raw)
     assert result["identity_discovery"]["status"] == "ready", result["identity_discovery"]
     assert result["identity_discovery"]["differential_candidates"] == 2
-    rows = {row["url"]: row for row in result["validations"]}
-    assert rows[BASE + "orders/" + IDS["alice"]]["verdict"] == "CONFIRMED"
-    assert rows[BASE + "orders/" + IDS["bob"]]["verdict"] == "UNCONFIRMED"
+    assert_route_contract(result, operational, {
+        BASE + "orders/" + IDS["alice"]: ("alice", "bob", "CONFIRMED"),
+        BASE + "orders/" + IDS["bob"]: ("bob", "alice", "UNCONFIRMED"),
+    }, private_values=(*IDS.values(), "alice-subject", "bob-subject",
+                       "alice-secret", "bob-secret", "alice-marker@lab", "bob-marker@lab"))
     assert "alice-secret" not in raw and "alice-marker@lab" not in raw
 
 

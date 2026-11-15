@@ -50,7 +50,11 @@ def parameter_declarations(value: Any) -> list[dict[str, Any]]:
 
 def card_route(url: str) -> str:
     """Cards are semantic pointers, not a second credential-bearing query archive."""
-    parsed = urlsplit(url)
+    from python_identity_discovery import public_export
+    # Dynamic owned path atoms are values too, not merely query samples. The
+    # host candidate/arguments keep the exact route; model cards keep its shape.
+    safe = public_export({"validation_queue": [{"url": url}]})["validation_queue"][0]["url"]
+    parsed = urlsplit(safe)
     return parsed._replace(query="", fragment="").geturl()
 
 
@@ -150,6 +154,72 @@ def candidate(task: str, *, route: str, param: str = "", identity: Any = "anon",
             "evidence_refs": []}
 
 
+def authorization_controls_complete(record: dict[str, Any]) -> bool:
+    """Signed verdicts still need same-object owner/attacker/anonymous wire controls."""
+    context = record.get("execution_context")
+    evidence = record.get("evidence")
+    if (not isinstance(context, dict) or not isinstance(evidence, dict)
+            or record.get("oracle") != "content_match" or context.get("url") != record.get("target")
+            or not context.get("identity") or not context.get("resource_owner")
+            or context["identity"] == context["resource_owner"] or context.get("method") != "GET"):
+        return False
+    responses = record.get("request_evidence")
+    if not isinstance(responses, list):
+        return False
+    roles: dict[str, dict[str, Any]] = {}
+    for response in responses:
+        if not isinstance(response, dict):
+            return False
+        role = response.get("role")
+        if role not in {"owner", "attacker", "anonymous"}:
+            return False
+        if (role in roles or response.get("transport_ok") is not True
+                or response.get("request_url") != record.get("target") or response.get("method") != "GET"
+                or not re.fullmatch(r"[0-9a-f]{64}", str(response.get("response_sha256", "")))
+                or type(response.get("response_length")) is not int or response["response_length"] < 0):
+            return False
+        roles[role] = response
+    if not {"owner", "attacker"} <= roles.keys() or roles["owner"].get("status") not in {200, 206}:
+        return False
+    if "identity_fingerprints_distinct" in evidence and evidence["identity_fingerprints_distinct"] is not True:
+        return False
+    if "owner_marker_in_owner_response" in evidence and evidence["owner_marker_in_owner_response"] is not True:
+        return False
+    if "owner_status" in evidence and evidence["owner_status"] != roles["owner"].get("status"):
+        return False
+    if "attacker_status" in evidence and evidence["attacker_status"] != roles["attacker"].get("status"):
+        return False
+    if ("anonymous" in roles and "anonymous_status" in evidence
+            and evidence["anonymous_status"] != roles["anonymous"].get("status")):
+        return False
+    verdict = record.get("verdict")
+    if verdict == "CONFIRMED":
+        return (
+            "anonymous" in roles
+            and roles["attacker"].get("status") in {200, 206}
+            and evidence.get("owner_marker_in_attacker_response") is True
+            and roles["anonymous"].get("status") in {401, 403, 404}
+            and evidence.get("owner_marker_in_anonymous_response") is False
+        )
+    if verdict == "UNCONFIRMED":
+        if "anonymous" in roles and (
+            roles["anonymous"].get("status") not in {401, 403, 404}
+            or evidence.get("owner_marker_in_anonymous_response") is True
+        ):
+            return False
+        attacker_status = roles["attacker"].get("status")
+        if attacker_status in {200, 206}:
+            return (
+                roles["attacker"]["response_sha256"] != roles["owner"]["response_sha256"]
+                and evidence.get("owner_marker_in_attacker_response") is False
+            )
+        return (
+            attacker_status in {401, 403, 404}
+            and evidence.get("owner_marker_in_attacker_response") is not True
+        )
+    return False
+
+
 def parameter_candidates(spec: Any, records: list[dict[str, Any]],
                          bindings: dict[str, Any]) -> list[dict[str, Any]]:
     """Select read-only oracle capabilities from records, not names or truth."""
@@ -173,7 +243,10 @@ def parameter_candidates(spec: Any, records: list[dict[str, Any]],
         except ValueError as exc:
             reason = reason or str(exc)
             params, declarations = {}, []
+        # Unattributed observations default to anonymous; never infer a vault member.
         identity = record.get("identity_ref", "anon")
+        if identity == "anonymous":
+            identity = "anon"
         if identity not in ("anon", "anonymous") and (not isinstance(identity, str) or identity not in bindings):
             reason = reason or "missing_observed_identity_binding"
         if reason:
@@ -191,7 +264,7 @@ def parameter_candidates(spec: Any, records: list[dict[str, Any]],
                 # Direct validators have no session-ref argument. Authenticated
                 # records use Hunter's existing vault-only profile rather than
                 # projecting credentials or silently testing anonymously.
-                tool = "hunter_run_web_loop" if bindings or direct not in spec.tools else direct
+                tool = "hunter_run_web_loop" if (bindings and identity != "anon") or direct not in spec.tools else direct
                 args: dict[str, Any]
                 if tool == direct:
                     args = {"target_url": url, "param": param, "method": "GET", "carrier": "query"}
@@ -201,17 +274,26 @@ def parameter_candidates(spec: Any, records: list[dict[str, Any]],
                     args = {"target": url, "live": True, "crawl": False,
                             "validation_profile": profile, "fuzz_limit": 4,
                             "max_validations": 16, "candidate_sample_limit": 16, "sleep_s": 0.2}
-                    if bindings:
-                        # The host's member-first ordering selects Hunter's
-                        # primary discovery session; sorting labels would undo it.
-                        args["session_bindings"] = json.dumps(bindings)
+                    if identity in bindings:
+                        args["session_bindings"] = json.dumps({identity: bindings[identity]})
                 output.append(candidate(spec.id, route=url, param=param,
-                    identity=sorted(bindings) if bindings else "anon", vector=vector,
+                    identity=identity, vector=vector,
                     tool=tool, arguments=args, provenance=provenance,
-                    reason=binding_reason or ("unsupported_parameter_carrier" if declared.get(param, "query") != "query"
+                    reason=(binding_reason if identity in bindings else "") or ("unsupported_parameter_carrier" if declared.get(param, "query") != "query"
                         else "missing_observed_query_sample" if param not in params
                         else "validator_not_declared" if tool not in spec.tools else "")))
-    return output
+    # Prefer a provenance-backed anonymous observation of the identical slice.
+    # Invalid/contradictory rows remain visible and cannot be hidden by it.
+    public = {(row["route"], row["param"], row["vector"]): row for row in output
+              if row["identity_ref"] == "anon" and row["eligible"]}
+    selected = []
+    for row in output:
+        anonymous = public.get((row["route"], row["param"], row["vector"]))
+        if anonymous is not None and row["identity_ref"] != "anon" and row["eligible"]:
+            anonymous["provenance"].extend(row["provenance"])
+        else:
+            selected.append(row)
+    return selected
 
 
 def compact_cards(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:

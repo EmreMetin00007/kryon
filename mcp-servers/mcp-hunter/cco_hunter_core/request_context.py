@@ -20,6 +20,7 @@ import re
 import os
 import hashlib
 import json
+from typing import Any, Callable
 from urllib.parse import parse_qsl, unquote, urlencode, urlsplit, urlunsplit
 
 _LOCK = threading.Lock()
@@ -29,6 +30,28 @@ _MAX_CONTEXTS = 1024
 _FIELDS: ContextVar[dict] = ContextVar("hunter_request_fields", default={})
 _POLICY_GATE: ContextVar = ContextVar("hunter_request_policy", default=None)
 _READONLY_OPERATION: ContextVar = ContextVar("hunter_readonly_operation", default="")
+
+
+class RequestPolicyGate:
+    """Callable wire gate with explicit observer and accounting contracts."""
+
+    def __init__(self, request: Callable[..., tuple[bool, str]], *,
+                 observe: Callable[[dict[str, Any], dict[str, Any]], None],
+                 program_policy: Callable[[], dict[str, Any]],
+                 stop_reason: Callable[[], str], authorized_requests: Callable[[], int],
+                 require_blind_policy: Callable[[bool], None],
+                 require_session_guard: Callable[[Callable[[], bool]], None]):
+        self.request = request
+        self.observe = observe
+        self.accounts_campaign_requests = True
+        self.program_policy = program_policy
+        self.stop_reason = stop_reason
+        self.authorized_requests = authorized_requests
+        self.require_blind_policy = require_blind_policy
+        self.require_session_guard = require_session_guard
+
+    def __call__(self, method: str, url: str, headers: dict[str, Any]) -> tuple[bool, str]:
+        return self.request(method, url, headers)
 
 
 @contextmanager
@@ -151,22 +174,19 @@ def policy_scoped(tool_name: str):
                     elif not response.get("ok"):
                         stopped = "run stopped: transport failure"
 
-            gate.observe = observe
-            gate.accounts_campaign_requests = True
-            gate.program_policy = lambda: dict(engine.program_policy) if engine is not None else {}
-            gate.stop_reason = lambda: stopped
-            gate.authorized_requests = lambda: authorized_requests
             def require_blind_policy(private_required):
                 nonlocal blind_policy
                 with wire_lock:
                     blind_policy = bool(private_required)
-            gate.require_blind_policy = require_blind_policy
             def require_session_guard(guard):
                 nonlocal session_guard
                 with wire_lock:
                     session_guard = guard
-            gate.require_session_guard = require_session_guard
-            token = _POLICY_GATE.set(gate)
+            wire_gate = RequestPolicyGate(gate, observe=observe,
+                program_policy=lambda: dict(engine.program_policy) if engine is not None else {},
+                stop_reason=lambda: stopped, authorized_requests=lambda: authorized_requests,
+                require_blind_policy=require_blind_policy, require_session_guard=require_session_guard)
+            token = _POLICY_GATE.set(wire_gate)
             try:
                 return function(*args, **kwargs)
             finally:
@@ -270,7 +290,7 @@ def materialize_record(record: dict, headers: dict | None = None) -> tuple[dict,
             clean["_captured_wire"] = copy.deepcopy(wire)
             from cco_surface_core.serialization import media_type, multipart_parts, decoded_body
             def grouped(pairs):
-                out = {}
+                out: dict[str, list[Any]] = {}
                 for name, value in pairs:
                     out.setdefault(name, []).append(value)
                 return {name: values[0] if len(values) == 1 else values for name, values in out.items()}
@@ -318,7 +338,7 @@ def materialize_record(record: dict, headers: dict | None = None) -> tuple[dict,
     if operation.get("protocol") == "graphql":
         params = [p for p in clean.get("params") or [] if isinstance(p, dict)]
         paths = {tuple(p.get("path") or [p.get("name")]): p.get("sample") for p in params}
-        envelope_variables = next((p.get("sample") for p in params if p.get("name") == "variables"), {})
+        envelope_variables: Any = next((p.get("sample") for p in params if p.get("name") == "variables"), {})
         try:
             if isinstance(envelope_variables, str):
                 envelope_variables = json.loads(envelope_variables)
@@ -403,6 +423,521 @@ def request_binding(headers: dict) -> dict:
     canonical = {str(key).lower(): str(value) for key, value in (headers or {}).items()}
     return {"session_sha256": hashlib.sha256(json.dumps(canonical, sort_keys=True).encode()).hexdigest(),
             "scope_revision": current_scope_revision(), "policy_hash": current_policy_hash()}
+
+
+def capture_state(identities: dict) -> dict:
+    """Host-private synthetic observations. Never serialize this as a tool report."""
+    return {name: {"identity_ref": secrets.token_urlsafe(24),
+                   "request_binding": request_binding(actor.get("headers", {})),
+                   "role": actor.get("role"), "owned_objects_private": actor.get("owned_objects_private"),
+                   "observed_at": actor.get("_discovery_observed_at", time.time()),
+                   **{key: copy.deepcopy(actor[key]) for key in ("objects", "resources", "identity_facts") if key in actor}}
+             for name, actor in identities.items() if isinstance(actor, dict) and actor.get("test_data_only") is True}
+
+
+_PUBLIC_ATOM = re.compile(r"(?:[0-9a-f]{64}|opaque:[0-9a-f]{64})\Z")
+# These are semantic types, not samples taken from a target or a fixture.
+_PUBLIC_TYPES = {
+    "vuln_type": {"SQL Injection", "SSTI", "IDOR", "BOLA", "Auth Bypass", "Open Redirect"},
+    "oracle": {"differential_boolean", "arithmetic_eval", "authz_oracle", "oob_oracle"},
+    "method": {"GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"},
+    "carrier": {"query", "path", "body", "form", "json", "header", "cookie"},
+    "role": {"member", "admin", "anonymous", "user", "guest", "owner"},
+    "source": {"response_metadata", "identity_discovery", "capture", "observed", "declared"},
+    "confidence": {"observed", "declared", "verified", "inferred", "unknown"},
+    "state_key": {"observed", "declared", "unknown"},
+    "vuln_class": {"sqli", "sql_injection", "ssti", "path_traversal", "lfi", "xss_reflected",
+                   "open_redirect", "command_injection", "xxe", "deserialization", "opaque_token",
+                   "idor", "bola", "bfla", "authentication_bypass", "ssrf", "csrf",
+                   "broken_access_control"},
+    "param": {"id", "user", "user_id", "object", "object_id", "account", "account_id", "contact",
+              "email", "query", "q", "search", "page", "limit", "offset", "sort", "filter",
+              "name", "file", "path", "url", "redirect", "next", "return", "template"},
+    "candidate_source": {"light_oracle", "bounded_sampling", "surface_applicability", "identity_discovery",
+                         "observed", "declared"},
+    "candidate_reason": {"observed_signal", "valid_baseline_without_light_signal", "readonly_traversal_validator",
+                         "readonly_ssti_validator", "readonly_boolean_validator", "observed_access_surface"},
+}
+_PUBLIC_PATH_WORDS = {"api", "v1", "v2", "v3", "users", "user", "objects", "object", "accounts",
+                      "account", "resources", "resource", "profile", "me", "self", "search",
+                      "files", "file", "orders", "order", "invoices", "invoice", "items", "item"}
+_PRIVATE_EXPORT_KEYS = {"identity_facts", "headers", "cookie", "cookies", "authorization", "marker",
+                        "owner_marker", "request_fields", "request_field_values", "request_context_ref",
+                        "request_ref", "request_samples", "baseline_json", "baseline_body", "baseline_form",
+                        "secret_ref", "private_reference", "producer_reference", "execution_reference",
+                        "result_path", "source_references", "operational_report", "states"}
+_VALUE_FIELDS = {"param", "carrier", "location", "role", "owner_role", "attacker_role", "operation_id",
+                 "observation_id", "candidate_source", "candidate_reason", "resource_key", "resource_family",
+                 "family", "state_key", "variant_key", "source", "confidence", "source_spec_id",
+                 "source_artifact", "provenance", "ownership_evidence", "resource_id", "tenant",
+                 "principal", "contact", "email", "value", "fingerprint", "run_id"}
+_PUBLIC_FIELDS = set("""ok engine target mode plan allow_deepen ascan steps discover discovery_operations crawl zap fuzz
+validations validation_candidates validation_queue budgets validation_limit validations_used confirmed surface_probes
+tool_states skipped exploits errors next identity_matrix identity_discovery identity_discovery_state replan feedback_queue
+requests_authorized stopped artifact artifact_error url url_sha256 baseline_url target_url method vuln_class param carrier location
+identity resource_owner owner_identity attacker_identity run_id fingerprint operation_id observation_id candidate_source
+candidate_reason access_rule_hash resource_key resource_family family state_key variant_key sources source confidence
+source_spec_id source_artifact source_sha256 scope_revision policy_hash provenance ownership_evidence identity_ref
+request_binding session_sha256 role owned_objects_private observed_at objects resources step tool optional skip_if classes
+authz_classes authz_note oob_classes oob_note surface_hooks passive_adapters skip if available adapter reason reason_code
+preconditions status requests reasons budget_limited truncated_responses owned_objects_observed eligible_candidates
+differential_candidates complete_coverage feedback_reason tool_lifecycle executed validated coverage_recorded verdict validation_id hook
+access_dimensions live status_code baseline_eligible triage_verdict coverage_status candidate_sampling likely_hits
+validator_queue probes executed_live requests_sent marked_tested fanout truncated stop_reason ingested runnable applicable
+disabled_surface_hooks candidates tests family_id resource_id tenant principal contact email value count total limit
+offset bytes sha256 path content_ref eof next_offset text schema spec_id tool arguments result output execution_failed
+items fields omitted summary_feedback candidate_cards candidate_count coverage_gaps coverage_gap coverage_gap_count source_ref
+context_archive_ref recent_results task_spec session_bindings bindings owners pairs comparisons dimensions identities
+matrix expectations observations outcomes authz_matrix permission expected_access actor owner source identity_names
+attacker_role owner_role validation_outcomes reportable success transport_ok operation protocol action effect control
+tool_budget http_budget request_budget requests_used elapsed_seconds discovery_requests replayed reused state_names
+task_spec_id origin actual_request_cost error summary findings evidence validated_findings notes evidence_accepted
+vuln_type oracle schema_version artifact content_sha256 execution_context request_evidence guard differential
+transport_ok response_sha256 response_length request_url elapsed_ms persisted binding records route
+actions category categories next_action automatic_retry note hypothesis_fingerprint bound_refs page_count xhr_count
+selected confirm_now waf_blocked surface_queued schema_repair_queue revisit_candidates review_coverage validate_with
+expectation test_type missing_coverage blocked_identities authz_candidate
+""".split())
+_PUBLIC_DECISIONS = {"ready", "blocked", "planned", "incomplete", "unknown", "fresh", "stale", "expired",
+                     "LIVE", "PLAN", "CONFIRMED", "UNCONFIRMED", "INCONCLUSIVE", "NOT TESTED", "TESTED",
+                     "observed", "declared", "anonymous", "anon", "unspecified", "passive_inventory",
+                     "discover", "crawl", "fuzz", "validate", "exploit", "identity_discovery", "remaining",
+                     "query", "path", "body", "json", "form", "header", "cookie", "authz_oracle", "oob_oracle"}
+_LOOP_STEPS = {
+    "identity_discovery", "discover", "crawl", "zap", "fuzz", "validate", "exploit",
+    "validate_coverage_gap", "coverage_gap", "jwt_kid_jku", "session", "remaining",
+    "advanced_surface_hooks", "websocket", "grpc", "smuggling", "cache", "graphql_suggestion",
+}
+_COVERAGE_GAP_STATUSES = {"not_tested", "confirmed", "tested_clean", "inconclusive"}
+_REPLAN_STATUSES = {"invalid", "planned", "blocked", "incomplete", "review_coverage"}
+_REPLAN_CATEGORIES = {
+    "rate_limit", "session", "policy", "schema", "transport", "budget", "identity", "surface", "unavailable",
+}
+_REPLAN_ACTIONS = {
+    "wait_and_reassess", "restore_test_session", "review_scope_and_grant", "repair_request_context",
+    "inspect_transport", "review_budget", "bind_declared_test_resource", "review_probe_controls",
+    "inspect_tool_state",
+}
+_REPLAN_REASONS = {
+    "429/rate-limit threshold stopped live probing",
+    "401 or login redirect interrupted the authenticated session",
+    "policy/WAF block interrupted probing",
+    "400/422 or response schema failure prevented clean baseline comparison",
+    "transport/network failure interrupted probing",
+    "request or validation budget capped execution",
+    "declared test identity or owned object prerequisite missing",
+    "surface discovery or probe execution left gaps",
+    "tool adapter unavailable or error state recorded",
+}
+_REPLAN_NOTE = "A run is not fully covered merely because no finding was confirmed."
+_FEEDBACK_STATUSES = {"confirmed", "tested_no_violation", "proposed", "ready", "blocked", "inconclusive"}
+_FEEDBACK_REASON_CODES = {
+    "budget_exhausted", "rate_limited", "session_unavailable", "missing_access_context",
+    "invalid_request_context", "policy_blocked", "transport_unavailable", "waf_blocked",
+    "validator_inconclusive", "probe_without_candidate", "candidate_proposed", "candidate_ready",
+    "verified_validator_evidence", "evidence_unavailable", "access_context_bound",
+}
+_FEEDBACK_NEXT_ACTIONS = {
+    "review_budget", "wait_and_reassess", "restore_test_session", "bind_declared_test_resource",
+    "repair_request_context", "review_scope_and_grant", "inspect_transport", "review_probe_controls",
+    "schedule_bounded_validation", "bind_request_context", "validate_with_fresh_budget", "none",
+}
+_FANOUT_NEXT_ACTIONS = _FEEDBACK_NEXT_ACTIONS | {
+    "stop", "session_recovery", "backoff", "schema_repair", "baseline_repair", "probe",
+}
+_PRECONDITIONS = {
+    "authorized_test_identity", "protected_test_resource", "authentication_required", "protected_marker",
+    "distinct_test_identities", "distinct_roles", "function_test_resource", "denied_role_rule",
+    "owned_test_object", "owner_marker", "fresh_scope_and_grant", "request_context", "campaign_budget",
+}
+_TRIAGE_VERDICTS = {
+    "LIKELY", "UNLIKELY", "INCONCLUSIVE", "SKIPPED", "DEFERRED", "WAF_BLOCKED", "ERROR", "CLEAN", "NOT_TESTED",
+}
+_FANOUT_COVERAGE_STATUSES = {"not_tested", "blocked", "inconclusive", "tested", "tested_clean", "confirmed"}
+_FANOUT_REASONS = {
+    "probe outside the requested target origin", "declared application file context changed",
+    "baseline transport failed", "baseline rate limited", "session unavailable or login redirect",
+    "probe rate limited", "probe transport failed", "request budget cannot fit baseline and probe",
+    "baseline_transport_failed", "baseline_session_unavailable", "baseline_rate_limited",
+    "baseline_schema_repair_required", "baseline_graphql_invalid_response", "baseline_graphql_errors",
+    "baseline_graphql_missing_data", "baseline_application_error", "baseline_http_error",
+}
+_NON_GET_DEFERRED_RE = re.compile(
+    r"read-only hunter gate: non-GET canary deferred \((?:GET|HEAD|POST|PUT|PATCH|DELETE|OPTIONS)\)"
+)
+_SKIPPED_REASONS = {
+    "ZAP request-level policy unavailable",
+    "run advanced probes separately with their own scope and grant",
+    "unverified targeted validation",
+    "oob auto: needs oob_validate (CCO_OOB_DOMAIN)",
+    "crawl: no crawl_fn",
+    "yuzey kuyrugu bos (0 probe) — discover/crawl kaydi yok veya hedef anahtari uyumsuz",
+    "declared application file context changed",
+    "request context missing, expired or mismatched",
+    "session unavailable or not recently verified",
+    "explicit private synthetic objects required",
+    "campaign request budget exhausted",
+    "session unavailable for planned identity",
+    "session unavailable or ownership context mismatched",
+    "blocked policy: synthetic ownership authorization required",
+    "request context cannot contain raw identity headers",
+    "attempt limit exhausted",
+    "verified session block record unavailable",
+    "active campaign required",
+    "coverage dimension already complete",
+    "task dependency unavailable",
+    "session changed during admission",
+    "new session verification required for each bound account",
+    "declared test resource unavailable or changed",
+    "candidate binding limit exceeded",
+    "observed access candidate unavailable",
+    "request context unavailable",
+    "second identity unavailable",
+}
+_SKIP_IF_REASONS = {
+    "crawl=False or playwright missing",
+    "request-level policy integration unavailable",
+    "Playwright or Chromium unavailable",
+}
+_VALIDATOR_HOOKS = {
+    "validate_sqli", "validate_ssti", "validate_open_redirect", "validate_path_traversal",
+    "validate_xss_reflection", "validate_command_injection", "validate_xxe", "validate_deserialization",
+    "validate_token_differential", "authz_oracle", "oob_oracle",
+}
+_VALIDATOR_VERDICTS = {"CONFIRMED", "UNCONFIRMED", "INCONCLUSIVE", "SKIPPED"}
+_PUBLIC_DIAGNOSTICS = {
+    "max_validations", "no validator", "not auto-validated", "active_adapter_deferred", "missing_access_context",
+    "candidate outside target origin", "authz auto: only GET", "authz auto: no authz validator",
+    "authz auto: needs 1 identities", "authz auto: needs 2 identities", "signed coverage plan unavailable",
+    "identity-only slice has its own observed discovery", "identity discovery blocked", "identity discovery unavailable",
+    "identity discovery unavailable", "owned object discovery incomplete", "identity discovery blocked",
+    "authz test identities or declared test resource prerequisites missing", "request budget exhausted",
+    "tool budget exhausted", "time budget exhausted", "token budget exhausted", "feedback persistence unavailable",
+    "session_not_recently_verified", "active_adapter_deferred", "observed_flow_required", "jwt_validator_failed",
+    "invalid_session_bindings_json", "invalid_session_binding_count", "invalid_session_binding",
+    "mixed_session_material", "session_target_outside_scope", "session_origin_mismatch",
+    "session_guard_unavailable", "invalid_session_role", "invalid_session_material",
+    "ambiguous_session_material", "session_reference_unavailable",
+    "policy gate denied", "policy gate unavailable", "session unavailable",
+}
+_DECISION_FIELDS = {"status", "verdict", "mode", "step", "steps", "sources", "hook", "coverage_status",
+                    "triage_verdict", "feedback_reason", "state_key", "carrier", "location", "identity_ref"}
+_DIAGNOSTIC_FIELDS = {"reason", "reasons", "reason_code", "error", "errors", "feedback_reason", "stopped", "stop_reason"}
+_NUMERIC_FIELDS = {"observed_at", "requests", "requests_sent", "requests_authorized", "requests_used",
+                   "actual_request_cost", "probes", "status_code", "count", "total", "limit", "offset", "bytes",
+                   "validation_limit", "validations_used", "owned_objects_observed", "eligible_candidates",
+                    "differential_candidates", "elapsed_seconds", "candidate_count", "coverage_gap_count",
+                    "response_length", "elapsed_ms"}
+_DIGEST_FIELDS = {"sha256", "url_sha256", "source_sha256", "scope_revision", "policy_hash", "session_sha256",
+                    "access_rule_hash", "fingerprint", "hypothesis_fingerprint", "bound_refs",
+                    "content_sha256", "response_sha256"}
+_PUBLIC_SERIALIZED_BYTES = 16 * 1024 * 1024
+_PUBLIC_PROJECTION_DEPTH = 64
+
+
+def _typed_public_scalar(value: Any, field: str, container: tuple[str, ...]) -> tuple[bool, Any]:
+    """Allow fixed operational enums and bounded ints only in their typed field/subtree."""
+    parent = container[-1] if container else ""
+    grandparent = container[-2] if len(container) >= 2 else ""
+    if type(value) is int:
+        if parent == "fanout" and field == "status" and 100 <= value <= 599:
+            return True, value
+        if (parent in {"crawl", "discover", "fuzz", "candidate_sampling"}
+                and field in {"page_count", "xhr_count", "ingested", "selected", "executed",
+                              "executed_live", "marked_tested",
+                              "surface_queued", "waf_blocked", "likely_hits"}
+                and value >= 0):
+            return True, value
+        if parent == "identity_discovery" and field in {"identities", "truncated_responses"} and value >= 0:
+            return True, value
+        if parent == "identity_matrix" and field in {"count", "total"} and value >= 0:
+            return True, value
+        return False, None
+    if not isinstance(value, str):
+        return False, None
+    if parent == "coverage_gap" and field == "status" and value in _COVERAGE_GAP_STATUSES:
+        return True, value
+    if parent == "replan" and field == "status" and value in _REPLAN_STATUSES:
+        return True, value
+    if parent == "replan" and field == "note" and value == _REPLAN_NOTE:
+        return True, value
+    if parent == "categories" and grandparent == "replan" and field == "categories" and value in _REPLAN_CATEGORIES:
+        return True, value
+    if parent == "actions" and grandparent == "replan":
+        if field == "category" and value in _REPLAN_CATEGORIES:
+            return True, value
+        if field == "action" and value in _REPLAN_ACTIONS:
+            return True, value
+        if field == "reason" and value in _REPLAN_REASONS:
+            return True, value
+    if parent == "feedback_queue":
+        if field == "status" and value in _FEEDBACK_STATUSES:
+            return True, value
+        if field == "reason_code" and value in (_FEEDBACK_REASON_CODES | _PUBLIC_DIAGNOSTICS):
+            return True, value
+        if field == "next_action" and value in _FEEDBACK_NEXT_ACTIONS:
+            return True, value
+    if parent == "preconditions" and grandparent in {"feedback_queue", "skipped"} and value in _PRECONDITIONS:
+        return True, value
+    if parent == "fanout":
+        if field == "triage_verdict" and value in _TRIAGE_VERDICTS:
+            return True, value
+        if field == "coverage_status" and value in _FANOUT_COVERAGE_STATUSES:
+            return True, value
+        if field == "next_action" and value in _FANOUT_NEXT_ACTIONS:
+            return True, value
+        if field == "reason" and (
+                value in (_PUBLIC_DIAGNOSTICS | _FANOUT_REASONS) or _NON_GET_DEFERRED_RE.fullmatch(value)):
+            return True, value
+    if parent == "skipped":
+        if field == "reason_code" and value in (_FEEDBACK_REASON_CODES | _PUBLIC_DIAGNOSTICS):
+            return True, value
+        if field == "reason" and (
+                value in (_PUBLIC_DIAGNOSTICS | _SKIPPED_REASONS) or re.fullmatch(r"blocked_[a-z_]+", value)):
+            return True, value
+    if field in {"steps", "step"} and parent in {"steps", "plan", "skipped"} and value in _LOOP_STEPS:
+        return True, value
+    if field == "disabled_surface_hooks" and parent == "disabled_surface_hooks" and grandparent in {"", "plan"} and value in _LOOP_STEPS:
+        return True, value
+    if parent == "plan" and field == "skip_if" and value in _SKIP_IF_REASONS:
+        return True, value
+    if parent in {"classes", "authz_classes", "oob_classes", "skip"} and grandparent == "plan" and value in _PUBLIC_TYPES["vuln_class"]:
+        return True, value
+    if parent in {"validations", "confirmed"}:
+        if field == "hook" and value in _VALIDATOR_HOOKS:
+            return True, value
+        if field == "verdict" and value in _VALIDATOR_VERDICTS:
+            return True, value
+    if parent == "surface_probes" and field == "hook" and value in _LOOP_STEPS:
+        return True, value
+    if parent in {"crawl", "discover"} and field in {"reason", "stop_reason"} and value in _PUBLIC_DIAGNOSTICS:
+        return True, value
+    return False, None
+
+
+def public_value_ref(value) -> str:
+    """Non-reversible, idempotent value reference; never an executable private ref."""
+    if isinstance(value, str) and value.startswith("opaque:") and _PUBLIC_ATOM.fullmatch(value):
+        return value
+    return "opaque:" + hashlib.sha256(json.dumps(value, sort_keys=True, ensure_ascii=True,
+                                                default=str).encode()).hexdigest()
+
+
+def public_discovery_url(value) -> str:
+    """Allowlisted route shape only. Every other path atom and query value is a template."""
+    try:
+        parsed = urlsplit(value)
+        if parsed.username is not None or parsed.password is not None:
+            return public_value_ref(value)
+        if parsed.scheme not in {"http", "https", ""}:
+            return public_value_ref(value)
+        path = "/".join(part if part in _PUBLIC_PATH_WORDS or not part or part == "{value}"
+                        else "{value}" for part in parsed.path.split("/"))
+        query = urlencode([(name if name in _PUBLIC_TYPES["param"] else public_value_ref(name), "<redacted>")
+                           for name, _ in parse_qsl(parsed.query, keep_blank_values=True)])
+        # DNS labels are not identity/resource values; credentials/fragments never survive.
+        return urlunsplit(parsed._replace(path=path, query=query, fragment=""))
+    except (TypeError, ValueError):
+        return public_value_ref(value)
+
+
+def _public_metadata(value, field=""):
+    if isinstance(value, dict):
+        return {key if key in _PUBLIC_FIELDS else public_value_ref(key): _public_metadata(item, key)
+                for key, item in value.items()
+                if key not in _PRIVATE_EXPORT_KEYS}
+    if isinstance(value, list):
+        return [_public_metadata(item, field) for item in value]
+    if value is None or isinstance(value, bool) or field == "observed_at" and type(value) in {int, float}:
+        return value
+    if not isinstance(value, str):
+        return public_value_ref(value)
+    if not value:
+        return value
+    if _PUBLIC_ATOM.fullmatch(value) and (value.startswith("opaque:") or field in _DIGEST_FIELDS):
+        return value
+    if field == "run_id" and re.fullmatch(r"run-[0-9a-f]{8,64}", value):
+        return value
+    if field in {"url", "target", "baseline_url"} or value.startswith(("http://", "https://")):
+        return public_discovery_url(value)
+    semantic = {"location": "carrier", "owner_role": "role", "attacker_role": "role"}.get(field, field)
+    if value in _PUBLIC_TYPES.get(semantic, set()):
+        return value
+    if field in {"family", "resource_family"} and value.startswith("/"):
+        return public_discovery_url(value)
+    return public_value_ref(value)
+
+
+def public_validator_report(value: Any) -> Any:
+    """Value-safe validator view, never a replacement for canonical signed evidence.
+
+    Verdicts, IDs, digests and request semantics survive. Marker arrays, excerpts,
+    principals and operational URL values cannot become public by omitting a
+    discovery envelope. This projection carries no signature/host authority.
+    """
+    return public_discovery_report(value, strict=True)
+
+
+def public_discovery_report(value: Any, field: str = "", *, strict: bool = False,
+                            _depth: int = 0, _container: tuple[str, ...] = ()) -> Any:
+    """Project every public report branch, not merely cards or credential-named keys.
+
+    Operational routes and arbitrary metadata are retained separately by the host.
+    Fixed decisions/counts and public session/validator references remain useful;
+    resource/provenance values cannot gain public authority from an allowed key.
+    """
+    if _depth >= _PUBLIC_PROJECTION_DEPTH:
+        # Do not serialize an arbitrarily deep/cyclic object to make this ref.
+        return public_value_ref("public projection depth limit")
+    if isinstance(value, dict):
+        if not strict and ("validation_id" in value or "verdict" in value and (
+                {"vuln_type", "oracle", "request_evidence", "differential"} & value.keys())):
+            strict = True
+        strict = strict or bool({"identity_discovery_state", "discovery_operations", "validation_candidates",
+                                 "validation_queue"} & value.keys())
+        result: dict[str, Any] = {}
+        for key, item in value.items():
+            if key in _PRIVATE_EXPORT_KEYS:
+                continue
+            public_key = key if not strict or key in _PUBLIC_FIELDS or _PUBLIC_ATOM.fullmatch(str(key)) else public_value_ref(key)
+            child_container = (*_container, str(key)) if isinstance(item, (dict, list)) else _container
+            if key == "identity_discovery_state" and isinstance(item, dict):
+                result[public_key] = public_discovery_state(item)
+            elif strict and key in _VALUE_FIELDS:
+                result[public_key] = _public_metadata(item, key)
+            elif strict and isinstance(item, str) and (key in {"url", "target", "baseline_url"}
+                                           or item.startswith(("http://", "https://"))):
+                result[public_key] = public_discovery_url(item)
+                if "url_sha256" not in value and "url_sha256" not in result:
+                    sha_source = next(
+                        (value[k] for k in ("url", "target", "baseline_url", "target_url")
+                         if isinstance(value.get(k), str)),
+                        next(
+                            (v for _, v in sorted(value.items())
+                             if isinstance(v, str) and v.startswith(("http://", "https://"))),
+                            item,
+                        ),
+                    )
+                    result["url_sha256"] = hashlib.sha256(sha_source.encode()).hexdigest()
+            else:
+                result[public_key] = public_discovery_report(item, key, strict=strict or (
+                    key == "arguments" and (value.get("tool") == "hunter_run_web_loop"
+                        or str(value.get("tool", "")).startswith("validator_validate_"))),
+                    _depth=_depth + 1, _container=child_container)
+        return result
+    if isinstance(value, list):
+        return [public_discovery_report(item, field, strict=strict, _depth=_depth + 1,
+                                        _container=_container) for item in value]
+    if strict and isinstance(value, str) and value.startswith(("http://", "https://")):
+        return public_discovery_url(value)
+    if isinstance(value, str) and value:
+        # JSON permits four leading whitespace characters and string-wrapped
+        # reports. Recognize those at every nesting level, not just envelopes.
+        # Oversize/decoder-depth failures cannot fall back to public raw text.
+        if value.lstrip(" \t\r\n").startswith(("{", "[", '"')):
+            if (len(value) > _PUBLIC_SERIALIZED_BYTES
+                    or len(value.encode("utf-8")) > _PUBLIC_SERIALIZED_BYTES):
+                return public_value_ref(value)
+            try:
+                decoded = json.loads(value)
+                next_container = (*_container, field) if field and isinstance(decoded, (dict, list)) else _container
+                safe = public_discovery_report(decoded, field, strict=strict, _depth=_depth + 1,
+                                               _container=next_container)
+                if strict or safe != decoded:
+                    return json.dumps(safe, sort_keys=True)
+            except RecursionError:
+                return public_value_ref(value)
+            except (ValueError, TypeError):
+                pass
+        if not strict:
+            return value
+        if _PUBLIC_ATOM.fullmatch(value) and (value.startswith("opaque:") or field in _DIGEST_FIELDS):
+            return value
+        if field in _DIAGNOSTIC_FIELDS:
+            # Preserve host decision semantics, never the dynamic policy/error
+            # suffix (which may include an operational URL or private value).
+            for prefix, decision in (
+                ("run stopped: policy gate unavailable:", "policy gate unavailable"),
+                ("run stopped: policy gate ", "policy gate denied"),
+                ("run stopped: session unavailable,", "session unavailable"),
+            ):
+                if value.startswith(prefix):
+                    return decision
+        allowed_typed, typed_value = _typed_public_scalar(value, field, _container)
+        if allowed_typed:
+            return typed_value
+        if (field in _DECISION_FIELDS and value in _PUBLIC_DECISIONS
+                or field in _DIAGNOSTIC_FIELDS and value in _PUBLIC_DIAGNOSTICS
+                or value in _PUBLIC_TYPES.get(field, set())):
+            return value
+        # Public identity labels are host-registered session *references*, not
+        # principal/contact facts. They retain the existing vault-lookup ABI.
+        if field in {"identity", "resource_owner", "owner_identity", "attacker_identity"} and re.fullmatch(
+                r"[A-Za-z_][A-Za-z0-9_-]{0,31}", value):
+            return value
+        if field == "run_id" and (value == "unspecified" or re.fullmatch(r"run-[0-9a-f]{8,64}", value)):
+            return value
+        if field == "validation_id" and re.fullmatch(r"[0-9a-f]{32}", value):
+            return value
+        if field == "path" and re.fullmatch(
+                r"context-archive/(?:tool-result|index|coverage-gaps|invalid-summary|provider-context|validator|handoff|branch-handoff|[0-9a-f]{16}|[0-9a-f]{64})-[0-9a-f]{64}\.json",
+                value):
+            return value
+        return public_value_ref(value)
+    if strict and type(value) in {int, float}:
+        allowed_typed, typed_value = _typed_public_scalar(value, field, _container)
+        if allowed_typed:
+            return typed_value
+        if field not in _NUMERIC_FIELDS:
+            return public_value_ref(value)
+    if strict and value is not None and not isinstance(value, (str, bool, int, float)):
+        return public_value_ref(value)
+    return value
+
+
+def public_discovery_state(states: dict) -> dict:
+    """Semantic cards only: no principals, contact/object markers or request samples.
+
+    This is deliberately an allowlist, not key-name credential redaction. The
+    operational objects/facts remain in the independently signed private state.
+    """
+    fields = ("identity_ref", "request_binding", "role", "owned_objects_private", "observed_at")
+    resource_fields = ("url", "method", "param", "carrier", "operation_id", "observation_id",
+                       "candidate_source", "candidate_reason", "resource_key", "resource_family",
+                       "family", "state_key", "variant_key")
+
+    def provenance(value):
+        if isinstance(value, list):
+            return [provenance(item) for item in value if isinstance(item, dict)]
+        if not isinstance(value, dict):
+            return {}
+        allowed = ("source", "confidence", "source_spec_id", "source_artifact", "source_sha256",
+                   "operation_id", "observation_id", "scope_revision", "policy_hash")
+        return {key: _public_metadata(value[key], key) for key in allowed
+                if key in value and isinstance(value[key], (str, int))}
+
+    result = {}
+    for name, state in states.items():
+        if not isinstance(state, dict):
+            continue
+        card = {key: _public_metadata(state[key], key) for key in fields if key in state}
+        if isinstance(card.get("request_binding"), dict):
+            card["request_binding"] = {key: value for key, value in card["request_binding"].items()
+                                       if key in ("session_sha256", "scope_revision", "policy_hash")}
+        for key in ("objects", "resources"):
+            if key in state:
+                card[key] = []
+                for item in state[key] if isinstance(state[key], list) else []:
+                    if not isinstance(item, dict):
+                        continue
+                    resource = {field: _public_metadata(item[field], field) for field in resource_fields
+                                 if field in item and isinstance(item[field], (str, int))}
+                    for field in ("provenance", "ownership_evidence"):
+                        if field in item:
+                            resource[field] = provenance(item[field])
+                    card[key].append(resource)
+        result[name if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_-]{0,31}", str(name)) else public_value_ref(name)] = card
+    return result
 
 
 def baseline_error(response: dict, operation: dict) -> str:

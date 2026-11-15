@@ -321,7 +321,7 @@ def authorize_provider(provider_config: str | Path, *, model: str = "", worker_m
         "provider_host": host,
         "provider_kind": provider_kind,
         "api_key_env": env_name,
-        "live_provider_authorized": bool(authorize_live_provider and reason) if provider_kind == "remote" else None,
+        "live_provider_authorized": bool(authorize_live_provider and reason) if provider_kind == "remote" else False,
         "live_authorization_reason": reason if (provider_kind == "remote" and authorize_live_provider and reason) else None,
     }
 

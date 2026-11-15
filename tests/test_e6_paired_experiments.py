@@ -967,6 +967,19 @@ def test_adversarial_derived_legacy_and_provenance_hardening(baseline, tmp_path)
         )
 
 
+def _fit_loopback_tool_args(body: dict, tool_name: str, args: dict) -> dict:
+    """Filter scripted tool arguments to advertised JSON schema properties when closed."""
+    for row in body.get("tools", []):
+        fn = row.get("function", {})
+        if fn.get("name") == tool_name:
+            params = fn.get("parameters", {})
+            props = params.get("properties")
+            if isinstance(props, dict) and params.get("additionalProperties") is False:
+                return {key: value for key, value in args.items() if key in props}
+            return args
+    return args
+
+
 def _make_fast_loopback_provider():
     """Fast deterministic loopback OpenAI-compatible handler completing real python_loop verification."""
 
@@ -1024,9 +1037,10 @@ def _make_fast_loopback_provider():
                     "steps": [{"id": step["id"], "status": "done"}
                               for step in spec["steps"] if not step["host_managed"]],
                 }
+            fitted_args = _fit_loopback_tool_args(body, tool, args)
             payload = {
                 "choices": [{"message": {"tool_calls": [{
-                    "function": {"name": tool, "arguments": json.dumps(args)}
+                    "function": {"name": tool, "arguments": json.dumps(fitted_args)}
                 }]}}],
                 "usage": {"prompt_tokens": 120, "completion_tokens": 80, "total_tokens": 200},
             }
@@ -1140,7 +1154,7 @@ def test_offline_multi_seed_and_repetition_execution_under_unchanged_caps(baseli
         if entry["path"] == "config/llm.json":
             entry["sha256"] = holdout.digest(staged_cfg)
     dump(staged_index, idx_doc)
-    with pytest.raises(ValueError, match="diverges from frozen preflight snapshot"):
+    with pytest.raises(ValueError, match=r"evidence artifact digest mismatch \(runtime_index\)"):
         e6.compare_cohorts(report_path, report_path, mode="strict")
 
 

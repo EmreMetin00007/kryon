@@ -391,11 +391,13 @@ def test_authz_gap_restores_only_its_owner_and_attacker(setup, monkeypatch):
     import requests
     hunter, runtime, campaign, *_ = setup
     bindings = sessions(hunter)
+    run_id = "run-0000000000000001"
     item, fingerprint = plan(hunter, identity="bob", url=BASE + "orders/owned-object",
                              param="", vuln_class="bola", authz_candidate=True, owned_object=True,
                              owner_identity="alice", attacker_identity="bob", resource_owner="alice",
-                             owner_marker="private-synthetic-owner-marker", owner_role="member", attacker_role="member")
-    result = schedule(runtime, campaign, session_bindings=bindings)
+                             owner_marker="private-synthetic-owner-marker", owner_role="member",
+                             attacker_role="member", run_id=run_id)
+    result = schedule(runtime, campaign, session_bindings=bindings, run_id=run_id)
     assert len(result["scheduled"]) == 1
     calls = []
     class Response:
@@ -412,7 +414,7 @@ def test_authz_gap_restores_only_its_owner_and_attacker(setup, monkeypatch):
     report = json.loads(hunter.run_web_loop(BASE, live=True, gap_ref=fingerprint,
                                            session_bindings=bindings, headers='{"X-Research":"researcher"}'))
     assert report["coverage_gap"]["status"] == "confirmed"
-    assert report["run_id"] == "source-run"
+    assert report["run_id"] == run_id
     assert report["requests_authorized"] == len(calls)
     assert set(calls) == {"sid=alice-synthetic-secret", "sid=bob-synthetic-secret", ""}
     for path in (runtime.db_path, Path(hunter.MEM_DB), runtime.cco_home / "credential_vault.db"):

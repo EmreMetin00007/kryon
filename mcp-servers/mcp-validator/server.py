@@ -2149,6 +2149,20 @@ def validate_idor(object_url: str, owner_headers_json: str, attacker_headers_jso
     if atk.get("ok") and atk.get("status") in (200, 206) and marker_in_attacker:
         anon_h = _anonymous_headers(owner_h)
         anon = _request("GET", object_url, headers=anon_h, allow_redirects=False, observe_session=False)
+        anon_status = anon.get("status")
+        if (not anon.get("ok") or anon_status is None or anon_status == 429
+                or anon_status >= 500):
+            return _result(
+                "IDOR", object_url, INCONCLUSIVE, "content_match",
+                {"owner_status": owner["status"], "attacker_status": atk["status"],
+                 "anonymous_status": anon_status}, "-",
+                notes="Anonim kontrol tamamlanamadı; erişim kararını doğrulamak için başarılı baseline gerekir.",
+                guard={"transport_ok": bool(anon.get("ok")),
+                       "controls": ["attacker request", "anonymous baseline request"]},
+                request_evidence=[response_evidence(owner, "owner", 0),
+                                  response_evidence(atk, "attacker", 0),
+                                  response_evidence(anon, "anonymous", 0)],
+            )
         marker_in_anon = bool(anon.get("ok") and anon.get("status") in (200, 206)
                               and owner_marker in anon.get("text", ""))
         evidence = {"owner_status": owner["status"], "attacker_status": atk["status"],

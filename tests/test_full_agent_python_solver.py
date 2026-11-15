@@ -465,9 +465,9 @@ def parameter_solver(broker, monkeypatch):
     view = broker.view({'links': ['/lookup/catalog/a?id=1', '/lookup/catalog/b?id=1']})
     ref = view['content_ref']
     broker.results.append({'spec_id': broker.tasks.specs[1].id, 'tool': 'kali-tools_crawl_web_surface',
-                           'arguments': {'target': spec.target}, **view})
-    records = [{'url': spec.target + path, 'method': 'GET', 'source_artifact': ref['path'],
-                'source_sha256': ref['sha256']} for path in (
+                           'arguments': {'target': spec.target, 'identity': 'synthetic-0'}, **view})
+    records = [{'url': spec.target + path, 'method': 'GET', 'identity_ref': 'synthetic-0',
+                'source_artifact': ref['path'], 'source_sha256': ref['sha256']} for path in (
                     'lookup/catalog', 'lookup/catalog/a?id=1', 'lookup/catalog/b?id=1')]
     solver.summaries['enum-2'] = {'surface': {'records': records}}
     broker.results.append({'spec_id': spec.id, 'tool': 'hunter_run_web_loop',

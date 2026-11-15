@@ -6,11 +6,18 @@ owns keys and raw artifacts; the model receives bounded reference views.
 from __future__ import annotations
 
 import copy
+import errno
 import hashlib
+import hmac
 import json
 import os
+import re
+import stat
 import sys
+import time
+import weakref
 from pathlib import Path
+from typing import Any
 from urllib.parse import parse_qsl, urlsplit
 
 from full_agent_budget import (BudgetError, compact_tools, completion_request,
@@ -22,7 +29,8 @@ from full_agent_provider import (PYTHON_ALLOWANCE_INSTRUCTION,
 from full_agent_runtime_policy import (MAX_CONTEXT_BYTES, MAX_PROMPT_TOKENS,
                                        MIN_OUTPUT_TOKENS, PHASE_WEIGHTS, RuntimePolicy)
 from orchestration_spec import COMPILED_WORKFLOW_TOOL
-from python_candidate_runtime import PROFILES, compact_gaps, page_cards, query_parameters, upstream_ids
+from python_candidate_runtime import (PROFILES, authorization_controls_complete, compact_gaps,
+                                      page_cards, query_parameters, upstream_ids)
 
 PHASE_CALL_LIMITS = {"recon": 12, "enum": 16, "access": 14, "report": 6, "planner": 8}
 SUMMARY_TOOL = "submit_phase_summary"
@@ -172,11 +180,146 @@ class PythonRuntimePolicy(RuntimePolicy):
                 "host_finalizing": sorted(self.host_finalizing)}
 
 
+def _close_fd_box(box: list[int | None]) -> None:
+    fd = box[0] if box else None
+    if fd is not None:
+        box[0] = None
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+
+
+def _open_anchored_dir(
+    path: Path,
+    *,
+    expected_identities: tuple[tuple[int, int], ...] | None = None,
+) -> tuple[int, tuple[tuple[int, int], ...]]:
+    """Open an absolute directory lexically component-by-component with O_NOFOLLOW."""
+    if not path.is_absolute() or ".." in path.parts:
+        raise ValueError("invalid artifact reference")
+    parts = path.parts
+    dir_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    identities: list[tuple[int, int]] = []
+    try:
+        cur_fd = os.open(parts[0], dir_flags)
+    except OSError as exc:
+        if exc.errno in {errno.ELOOP, errno.ENOTDIR, errno.ENOENT, errno.ENXIO}:
+            raise ValueError("invalid artifact reference") from None
+        raise
+    try:
+        st = os.fstat(cur_fd)
+        if not stat.S_ISDIR(st.st_mode):
+            raise ValueError("invalid artifact reference")
+        ident = (st.st_dev, st.st_ino)
+        if expected_identities is not None:
+            if len(expected_identities) != len(parts) or ident != expected_identities[0]:
+                raise ValueError("invalid artifact reference")
+        identities.append(ident)
+        for idx, part in enumerate(parts[1:], start=1):
+            if part in ("", ".", ".."):
+                raise ValueError("invalid artifact reference")
+            try:
+                next_fd = os.open(part, dir_flags, dir_fd=cur_fd)
+            except OSError as exc:
+                if exc.errno in {errno.ELOOP, errno.ENOTDIR, errno.ENOENT, errno.ENXIO}:
+                    raise ValueError("invalid artifact reference") from None
+                raise
+            os.close(cur_fd)
+            cur_fd = next_fd
+            st = os.fstat(cur_fd)
+            if not stat.S_ISDIR(st.st_mode):
+                raise ValueError("invalid artifact reference")
+            ident = (st.st_dev, st.st_ino)
+            if expected_identities is not None and ident != expected_identities[idx]:
+                raise ValueError("invalid artifact reference")
+            identities.append(ident)
+    except BaseException:
+        os.close(cur_fd)
+        raise
+    return cur_fd, tuple(identities)
+
+
+class _DiscoveryOutputAdapter:
+    """Project in-process discovery outputs before the shared executor receipts.
+
+    Subprocess Hunter already writes its private producer handoff. In-process
+    adapters can supply operational observations directly; neither path may
+    write raw observations into the canonical public tool output.
+    """
+
+    def __init__(self, executor):
+        self.executor = executor
+
+    @property
+    def timeout_seconds(self):
+        return self.executor.timeout_seconds
+
+    @timeout_seconds.setter
+    def timeout_seconds(self, value):
+        self.executor.timeout_seconds = value
+
+    def terminate(self):
+        # Host cancellation can arrive while the discovery adapter is installed.
+        return self.executor.terminate()
+
+    def __call__(self, task):
+        from python_identity_discovery import public_export, publish_discovery
+        execution = self.executor(task)
+        result = execution.get("result") if isinstance(execution, dict) else None
+        output = result.get("output") if isinstance(result, dict) else None
+        try:
+            report = json.loads(output) if isinstance(output, str) else output
+        except ValueError:
+            # Preserve non-JSON failures and their measured request receipts.
+            return execution
+        if isinstance(report, dict) and isinstance(result, dict):
+            safe = public_export(report)
+            states = report.get("identity_discovery_state", {})
+            from python_identity_discovery import CONTEXT_ENV
+            expected_raw = os.environ.get(CONTEXT_ENV)
+            if expected_raw and isinstance(states, dict):
+                # An actual Hunter producer may already have signed its exact private
+                # pipeline; only publish projected subprocess output if absent.
+                expected = json.loads(expected_raw)
+                if expected.get("result_path") and not Path(expected["result_path"]).exists():
+                    publish_discovery(states, safe, operational_report=report)
+            if safe != report:
+                execution = {**execution, "result": {**result, "output": safe}}
+        return execution
+
+
 class PythonBroker(HostBroker):
     """Call MCP directly; native dispatch/gate/file-writing are not model APIs."""
 
     def __init__(self, *, workflow_sender=None, **kwargs):
-        super().__init__(**kwargs)
+        raw_workdir = kwargs.get("workdir")
+        if raw_workdir is None:
+            raise ValueError("invalid workdir root")
+        raw_path = Path(os.fspath(raw_workdir))
+        if ".." in raw_path.parts:
+            raise ValueError("invalid workdir root")
+        if not raw_path.is_absolute():
+            raw_path = Path(os.getcwd()) / raw_path
+        authorized_workdir = Path(os.path.abspath(os.fspath(raw_path)))
+        try:
+            workdir_fd, chain_identities = _open_anchored_dir(authorized_workdir)
+        except ValueError:
+            raise ValueError("invalid workdir root") from None
+        fd_box: list[int | None] = [workdir_fd]
+        try:
+            super().__init__(**kwargs)
+        except BaseException:
+            _close_fd_box(fd_box)
+            raise
+        if self._workdir != authorized_workdir:
+            _close_fd_box(fd_box)
+            raise ValueError("invalid workdir root")
+        self._authorized_workdir = authorized_workdir
+        self._authorized_chain_identities = chain_identities
+        self._workdir_fd: int | None = workdir_fd
+        self._workdir_fd_box = fd_box
+        self._workdir_finalizer = weakref.finalize(self, _close_fd_box, fd_box)
         self.runtime_policy = PythonRuntimePolicy(self.budget)
         self.results = []
         self.references = {}
@@ -185,6 +328,29 @@ class PythonBroker(HostBroker):
         self.workflow_bindings = {}
         self.branch_handoffs = {}
         self.read_progress = {}
+        # Host-only map. Never register private references in model archives or
+        # put them in results/context rows (which the model can page through).
+        self.private_discovery_sources = {}
+
+    @property
+    def workdir(self):
+        return self._authorized_workdir
+
+    @workdir.setter
+    def workdir(self, value):
+        raise AttributeError("PythonBroker workdir is immutable")
+
+    def _close_workdir_fd(self):
+        finalizer = getattr(self, "_workdir_finalizer", None)
+        if finalizer is not None:
+            finalizer()
+        self._workdir_fd = None
+
+    def close(self):
+        try:
+            super().close()
+        finally:
+            self._close_workdir_fd()
 
     def bind_workflow(self, task_spec_id, manifest, **binding_args):
         """Host API: bind compiled evidence, never accept manifests from the LLM."""
@@ -378,6 +544,13 @@ class PythonBroker(HostBroker):
             return body, self.runtime_policy.prepare(spec, prompt_bound(provider_json(body))[0]), None
         if not isinstance(context, dict) or context.get('schema') != 'python-workflow-v1':
             return body, self.runtime_policy.prepare(spec, prompt_bound(provider_json(body))[0]), None
+        from python_identity_discovery import public_export
+        context = public_export(context)
+        if context.get('discovery'):
+            # A prior crawler/summary may have no discovery-envelope marker.
+            # It is navigation data here, not operational host request context.
+            from cco_hunter_core.request_context import public_validator_report
+            context['discovery'] = public_validator_report(context['discovery'])
         source_ref = None
         initial_finalizing = set(self.runtime_policy.finalizing)
         for level in range(4):
@@ -453,19 +626,26 @@ class PythonBroker(HostBroker):
                             latest.pop('content_ref', None)  # Exact wrapper remains in context_archive_ref.
                         if not projected.get('coverage_gap_count'):
                             projected.pop('coverage_gap_archive_ref', None)
-                        if not spec.references and not spec.compiled_workflows:
-                            fields = {'hunter_run_web_loop': {'target', 'live', 'session_bindings', 'validation_profile'},
-                                      COVERAGE_TOOL: {'target', 'campaign_id'},
-                                      'validator_validate_sqli': {'target_url', 'param', 'method', 'carrier', 'boolean_only'},
-                                      'validator_validate_ssti': {'target_url', 'param', 'method', 'carrier'}}
-                            for tool in candidate['tools']:
-                                name = tool['function']['name']
-                                params = tool['function']['parameters']
-                                if name in fields:
-                                    keep = fields[name] | set(params.get('required', []))
-                                    params['properties'] = {key: value for key, value in params.get('properties', {}).items()
-                                                            if key in keep}
-                                    params['additionalProperties'] = False
+                    if (not spec.references and not spec.compiled_workflows
+                            and (spec.phase == 'access' or recent and recent[-1].get('tool') == READ_TOOL
+                                 and len(recent[-1].get('result', {}).get('text', '')) > 1000)):
+                        # Candidate selection needs the slice keys, not every
+                        # optional Hunter knob. The solver executes canonical
+                        # bounded defaults; preserve required schema constraints.
+                        # Do this before the first access turn too, so a large
+                        # catalog alone cannot force premature summary-only mode.
+                        fields = {'hunter_run_web_loop': {'target', 'live', 'session_bindings', 'validation_profile'},
+                                   COVERAGE_TOOL: {'target', 'campaign_id'},
+                                   'validator_validate_sqli': {'target_url', 'param', 'method', 'carrier', 'boolean_only'},
+                                   'validator_validate_ssti': {'target_url', 'param', 'method', 'carrier'}}
+                        for tool in candidate['tools']:
+                            name = tool['function']['name']
+                            params = tool['function']['parameters']
+                            if name in fields and params.get('properties'):
+                                keep = fields[name] | set(params.get('required', []))
+                                params['properties'] = {key: value for key, value in params['properties'].items()
+                                                        if key in keep}
+                                params['additionalProperties'] = False
                 if level == 3:
                     self.runtime_policy.finalizing.add(spec.id)
                     for row in projected['recent_results']:
@@ -522,12 +702,30 @@ class PythonBroker(HostBroker):
             return candidate, info, projection
         raise AssertionError('unreachable projection state')
 
+    _HOST_ARCHIVE_LABELS = frozenset({
+        "tool-result",
+        "index",
+        "coverage-gaps",
+        "invalid-summary",
+        "provider-context",
+        "validator",
+        "handoff",
+        "branch-handoff",
+    })
+
     def archive(self, value, label="tool-result"):
+        from python_identity_discovery import public_export
+        value = public_export(value)
         raw = provider_json(value)
         if len(raw) > MAX_ARCHIVE_BYTES:
             raise ArchiveSizeError("archive size limit exceeded")
         digest = hashlib.sha256(raw).hexdigest()
-        relative = f"context-archive/{label}-{digest}.json"
+        # Preserve fixed host-internal labels while hashing non-host labels
+        # so custom caller labels never leak private metadata or bloat refs.
+        raw_label = str(label)
+        safe_label = (raw_label if raw_label in self._HOST_ARCHIVE_LABELS
+                      else hashlib.sha256(raw_label.encode()).hexdigest()[:16])
+        relative = f"context-archive/{safe_label}-{digest}.json"
         path = self.workdir / relative
         path.parent.mkdir(exist_ok=True)
         if path.exists() and (path.is_symlink() or path.read_bytes() != raw):
@@ -539,21 +737,68 @@ class PythonBroker(HostBroker):
         self.references[relative] = ref
         return ref
 
+    def _read_reference_bytes(self, ref):
+        """Bounded, confined, non-blocking regular-file read for a registered archive."""
+        if not isinstance(ref, dict):
+            raise ValueError("unknown artifact reference")
+        rel = ref.get("path")
+        if not isinstance(rel, str) or not rel or self.references.get(rel) != ref:
+            raise ValueError("unknown artifact reference")
+        expected_bytes = ref.get("bytes")
+        expected_sha = ref.get("sha256")
+        if (type(expected_bytes) is not int or not 0 <= expected_bytes <= MAX_ARCHIVE_BYTES
+                or not isinstance(expected_sha, str) or not re.fullmatch(r"[0-9a-f]{64}", expected_sha)):
+            raise ValueError("invalid artifact reference")
+        if rel.startswith("/") or "\\" in rel or "\x00" in rel:
+            raise ValueError("invalid artifact reference")
+        parts = rel.split("/")
+        if any(part in ("", ".", "..") for part in parts):
+            raise ValueError("invalid artifact reference")
+        dir_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+        file_flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+        cur_fd, _identities = _open_anchored_dir(
+            self._authorized_workdir,
+            expected_identities=self._authorized_chain_identities,
+        )
+        try:
+            if self._workdir_fd is not None:
+                anchored_st = os.fstat(self._workdir_fd)
+                opened_st = os.fstat(cur_fd)
+                if (opened_st.st_dev, opened_st.st_ino) != (anchored_st.st_dev, anchored_st.st_ino):
+                    raise ValueError("invalid artifact reference")
+            for part in parts[:-1]:
+                next_fd = os.open(part, dir_flags, dir_fd=cur_fd)
+                os.close(cur_fd)
+                cur_fd = next_fd
+            fd = os.open(parts[-1], file_flags, dir_fd=cur_fd)
+        except OSError as exc:
+            if exc.errno in {errno.ELOOP, errno.ENOTDIR, errno.ENOENT, errno.ENXIO}:
+                raise ValueError("invalid artifact reference") from None
+            raise
+        finally:
+            os.close(cur_fd)
+        try:
+            st = os.fstat(fd)
+            if not stat.S_ISREG(st.st_mode):
+                raise ValueError("artifact reference is not a regular file")
+            if st.st_size > MAX_ARCHIVE_BYTES:
+                raise ValueError("artifact reference exceeds size limit")
+        except BaseException:
+            os.close(fd)
+            raise
+        with os.fdopen(fd, "rb") as handle:
+            raw = handle.read(MAX_ARCHIVE_BYTES + 1)
+        if len(raw) > MAX_ARCHIVE_BYTES or len(raw) != expected_bytes or hashlib.sha256(raw).hexdigest() != expected_sha:
+            raise ValueError("artifact reference changed")
+        return raw
+
     def read_reference(self, ref):
         """Bounded hash-checked exact bytes; no mtime-only integrity shortcuts."""
-        if not isinstance(ref, dict) or self.references.get(ref.get("path")) != ref:
-            raise ValueError("unknown artifact reference")
-        path = self.workdir / ref["path"]
-        if (self.workdir not in path.resolve().parents or any(p.is_symlink() for p in (path, *path.parents))
-                or type(ref.get("bytes")) is not int or not 0 <= ref["bytes"] <= MAX_ARCHIVE_BYTES):
-            raise ValueError("invalid artifact reference")
-        with os.fdopen(os.open(path, os.O_RDONLY | os.O_NOFOLLOW), "rb") as handle:
-            raw = handle.read(MAX_ARCHIVE_BYTES + 1)
-        if len(raw) != ref["bytes"] or hashlib.sha256(raw).hexdigest() != ref["sha256"]:
-            raise ValueError("artifact reference changed")
-        return json.loads(raw)
+        return json.loads(self._read_reference_bytes(ref))
 
     def view(self, value, label="tool-result"):
+        from python_identity_discovery import public_export
+        value = public_export(value)
         ref = self.archive(value, label)
         if len(provider_json(value)) <= 3000:
             return {"result": value, "content_ref": ref}
@@ -606,6 +851,16 @@ class PythonBroker(HostBroker):
                 self.runtime_policy.record_result(spec, tool, None, "denied")
                 raise SessionBindingError()
             args.update(session_target=target, identity=identity)
+            from cco_surface_core import session_store
+            if (session_store.get_session(target, identity) is not None
+                    and session_store.verified_session(target, identity) is None):
+                pre_view = self.invoke(SESSION_CHECK_TOOL, {"target": target, "identity": identity})
+                pre_value = pre_view["result"]
+                if (not isinstance(pre_value, dict) or pre_value.get("status") != "fresh"
+                        or pre_value.get("error") or pre_value.get("execution_failed")
+                        or session_store.verified_session(target, identity) is None):
+                    self.runtime_policy.record_result(spec, tool, None, "denied")
+                    raise SessionBindingError()
         if tool == COVERAGE_TOOL:
             # Missing target is safely bound to the immutable phase target;
             # an explicitly different target is never rewritten.
@@ -620,17 +875,11 @@ class PythonBroker(HostBroker):
             self.runtime_policy.check_tool(spec, tool)
             ticket = self.budget.reserve("http", 0)
             try:
-                ref = self.references.get(args.get("path"))
+                path_arg = args.get("path")
+                ref = self.references.get(path_arg) if isinstance(path_arg, str) else None
                 if ref is None:
                     raise ValueError("unknown artifact reference")
-                path = self.workdir / ref["path"]
-                if (self.workdir not in path.resolve().parents or ref["bytes"] > MAX_ARCHIVE_BYTES
-                        or any(p.is_symlink() for p in (path, *path.parents))):
-                    raise ValueError("artifact reference is a symlink")
-                with os.fdopen(os.open(path, os.O_RDONLY | os.O_NOFOLLOW), "rb") as handle:
-                    raw = handle.read(MAX_ARCHIVE_BYTES + 1)
-                if len(raw) != ref["bytes"] or hashlib.sha256(raw).hexdigest() != ref["sha256"]:
-                    raise ValueError("artifact reference changed")
+                raw = self._read_reference_bytes(ref)
                 offset, size = args.get("offset", 0), args.get("limit", 3000)
                 if type(offset) is not int or offset < 0 or type(size) is not int or not 1 <= size <= 3000:
                     raise ValueError("invalid bounded artifact range")
@@ -670,7 +919,22 @@ class PythonBroker(HostBroker):
             if not sep:
                 raise ValueError("invalid MCP tool name")
             before = len(self.tools)
+            from python_identity_discovery import (CONTEXT_ENV, STATE_ENV,
+                                                   prepare_discovery, prepare_invocation,
+                                                   seal_discovery)
+            discovery_context = os.environ.pop(CONTEXT_ENV, None)
+            discovery_state = os.environ.pop(STATE_ENV, None)
+            prepared_state_path = None
+            expected_discovery = None
             try:
+                if (tool == "hunter_run_web_loop" and spec.phase == "access" and not spec.references
+                        and not spec.compiled_workflows and args.get("live") is True
+                        and args.get("blind_discovery") is True and args.get("target") == spec.target):
+                    self._check_handoff(spec)
+                    prepared_state_path = prepare_discovery(self, spec, args)
+                    expected_discovery = json.loads(os.environ[CONTEXT_ENV])
+                elif tool == "hunter_run_web_loop":
+                    expected_discovery = prepare_invocation(self, spec, args)
                 if tool == SESSION_CHECK_TOOL and {"target": args.get("target"),
                         "identity": args.get("identity", "anon")} not in self.session_checks(spec):
                     # Do not silently rewrite an endpoint into a session target.
@@ -678,12 +942,43 @@ class PythonBroker(HostBroker):
                     # to the same allowance and consecutive-failure brake.
                     self.runtime_policy.check_tool(spec, tool)
                     raise SessionBindingError()
-                emitted = self.call_tool(group, name, args)
+                if tool == "hunter_run_web_loop":
+                    with self.lock:
+                        tool_executor: Any = self.tool_executor
+                        executor = tool_executor.executor
+                        tool_executor.executor = _DiscoveryOutputAdapter(executor)
+                        try:
+                            emitted = self.call_tool(group, name, args)
+                        finally:
+                            tool_executor.executor = executor
+                    if expected_discovery is not None and not emitted.get("isError") and len(self.tools) > before:
+                        receipt_path = Path(self.tools[-1]["artifact"])
+                        receipt = json.loads(receipt_path.read_bytes())
+                        exec_payload = receipt.get("execution")
+                        if (not receipt.get("error") and isinstance(exec_payload, dict)
+                                and not exec_payload.get("execution_failed")):
+                            report = json.loads(emitted["content"][0]["text"])
+                            seal_discovery(self, spec, args, report, receipt_path, expected_discovery)
+                else:
+                    emitted = self.call_tool(group, name, args)
             except ValueError:
                 # Policy denials before execution still participate in the brake.
                 if len(self.tools) == before:
                     self.runtime_policy.record_result(spec, tool, None, "denied")
                 raise
+            finally:
+                os.environ.pop(CONTEXT_ENV, None)
+                os.environ.pop(STATE_ENV, None)
+                if prepared_state_path is not None:
+                    try:
+                        if not prepared_state_path.is_symlink() and prepared_state_path.exists():
+                            prepared_state_path.unlink()
+                    except OSError:
+                        pass
+                if discovery_context is not None:
+                    os.environ[CONTEXT_ENV] = discovery_context
+                if discovery_state is not None:
+                    os.environ[STATE_ENV] = discovery_state
             text = emitted["content"][0]["text"]
             try:
                 value = json.loads(text)
@@ -697,6 +992,22 @@ class PythonBroker(HostBroker):
         view = ({"result": value, "content_ref": self.archive(value)}
                 if tool == READ_TOOL else self.view(value))
         row = {"spec_id": spec.id, "tool": tool, "arguments": args, **view}
+        if tool == SESSION_CHECK_TOOL:
+            # Scheduling age and host-private verified vault linkage only;
+            # never project credentials, secret_ref, or raw claims.
+            row["session_check_observed_at"] = time.time()
+            if (isinstance(value, dict) and value.get("status") == "fresh"
+                    and not value.get("error") and not value.get("execution_failed")
+                    and value.get("target") == args.get("target")
+                    and value.get("identity") == args.get("identity")):
+                from cco_surface_core import session_store
+                verified = session_store.verified_session(args["target"], args["identity"])
+                if (isinstance(verified, dict)
+                        and isinstance(verified.get("check_id"), str) and verified["check_id"]
+                        and isinstance(verified.get("secret_ref"), str) and verified["secret_ref"]):
+                    row["session_check_fingerprint"] = session_store.check_fingerprint(
+                        args["target"], args["identity"], entry=verified
+                    )
         self.results.append(row)
         dump(self.private / "python-tool-results.json", self.results)
         if spec.phase == "access" and tool == "hunter_run_web_loop":
@@ -718,6 +1029,54 @@ class PythonBroker(HostBroker):
             raise BudgetError(self.stop_reason)
         return view
 
+    def private_discovery_report_for_execution(self, spec, execution_path, public_output=None):
+        """Resolve signed private operational report for one measured receipt."""
+        from python_identity_discovery import _reference, _read_reference, _source_observation
+        path = str(execution_path)
+        private_ref = self.private_discovery_sources.get(path)
+        if private_ref is None:
+            raise ValueError("private discovery report provenance unavailable")
+        source = {"execution_reference": _reference(Path(path)), "private_reference": private_ref}
+        receipt = _read_reference(source["execution_reference"])
+        if public_output is None:
+            public_output = ((receipt.get("execution") or {}).get("result") or {}).get("output")
+            if isinstance(public_output, str):
+                public_output = json.loads(public_output)
+        observation = _source_observation(source, spec.to_dict(), public_output, receipt)
+        return copy.deepcopy(observation["operational_report"])
+
+    def private_discovery_report(self, spec, content_ref):
+        """Host-only exact pipeline after public archive/receipt/producer checks.
+
+        This is deliberately not a model tool or an archive-reader mode. Public
+        read_reference/read_artifact never hydrate operational routes or markers.
+        """
+        from evidence_trust import canonical_bytes
+        from python_identity_discovery import _reference, _read_reference, _source_observation
+        public = self.read_reference(content_ref)
+        for row in self.results:
+            if (row["spec_id"] != spec.id or row["tool"] != "hunter_run_web_loop"
+                    or row["content_ref"] != content_ref):
+                continue
+            for execution in self.tools:
+                if (execution.get("origin") != "solver" or execution.get("task_spec_id") != spec.id
+                        or execution.get("tool") != "hunter_run_web_loop"):
+                    continue
+                path = str(execution["artifact"])
+                private_ref = self.private_discovery_sources.get(path)
+                if private_ref is None:
+                    continue
+                source = {"execution_reference": _reference(Path(path)), "private_reference": private_ref}
+                receipt = _read_reference(source["execution_reference"])
+                if canonical_bytes(receipt.get("arguments")) != canonical_bytes(row["arguments"]):
+                    continue
+                try:
+                    observation = _source_observation(source, spec.to_dict(), public, receipt)
+                except (ValueError, OSError, TypeError, KeyError):
+                    continue
+                return copy.deepcopy(observation["operational_report"])
+        raise ValueError("private discovery report provenance unavailable")
+
     def validation_attempts(self, spec):
         """IDs come only from executed validation tools and current signatures."""
         from brain import _VALIDATOR_VECTOR_TYPES, _VALIDATOR_VECTOR_ALIASES, runtime_root
@@ -725,6 +1084,7 @@ class PythonBroker(HostBroker):
         if validator_path not in sys.path:
             sys.path.append(validator_path)
         from cco_validator_core import artifact_is_current, load_validation, normalize_finding_type
+        from python_identity_discovery import public_export
         attempts = {}
         executions = {}
         owners: dict[str, str] = {}
@@ -744,8 +1104,11 @@ class PythonBroker(HostBroker):
                     continue
             if not isinstance(value, dict):
                 continue
-            key = provider_json([execution["task_spec_id"], execution["tool"], receipt["arguments"], value])
-            executions[key] = True
+            # Join only the exact safe projection of a measured private receipt.
+            # Direct signed records stay untouched; public route templates are
+            # never used as operational request/scoring context.
+            key = provider_json([execution["task_spec_id"], execution["tool"], receipt["arguments"], public_export(value)])
+            executions[key] = execution["artifact"]
             for item in [value, *(value.get("validations") or [])]:
                 if isinstance(item, dict) and isinstance(item.get("validation_id"), str):
                     owners.setdefault(item["validation_id"], execution["task_spec_id"])
@@ -757,8 +1120,19 @@ class PythonBroker(HostBroker):
             value = self.read_reference(ref)
             if not isinstance(value, dict) or value.get("execution_failed") or value.get("error"):
                 continue
-            if provider_json([spec.id, row["tool"], row["arguments"], value]) not in executions:
+            execution_path = executions.get(provider_json([spec.id, row["tool"], row["arguments"], value]))
+            if execution_path is None:
                 continue
+            if row["tool"] == "hunter_run_web_loop" and str(execution_path) in self.private_discovery_sources:
+                from python_identity_discovery import _reference, _read_reference, _source_observation
+                source = {"execution_reference": _reference(Path(execution_path)),
+                          "private_reference": self.private_discovery_sources[str(execution_path)]}
+                try:
+                    observation = _source_observation(source, spec.to_dict(), value,
+                                                      _read_reference(source["execution_reference"]))
+                except (ValueError, OSError, TypeError, KeyError):
+                    continue
+                value = observation["operational_report"]
             candidates = [value, *(value.get("validations") or [])]
             for candidate in candidates:
                 if not isinstance(candidate, dict) or not candidate.get("validation_id"):
@@ -811,6 +1185,8 @@ class PythonBroker(HostBroker):
                 else:
                     # Hunter's evidence contract is its observed validation
                     # queue, not a top-level scalar copied from another run.
+                    continue
+                if vector == "authz-idor" and not authorization_controls_complete(record):
                     continue
                 attempts[record["validation_id"]] = {"vector": vector, "record": record,
                     "tool": row["tool"],
@@ -868,12 +1244,25 @@ class PythonBroker(HostBroker):
     def session_check_evidence(self, spec=None):
         spec = spec or self.tasks.active_spec
         sources = {spec.id, *upstream_ids(spec, self.tasks.specs)} if spec else set()
-        checks = {}
+        checks: dict[str, dict] = {}
         for row in self.results:
-            if row["spec_id"] in sources and row["tool"] == SESSION_CHECK_TOOL:
-                value = json.loads((self.workdir / row["content_ref"]["path"]).read_bytes())
-                if value.get("status") == "fresh":
-                    checks[row["arguments"]["identity"]] = value
+            if row.get("spec_id") in sources and row.get("tool") == SESSION_CHECK_TOOL:
+                args = row.get("arguments") or {}
+                identity = args.get("identity")
+                target = args.get("target")
+                if not isinstance(identity, str) or not identity or not isinstance(target, str) or not target:
+                    continue
+                if (row.get("is_error") or not isinstance(row.get("session_check_fingerprint"), str)
+                        or not row["session_check_fingerprint"]):
+                    checks.pop(identity, None)
+                    continue
+                value = self.read_reference(row.get("content_ref"))
+                if (isinstance(value, dict) and value.get("status") == "fresh"
+                        and not value.get("error") and not value.get("execution_failed")
+                        and value.get("target") == target and value.get("identity") == identity):
+                    checks[identity] = value
+                else:
+                    checks.pop(identity, None)
         return checks
 
     def write_attempt_ledger(self):
@@ -897,21 +1286,65 @@ class PythonBroker(HostBroker):
                    "artifacts": refs, "workflow_files": snapshots}
         dump(self.workdir / "attempt-ledger.json", attest(payload, "python-attempt-ledger"))
 
+    def _fresh_task_session_check(self, spec, args):
+        from cco_surface_core import session_store
+        if not isinstance(args, dict):
+            return False
+        target = args.get("target")
+        identity = args.get("identity")
+        if not isinstance(target, str) or not target or not isinstance(identity, str) or not identity:
+            return False
+        verified = session_store.verified_session(target, identity)
+        if not isinstance(verified, dict):
+            return False
+        if (not isinstance(verified.get("check_id"), str) or not verified["check_id"]
+                or not isinstance(verified.get("secret_ref"), str) or not verified["secret_ref"]):
+            return False
+        try:
+            current_fingerprint = session_store.check_fingerprint(target, identity, entry=verified)
+        except (OSError, TypeError, ValueError):
+            return False
+        if not isinstance(current_fingerprint, str) or not current_fingerprint:
+            return False
+        for row in reversed(self.results):
+            if (row.get("spec_id") == spec.id and row.get("tool") == SESSION_CHECK_TOOL
+                    and row.get("arguments") == {"target": target, "identity": identity}):
+                if row.get("is_error"):
+                    return False
+                observed_fp = row.get("session_check_fingerprint")
+                if (not isinstance(observed_fp, str) or not observed_fp
+                        or not hmac.compare_digest(observed_fp, current_fingerprint)):
+                    return False
+                try:
+                    value = self.read_reference(row.get("content_ref"))
+                except (ValueError, OSError):
+                    return False
+                if (not isinstance(value, dict) or value.get("status") != "fresh"
+                        or value.get("error") or value.get("execution_failed")):
+                    return False
+                if value.get("target") != target or value.get("identity") != identity:
+                    return False
+                if value.get("check_id") is not None and value.get("check_id") != verified["check_id"]:
+                    return False
+                return True
+        return False
+
     def handoff(self):
         spec = self.tasks.active_spec
         checks = self.session_checks(spec)
         if len(checks) != len(self.tasks.bindings):
             raise HandoffError("handoff_session_binding_invalid")
-        self.runtime_policy.reserve_handoff(spec, len(checks))
+        pending = [args for args in checks if not self._fresh_task_session_check(spec, args)]
+        self.runtime_policy.reserve_handoff(spec, len(pending))
         remaining = min(spec.max_calls, PHASE_CALL_LIMITS[spec.phase]) - self.runtime_policy.tool_calls.get(spec.id, 0)
-        if remaining < len(checks) + 1:
+        if remaining < len(pending) + 1:
             raise BudgetError("handoff_tool_budget_exhausted")
         self.runtime_policy.host_finalizing.add(spec.id)
         try:
             # Provider turns may exceed the 300-second freshness window. Do
             # real policy-gated, charged checks immediately before handoff;
             # never extend the window or assume setup remains fresh.
-            for args in checks:
+            for args in pending:
                 try:
                     view = self.invoke(SESSION_CHECK_TOOL, args)
                 except BudgetError:
@@ -1016,6 +1449,8 @@ class PythonBroker(HostBroker):
             record, _ = _confirmation_record(finding, vector, ledger)
             if record is None:
                 raise ValueError("validator receipt became stale")
+            if vector == "authz-idor" and not authorization_controls_complete(record):
+                raise ValueError("validator receipt missing authorization controls")
             hypotheses.mark(ledger, vector, "confirmed", note="host verified validator receipt")
             entry = next(e for e in ledger["hypotheses"] if e["vector"] == vector)
             entry.update(_confirmation_reference(record))

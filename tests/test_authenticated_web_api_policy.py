@@ -388,13 +388,18 @@ def test_authz_controls_inherit_program_header_without_leaking_identity(policy, 
 
 def test_fake_transport_discovery_through_uuid_authz_and_signed_coverage(policy, monkeypatch):
     """Exercise real adapters together while replacing every HTTP transport."""
+    import hashlib
     import requests
     from urllib.parse import urlsplit
+    from cco_validator_core import artifact_is_current
+    from python_candidate_runtime import authorization_controls_complete
 
     base = "https://own.test/allowed"
-    alice_url = base + "/api/orders/5080c899-12bf-4523-89ce-d91a5ce3d1f4"
-    bob_url = base + "/api/orders/c534cae2-f5c9-41bc-b77a-de99aa2df907"
-    admin_url = base + "/admin/export"
+    alice_uuid = "5080c899-12bf-4523-89ce-d91a5ce3d1f4"
+    bob_uuid = "c534cae2-f5c9-41bc-b77a-de99aa2df907"
+    alice_url = f"{base}/api/orders/{alice_uuid}"
+    bob_url = f"{base}/api/orders/{bob_uuid}"
+    admin_url = f"{base}/admin/export"
     seen = []
 
     class Response:
@@ -441,12 +446,31 @@ def test_fake_transport_discovery_through_uuid_authz_and_signed_coverage(policy,
                               identities=json.dumps(identities), sleep_s=0)
     result = json.loads(raw)
     assert result["discover"].get("ingested")
-    rows = {row["url"]: row for row in result["validations"]}
-    assert rows[alice_url]["verdict"] == "CONFIRMED"
-    assert rows[bob_url]["verdict"] == "UNCONFIRMED"
-    assert rows[admin_url]["verdict"] == "CONFIRMED"
-    assert all(row["coverage_recorded"] for row in rows.values())
     assert "session=alice" not in raw and "session=bob" not in raw
+    assert alice_uuid not in raw and bob_uuid not in raw
+    assert "alice-owned-canary" not in raw and "bob-owned-canary" not in raw
+    assert "admin-owned-canary" not in raw
+    alice_key = hashlib.sha256(alice_url.encode()).hexdigest()
+    bob_key = hashlib.sha256(bob_url.encode()).hexdigest()
+    admin_key = hashlib.sha256(admin_url.encode()).hexdigest()
+    expected_targets = {alice_key: alice_url, bob_key: bob_url, admin_key: admin_url}
+    rows = {row["url_sha256"]: row for row in result["validations"]}
+    assert set(rows) == set(expected_targets)
+    assert rows[alice_key]["verdict"] == "CONFIRMED"
+    assert rows[bob_key]["verdict"] == "UNCONFIRMED"
+    assert rows[admin_key]["verdict"] == "CONFIRMED"
+    assert all(row["coverage_recorded"] for row in rows.values())
+    for key, raw_url in expected_targets.items():
+        row = rows[key]
+        assert row["url"] != raw_url and "{value}" in row["url"]
+        artifact = hunter.load_validation(row["validation_id"])
+        assert artifact and artifact_is_current(artifact)
+        assert hunter.validator_artifact_is_valid(artifact, expected_target=raw_url)
+        assert artifact["target"] == raw_url
+        if key == admin_key:
+            assert {r["role"] for r in artifact["request_evidence"]} >= {"owner", "other", "anonymous"}
+        else:
+            assert authorization_controls_complete(artifact)
     coverage = json.loads(hunter.coverage_report_run(base, result["run_id"]))
     assert {row["endpoint"] for row in coverage["per_endpoint"]} >= {alice_url, bob_url, admin_url}
     assert seen

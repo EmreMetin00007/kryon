@@ -8,6 +8,7 @@ seed ve işaretler operatör tarafında kalır. Bütçe: uygulama istek sayacı.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import secrets
@@ -63,10 +64,40 @@ def _rows(value) -> list[dict]:
     return [row for row in value if isinstance(row, dict)] if isinstance(value, list) else []
 
 
-def _matches_case(case: dict, item: dict, target: str, *, candidate: bool = False) -> bool:
+def _known_case_hashes(case: dict, target: str, rows: list[dict] = ()) -> set[str]:
+    """Cryptographic URL digests known to the operator for exact case path matching."""
+    hashes: set[str] = set()
+    parsed = urlparse(str(target or ""))
+    if parsed.scheme in {"http", "https"} and parsed.netloc:
+        path = str(case.get("path") or "")
+        exact = f"{parsed.scheme}://{parsed.netloc}{path if path.startswith('/') else '/' + path}"
+        hashes.add(hashlib.sha256(exact.encode()).hexdigest())
+    for row in rows:
+        url = str(row.get("url") or row.get("target") or "")
+        if url and _origin(url) == _origin(target) and _path_of(row) == case["path"]:
+            hashes.add(hashlib.sha256(url.encode()).hexdigest())
+    return hashes
+
+
+def _path_matches(case: dict, item: dict, target: str, *, allow_hash: bool = False,
+                  known_hashes: set[str] | None = None) -> bool:
+    if _path_of(item) == case["path"]:
+        return True
+    if not allow_hash:
+        return False
+    digest = item.get("url_sha256")
+    raw_url = str(item.get("url") or item.get("target") or "")
+    if not isinstance(digest, str) or "{value}" not in raw_url:
+        return False
+    expected_hashes = _known_case_hashes(case, target) if known_hashes is None else known_hashes
+    return digest in expected_hashes
+
+
+def _matches_case(case: dict, item: dict, target: str, *, candidate: bool = False,
+                  known_hashes: set[str] | None = None) -> bool:
     """Missing actor/owner is acceptable for a lead, never for a verdict."""
     if (_origin(item.get("url") or item.get("target")) != _origin(target)
-            or _path_of(item) != case["path"]
+            or not _path_matches(case, item, target, allow_hash=candidate, known_hashes=known_hashes)
             or _norm_class(item) != _norm_class({"type": case["class"]})
             or str(item.get("method") or ("GET" if candidate else "")).upper()
             != str(case.get("method") or "GET").upper()):
@@ -124,6 +155,13 @@ def _pipeline(case: dict, loop: dict, events: list[dict], inventory: dict | None
     """Diagnose progress from telemetry; only verified events establish results."""
     target = str(loop.get("target") or "")
     fuzz = loop.get("fuzz") if isinstance(loop.get("fuzz"), dict) else {}
+    inventory_ok = (isinstance(inventory, dict) and bool(_origin(target)) and bool(loop.get("run_id"))
+                    and loop.get("run_id") != "unspecified"
+                    and inventory.get("run_id") == loop["run_id"]
+                    and inventory.get("source") == "isolated_run_surface_snapshot")
+    known_hashes = _known_case_hashes(
+        case, target, [*(_rows(inventory.get("records")) if inventory_ok else []), *events]
+    )
 
     def leads(rows):
         matched = []
@@ -131,14 +169,10 @@ def _pipeline(case: dict, loop: dict, events: list[dict], inventory: dict | None
             if raw.get("run_id") not in (None, "", loop.get("run_id")):
                 continue
             row = {**raw, "carrier": raw.get("carrier") or raw.get("location")}
-            if _matches_case(case, row, target, candidate=True):
+            if _matches_case(case, row, target, candidate=True, known_hashes=known_hashes):
                 matched.append(row)
         return matched
 
-    inventory_ok = (isinstance(inventory, dict) and bool(_origin(target)) and bool(loop.get("run_id"))
-                    and loop.get("run_id") != "unspecified"
-                    and inventory.get("run_id") == loop["run_id"]
-                    and inventory.get("source") == "isolated_run_surface_snapshot")
     observed = []
     discovery_rows = [row for row in _rows(loop.get("discovery_operations"))
                       if row.get("run_id") == loop.get("run_id")]
@@ -147,7 +181,7 @@ def _pipeline(case: dict, loop: dict, events: list[dict], inventory: dict | None
     for row in discovery_rows:
         # Discovery identifies an operation, not a vulnerability or actor.
         if (_origin(row.get("url")) == _origin(target)
-                and _path_of(row) == case["path"]
+                and _path_matches(case, row, target, allow_hash=True, known_hashes=known_hashes)
                 and (case.get("operation_id") is None or row.get("operation_id") == case["operation_id"])
                 and str(row.get("method") or "").upper() == str(case.get("method") or "GET").upper()):
             observed.append(row)
@@ -225,11 +259,14 @@ def evaluate(truth: list[dict], loop: dict, *, verified_coverage: list[dict] | N
     fuzz = loop.get("fuzz") if isinstance(loop.get("fuzz"), dict) else {}
     likely = _rows(fuzz.get("likely_hits"))
     cases = []
+    inv_records = (_rows(surface_inventory.get("records"))
+                   if isinstance(surface_inventory, dict) else [])
     for case in truth:
+        known_hashes = _known_case_hashes(case, target, [*inv_records, *events])
         matched = [event for event in events if _matches_case(case, event, target)]
         statuses = {event["status"] for event in matched}
         hit_c = "confirmed" in statuses
-        hit_l = any(_matches_case(case, item, target, candidate=True) for item in likely)
+        hit_l = any(_matches_case(case, item, target, candidate=True, known_hashes=known_hashes) for item in likely)
         if case["expected"] == "positive":
             blocked = loop.get("ok") is False and bool(
                 loop.get("stopped") or loop.get("skipped"))

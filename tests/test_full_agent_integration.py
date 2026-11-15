@@ -1391,8 +1391,9 @@ def test_native_readonly_validation_signed_coverage(integration_run, record_test
             record = read_json(path)
             assert record["verdict"] == row["verdict"] == "CONFIRMED"
             assert record["request_evidence"]
+            assert hashlib.sha256(record["target"].encode()).hexdigest() == row["url_sha256"]
             assert artifact_is_valid(record, trusted_root=str(path.parent),
-                                     expected_target=row["url"], expected_finding_type=row["vuln_class"])
+                                     expected_target=record["target"], expected_finding_type=row["vuln_class"])
             signed_artifacts.append({"path": str(path), "sha256": preflight.sha256(path),
                                      "validation_id": row["validation_id"], "public_signature_verified": True})
         assert live["requests_authorized"] > 0
@@ -1431,7 +1432,7 @@ def test_native_negative_control_closure_and_tamper(integration_run, record_test
         assert not live["confirmed"] and not live["errors"] and not live.get("stopped")
         assert not live["fuzz"]["stopped"]
         row = live["validations"][0]
-        assert urlsplit(row["url"]).path == "/safe/go" and row["vuln_class"] == "open_redirect"
+        assert urlsplit(row["url"]).path == "/{value}/{value}" and row["vuln_class"] == "open_redirect"
         assert row["verdict"] == "UNCONFIRMED" and row["coverage_recorded"] and row["validation_id"]
         assert any(candidate["candidate_source"] == "bounded_sampling"
                    and candidate["vuln_class"] == "open_redirect" for candidate in live["validation_candidates"])
@@ -1439,8 +1440,10 @@ def test_native_negative_control_closure_and_tamper(integration_run, record_test
         assert len(paths) == 1
         path = paths[0]
         record = read_json(path)
+        assert urlsplit(record["target"]).path == "/safe/go"
+        assert hashlib.sha256(record["target"].encode()).hexdigest() == row["url_sha256"]
         monkeypatch.setenv("CCO_HOME", str(private / "state"))
-        verification = {"trusted_root": str(path.parent), "expected_target": row["url"],
+        verification = {"trusted_root": str(path.parent), "expected_target": record["target"],
                         "expected_finding_type": row["vuln_class"]}
         assert record["verdict"] == "UNCONFIRMED" and record["request_evidence"]
         assert record["guard"]["transport_ok"] and artifact_is_valid(record, **verification)
@@ -1516,17 +1519,19 @@ def assert_successful_native_closure(integration_run, record_testsuite_property,
         assert not live["errors"] and not live.get("stopped") and not live["fuzz"]["stopped"]
         row, = live["validations"]
         assert row["verdict"] == "CONFIRMED" and row["coverage_recorded"]
-        assert row["vuln_class"] == "open_redirect" and urlsplit(row["url"]).path == "/go"
+        assert row["vuln_class"] == "open_redirect" and urlsplit(row["url"]).path == "/{value}"
         paths = list((private / "state/validations").glob(row["validation_id"] + "_*.json"))
         assert len(paths) == 1
         artifact_path = paths[0]
         record = read_json(artifact_path)
+        assert urlsplit(record["target"]).path == "/go"
+        assert hashlib.sha256(record["target"].encode()).hexdigest() == row["url_sha256"]
         monkeypatch.setenv("CCO_HOME", str(private / "state"))
         assert record["verdict"] == "CONFIRMED" and record["request_evidence"]
         assert record["guard"]["transport_ok"]
         assert record["artifact"]["signature"]["algorithm"] == "ed25519:v1"
         assert artifact_is_valid(record, trusted_root=str(artifact_path.parent),
-                                 expected_target=row["url"], expected_finding_type=row["vuln_class"])
+                                 expected_target=record["target"], expected_finding_type=row["vuln_class"])
         ledger = read_json(work / "report/ledger.json")
         checkpoint = ledger["checkpoint"]
         assert checkpoint["sealed"] is True and checkpoint["check_exit"] == 0, checkpoint

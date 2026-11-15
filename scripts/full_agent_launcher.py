@@ -279,20 +279,31 @@ def host_environment(home, workdir, runtime):
         os.environ.update(previous)
 
 
-def setup_sessions(broker, accounts, base, home):
+def setup_sessions(broker, accounts, base, home, *, verify_checks=True):
     if not accounts:
         return {}
     from cco_surface_core import session_store
+    if verify_checks is True:
+        verify_identities = set(accounts)
+    elif verify_checks is False:
+        verify_identities = set()
+    elif verify_checks == "crawl_only":
+        ordered = sorted(accounts)
+        members = [label for label in ordered if accounts[label].get("role") == "member"]
+        verify_identities = {(members or ordered)[0]}
+    else:
+        raise ValueError("verify_checks must be True, False, or 'crawl_only'")
     bindings = {}
     for label, account in accounts.items():
         session_store.put_session(base, label, headers={"Authorization": "Bearer " + account["token"]},
                                   check_url=base, marker=label, home=str(home))
         session_store.bind_resources(base, label, {"role": account["role"]},
                                      permits=lambda url: url == base, home=str(home))
-        result = broker.call_tool("validator", "session_vault_check", {"target": base, "identity": label}, origin="setup")
-        checked = json.loads(result["content"][0]["text"])
-        if result.get("isError") or checked.get("status") != "fresh":
-            raise ValueError("synthetic session check failed")
+        if label in verify_identities:
+            result = broker.call_tool("validator", "session_vault_check", {"target": base, "identity": label}, origin="setup")
+            checked = json.loads(result["content"][0]["text"])
+            if result.get("isError") or checked.get("status") != "fresh":
+                raise ValueError("synthetic session check failed")
         bindings[label] = {"target": base, "role": account["role"], "test_data_only": True,
                            "owned_objects_private": True}
     return bindings
@@ -413,10 +424,16 @@ def launch_seed(prepared, *, seed, output, provider, api_key, bwrap=None, openco
                     broker.load_catalog(home)
                     lab_thread = threading.Thread(target=lab.serve_forever, daemon=True)
                     lab_thread.start()
-                    bindings = setup_sessions(broker, lab.blind_state["accounts"], base, home)
+                    bindings = setup_sessions(
+                        broker,
+                        lab.blind_state["accounts"],
+                        base,
+                        home,
+                        verify_checks="crawl_only" if solver_mode == "python_loop" else True,
+                    )
                 if solver_mode == "python_loop":
                     from full_agent_tasks import TaskRegistry
-                    broker.tasks = TaskRegistry(specs, workdir, bindings, setup_checks_passed=True)
+                    broker.tasks = TaskRegistry(specs, workdir, bindings, setup_checks_passed=False)
                 else:
                     from full_agent_tasks import NativeTasks
                     broker.tasks = NativeTasks(specs, workdir, bindings, setup_checks_passed=True)

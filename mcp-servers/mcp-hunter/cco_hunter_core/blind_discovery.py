@@ -231,6 +231,37 @@ class _Links(HTMLParser):
             self._json_script, self._buffer = False, []
 
 
+def _json_collection_entries(text):
+    """Return same-node (link, owners, ids) tuples only from complete top-level JSON."""
+    try:
+        data = _load_json(text)
+    except (TypeError, ValueError, RecursionError):
+        return []
+    if not isinstance(data, (dict, list)):
+        return []
+    entries, pending, seen = [], deque([data]), 0
+    while pending and seen < _MAX_JSON_NODES:
+        node = pending.popleft()
+        seen += 1
+        if isinstance(node, dict):
+            node_links = []
+            for key, value in node.items():
+                if _key(key) in _LINK_FIELDS and isinstance(value, str) and len(node_links) < _MAX_LINKS_PER_PAGE:
+                    node_links.append(value)
+                if isinstance(value, (dict, list)):
+                    pending.append(value)
+            if node_links and any(_key(key) in _OWNER_FIELDS | {"owner"} for key in node):
+                owners, ids = _attribution(node)
+                if owners and ids:
+                    for value in node_links:
+                        entries.append((value, owners, ids))
+        elif isinstance(node, list):
+            pending.extend(node[:_MAX_JSON_NODES])
+            if len(node) > _MAX_JSON_NODES:
+                return []
+    return [] if pending else entries
+
+
 def _document(text, is_profile):
     """Parse explicit JSON/HTML attribution, without executing scripts."""
     try:
@@ -332,8 +363,8 @@ def _observed_exposure(text):
 
 
 def discover_owned_resources(target, identities, fetch, permits, *, stop_reason=None,
-                             max_requests=24, per_identity=8, max_depth=3, pace=None,
-                             allow_private_owned=False):
+                              max_requests=24, per_identity=8, max_depth=3, pace=None,
+                              allow_private_owned=False, observations=None):
     """Return (safe summary, transient identities, transient candidates).
 
     The caller supplies a gate-backed GET transport and scope predicate. The
@@ -386,8 +417,34 @@ def discover_owned_resources(target, identities, fetch, permits, *, stop_reason=
     # Only an admitted discovery can be incomplete. Failed prerequisites must
     # stop the caller's subsequent discover/crawl/fuzz traffic as well.
     summary["status"] = "incomplete"
+    cached = observations or {}
     observations = {}
     for name, identity, _ in actors:
+        if name in cached:
+            state = cached[name]
+            facts = state.get("identity_facts", [])
+            subjects = {item["value"] for item in facts if item.get("field") == "principal"
+                        and item.get("source") == "response_metadata" and item.get("confidence") == "observed"}
+            objects = state.get("objects", [])
+            if len(subjects) != 1 or not objects:
+                summary["status"] = "blocked"
+                summary["reasons"].append("completed discovery ownership context unavailable")
+                return summary, copy.deepcopy(identities), []
+            # Reuse discovery only. Each new owner/attacker comparison still
+            # creates a new queue and executes its ordinary signed controls.
+            enriched[name].update({key: copy.deepcopy(state[key]) for key in
+                                   ("objects", "resources", "identity_facts") if key in state})
+            enriched[name]["_discovery_observed_at"] = state["observed_at"]
+            resources = []
+            for obj in objects:
+                url = _safe_link(start, obj.get("url"), origin, permits)
+                if not url or not obj.get("marker"):
+                    summary["status"] = "blocked"
+                    summary["reasons"].append("completed discovery object is no longer permitted")
+                    return summary, copy.deepcopy(identities), []
+                resources.append((url, obj["marker"], subjects))
+            observations[name] = (subjects, resources, False, {})
+            continue
         subjects, resources, subject_conflict = set(), [], False
         exposures = {}
         queue, seen = deque([(start, 0, False)]), set()
@@ -436,6 +493,46 @@ def discover_owned_resources(target, identities, fetch, permits, *, stop_reason=
             marker, owner_values = _owned_record(current, owned_records)
             if owner_values and marker and marker in text:
                 resources.append((current, marker, owner_values))
+            elided_links = set()
+            if (allow_private_owned and identity.get("owned_objects_private") is True
+                    and not ambiguous and not subject_conflict and subjects and depth < depth_limit):
+                proven_by_link = {}
+                ambiguous_proven = set()
+                existing_objects = [item for item in (identity.get("objects") or []) if isinstance(item, dict)]
+                for raw_link, entry_owners, entry_ids in _json_collection_entries(text):
+                    try:
+                        link = _safe_link(current, raw_link, origin, permits)
+                    except Exception:
+                        link = ""
+                    if not link:
+                        continue
+                    node_marker = _marker(link, entry_ids)
+                    rec_marker, rec_owners = _owned_record(link, owned_records)
+                    proven_owners = entry_owners & rec_owners
+                    if (not node_marker or node_marker != rec_marker or node_marker not in text
+                            or node_marker in exposures or not (proven_owners & subjects)
+                            or any(r_marker != node_marker for r_url, r_marker, _ in resources if r_url == link)
+                            or any(item.get("url") == link and item.get("marker") != node_marker for item in existing_objects)):
+                        ambiguous_proven.add(link)
+                        proven_by_link.pop(link, None)
+                        continue
+                    if link in ambiguous_proven:
+                        continue
+                    if link in proven_by_link:
+                        prev_marker, prev_owners = proven_by_link[link]
+                        merged = prev_owners & proven_owners
+                        if prev_marker != node_marker or not (merged & subjects):
+                            ambiguous_proven.add(link)
+                            proven_by_link.pop(link, None)
+                        else:
+                            proven_by_link[link] = (node_marker, merged)
+                    else:
+                        proven_by_link[link] = (node_marker, proven_owners)
+                for link, (node_marker, proven_owners) in proven_by_link.items():
+                    if link not in seen:
+                        elided_links.add(link)
+                        seen.add(link)
+                        resources.append((link, node_marker, proven_owners))
             if depth < depth_limit:
                 owned_links = []
                 for value, is_me in sorted(links, key=lambda item: not item[1]):
@@ -443,7 +540,7 @@ def discover_owned_resources(target, identities, fetch, permits, *, stop_reason=
                         link = _safe_link(current, value, origin, permits)
                     except Exception:
                         link = ""
-                    if link and link not in seen and len(queue) + len(owned_links) < per_limit * 3:
+                    if link and link not in seen and link not in elided_links and len(queue) + len(owned_links) < per_limit * 3:
                         entry = (link, depth + 1, is_me)
                         if any(owners & subjects and _marker(link, ids) for owners, ids in owned_records):
                             # Resolve an observed owner's object while its list

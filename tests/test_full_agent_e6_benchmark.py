@@ -35,6 +35,21 @@ def _write_llm_config(path: Path, base_url: str, model_id: str = "model") -> Pat
     return path
 
 
+def _fit_tool_args(body: dict, tool_name: str, args):
+    """Filter scripted tool arguments to advertised JSON schema properties when closed."""
+    if not isinstance(args, dict):
+        return args
+    for row in body.get("tools", []):
+        fn = row.get("function", {})
+        if fn.get("name") == tool_name:
+            params = fn.get("parameters", {})
+            props = params.get("properties")
+            if isinstance(props, dict) and params.get("additionalProperties") is False:
+                return {key: value for key, value in args.items() if key in props}
+            return args
+    return args
+
+
 def _make_fake_provider(mode: str, *, fail_families: set[str] | None = None):
     """Build a deterministic OpenAI-compatible HTTP handler for loopback cohort tests."""
     fail_on = set(fail_families or ())
@@ -66,18 +81,43 @@ def _make_fake_provider(mode: str, *, fail_families: set[str] | None = None):
                 }
             elif spec["phase"] == "access":
                 discovery = context.get("discovery") or {}
-                have_read = any(r.get("tool") == READ_TOOL for r in results)
+                read_results = [r for r in results if r.get("tool") == READ_TOOL]
                 have_loop = any(r.get("tool") == "hunter_run_web_loop" for r in results)
-                if not have_loop and len(bindings_map) == 1 and not have_read and discovery.get("content_ref"):
+                read_texts = " ".join(
+                    (r.get("result") or {}).get("text", "") for r in read_results
+                )
+                candidate_cards = context.get("candidate_cards") or []
+                surface_text = (
+                    json.dumps(discovery)
+                    + " "
+                    + read_texts
+                    + " "
+                    + json.dumps(candidate_cards)
+                )
+                has_sqli = "id=" in surface_text or any(
+                    isinstance(card, dict) and card.get("param") == "id"
+                    for card in candidate_cards
+                )
+                has_ssti = "name=" in surface_text or any(
+                    isinstance(card, dict) and card.get("param") == "name"
+                    for card in candidate_cards
+                )
+                last_read = (read_results[-1].get("result") or {}) if read_results else {}
+                need_more_read = bool(
+                    discovery.get("content_ref")
+                    and not (has_sqli or has_ssti)
+                    and (
+                        not read_results
+                        or (not last_read.get("eof") and isinstance(last_read.get("next_offset"), int))
+                    )
+                )
+                if not have_loop and len(bindings_map) == 1 and need_more_read:
+                    next_offset = last_read.get("next_offset", 0) if read_results else 0
                     tool, args = READ_TOOL, {
-                        "path": discovery["content_ref"]["path"], "offset": 0, "limit": 1200,
+                        "path": discovery["content_ref"]["path"], "offset": next_offset, "limit": 3000,
                     }
                 elif not have_loop:
-                    read_texts = " ".join(
-                        r.get("result", {}).get("text", "") for r in results if r.get("tool") == READ_TOOL
-                    )
-                    surface_text = json.dumps(discovery) + " " + read_texts
-                    if "ssti" in fail_on and "name=" in surface_text:
+                    if "ssti" in fail_on and has_ssti:
                         # Trigger a deterministic second-batch protocol failure cleanly.
                         tool, args = "kali-tools_curl_request", "not-an-object"
                     elif mode == "before" and len(bindings_map) >= 2:
@@ -90,7 +130,7 @@ def _make_fake_provider(mode: str, *, fail_families: set[str] | None = None):
                             "max_validations": 8, "sleep_s": 0.2,
                             "session_bindings": json.dumps(bindings),
                         }
-                    elif "id=" in surface_text:
+                    elif has_sqli:
                         tool, args = "hunter_run_web_loop", {
                             "target": target, "live": True, "crawl": False,
                             "fuzz_limit": 4, "candidate_sample_limit": 16,
@@ -98,7 +138,7 @@ def _make_fake_provider(mode: str, *, fail_families: set[str] | None = None):
                             "validation_profile": "readonly_sqli_boolean",
                             "session_bindings": json.dumps(bindings_map),
                         }
-                    elif "name=" in surface_text:
+                    elif has_ssti:
                         tool, args = "hunter_run_web_loop", {
                             "target": target, "live": True, "crawl": False,
                             "fuzz_limit": 4, "candidate_sample_limit": 16,
@@ -134,11 +174,12 @@ def _make_fake_provider(mode: str, *, fail_families: set[str] | None = None):
                         "steps": [{"id": step["id"], "status": "done"}
                                   for step in spec["steps"] if not step["host_managed"]],
                     }
+            fitted_args = _fit_tool_args(body, tool, args)
             payload = {
                 "choices": [{"message": {"tool_calls": [{
                     "function": {
                         "name": tool,
-                        "arguments": json.dumps(args) if isinstance(args, dict) else "{",
+                        "arguments": json.dumps(fitted_args) if isinstance(fitted_args, dict) else "{",
                     }
                 }]}}],
                 "usage": {"prompt_tokens": 120, "completion_tokens": 80, "total_tokens": 200},

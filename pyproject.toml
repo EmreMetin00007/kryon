@@ -95,7 +95,7 @@ select = [
 
 [tool.mypy]
 python_version = "3.12"
-mypy_path = ["scripts", "mcp-servers/mcp-validator", "mcp-servers/mcp-memory-server"]
+mypy_path = ["scripts", "mcp-servers/mcp-hunter", "mcp-servers/mcp-validator", "mcp-servers/mcp-memory-server"]
 check_untyped_defs = true
 warn_unused_ignores = false
 # The CI core gate checks its explicit entrypoints. MCP runtime imports are
@@ -129,6 +129,7 @@ files = [
   "scripts/policy_gate_cli.py",
   "scripts/python_workflow_binding.py",
   "scripts/python_candidate_runtime.py",
+  "scripts/python_identity_discovery.py",
   "scripts/release_check.py",
   "scripts/runtime_paths.py",
   "scripts/session_store.py",
@@ -139,7 +140,7 @@ files = [
 ]
 
 [[tool.mypy.overrides]]
-module = ["jsonschema", "jsonschema.*"]
+module = ["jsonschema", "jsonschema.*", "tiktoken", "tiktoken.*"]
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]

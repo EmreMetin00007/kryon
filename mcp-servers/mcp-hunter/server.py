@@ -2519,10 +2519,16 @@ def _loop_blind_discover(target, identities, *, max_requests=24, sleep_s=0.15,
                 target, identities, _blind_discovery_get, scope.permits_url,
                 stop_reason=getattr(gate, "stop_reason", None), max_requests=max_requests,
                 pace=lambda: time.sleep(max(0.15, delay)))
+        if os.environ.get("CCO_PYTHON_DISCOVERY_INVOCATION"):
+            from python_identity_discovery import load_discovery
+            observed = load_discovery(target, identities, max_requests)
+        else:
+            observed = {}
         return discover_owned_resources(
             target, identities, _blind_discovery_get, scope.permits_url,
             stop_reason=getattr(gate, "stop_reason", None), max_requests=max_requests,
-            pace=lambda: time.sleep(max(0.15, delay)), allow_private_owned=private_allowed)
+            pace=lambda: time.sleep(max(0.15, delay)), allow_private_owned=private_allowed,
+            observations=observed)
     except (ImportError, OSError, RuntimeError, TypeError, ValueError):
         return ({"status": "blocked", "identities": 0, "requests": 0,
                  "reasons": ["identity discovery policy unavailable"]}, identities, [])
@@ -2900,7 +2906,7 @@ def _session_binding_reason_code(error):
 
 def _run_coverage_gap(target, gap_ref, live, session_bindings, headers):
     from cco_hunter_core.campaign_gaps import load_request, prerequisite_reason, _AUTHZ, _DECLARED
-    from cco_hunter_core.gap_queue import _redact_url
+    from cco_hunter_core.request_context import public_discovery_report
     from policy_engine import ScopeResolver
 
     report = {"ok": False, "mode": "LIVE" if live else "PLAN", "target": target,
@@ -2910,7 +2916,7 @@ def _run_coverage_gap(target, gap_ref, live, session_bindings, headers):
     if not live:
         report["ok"] = True
         report["replan"] = replan_web_report(report)
-        return json.dumps(report)
+        return json.dumps(public_discovery_report(report, strict=True))
     try:
         common = _parse_header_string(headers)
         if any(re.search(r"auth|cookie|token|session|credential|api[-_]?key|csrf|xsrf|secret|password", k, re.I)
@@ -2989,11 +2995,9 @@ def _run_coverage_gap(target, gap_ref, live, session_bindings, headers):
                                                      _verified_coverage_events(target), normalize=_coverage_url)
     except (ImportError, OSError, ValueError, sqlite3.Error):
         report["feedback_queue"] = []
-    # Match evidence on its exact context before removing all query samples
-    # from the public task result. The persistent feedback plan is redacted.
-    for row in (report.get("validation_queue") or []) + report["validations"] + report["confirmed"]:
-        row["url"] = _redact_url(row["url"])
-    return json.dumps(report, ensure_ascii=False)
+    # Match and persist evidence on exact private context before projecting the
+    # complete public result, including early failures and nested feedback.
+    return json.dumps(public_discovery_report(report, strict=True), ensure_ascii=False)
 
 
 @mcp.tool()
@@ -3089,7 +3093,8 @@ def run_web_loop(
                       "skipped": [{"step": "session", "reason": "session unavailable or not recently verified",
                                    "reason_code": _session_binding_reason_code(exc)}]}
             report["replan"] = replan_web_report(report)
-            return json.dumps(report, ensure_ascii=False)
+            from cco_hunter_core.request_context import public_discovery_report
+            return json.dumps(public_discovery_report(report, strict=True), ensure_ascii=False)
     else:
         try:
             ident_map = json.loads(identities) if identities and identities.strip() else {}
@@ -3144,6 +3149,8 @@ def run_web_loop(
                     if request_binding(actor.get("headers") or {}) == effective_binding]
         if len(matching) == 1:
             session_identity = matching[0]
+    private_discovery_state: dict = {}
+    private_report: dict = {}
     report = execute_web_loop(
         target,
         live=bool(live),
@@ -3177,7 +3184,11 @@ def run_web_loop(
         identity_discover=(lambda url, actors: _loop_blind_discover(
             url, actors, max_requests=blind_max_requests, sleep_s=sleep_s,
             differential=bool(blind_differential))) if live and blind_discovery else None,
+        on_discovery_state=private_discovery_state.update,
+        on_private_report=private_report.update,
     )
+    # Feedback/planning and validators use exact host-only routes, never templates.
+    report = private_report or report
     if blind_discovery and not live:
         report["identity_discovery"] = {"status": "planned", "requests": 0}
     report["run_id"] = run_id
@@ -3218,11 +3229,23 @@ def run_web_loop(
         except (ImportError, OSError, ValueError, sqlite3.Error):
             report["feedback_queue"] = []
             report["errors"].append("feedback persistence unavailable")
+    from cco_hunter_core.loop import compact_loop_discover
+    from cco_hunter_core.request_context import public_discovery_report
+    operational_report = compact_loop_discover(report)
+    report = public_discovery_report(operational_report)
     try:
         if write_artifact:
             report["artifact"] = write_artifact(report, prefix="webloop")
     except Exception as exc:
         report["artifact_error"] = str(exc)
+    report = public_discovery_report(report)
+    if os.environ.get("CCO_PYTHON_DISCOVERY_INVOCATION"):
+        from python_identity_discovery import publish_discovery
+        operational_report.update({key: report[key] for key in ("artifact", "artifact_error") if key in report})
+        publish_discovery(private_discovery_state, report, operational_report=operational_report)
+    compact = json.dumps(report, separators=(",", ":"), ensure_ascii=False, default=str)
+    if len(compact) > 32000:
+        return compact
     return json.dumps(report, indent=2, ensure_ascii=False, default=str)
 
 
