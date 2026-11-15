@@ -31,7 +31,7 @@ def _load_worker():
     return module
 
 
-def _write_custom_executor(tmp_path, *, cgroup_mode="best_effort", io_limits=None, module_source=None):
+def _write_custom_executor(tmp_path, *, cgroup_mode="best_effort", io_limits=None, module_source=None, pids=16):
     module_path = tmp_path / "custom_fixture.py"
     default_source = (
         "import json\n"
@@ -63,7 +63,7 @@ def _write_custom_executor(tmp_path, *, cgroup_mode="best_effort", io_limits=Non
             "cpu_seconds": 10,
             "cpu_cores": 1.0,
             "memory_mb": 256,
-            "pids": 16,
+            "pids": pids,
             "cgroup_mode": cgroup_mode,
         },
         "environment": {"allow": ["CUSTOM_SAFE"]},
@@ -446,7 +446,8 @@ def test_successful_custom_executor_reaps_spawned_descendants(tmp_path, monkeypa
         "stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)\n"
         "    return {'result': {'descendant_pid': child.pid}}\n"
     )
-    contract_path, _contract = _write_custom_executor(tmp_path, module_source=source)
+    # Non-root Linux runners share RLIMIT_NPROC across the whole UID, so fork headroom must exceed ambient runner processes.
+    contract_path, _contract = _write_custom_executor(tmp_path, module_source=source, pids=2048)
     monkeypatch.setenv("CCO_ENABLE_CUSTOM_WORKER_EXECUTOR", "1")
     executor = worker_mod.CustomSubprocessExecutor(contract_path, timeout_seconds=5)
 
