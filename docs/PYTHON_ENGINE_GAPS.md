@@ -268,11 +268,17 @@ yapıldığı doğrulandı.
 
 ### E6 — Bulgu gücünü gerçek modelle ölçme
 
-**Durum: gerçek model ölçümü ve ortak-tavan önce/sonra değerlendirmesi yapıldı
-(2026-11-14 ve 2026-11-15); bulgu gücü kabulü hâlâ açık.** Hem ilk cohort hem
-P0/P1 birleşimi (`main@a385231`) sonrasındaki yeniden ölçüm cohort'u
-`aggregate_status: incomplete`, `paid_model_generalization: evaluated_incomplete`
-üretti. Ölçümün tamamlanması başarılı recall veya güvenlik kapsamı demek değildir.
+**Durum: gerçek model kabul ölçümü geçti (2026-11-16, `main@e953ec6`);
+`aggregate_status: passed`, `paid_model_generalization: passed`.** İlk cohort
+(2026-11-14) ve P0/P1 birleşimi (`main@a385231`, 2026-11-15) sonrasındaki
+koşularda `0/24` recall ve `aggregate_status: incomplete` gözlenmişti. Stateful
+discovery frontier (`scripts/python_discovery_runtime.py`), çoklu-profil
+kümeleme, yaprak (leaf) düzeyi kanıt muhasebesi (`91d551d`) ve kabul edilmiş
+doğrulamalı `access` fazında kısmi ilerleme korunumu (`e953ec6`) sonrasında
+üç bağımsız sentetik ailede (`readonly-api-access-control`, `readonly-sql-injection`,
+`readonly-template-injection`) **24/24 recall (1.000), 24/24 negative coverage
+(1.000), 0/24 FP ve 0/3 failed run rate** elde edildi; genelleme ve `NOT TESTED`
+sınırları aşağıda korunur.
 `scripts/full_agent_e6_benchmark.py`, `scripts/full_agent_holdout.py:audit_run_status`,
 `scripts/full_agent_preflight.py --http-budget` ve `scripts/agent_cli.py benchmark`
 üzerinden E6 ölçüm ve önce/sonra kıyaslama yolu eklendi; runtime snapshot
@@ -433,6 +439,54 @@ Dış kanıtlar: `/root/cco-work/wf-eb9f69a9/live-e6-plan-v2/` ve
 `/root/cco-work/wf-eb9f69a9/e6-meta-after-v2/` (`cohort/cohort-report.json`,
 `reaudit/cohort-report.json`, `descriptive-comparison/comparison.json`,
 `logs/live-cohort.log`).
+
+#### Gerçek model yeniden ölçümü — 2026-11-16 (`main@91d551d` → `main@e953ec6`)
+
+`scripts/python_discovery_runtime.py` ile fazlar arası checkpoint edilen
+discovery frontier, HTML/JSON hypermedia çıkarımı, `access-idor` giriş keşfi,
+SQLi/SSTI çoklu-profil kümeleme, leaf düzeyi imzalı kanıt muhasebesi (`91d551d`)
+ve kabul edilmiş doğrulamalar varken `access` özetinde `"blocked"` → `"partial"`
+normalizasyonu (`e953ec6`) sonrasında aynı ortak tavanlarla (`250 HTTP / 150000
+token / 900 sn`), aynı üç aile ve tohumlarla (`314159`, `271828`, `141421`),
+`meta/muse-spark-1.3-contributor` (`api.meta.ai`) üzerinde tek seferlik kullanıcı
+onaylı canlı yeniden ölçüm (`v4` ve `v5`) yapıldı:
+
+| Metrik | `e6-meta-after-v2` (`a385231`) | `e6-meta-after-v4` (`91d551d`) | **`e6-meta-after-v5` (`e953ec6`)** |
+|---|---:|---:|---:|
+| Recall (toplam) | `0/24` (`0.000`) | `16/24` (`0.667` — API `8/8`, SQL `8/8`, SSTI `0/8`) | **`24/24` (`1.000` — API `8/8`, SQL `8/8`, SSTI `8/8`)** |
+| False positives | `0/0` (`null`) | `0/16` (`0.000`) | **`0/24` (`0.000`)** |
+| Negative coverage | `0/24` (`0.000`) | `16/24` (`0.667` — API `8/8`, SQL `8/8`, SSTI `0/8`) | **`24/24` (`1.000` — API `8/8`, SQL `8/8`, SSTI `8/8`)** |
+| Failed run rate | `3/3` (`1.000`) | `1/3` (`0.333`) | **`0/3` (`0.000`)** |
+| Kapanış doğrulaması | 3/3 `false` | 2/3 `true` (SSTI `python_inconclusive`) | **3/3 `true` (`python_finished_verified`)** |
+| Doğrulama hunisi (`funnel`) | `observed=0, admitted=0, accepted=0` | `observed=70, eligible=70, admitted=38, accepted=38` | **`observed=70, eligible=70, admitted=38, executed=38, accepted=38`** |
+| Requests / verified finding | `None` | `23.188` | **`15.458`** |
+| Tokens / verified finding | `None` | `8581.812` | **`6171.417`** |
+| Gerçek sağlayıcı çağrısı | `29` | `42` | **`46`** |
+| Gerçek hedef HTTP isteği | `10` | `371` | **`371`** (`API 131`, `SQL 124`, `SSTI 116`) |
+| Ölçülen toplam token | `87992` | `137309` | **`148114`** (`113574` prompt + `34540` completion) |
+| Ölçülen çalışma süresi (s) | `173,541` | `849,0` | **`930,024`** (`API 303,1`, `SQL 378,0`, `SSTI 248,9`) |
+| USD maliyet | `None` | `None` | `None` (`unknown_cost_is_zero=false`) |
+| `acceptance.passed` | `false` (`rc=3`) | `false` (`rc=3`) | **`true` (`rc=0`, `aggregate_status="passed"`)** |
+
+**`v4` → `v5` tanısı:** `v4` (`91d551d`) koşusunda da motor her üç ailede gerçek
+bulguların tamamını üretmişti (`SSTI` dahil `8 CONFIRMED + 8 UNCONFIRMED` imzalı
+kanıt kabul edilmişti), ancak `SSTI` `access-3` adımında modelin `"blocked"`
+özeti göndermesi `report-4` fazının açılmasını önlemişti (`unresolved_tasks_remain_NOT_TESTED`).
+`e953ec6` ile kabul edilmiş imzalı doğrulamalar varken `"blocked"` özeti `"partial"`
+olarak korununca `v5` tüm kabul eşiklerini `0` yanlış pozitif ve `0/3` başarısız
+koşu oranıyla geçti (`RUN_RC=0`, `AUDIT_RC=0`, `INVARIANT_RC=0`).
+
+**Kalan `NOT TESTED` / genelleme sınırları (`v5`):** `readonly_get_only`,
+`synthetic_fixture_boundaries`, `out_of_band_and_multi_step_business_logic`. Ayrıca
+bu kabul koşusu tek model (`meta/muse-spark-1.3-contributor`) ve tek tekrar (`repetitions=1`)
+ile salt-okunur sentetik laboratuvarlar üzerinde ölçülmüştür; farklı model aileleri,
+çoklu tekrar kararlılığı ve mutating/POST veya çok adımlı iş mantığı hedefleri
+ayrıca kapsanmalıdır.
+
+Dış kanıtlar: `/root/cco-work/wf-eb9f69a9/live-e6-plan-v5/`,
+`/root/cco-work/wf-eb9f69a9/e6-meta-after-v4/` ve
+`/root/cco-work/wf-eb9f69a9/e6-meta-after-v5/` (`cohort/cohort-report.json`,
+`cohort/cohort-report.md`, `reaudit/cohort-report.json`, `logs/live-cohort.log`).
 
 ### E7 — Ortak modüllerde kalan tarihsel native kod
 
