@@ -2029,6 +2029,14 @@ class PythonSolver:
                         step["status"] = "not_tested"
                 if summary.get("status") == "done" and any(row.get("status") != "done" for row in steps):
                     summary["status"] = "partial"
+                if (
+                    summary.get("status") == "blocked"
+                    and outcomes
+                    and any(isinstance(row, dict) and row.get("status") == "done" for row in steps)
+                ):
+                    # Accepted signed outcomes mean minimal-validation completed;
+                    # untested residual slices represent partial access, not a block.
+                    summary["status"] = "partial"
         if spec.phase == "report":
             sources = set(upstream_ids(spec, self.broker.tasks.specs))
             summary["validation_funnels"] = {}

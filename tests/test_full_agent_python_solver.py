@@ -2078,3 +2078,23 @@ def test_partial_parameter_slice_shortfall_tracks_leaf_outcomes_without_invalid_
     assert not any(g["reason_code"] == "invalid_or_missing_signed_evidence" for g in summary["coverage_gaps"])
     before = len(wire)
     assert not solver.dispatch_access_validation(spec) and len(wire) == before
+
+
+def test_access_with_accepted_outcomes_promotes_blocked_to_partial_while_empty_stays_blocked(solver_replay_lab):
+    from test_python_candidate_runtime import observe
+    broker, target, _wire = solver_replay_lab
+    source, spec = broker.tasks.specs[1:3]
+    solver = PythonSolver(broker, model="model")
+    observe(broker, solver, source, [{"url": target + "search/part/0-unsafe?term=alpha"}])
+    broker.tasks.active_spec = spec
+
+    blocked_empty = solver.compile_summary(spec, terminal(spec, status="blocked", steps=[
+        {"id": step.id, "status": "blocked"} for step in spec.steps]))
+    assert blocked_empty["status"] == "blocked"
+
+    assert solver.dispatch_access_validation(spec)
+    promoted = solver.compile_summary(spec, terminal(spec, status="blocked", steps=[
+        {"id": step.id, "status": "not_tested"} for step in spec.steps]))
+    assert promoted["status"] == "partial"
+    assert promoted["steps"][0] == {"id": "minimal-validation", "status": "done"}
+    assert promoted["validation_funnel"]["evidence_accepted"] > 0
