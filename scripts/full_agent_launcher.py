@@ -88,6 +88,8 @@ def prepared_run(path):
         selected = contract["holdout_run"]
         replay(selected)
         expected["holdout_run"] = selection(selected["family"], selected["seed"])
+        if "policy_provisioning" in manifest and manifest["policy_provisioning"] != preflight.holdout_policy_contract(selected["family"]):
+            raise ValueError("holdout private policy contract changed since preflight")
     if contract != expected:
         raise ValueError("native contract does not match the supported limits and evidence requirements")
     snapshot = manifest["runtime_snapshot"]
@@ -387,22 +389,17 @@ def launch_seed(prepared, *, seed, output, provider, api_key, bwrap=None, openco
         base = f"http://127.0.0.1:{lab.server_port}/"
         runtime, index = stage_runtime(prepared, directory, base)
         dump(private / "scope-verification.json", verify_lab_scope(runtime, base))
-        if lab.blind_state.get("lab_version") == "readonly-traversal/1":
-            from lab.readonly_traversal_holdout import declaration
-            sys.path.insert(0, str(ROOT / "mcp-servers/mcp-validator"))
-            from cco_validator_core.traversal import application_files
-            policy = lab_policy(base)[1]
-            policy["path_traversal"] = declaration(lab.blind_state, base)
-            # Only fixture declarations extend the unchanged public policy.
-            # The solver mount retains the generic policy and no endpoint list.
-            for case in lab.blind_state["truth"]:
-                application_files(policy["path_traversal"], base.rstrip("/") + case["path"],
-                                  case["param"], "query", lambda url: url.startswith(base))
-            dump(home / "holdout-program-policy.json", policy)
-            dump(private / "fixture-policy-verification.json", {
-                "before_traffic": True, "declarations_validated": len(policy["path_traversal"]["files"]),
-                "sha256": preflight.sha256(home / "holdout-program-policy.json"),
-                "public_policy_unchanged": True, "host_only": True})
+        from full_agent_holdout import provision_private_policy
+        selected_family = prepared["contract"]["holdout_run"]["family"] if "holdout_run" in prepared["contract"] else ""
+        if selected_family:
+            provision_private_policy(
+                family=selected_family,
+                lab=lab,
+                base=base,
+                home=home,
+                private=private,
+                base_policy=lab_policy(base)[1],
+            )
         from orchestration_spec import dump_specs
         specs = (bootstrap_plan(base, workdir, solver_mode=solver_mode)
                  if solver_mode == "python_loop" else bootstrap_plan(base, workdir))

@@ -3243,6 +3243,71 @@ def run_web_loop(
     from cco_hunter_core.loop import compact_loop_discover
     from cco_hunter_core.request_context import public_discovery_report
     operational_report = compact_loop_discover(report)
+    if (
+        live
+        and validation_profile in {"readonly_sqli_boolean", "readonly_ssti_arithmetic", "readonly_traversal_application_files"}
+        and operational_report.get("ok") is True
+        and not operational_report.get("errors")
+        and not operational_report.get("stopped")
+        and not operational_report.get("confirmed")
+        and not any(
+            isinstance(step, dict)
+            and (step.get("step") == "remaining" or step.get("reason") in {"max_validations", "no validator", "signed coverage plan unavailable"})
+            for step in (operational_report.get("skipped") or [])
+        )
+    ):
+        try:
+            scripts_dir = os.path.abspath(os.path.join(_SERVER_DIR, "..", "..", "scripts"))
+            if scripts_dir not in sys.path:
+                sys.path.insert(0, scripts_dir)
+            validator_dir = os.path.join(os.path.dirname(_SERVER_DIR), "mcp-validator")
+            if validator_dir not in sys.path:
+                sys.path.insert(0, validator_dir)
+            import evidence_trust as _trust
+            if not _trust.public_only():
+                from cco_validator_core.evidence import current_policy_hash, current_scope_revision, redact_url
+                from signed_completion import build_signed_completion, compute_check_revision
+
+                scope_rev = current_scope_revision()
+                pol_hash = current_policy_hash()
+                req_checks = (
+                    ["baseline", "direct-name", "missing-file", "traversal-probe", "traversal-repeat"]
+                    if validation_profile == "readonly_traversal_application_files"
+                    else ["baseline", "differential_boolean"]
+                    if validation_profile == "readonly_sqli_boolean"
+                    else ["baseline", "arithmetic_eval"]
+                )
+                check_rev = compute_check_revision(scope_rev, pol_hash, validation_profile, req_checks)
+                queue_items = [q for q in (operational_report.get("validation_queue") or []) if isinstance(q, dict)]
+                val_items = [v for v in (operational_report.get("validations") or []) if isinstance(v, dict)]
+                if queue_items and len(val_items) == len(queue_items) and all(
+                    v.get("verdict") == "UNCONFIRMED" and v.get("coverage_recorded") is True for v in val_items
+                ):
+                    envelopes = []
+                    for item in val_items:
+                        safe_url = redact_url(str(item.get("url") or target))
+                        envelopes.append(
+                            build_signed_completion(
+                                run_id=run_id,
+                                target=redact_url(target),
+                                url=safe_url,
+                                param=str(item.get("param") or ""),
+                                method=str(item.get("method") or "GET").upper(),
+                                carrier=str(item.get("carrier") or item.get("location") or "query"),
+                                identity=str(item.get("identity") or session_identity),
+                                profile=validation_profile,
+                                target_scope=scope_rev,
+                                check_revision=check_rev,
+                                required_checks=req_checks,
+                                completed_checks=req_checks,
+                                completion_status="completed_clean",
+                                findings_count=0,
+                                validation_ids=[str(item.get("validation_id"))] if item.get("validation_id") else (),
+                            )
+                        )
+                    operational_report["signed_completions"] = envelopes
+        except (ImportError, ValueError, OSError):
+            pass
     report = public_discovery_report(operational_report)
     try:
         if write_artifact:

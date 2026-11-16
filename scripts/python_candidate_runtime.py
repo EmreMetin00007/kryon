@@ -11,10 +11,90 @@ from urllib.parse import parse_qsl, urlsplit
 PROFILES = {
     "readonly_sqli_boolean": ("injection-sqli", "validator_validate_sqli", "differential_boolean"),
     "readonly_ssti_arithmetic": ("injection-ssti", "validator_validate_ssti", "arithmetic_eval"),
+    "readonly_traversal_application_files": ("file-access", "validator_validate_path_traversal", "file_signature"),
 }
 STAGES = ("observed", "eligible", "admitted", "executed", "evidence_accepted")
+OUTCOME_BUCKETS = (
+    "ineligible",
+    "completed_negative",
+    "positive",
+    "budget_deferred",
+    "failed",
+    "invalid_evidence",
+    "pending",
+)
+BUDGET_DEFERRED_REASONS = frozenset({
+    "deferred_budget",
+    "phase_tool_budget_exhausted",
+    "http_budget_exhausted",
+    "token_budget_exhausted",
+    "wall_clock_budget_exhausted",
+    "insufficient_time_for_rate_window",
+    "validator_execution_budget_exhausted",
+    "remaining_leaves_not_validated",
+    "remaining_leaf_not_validated",
+})
+FAILED_EXECUTION_REASONS = frozenset({
+    "validator_execution_denied",
+    "archive_size_limit_exceeded",
+    "consecutive_tool_failure_limit",
+    "execution_failed",
+    "indeterminate_leaf_outcome",
+    "indeterminate_dispatch_not_replayed",
+})
+_TRAVERSAL_PARAM_NAMES = frozenset({
+    "file", "filepath", "filename", "path", "doc", "document",
+    "page", "download", "export", "attachment", "template_file", "view", "include",
+})
+_TRAVERSAL_PATH_RE = re.compile(r"/(?:files?|downloads?|exports?|documents?|attachments?|reads?)(?:/|$)", re.I)
+_FILENAME_SAMPLE_RE = re.compile(r"^[A-Za-z0-9_.-]+\.[A-Za-z0-9]{1,8}\Z")
+_TEMPLATE_PATH_RE = re.compile(r"/(?:templates?|ssti[-_/])(?:/|$)", re.I)
+_SQL_LOOKUP_PATH_RE = re.compile(r"/(?:lookup|items/sqli[-_/])(?:/|$)", re.I)
 CARD_LIMIT = 8
 CARD_BYTES = 2000
+
+
+def surface_profile_applicability(url: str, param: str, sample: str, profile: str) -> tuple[bool, bool, str]:
+    """Evaluate ordinary surface applicability strictly from discovered surface fields.
+
+    Returns (should_materialize, surface_eligible, reason_code).
+    """
+    path = urlsplit(url).path or "/"
+    lower_path = path.lower()
+    lower_param = str(param or "").lower()
+    sample_text = str(sample or "")
+    is_traversal_surface = (
+        lower_param in _TRAVERSAL_PARAM_NAMES
+        or bool(_TRAVERSAL_PATH_RE.search(lower_path))
+        or bool(_FILENAME_SAMPLE_RE.fullmatch(sample_text))
+    )
+    is_template_only = bool(_TEMPLATE_PATH_RE.search(lower_path)) or (
+        lower_param == "name"
+        and bool(sample_text)
+        and not sample_text.isdigit()
+        and not _FILENAME_SAMPLE_RE.fullmatch(sample_text)
+        and "search" not in lower_path
+        and "render" not in lower_path
+    )
+    is_sql_lookup_only = bool(_SQL_LOOKUP_PATH_RE.search(lower_path)) or (
+        lower_param == "id"
+        and (not sample_text or sample_text.isdigit())
+        and "search" not in lower_path
+        and "render" not in lower_path
+    )
+    if profile == "readonly_traversal_application_files":
+        if not is_traversal_surface:
+            return False, False, "profile_not_applicable_to_surface"
+        return True, True, ""
+    if profile == "readonly_sqli_boolean":
+        if is_traversal_surface or is_template_only:
+            return True, False, "profile_not_applicable_to_surface"
+        return True, True, ""
+    if profile == "readonly_ssti_arithmetic":
+        if is_traversal_surface or is_sql_lookup_only:
+            return True, False, "profile_not_applicable_to_surface"
+        return True, True, ""
+    return True, True, ""
 
 
 def query_parameters(url: str) -> dict[str, str]:
@@ -244,7 +324,8 @@ def authorization_controls_complete(record: dict[str, Any]) -> bool:
 
 
 def parameter_candidates(spec: Any, records: list[dict[str, Any]],
-                         bindings: dict[str, Any]) -> list[dict[str, Any]]:
+                         bindings: dict[str, Any], *,
+                         profile_eligibility: Any = None) -> list[dict[str, Any]]:
     """Select read-only oracle capabilities from records, not names or truth."""
     output = []
     binding_reason = ""
@@ -280,9 +361,34 @@ def parameter_candidates(spec: Any, records: list[dict[str, Any]],
                                     reason="unsupported_readonly_method"))
             continue
         declared = {item["name"]: item.get("in", "query") for item in declarations}
+        declared_samples = {item["name"]: str(item.get("sample", "")) for item in declarations}
         for param in dict.fromkeys([*params, *declared]):
+            sample = params.get(param, declared_samples.get(param, ""))
             for profile, (vector, direct, _) in PROFILES.items():
                 if spec.vector not in ("", "access", vector):
+                    continue
+                materialize, surface_ok, surface_reason = surface_profile_applicability(url, param, sample, profile)
+                if not materialize:
+                    continue
+                carrier = declared.get(param, "query")
+                policy_reason = ""
+                if surface_ok and profile == "readonly_traversal_application_files":
+                    if callable(profile_eligibility):
+                        decision = profile_eligibility(spec, url, param, carrier, profile)
+                        if not isinstance(decision, dict) or decision.get("eligible") is not True:
+                            policy_reason = str(
+                                (decision or {}).get("reason_code") if isinstance(decision, dict) else ""
+                            ) or "traversal_policy_not_declared"
+                    else:
+                        policy_reason = "traversal_policy_not_declared"
+                if not surface_ok or policy_reason:
+                    output.append(candidate(
+                        spec.id, route=url, param=param,
+                        identity=identity, vector=vector,
+                        provenance=provenance,
+                        reason=surface_reason or policy_reason,
+                        validation_profile=profile,
+                    ))
                     continue
                 # Direct validators have no session-ref argument. Authenticated
                 # records use Hunter's existing vault-only profile rather than
@@ -311,10 +417,15 @@ def parameter_candidates(spec: Any, records: list[dict[str, Any]],
                     spec.id, route=url, param=param,
                     identity=identity, vector=vector,
                     tool=tool, arguments=args, provenance=provenance,
-                    reason=(binding_reason if identity in bindings else "") or (
-                        "unsupported_parameter_carrier" if declared.get(param, "query") != "query"
-                        else "missing_observed_query_sample" if param not in params
-                        else "validator_not_declared" if tool not in spec.tools else ""
+                    reason=(
+                        (binding_reason if identity in bindings else "")
+                        or surface_reason
+                        or policy_reason
+                        or (
+                            "unsupported_parameter_carrier" if carrier != "query"
+                            else "missing_observed_query_sample" if param not in params
+                            else "validator_not_declared" if tool not in spec.tools else ""
+                        )
                     ),
                     validation_profile=profile,
                     recipes=recipes or None,
@@ -375,10 +486,46 @@ def page_cards(cards: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return output
 
 
+def classify_candidate_outcome(row: dict[str, Any]) -> str:
+    """Classify one candidate row into explicit, non-overlapping outcome buckets."""
+    if not row.get("eligible"):
+        return "ineligible"
+    if row.get("evidence_accepted"):
+        if row.get("outcome") == "positive" or row.get("accepted_verdict") == "CONFIRMED":
+            return "positive"
+        return "completed_negative"
+    reason = str(row.get("reason_code") or "")
+    if reason in BUDGET_DEFERRED_REASONS:
+        return "budget_deferred"
+    if reason in FAILED_EXECUTION_REASONS:
+        return "failed"
+    if row.get("executed") or reason == "invalid_or_missing_signed_evidence":
+        return "invalid_evidence"
+    return "pending"
+
+
 def funnel(rows: list[dict[str, Any]]) -> dict[str, Any]:
-    return {"schema": "python-validation-funnel/1", "unit": "deduplicated_task_candidate",
-             **{stage: sum(bool(row[stage]) for row in rows) for stage in STAGES},
-            "candidates": copy.deepcopy(rows)}
+    outcomes = {bucket: 0 for bucket in OUTCOME_BUCKETS}
+    for row in rows:
+        outcomes[classify_candidate_outcome(row)] += 1
+    counts = {stage: sum(bool(row[stage]) for row in rows) for stage in STAGES}
+    return {
+        "schema": "python-validation-funnel/1",
+        "unit": "deduplicated_task_candidate",
+        **counts,
+        "denominators": {
+            "discovered_pairs": counts["observed"],
+            "eligible_pairs": counts["eligible"],
+            "admitted_pairs": counts["admitted"],
+            "executed_pairs": counts["executed"],
+            "evidence_accepted_executions": counts["evidence_accepted"],
+        },
+        "outcomes": outcomes,
+        "candidates": [
+            {key: value for key, value in row.items() if key != "recipes"}
+            for row in copy.deepcopy(rows)
+        ],
+    }
 
 
 LEAF_STATUSES = ("accepted", "pending", "indeterminate", "invalid_evidence")

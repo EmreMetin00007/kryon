@@ -341,7 +341,8 @@ def _persist(res: dict) -> None:
 def _result(vuln_type: str, target: str, verdict: str, oracle: str,
              evidence: dict, reproduction, notes: str = "",
              severity: str = "high", guard: dict | None = None,
-             request_evidence: list | None = None) -> str:
+             request_evidence: list | None = None,
+             signed_completion: dict | None = None) -> str:
     confidence = ORACLE_CONFIDENCE.get(oracle, 0.0) if verdict == CONFIRMED else 0.0
     if isinstance(reproduction, str):
         reproduction = [reproduction]
@@ -374,6 +375,8 @@ def _result(vuln_type: str, target: str, verdict: str, oracle: str,
         "notes": notes,
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
+    if signed_completion is not None and verdict == UNCONFIRMED:
+        res["signed_completion"] = signed_completion
     _persist(res)
     return json.dumps(res, indent=2, ensure_ascii=False)
 
@@ -1198,12 +1201,43 @@ def validate_path_traversal(target_url: str, param: str = "", method: str = "GET
                                "prerequisites": ["declared synthetic file", "successful observed baseline"],
                                "decision_rule": "marker absent in baseline/direct/missing controls, present in both traversal responses"},
                         request_evidence=trace)
+            completion_env = None
+            try:
+                from cco_validator_core.evidence import current_validation_context, redact_url
+                import evidence_trust as _trust
+                if not _trust.public_only():
+                    from signed_completion import build_signed_completion, compute_check_revision
+                    ctx = current_validation_context()
+                    req_checks = ["baseline", "direct-name", "missing-file", "traversal-probe", "traversal-repeat"]
+                    scope_rev, pol_hash = revision
+                    safe_url = redact_url(target_url)
+                    completion_env = build_signed_completion(
+                        run_id=str(ctx.get("run_id") or "validator-standalone"),
+                        target=safe_url,
+                        url=safe_url,
+                        param=param,
+                        method=method.upper(),
+                        carrier=carrier,
+                        identity=str(ctx.get("identity") or "anonymous"),
+                        profile="readonly_traversal_application_files",
+                        target_scope=scope_rev,
+                        check_revision=compute_check_revision(
+                            scope_rev, pol_hash, "readonly_traversal_application_files", req_checks
+                        ),
+                        required_checks=req_checks,
+                        completed_checks=req_checks,
+                        completion_status="completed_clean",
+                        findings_count=0,
+                    )
+            except (ImportError, ValueError, OSError):
+                completion_env = None
             return _result("Path Traversal / LFI", target_url, UNCONFIRMED, "file_signature",
                 {"application_files_tested": len(files)}, "-",
                 notes="Completed declared file checks did not expose the expected markers.",
                 guard={"transport_ok": True, "controls": controls,
                        "limitations": ["only declared files and exact traversal paths were tested"]},
-                request_evidence=trace)
+                request_evidence=trace,
+                signed_completion=completion_env)
     except (ValueError, TypeError, OSError):
         return incomplete("Traversal baseline, declaration or request context is unavailable or changed.")
 

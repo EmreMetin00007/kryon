@@ -27,12 +27,13 @@ def endpoint_key(url):
         raise ValueError("invalid traversal endpoint") from exc
 
 
-def application_files(rule, url, param, carrier, permits):
+def _validate_application_files_rule(rule, permits):
     if (not isinstance(rule, dict) or set(rule) != {"mode", "files"}
             or rule.get("mode") != "application_files" or not isinstance(rule.get("files"), list)
-            or not 1 <= len(rule["files"]) <= 32 or not permits(url)):
+            or not 1 <= len(rule["files"]) <= 32):
         raise ValueError("declared traversal test files unavailable")
-    expected, selected, seen = endpoint_key(url), [], set()
+    seen = set()
+    entries = []
     for row in rule["files"]:
         if (not isinstance(row, dict) or set(row) != {"url", "param", "carrier", "path", "marker", "test_data_only", "outside_root"}
                 or row.get("test_data_only") is not True or row.get("outside_root") is not True
@@ -62,11 +63,43 @@ def application_files(rule, url, param, carrier, permits):
         if key in seen:
             raise ValueError("declared traversal test files unavailable")
         seen.add(key)
-        if (declared, row["param"], row["carrier"]) == (expected, param, carrier):
-            selected.append({"path": path, "marker": marker})
+        entries.append((declared, row["param"], row["carrier"], path, marker))
+    return entries
+
+
+def application_files(rule, url, param, carrier, permits):
+    if not permits(url):
+        raise ValueError("declared traversal test files unavailable")
+    entries = _validate_application_files_rule(rule, permits)
+    expected = endpoint_key(url)
+    selected = [
+        {"path": path, "marker": marker}
+        for declared, row_param, row_carrier, path, marker in entries
+        if (declared, row_param, row_carrier) == (expected, param, carrier)
+    ]
     if not 1 <= len(selected) <= 2:
         raise ValueError("declared traversal test files unavailable")
     return selected
+
+
+def check_traversal_policy_eligibility(rule, url, param, carrier, permits):
+    """Return opaque eligibility boolean and controlled reason code; never expose paths or markers."""
+    if rule is None or rule == {}:
+        return {"eligible": False, "reason_code": "traversal_policy_not_declared"}
+    try:
+        entries = _validate_application_files_rule(rule, permits)
+        if not permits(url):
+            return {"eligible": False, "reason_code": "traversal_policy_invalid"}
+        expected = endpoint_key(url)
+    except (ValueError, TypeError, KeyError):
+        return {"eligible": False, "reason_code": "traversal_policy_invalid"}
+    matches = [
+        1 for declared, row_param, row_carrier, _path, _marker in entries
+        if (declared, row_param, row_carrier) == (expected, param, carrier)
+    ]
+    if not 1 <= len(matches) <= 2:
+        return {"eligible": False, "reason_code": "traversal_policy_not_declared"}
+    return {"eligible": True, "reason_code": ""}
 
 
 def baseline_sample(url, param, carrier, supplied=""):

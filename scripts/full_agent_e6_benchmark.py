@@ -1017,6 +1017,18 @@ def _normalize_funnel_dict(
     }
 
 
+def funnel_denominators(funnel: dict[str, Any] | None) -> dict[str, int | None]:
+    """Return explicit funnel denominators without altering historical admitted_rate."""
+    data = funnel if isinstance(funnel, dict) else {}
+    return {
+        "discovered_pairs": data.get("observed"),
+        "eligible_pairs": data.get("eligible"),
+        "admitted_pairs": data.get("admitted"),
+        "executed_pairs": data.get("executed"),
+        "evidence_accepted_executions": data.get("evidence_accepted"),
+    }
+
+
 def _funnel_counts_key(funnel: dict[str, Any]) -> tuple[int | None, ...]:
     return tuple(funnel.get(stage) for stage in FUNNEL_STAGES)
 

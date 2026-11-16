@@ -465,7 +465,8 @@ _PRIVATE_EXPORT_KEYS = {"identity_facts", "headers", "cookie", "cookies", "autho
                         "owner_marker", "request_fields", "request_field_values", "request_context_ref",
                         "request_ref", "request_samples", "baseline_json", "baseline_body", "baseline_form",
                         "secret_ref", "private_reference", "producer_reference", "execution_reference",
-                        "result_path", "source_references", "operational_report", "states"}
+                        "result_path", "source_references", "operational_report", "states",
+                        "signed_completion", "signed_completions"}
 _VALUE_FIELDS = {"param", "carrier", "location", "role", "owner_role", "attacker_role", "operation_id",
                  "observation_id", "candidate_source", "candidate_reason", "resource_key", "resource_family",
                  "family", "state_key", "variant_key", "source", "confidence", "source_spec_id",

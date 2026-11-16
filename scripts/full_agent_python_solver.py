@@ -33,12 +33,15 @@ from full_agent_python_broker import (CRAWL_TOOL, COVERAGE_TOOL, PHASE_CALL_LIMI
 from full_agent_summary_feedback import summary_feedback
 from orchestration_spec import COMPILED_WORKFLOW_TOOL, TaskSpec, skeleton_summary, surface_errors, validate_chain
 from workflow_checkpoint import WorkflowCheckpoint, SCHEMA as CHECKPOINT_SCHEMA, file_ref
-from python_candidate_runtime import (PROFILES, candidate, compact_cards, compact_gaps, dedup_gaps, funnel, gap,
-                                      leaf_funnel, leaf_outcome, matches_model_call, pair_progress_entry,
-                                      pair_progress_summary, parameter_candidates, parameter_declarations,
-                                      parser_gaps, query_parameters, recipe_arguments, upstream_ids)
+from python_candidate_runtime import (BUDGET_DEFERRED_REASONS, PROFILES, candidate,
+                                      classify_candidate_outcome, compact_cards, compact_gaps, dedup_gaps,
+                                      funnel, gap, leaf_funnel, leaf_outcome, matches_model_call,
+                                      pair_progress_entry, pair_progress_summary, parameter_candidates,
+                                      parameter_declarations, parser_gaps, query_parameters, recipe_arguments,
+                                      upstream_ids)
 from python_discovery_runtime import (DISCOVERY_TOOLS, DiscoveryState, discovery_state_key,
                                       extract_json_hypermedia, normalize_identity, project_discovery_frontier)
+from python_scheduler import MAX_SCHEDULER_QUEUE, interleave_fair_work
 
 SCHEMA = "python-workflow-v1"
 PHASE_IDS = ("recon-1", "enum-2", "access-3", "report-4")
@@ -177,7 +180,7 @@ class PythonSolver:
                   'private_discovery_context': checkpoint_context() if broker.private_discovery_sources else {},
                  'policy': {key: (sorted(value) if isinstance(value, set) else value)
                             for key, value in vars(policy).items()
-                            if key not in {'budget', 'tool_failures'}},
+                            if key not in {'budget', 'tool_failures'} and not key.startswith('_')},
                  'tool_failures': [[*key, value] for key, value in policy.tool_failures.items()]}
         raw = provider_json(state)
         state_path = broker.private / 'checkpoint-state' / (hashlib.sha256(raw).hexdigest() + '.json')
@@ -666,7 +669,12 @@ class PythonSolver:
             if key in {"target", "role", "test_data_only", "owned_objects_private"}}
             for item in sorted(self.broker.session_checks(spec), key=lambda item:
                 self.broker.tasks.bindings[item["identity"]].get("role") != "member")}
-        planned = parameter_candidates(spec, records, bindings)
+        planned = parameter_candidates(
+            spec,
+            records,
+            bindings,
+            profile_eligibility=getattr(self.broker, "profile_eligibility", None),
+        )
         provenance = [{key: record[key] for key in ("source_spec_id", "source_artifact", "source_sha256")}
                       for record in records]
         provenance = [json.loads(raw) for raw in dict.fromkeys(provider_json(row).decode() for row in provenance)]
@@ -723,7 +731,11 @@ class PythonSolver:
                     # A later contradictory declaration must not leave the
                     # earlier same-key candidate eligible for host dispatch.
                     current["eligible"] = False
-            if row["reason_code"]:
+            if row["reason_code"] and row["reason_code"] not in {
+                "profile_not_applicable_to_surface",
+                "traversal_policy_not_declared",
+                "traversal_policy_invalid",
+            }:
                 self.add_gap(spec, row["reason_code"], row=state[row["candidate_id"]])
         self.refresh_candidate_evidence(spec)
         return list(state.values())
@@ -842,6 +854,9 @@ class PythonSolver:
         for row in self.candidates_by_task.get(spec.id, {}).values():
             if row["evidence_accepted"]:
                 row.update(evidence_accepted=False, evidence_refs=[], validation_state="NOT TESTED")
+                row.pop("outcome", None)
+                row.pop("completion_status", None)
+                row.pop("accepted_verdict", None)
         self.leaf_outcomes_by_task.pop(spec.id, None)
         self.pair_progress_by_task.pop(spec.id, None)
         sources = set(upstream_ids(spec, self.broker.tasks.specs))
@@ -862,11 +877,13 @@ class PythonSolver:
                     checked.add(key)
         outcomes = self.broker.validation_attempts(spec)
         trusted_by_id = {item["record"]["validation_id"]: item for item in outcomes}
+        completion_attempts = self.broker.signed_completions(spec) if hasattr(self.broker, "signed_completions") else []
         batch_analyses: dict[str, dict[str, Any]] = {}
         accepted_by_candidate: dict[str, list[dict[str, Any]]] = {}
         param_states: dict[str, tuple[str, str]] = {}
         for row in self.candidates_by_task.get(spec.id, {}).values():
             if not row["eligible"]:
+                row["outcome"] = "ineligible"
                 continue
             allowed_tools = {row["tool"], *(row.get("recipes") or {}).keys()}
             for execution in self.broker.tools:
@@ -908,7 +925,22 @@ class PythonSolver:
                             row.update(admitted=True, dispatch_started=True)
                         if any(leaf(item) for item in result.get("validations", [])):
                             row.update(admitted=True, executed=True)
+                        elif any(
+                            isinstance(env, dict)
+                            and isinstance(env.get("payload"), dict)
+                            and isinstance(env["payload"].get("execution_context"), dict)
+                            and env["payload"]["execution_context"].get("url") == row["route"]
+                            and env["payload"]["execution_context"].get("param", "") == row["param"]
+                            and env["payload"]["execution_context"].get("method", "GET") == "GET"
+                            and env["payload"]["execution_context"].get("carrier", "query") == "query"
+                            for env in (
+                                *(result.get("signed_completions") or []),
+                                *([result["signed_completion"]] if isinstance(result.get("signed_completion"), dict) else []),
+                            )
+                        ):
+                            row.update(admitted=True, executed=True)
             accepted = []
+            matched_completions: list[dict[str, Any]] = []
             analysis = None
             if row["vector"] == "access-idor":
                 batch: dict[str, Any] = next((batch for batch in self.batches_by_task.get(spec.id, [])
@@ -932,13 +964,58 @@ class PythonSolver:
                      and (isinstance(row["identity_ref"], str) and (row["identity_ref"] == "anon" and item.get("execution_context", item["record"].get("execution_context", {})).get("identity", "anon") in {"anon", "anonymous"}
                           or row["identity_ref"] != "anon" and item.get("execution_context", item["record"].get("execution_context", {})).get("identity") == row["identity_ref"])
                           or isinstance(row["identity_ref"], list) and item.get("execution_context", item["record"].get("execution_context", {})).get("identity") in row["identity_ref"])]
-            row["evidence_accepted"] = bool(accepted)
+                has_confirmed = any(item["record"].get("verdict") == "CONFIRMED" for item in accepted)
+                if not has_confirmed:
+                    for comp in completion_attempts:
+                        if comp["tool"] not in allowed_tools:
+                            continue
+                        pl = comp["payload"]
+                        ctx = pl.get("execution_context") or {}
+                        if (
+                            pl.get("profile") == row.get("validation_profile")
+                            and ctx.get("url") == row["route"]
+                            and ctx.get("param", "") == row["param"]
+                            and ctx.get("method", "GET") == "GET"
+                            and ctx.get("carrier", "query") == "query"
+                            and (not pl.get("candidate_id") or pl.get("candidate_id") == row["candidate_id"])
+                        ):
+                            if row["identity_ref"] == "anon" and ctx.get("identity", "anon") not in {"anon", "anonymous"}:
+                                continue
+                            if row["identity_ref"] != "anon" and isinstance(row["identity_ref"], str) and ctx.get("identity") != row["identity_ref"]:
+                                continue
+                            matched_completions.append(comp)
+            row["evidence_accepted"] = bool(accepted or matched_completions)
             if accepted:
                 accepted_by_candidate[row["candidate_id"]] = accepted
-                row.update(admitted=True, executed=True, validation_state="TESTED", reason_code="",
-                           evidence_refs=[{"validation_id": item["record"]["validation_id"],
-                                           "source_artifact": item["source_artifact"],
-                                            "source_sha256": item["source_sha256"]} for item in accepted])
+                has_confirmed = any(item["record"].get("verdict") == "CONFIRMED" for item in accepted)
+                row.update(
+                    admitted=True, executed=True, validation_state="TESTED", reason_code="",
+                    accepted_verdict="CONFIRMED" if has_confirmed else "UNCONFIRMED",
+                    outcome="positive" if has_confirmed else "completed_negative",
+                    completion_status="" if has_confirmed else ("negative_verified" if matched_completions else "unconfirmed"),
+                    evidence_refs=[{"validation_id": item["record"]["validation_id"],
+                                    "source_artifact": item["source_artifact"],
+                                    "source_sha256": item["source_sha256"]} for item in accepted],
+                )
+                self.coverage_gaps[spec.id] = [item for item in self.coverage_gaps.get(spec.id, [])
+                                               if item.get("candidate_id") != row["candidate_id"]]
+            elif matched_completions:
+                comp = matched_completions[-1]
+                pl = comp["payload"]
+                row.update(
+                    admitted=True, executed=True, validation_state="TESTED", reason_code="",
+                    accepted_verdict="UNCONFIRMED",
+                    outcome="completed_negative",
+                    completion_status="negative_verified",
+                    evidence_refs=[{
+                        "validation_id": f"completion:{pl['completion_id'][:16]}",
+                        "completion_id": pl["completion_id"],
+                        "kind": "signed_completion",
+                        "version": 1,
+                        "source_artifact": comp["source_artifact"],
+                        "source_sha256": comp["source_sha256"],
+                    }],
+                )
                 self.coverage_gaps[spec.id] = [item for item in self.coverage_gaps.get(spec.id, [])
                                                if item.get("candidate_id") != row["candidate_id"]]
             elif analysis is not None and (analysis["leaves"] or analysis["saw_invalid_report"]):
@@ -974,17 +1051,30 @@ class PythonSolver:
                 continue
             identity = row["identity_ref"] if isinstance(row["identity_ref"], str) else ",".join(row["identity_ref"])
             if row["evidence_accepted"]:
-                acc = accepted_by_candidate[row["candidate_id"]][0]
-                leaf_rows.append(leaf_outcome(
-                    task=spec.id, candidate_id=row["candidate_id"], vector=row["vector"],
-                    url=row["route"], method=row.get("method", "GET"), param=row["param"],
-                    carrier="query" if row["param"] else "", identity=identity,
-                    vuln_class=row["vector"], execution_state="executed", status="accepted",
-                    verdict=str(acc["record"].get("verdict") or ""),
-                    validation_id=acc["record"]["validation_id"],
-                    source_artifact=str(acc.get("source_artifact") or ""),
-                    source_sha256=str(acc.get("source_sha256") or ""),
-                ))
+                if row["candidate_id"] in accepted_by_candidate:
+                    acc = accepted_by_candidate[row["candidate_id"]][0]
+                    leaf_rows.append(leaf_outcome(
+                        task=spec.id, candidate_id=row["candidate_id"], vector=row["vector"],
+                        url=row["route"], method=row.get("method", "GET"), param=row["param"],
+                        carrier="query" if row["param"] else "", identity=identity,
+                        vuln_class=row["vector"], execution_state="executed", status="accepted",
+                        verdict=str(acc["record"].get("verdict") or ""),
+                        validation_id=acc["record"]["validation_id"],
+                        source_artifact=str(acc.get("source_artifact") or ""),
+                        source_sha256=str(acc.get("source_sha256") or ""),
+                    ))
+                else:
+                    ev_ref = (row.get("evidence_refs") or [{}])[0]
+                    leaf_rows.append(leaf_outcome(
+                        task=spec.id, candidate_id=row["candidate_id"], vector=row["vector"],
+                        url=row["route"], method=row.get("method", "GET"), param=row["param"],
+                        carrier="query" if row["param"] else "", identity=identity,
+                        vuln_class=row["vector"], execution_state="executed", status="accepted",
+                        verdict="UNCONFIRMED",
+                        validation_id=str(ev_ref.get("validation_id") or ""),
+                        source_artifact=str(ev_ref.get("source_artifact") or ""),
+                        source_sha256=str(ev_ref.get("source_sha256") or ""),
+                    ))
             elif row["executed"]:
                 leaf_state, vid = param_states.get(row["candidate_id"], ("invalid_evidence", ""))
                 leaf_rows.append(leaf_outcome(
@@ -1993,6 +2083,16 @@ class PythonSolver:
             if updated_gap:
                 self.refresh_candidate_evidence(spec)
             summary["validation_funnel"] = funnel(candidates)
+            summary["coverage_accounting"] = {
+                "schema": "python-coverage-accounting/1",
+                "denominators": dict(summary["validation_funnel"]["denominators"]),
+                "outcomes": dict(summary["validation_funnel"]["outcomes"]),
+                "confirmed_findings": len(summary["findings"]),
+                "verified_negatives": sum(
+                    1 for row in candidates
+                    if row.get("evidence_accepted") and row.get("completion_status") == "negative_verified"
+                ),
+            }
             summary["leaf_outcomes"] = copy.deepcopy(self.leaf_outcomes_by_task.get(spec.id, []))
             summary["leaf_validation_funnel"] = {
                 k: v for k, v in leaf_funnel(summary["leaf_outcomes"]).items() if k != "outcomes"
@@ -2214,7 +2314,12 @@ class PythonSolver:
             return None
         # Reject malformed/unsupported descendants rather than allowing a broad
         # prefix to bypass a leaf's eligibility gate.
-        if any(below(row) and not row["eligible"] for row in candidates):
+        if any(
+            below(row)
+            and not row["eligible"]
+            and (not row.get("validation_profile") or row.get("validation_profile") == profile)
+            for row in candidates
+        ):
             return None
         return {**copy.deepcopy(pending[0]), "tool": "hunter_run_web_loop", "arguments": args,
                 "slice_candidate_ids": [row["candidate_id"] for row in pending]}
@@ -2249,7 +2354,10 @@ class PythonSolver:
                 if not ids & covered and ids <= pending_ids:
                     selected.append(sliced)
                     covered.update(ids)
-        return [*selected, *(row for row in pending_params if row["candidate_id"] not in covered)]
+        combined = [*selected, *(row for row in pending_params if row["candidate_id"] not in covered)]
+        fair_selected, fair_deferred = interleave_fair_work(combined, max_queue_size=MAX_SCHEDULER_QUEUE)
+        self._last_scheduler_deferred = fair_deferred
+        return fair_selected
 
     def _is_premature_enum_summary(self, spec, submitted):
         """True when an enum summary skips required discovery or leaves frontier continuation."""
@@ -2532,13 +2640,21 @@ class PythonSolver:
                    and (not row["executed"] or self.deterministic_unaccepted_slice(spec, row))]
         idor_pending = [row for row in pending if row["vector"] == "access-idor"]
         param_pending = [row for row in pending if row["param"]]
+        self._last_scheduler_deferred = []
         if param_pending:
             param_pending = self.parameter_continuation(spec, candidates, param_pending)
         pending = [*idor_pending, *param_pending]
+        for deferred_row in getattr(self, "_last_scheduler_deferred", []):
+            self.add_gap(spec, "deferred_budget", "admission_budget", deferred_row)
         # A model-selected slice spent the same rate window as host slices.
         # Only an actual task-bound executor receipt establishes that history.
         dispatched = any(row.get("task_spec_id") == spec.id and row.get("origin") == "solver"
-                         and row["tool"] in {"hunter_run_web_loop", "validator_validate_sqli", "validator_validate_ssti"}
+                         and row["tool"] in {
+                             "hunter_run_web_loop",
+                             "validator_validate_sqli",
+                             "validator_validate_ssti",
+                             "validator_validate_path_traversal",
+                         }
                          for row in self.broker.tools)
         continued = False
         policy.host_finalizing.add(spec.id)
@@ -2605,13 +2721,32 @@ class PythonSolver:
                     continue
                 # Durable pre-dispatch intent. If interrupted, run() leaves the
                 # entire running TaskSpec inconclusive; resume never replays it.
+                exec_ticket = None
+                if hasattr(policy, "reserve_execution"):
+                    try:
+                        exec_ticket = policy.reserve_execution(spec, calls=1, estimated_tokens=0, uncertain=False)
+                    except BudgetError as exc:
+                        defer_reason = getattr(exc, "code", None) or (
+                            str(exc)
+                            if str(exc) in {"phase_tool_budget_exhausted", "token_budget_exhausted"}
+                            else "deferred_budget"
+                        )
+                        for remaining in pending[index:]:
+                            self.add_gap(spec, defer_reason, "admission_budget", remaining)
+                        break
                 row["dispatch_started"] = True
                 for ident in row.get("slice_candidate_ids", []):
                     self.candidates_by_task[spec.id][ident]["dispatch_started"] = True
                 self.save_checkpoint()
                 before = len(self.broker.tools)
                 try:
-                    self.broker.invoke(row["tool"], row["arguments"])
+                    ticket_ctx = (
+                        policy.activate_execution_ticket(exec_ticket)
+                        if exec_ticket is not None and hasattr(policy, "activate_execution_ticket")
+                        else contextlib.nullcontext()
+                    )
+                    with ticket_ctx:
+                        self.broker.invoke(row["tool"], row["arguments"])
                 except BudgetError:
                     self.add_gap(spec, "validator_execution_budget_exhausted", "admission_budget", row)
                     raise
@@ -2620,6 +2755,14 @@ class PythonSolver:
                 except ValueError:
                     self.add_gap(spec, "validator_execution_denied", "prerequisites", row)
                 finally:
+                    if exec_ticket is not None and hasattr(policy, "reconcile_execution"):
+                        actual_calls = 1 if len(self.broker.tools) > before else 0
+                        policy.reconcile_execution(
+                            exec_ticket,
+                            actual_calls=actual_calls,
+                            actual_tokens=0,
+                            measurement_valid=True,
+                        )
                     row["executed"] = len(self.broker.tools) > before
                     self.refresh_candidate_evidence(spec)
                     if row.get("slice_candidate_ids"):
@@ -2798,7 +2941,12 @@ class PythonSolver:
                         submitted = args
                     else:
                         if (spec.phase == "access" and not spec.references and not spec.compiled_workflows
-                                and name in {"validator_validate_sqli", "validator_validate_ssti", "hunter_run_web_loop"}
+                                and name in {
+                                    "validator_validate_sqli",
+                                    "validator_validate_ssti",
+                                    "validator_validate_path_traversal",
+                                    "hunter_run_web_loop",
+                                }
                                 and args.get("live", True) is not False):
                             options = self.plan_candidates(spec)
                             selected = next((row for row in options if matches_model_call(row, name, args)), None)

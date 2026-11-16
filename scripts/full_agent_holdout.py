@@ -9,9 +9,11 @@ import hashlib
 from contextlib import redirect_stdout
 import io
 import json
+import os
 from pathlib import Path
 import sqlite3
 import sys
+from typing import Any
 from urllib.parse import urlsplit
 
 from lab import readonly_api_holdout, readonly_sqli_holdout, readonly_ssti_holdout, readonly_traversal_holdout
@@ -44,6 +46,157 @@ def replay(selected, seed=None):
     if seed is not None and seed != selected["seed"]:
         raise ValueError("seed is not part of the frozen independent holdout")
     return FAMILIES[selected["family"]]
+
+
+def private_policy_contract(family: str) -> dict[str, Any]:
+    """Canonical private-policy provisioning contract shared by holdout, preflight, and launcher."""
+    if not isinstance(family, str) or (family and family not in FAMILIES):
+        raise ValueError("unknown independent family")
+    requires_traversal = family == readonly_traversal_holdout.FAMILY
+    return {
+        "schema": "holdout-private-policy-contract/1",
+        "family": family,
+        "requires_private_policy": requires_traversal,
+        "policy_section": "path_traversal" if requires_traversal else None,
+        "host_only": True,
+        "public_policy_unchanged": True,
+        "test_data_only": True,
+        "cross_run_reuse_forbidden": True,
+    }
+
+
+def _reject_symlink_path(path: Path) -> None:
+    if path.is_symlink() or any(parent.is_symlink() for parent in path.parents):
+        raise ValueError("private policy path cannot traverse symlinks")
+
+
+def verify_run_scoped_policy(policy_path: Path, expected_base: str) -> bool:
+    """Verify a run-scoped holdout policy file matches only expected_base and contains no cross-target entries."""
+    try:
+        path = Path(policy_path)
+        _reject_symlink_path(path)
+        if not path.is_file():
+            return False
+        data = json.loads(path.read_text(encoding="utf-8"))
+        rule = data.get("path_traversal") if isinstance(data, dict) else None
+        if not isinstance(rule, dict):
+            return False
+        validator_dir = str(Path(__file__).resolve().parents[1] / "mcp-servers/mcp-validator")
+        if validator_dir not in sys.path:
+            sys.path.append(validator_dir)
+        from cco_validator_core.traversal import check_traversal_policy_eligibility
+        expected = urlsplit(expected_base)
+        permits = lambda url: (
+            urlsplit(url).scheme == expected.scheme
+            and urlsplit(url).netloc == expected.netloc
+        )
+        files = rule.get("files") if isinstance(rule.get("files"), list) else []
+        if not files:
+            return False
+        for row in files:
+            if not isinstance(row, dict) or not permits(str(row.get("url") or "")):
+                return False
+            res = check_traversal_policy_eligibility(
+                rule, str(row.get("url") or ""), str(row.get("param") or ""), str(row.get("carrier") or "query"), permits
+            )
+            if not res.get("eligible"):
+                return False
+        return True
+    except (ValueError, OSError, TypeError):
+        return False
+
+
+def cleanup_private_policy(home: Path) -> None:
+    """Remove run-scoped holdout-program-policy.json cleanly on explicit teardown."""
+    target = Path(home) / "holdout-program-policy.json"
+    try:
+        if not target.is_symlink() and target.exists():
+            target.unlink()
+    except OSError:
+        pass
+
+
+def provision_private_policy(
+    *,
+    family: str,
+    lab: Any,
+    base: str,
+    home: Path,
+    private: Path,
+    base_policy: dict[str, Any],
+    scope_permits: Any = None,
+) -> dict[str, Any]:
+    """Provision run-scoped private host/MCP policy for fixture #4 without exposing it to the solver."""
+    import copy
+    from full_agent_provider import dump
+
+    contract = private_policy_contract(family)
+    home = Path(home)
+    private = Path(private)
+    _reject_symlink_path(home)
+    _reject_symlink_path(private)
+    policy_path = home / "holdout-program-policy.json"
+    if not contract["requires_private_policy"]:
+        cleanup_private_policy(home)
+        return {
+            "provisioned": False,
+            "family": family,
+            "target": base,
+            "policy_file": None,
+            "host_only": True,
+        }
+    if lab is None or lab.blind_state.get("lab_version") != readonly_traversal_holdout.VERSION:
+        raise ValueError("readonly traversal provisioning requires readonly-traversal/1 lab")
+    expected_origin = urlsplit(base)
+    if (expected_origin.scheme != "http" or expected_origin.hostname != "127.0.0.1"
+            or not expected_origin.port or expected_origin.path != "/"):
+        raise ValueError("traversal private policy requires exact loopback run base URL")
+    if not isinstance(base_policy, dict):
+        raise ValueError("base_policy must be a mapping")
+    validator_dir = str(Path(__file__).resolve().parents[1] / "mcp-servers/mcp-validator")
+    if validator_dir not in sys.path:
+        sys.path.append(validator_dir)
+    from cco_validator_core.traversal import application_files
+
+    decl = readonly_traversal_holdout.declaration(lab.blind_state, base)
+    permits = scope_permits or (lambda url: url.startswith(base))
+    for row in decl.get("files", []):
+        row_origin = urlsplit(str(row.get("url") or ""))
+        if (row_origin.scheme, row_origin.netloc) != (expected_origin.scheme, expected_origin.netloc):
+            raise ValueError("traversal policy declaration cross-target mismatch")
+        if row.get("test_data_only") is not True or row.get("outside_root") is not True:
+            raise ValueError("traversal policy declaration requires synthetic test_data_only=True")
+    for case in lab.blind_state["truth"]:
+        application_files(
+            decl,
+            base.rstrip("/") + case["path"],
+            case["param"],
+            "query",
+            permits,
+        )
+    policy = copy.deepcopy(base_policy)
+    policy["path_traversal"] = decl
+    dump(policy_path, policy)
+    os.chmod(policy_path, 0o600)
+    policy_digest = digest(policy_path)
+    dump(private / "fixture-policy-verification.json", {
+        "before_traffic": True,
+        "declarations_validated": len(decl["files"]),
+        "sha256": policy_digest,
+        "public_policy_unchanged": True,
+        "host_only": True,
+        "family": family,
+        "target_origin": expected_origin.netloc,
+    })
+    return {
+        "provisioned": True,
+        "family": family,
+        "target": base,
+        "policy_file": str(policy_path),
+        "sha256": policy_digest,
+        "declarations_validated": len(decl["files"]),
+        "host_only": True,
+    }
 
 
 def start(selected, private):

@@ -269,6 +269,18 @@ def native_contract(baseline, models, token_budget=MAX_LLM_TOKENS, *, solver_mod
     return contract
 
 
+def holdout_policy_contract(family: str) -> dict:
+    """Shared private-policy provisioning contract for holdout families."""
+    from full_agent_holdout import private_policy_contract
+    return private_policy_contract(family)
+
+
+def provision_holdout_policy(**kwargs) -> dict:
+    """Delegate private holdout policy provisioning to the single shared contract."""
+    from full_agent_holdout import provision_private_policy
+    return provision_private_policy(**kwargs)
+
+
 def python_host_inventory():
     """Freeze host code too: the Python model never receives these bytes."""
     paths = list((ROOT / "scripts").glob("*.py"))
@@ -338,6 +350,8 @@ def main(argv=None):
                 "remaining": ["native launcher isolation and metering validation in a socket/namespace-capable environment",
                               "native run and signed closure audit",
                               "independent holdout families"]}
+    if args.holdout_family:
+        manifest["policy_provisioning"] = holdout_policy_contract(args.holdout_family)
     if args.token_budget is None:
         manifest["remaining"].insert(0, "operator LLM token budget")
     if args.solver_mode == "python_loop":

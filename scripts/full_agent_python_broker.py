@@ -14,7 +14,9 @@ import os
 import re
 import stat
 import sys
+import threading
 import time
+import uuid
 import weakref
 from pathlib import Path
 from typing import Any
@@ -86,6 +88,19 @@ class PythonRuntimePolicy(RuntimePolicy):
         self.host_finalizing = set()
         self.host_continuing = set()
         self.summary_prompt_tokens = {}
+        self._lock = threading.RLock()
+        self._pending_executions: dict[str, dict[str, Any]] = {}
+        self._conservative_token_charges: dict[str, int] = {}
+        self._active_ticket = threading.local()
+
+    def allowance(self, spec):
+        remaining, phase, ident = super().allowance(spec)
+        with self._lock:
+            reserved_tokens = sum(
+                item["tokens"] for item in self._pending_executions.values() if item["phase"] == phase
+            )
+            conservative = self._conservative_token_charges.get(phase, 0)
+        return max(0, remaining - reserved_tokens - conservative), phase, ident
 
     def reserve_handoff(self, spec, session_count):
         if spec.phase != "enum" or type(session_count) is not int or session_count < 0:
@@ -96,11 +111,78 @@ class PythonRuntimePolicy(RuntimePolicy):
         self.handoff_reserves[spec.id] = reserve
 
     def tool_allowance(self, spec):
-        reserved = (0 if spec.id in self.host_finalizing else
-                    self.handoff_reserves.get(spec.id, 0) + self.validation_reserves.get(spec.id, 0)
-                    + self.checkpoint_reserves.get(spec.id, 0))
-        return max(0, min(spec.max_calls, PHASE_CALL_LIMITS[spec.phase])
-                   - reserved - self.tool_calls.get(spec.id, 0))
+        with self._lock:
+            pending_calls = sum(
+                max(0, item["calls"] - item["counted_calls"])
+                for item in self._pending_executions.values()
+                if item["spec_id"] == spec.id
+            )
+            reserved = (0 if spec.id in self.host_finalizing else
+                        self.handoff_reserves.get(spec.id, 0) + self.validation_reserves.get(spec.id, 0)
+                        + self.checkpoint_reserves.get(spec.id, 0))
+            return max(0, min(spec.max_calls, PHASE_CALL_LIMITS[spec.phase])
+                       - reserved - self.tool_calls.get(spec.id, 0) - pending_calls)
+
+    def reserve_execution(self, spec, *, calls: int = 1, estimated_tokens: int = 0, uncertain: bool = False) -> str:
+        """Atomically reserve phase call and token budget before dispatching a candidate."""
+        if type(calls) is not int or calls < 1:
+            raise ValueError("calls reservation must be a positive integer")
+        if type(estimated_tokens) is not int or estimated_tokens < 0:
+            raise ValueError("estimated_tokens reservation must be a non-negative integer")
+        reserve_tokens = max(MIN_OUTPUT_TOKENS, estimated_tokens) if uncertain and estimated_tokens == 0 else estimated_tokens
+        with self._lock:
+            if self.consecutive_failures.get(spec.id, 0) >= 2:
+                raise BudgetError("consecutive_tool_failure_limit")
+            if self.tool_allowance(spec) < calls:
+                raise BudgetError("phase_tool_budget_exhausted")
+            remaining_tokens, phase, _ = self.allowance(spec)
+            if reserve_tokens > remaining_tokens:
+                raise BudgetError("token_budget_exhausted")
+            ticket = uuid.uuid4().hex
+            self._pending_executions[ticket] = {
+                "spec_id": spec.id,
+                "phase": phase,
+                "calls": calls,
+                "tokens": reserve_tokens,
+                "uncertain": bool(uncertain),
+                "counted_calls": 0,
+            }
+            return ticket
+
+    def activate_execution_ticket(self, ticket: str | None):
+        class _Guard:
+            def __enter__(_self):
+                _self.prev = getattr(self._active_ticket, "value", None)
+                self._active_ticket.value = ticket
+            def __exit__(_self, *_exc):
+                self._active_ticket.value = _self.prev
+        return _Guard()
+
+    def reconcile_execution(
+        self,
+        ticket: str,
+        *,
+        actual_calls: int | None = None,
+        actual_tokens: int | None = None,
+        measurement_valid: bool = True,
+    ) -> None:
+        """Atomically reconcile an execution reservation, retaining conservative charges when uncertain."""
+        with self._lock:
+            item = self._pending_executions.pop(ticket, None)
+            if item is None:
+                return
+            spec_id = item["spec_id"]
+            phase = item["phase"]
+            if actual_calls is not None and type(actual_calls) is int and actual_calls >= 0:
+                extra_calls = actual_calls - item["counted_calls"]
+                if extra_calls > 0:
+                    self.tool_calls[spec_id] = self.tool_calls.get(spec_id, 0) + extra_calls
+            if measurement_valid and type(actual_tokens) is int and 0 <= actual_tokens <= item["tokens"]:
+                if actual_tokens > 0:
+                    self._conservative_token_charges[phase] = self._conservative_token_charges.get(phase, 0) + actual_tokens
+            else:
+                # Uncertain or overrun usage conservatively retains the full reservation.
+                self._conservative_token_charges[phase] = self._conservative_token_charges.get(phase, 0) + item["tokens"]
 
     def prepare(self, spec, prompt_tokens):
         remaining, phase, ident = self.allowance(spec)
@@ -152,16 +234,23 @@ class PythonRuntimePolicy(RuntimePolicy):
         return allowed
 
     def check_tool(self, spec, tool):
-        if self.consecutive_failures.get(spec.id, 0) >= 2:
-            raise BudgetError("consecutive_tool_failure_limit")
-        count = self.tool_calls.get(spec.id, 0)
-        if count >= min(spec.max_calls, PHASE_CALL_LIMITS[spec.phase]):
-            raise BudgetError("phase_tool_budget_exhausted")
-        if self.tool_allowance(spec) == 0:
-            raise ValueError("tool allowance reserved for host handoff")
-        if tool not in self.allowed_tools(spec):
-            raise ValueError("tool unavailable in current phase or repair")
-        self.tool_calls[spec.id] = count + 1
+        with self._lock:
+            if self.consecutive_failures.get(spec.id, 0) >= 2:
+                raise BudgetError("consecutive_tool_failure_limit")
+            count = self.tool_calls.get(spec.id, 0)
+            if count >= min(spec.max_calls, PHASE_CALL_LIMITS[spec.phase]):
+                raise BudgetError("phase_tool_budget_exhausted")
+            active_ticket = getattr(self._active_ticket, "value", None)
+            active_item = self._pending_executions.get(active_ticket) if active_ticket else None
+            if active_item is not None and active_item["spec_id"] == spec.id and active_item["counted_calls"] < active_item["calls"]:
+                active_item["counted_calls"] += 1
+            elif self.tool_allowance(spec) == 0:
+                raise ValueError("tool allowance reserved for host handoff")
+            if tool not in self.allowed_tools(spec):
+                if active_item is not None and active_item["spec_id"] == spec.id and active_item["counted_calls"] > 0:
+                    active_item["counted_calls"] -= 1
+                raise ValueError("tool unavailable in current phase or repair")
+            self.tool_calls[spec.id] = count + 1
 
     def record_result(self, spec, tool, execution, error=None):
         super().record_result(spec, tool, execution, error)
@@ -604,11 +693,19 @@ class PythonBroker(HostBroker):
                         # Keep semantic cards and fresh evidence readable. A
                         # compact workflow tool set retains discovery, session
                         # checks and validators even before the first read.
+                        has_traversal_cards = any(
+                            isinstance(card, dict)
+                            and (card.get('vector') == 'file-access' or card.get('tool') == 'validator_validate_path_traversal')
+                            for card in (context.get('candidate_cards') or [])
+                        )
                         reading_tools = {READ_TOOL, SUMMARY_TOOL, SESSION_CHECK_TOOL,
                                            COVERAGE_TOOL, 'hunter_run_web_loop', CRAWL_TOOL,
                                            COMPILED_WORKFLOW_TOOL, 'validator_validate_sqli',
-                                           'validator_validate_ssti', 'validator_validate_idor',
+                                           'validator_validate_ssti',
+                                           'validator_validate_idor',
                                            'validator_validate_auth_bypass', 'validator_validate_open_redirect'}
+                        if has_traversal_cards:
+                            reading_tools.add('validator_validate_path_traversal')
                         if spec.phase in {'recon', 'enum'}:
                             reading_tools |= {
                                 'kali-tools_curl_request',
@@ -639,8 +736,14 @@ class PythonBroker(HostBroker):
                         # lookup target/identities; no session authority changes.
                         projected.pop('session_bindings', None)
                         projected.pop('registered_session_checks', None)
-                        candidate['tools'] = [row for row in candidate['tools'] if row['function']['name'] not in
-                                              {'validator_validate_open_redirect', 'validator_validate_auth_bypass'}]
+                        has_traversal_cards = any(
+                            isinstance(card, dict) and card.get('vector') == 'file-access'
+                            for card in (context.get('candidate_cards') or [])
+                        )
+                        trimmed_tools = {'validator_validate_open_redirect', 'validator_validate_auth_bypass'}
+                        if not has_traversal_cards:
+                            trimmed_tools.add('validator_validate_path_traversal')
+                        candidate['tools'] = [row for row in candidate['tools'] if row['function']['name'] not in trimmed_tools]
                         latest = projected['recent_results'][-1]
                         if latest.get('result', {}).get('content_ref'):
                             latest.pop('content_ref', None)  # Exact wrapper remains in context_archive_ref.
@@ -657,7 +760,8 @@ class PythonBroker(HostBroker):
                         fields = {'hunter_run_web_loop': {'target', 'live', 'session_bindings', 'validation_profile'},
                                    COVERAGE_TOOL: {'target', 'campaign_id'},
                                    'validator_validate_sqli': {'target_url', 'param', 'method', 'carrier', 'boolean_only'},
-                                   'validator_validate_ssti': {'target_url', 'param', 'method', 'carrier'}}
+                                   'validator_validate_ssti': {'target_url', 'param', 'method', 'carrier'},
+                                   'validator_validate_path_traversal': {'target_url', 'param', 'method', 'carrier'}}
                         for tool in candidate['tools']:
                             name = tool['function']['name']
                             params = tool['function']['parameters']
@@ -1262,6 +1366,161 @@ class PythonBroker(HostBroker):
                     "execution_context": context,
                     "source_artifact": ref["path"], "source_sha256": ref["sha256"]}
         return list(attempts.values())
+
+    def profile_eligibility(self, spec, url: str, param: str, carrier: str, profile: str) -> dict[str, Any]:
+        """Evaluate private-policy eligibility inside the trusted host boundary.
+
+        Exposes only an eligibility boolean and controlled reason code, never
+        file names, policy fragments, markers, or suggested routes.
+        """
+        if profile != "readonly_traversal_application_files":
+            return {"eligible": True, "reason_code": ""}
+        spec_origin = urlsplit(spec.target)
+        cand_origin = urlsplit(url)
+        if (cand_origin.scheme, cand_origin.netloc) != (spec_origin.scheme, spec_origin.netloc):
+            return {"eligible": False, "reason_code": "traversal_policy_invalid"}
+        validator_path = str(Path(__file__).resolve().parents[1] / "mcp-servers/mcp-validator")
+        if validator_path not in sys.path:
+            sys.path.append(validator_path)
+        from cco_validator_core.traversal import check_traversal_policy_eligibility
+
+        rule: Any = None
+        policy_map = getattr(self.engine, "program_policy", None)
+        if isinstance(policy_map, dict):
+            rule = policy_map.get("path_traversal")
+        elif os.environ.get("CCO_PROGRAM_POLICY_FILE"):
+            try:
+                from policy_engine import PolicyEngine
+                engine = PolicyEngine()
+                rule = engine.program_policy.get("path_traversal")
+            except (ValueError, OSError, TypeError):
+                return {"eligible": False, "reason_code": "traversal_policy_invalid"}
+        else:
+            return {"eligible": False, "reason_code": "traversal_policy_not_declared"}
+
+        permits = lambda candidate_url: (
+            urlsplit(candidate_url).scheme == spec_origin.scheme
+            and urlsplit(candidate_url).netloc == spec_origin.netloc
+        )
+        if os.environ.get("CCO_SCOPE_FILE"):
+            try:
+                from policy_engine import ScopeResolver
+                resolver = ScopeResolver(scope_file=os.environ.get("CCO_SCOPE_FILE"))
+                permits = lambda candidate_url: (
+                    urlsplit(candidate_url).scheme == spec_origin.scheme
+                    and urlsplit(candidate_url).netloc == spec_origin.netloc
+                    and bool(resolver.permits_url(candidate_url))
+                )
+            except (ValueError, OSError, TypeError):
+                return {"eligible": False, "reason_code": "traversal_policy_invalid"}
+        return check_traversal_policy_eligibility(rule, url, param, carrier, permits)
+
+    def signed_completions(self, spec) -> list[dict[str, Any]]:
+        """Return verified v1 signed_completion envelopes from executed host tool receipts."""
+        from signed_completion import verify_signed_completion
+        validator_path = str(Path(__file__).resolve().parents[1] / "mcp-servers/mcp-validator")
+        if validator_path not in sys.path:
+            sys.path.append(validator_path)
+        from cco_validator_core.evidence import artifact_is_current, current_scope_revision, load_validation
+
+        try:
+            expected_scope = current_scope_revision() if os.environ.get("CCO_SCOPE_FILE") else None
+        except (ValueError, OSError):
+            expected_scope = None
+
+        executions: dict[bytes, tuple[str, dict[str, Any]]] = {}
+        for execution in self.tools:
+            if (execution.get("origin") != "solver" or execution.get("task_spec_id") != spec.id
+                    or not (execution["tool"] == "hunter_run_web_loop" or execution["tool"].startswith("validator_validate_"))):
+                continue
+            receipt = json.loads(Path(execution["artifact"]).read_bytes())
+            result = receipt.get("execution") or {}
+            if receipt.get("error") or result.get("execution_failed"):
+                continue
+            value = result.get("result", {}).get("output")
+            if isinstance(value, str):
+                try:
+                    value = json.loads(value)
+                except ValueError:
+                    continue
+            if not isinstance(value, dict):
+                continue
+            from python_identity_discovery import public_export
+            key = provider_json([execution["task_spec_id"], execution["tool"], receipt["arguments"], public_export(value)])
+            executions[key] = (execution["artifact"], value)
+
+        verified: list[dict[str, Any]] = []
+        for row in self.results:
+            if row["spec_id"] != spec.id or not (
+                row["tool"] == "hunter_run_web_loop" or row["tool"].startswith("validator_validate_")
+            ):
+                continue
+            ref = row["content_ref"]
+            try:
+                value = self.read_reference(ref)
+            except (ValueError, OSError, TypeError):
+                continue
+            if not isinstance(value, dict) or value.get("execution_failed") or value.get("error"):
+                continue
+            exec_info = executions.get(provider_json([spec.id, row["tool"], row["arguments"], value]))
+            if exec_info is None:
+                continue
+            execution_path, raw_output = exec_info
+            envelopes: list[dict[str, Any]] = []
+            if row["tool"] == "hunter_run_web_loop":
+                report = raw_output
+                if str(execution_path) in self.private_discovery_sources:
+                    try:
+                        report = self.private_discovery_report_for_execution(spec, execution_path, value)
+                    except (ValueError, OSError, TypeError, KeyError):
+                        continue
+                if (
+                    not isinstance(report, dict)
+                    or report.get("ok") is not True
+                    or report.get("errors")
+                    or report.get("stopped")
+                ):
+                    continue
+                if not report.get("confirmed"):
+                    if isinstance(report.get("signed_completion"), dict):
+                        envelopes.append(report["signed_completion"])
+                    if isinstance(report.get("signed_completions"), list):
+                        envelopes.extend(e for e in report["signed_completions"] if isinstance(e, dict))
+                for val_item in report.get("validations") or []:
+                    if isinstance(val_item, dict) and val_item.get("validation_id"):
+                        rec = load_validation(str(val_item["validation_id"]))
+                        if (rec and rec.get("verdict") == "UNCONFIRMED"
+                                and rec.get("guard", {}).get("transport_ok")
+                                and artifact_is_current(rec, expected_target=spec.target)
+                                and isinstance(rec.get("signed_completion"), dict)):
+                            envelopes.append(rec["signed_completion"])
+            else:
+                if isinstance(raw_output.get("signed_completion"), dict):
+                    envelopes.append(raw_output["signed_completion"])
+                vid = raw_output.get("validation_id")
+                if isinstance(vid, str) and vid:
+                    rec = load_validation(vid)
+                    if (rec and rec.get("verdict") == "UNCONFIRMED"
+                            and rec.get("guard", {}).get("transport_ok")
+                            and artifact_is_current(rec, expected_target=spec.target)
+                            and isinstance(rec.get("signed_completion"), dict)):
+                        envelopes.append(rec["signed_completion"])
+            for env in envelopes:
+                ok, payload, _ = verify_signed_completion(
+                    env,
+                    expected_target=spec.target,
+                    expected_scope=expected_scope,
+                )
+                if ok and payload is not None:
+                    verified.append({
+                        "payload": payload,
+                        "envelope": env,
+                        "tool": row["tool"],
+                        "source_artifact": ref["path"],
+                        "source_sha256": ref["sha256"],
+                        "arguments": row["arguments"],
+                    })
+        return verified
 
     def direct_request_context(self, record, args):
         """Infer a slice only from signed wire traces, not unsigned tool metadata."""
