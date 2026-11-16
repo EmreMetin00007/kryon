@@ -2535,6 +2535,17 @@ def _loop_blind_discover(target, identities, *, max_requests=24, sleep_s=0.15,
 
 
 def _loop_discover(target, cookie="", headers="", sql_only=False, ssti_only=False, traversal_only=False):
+    if sql_only or ssti_only or traversal_only:
+        from urllib.parse import urlsplit
+        prefix = urlsplit(target).path.rstrip("/")
+        existing = next_work(target, limit=1000, untested_only=False, db_path=MEM_DB)
+        if any(
+            (urlsplit(rec.get("url") or "").path == prefix
+             or urlsplit(rec.get("url") or "").path.startswith(prefix + "/"))
+            and rec.get("params")
+            for rec in existing.get("queue", [])
+        ):
+            return json.dumps({"ok": True, "skipped": "surface_already_ingested", "records": []})
     from cco_surface_core.wire import SurfaceBlocked, scoped_surface_requests
     gate = current_policy_gate()
     if gate is None:

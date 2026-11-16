@@ -225,12 +225,15 @@ def _check_execution(receipt: dict[str, Any], task_id: str, args: dict[str, Any]
         raise ValueError("identity discovery source changed")
 
 
-def _check_observation(observation: dict[str, Any], report: dict[str, Any]) -> None:
+def _check_observation(
+    observation: dict[str, Any], report: dict[str, Any], *, require_fresh: bool = True
+) -> None:
     states = observation.get("states")
     produced_at = observation.get("produced_at")
     now = time.time()
     if (isinstance(produced_at, bool) or not isinstance(produced_at, (int, float))
-            or not math.isfinite(produced_at) or produced_at > now or now - produced_at >= TTL_SECONDS):
+            or not math.isfinite(produced_at) or produced_at > now
+            or (require_fresh and now - produced_at >= TTL_SECONDS)):
         raise ValueError("private identity discovery observation expired or invalid")
     if (not isinstance(states, dict) or observation.get("public_output_sha256") != _digest(report)
             or canonical_bytes(public_state(states)) != canonical_bytes(report.get("identity_discovery_state", {}))):
@@ -242,7 +245,8 @@ def _check_observation(observation: dict[str, Any], report: dict[str, Any]) -> N
 
 
 def _source_observation(source: dict[str, Any], task_spec: dict[str, Any],
-                        report: dict[str, Any], receipt: dict[str, Any]) -> dict[str, Any]:
+                        report: dict[str, Any], receipt: dict[str, Any],
+                        *, require_fresh: bool = True) -> dict[str, Any]:
     seal = _signed_reference(source.get("private_reference"), SOURCE_PURPOSE)
     observation = _signed_reference(seal.get("producer_reference"), OBSERVATION_PURPOSE)
     args = receipt.get("arguments")
@@ -258,7 +262,7 @@ def _source_observation(source: dict[str, Any], task_spec: dict[str, Any],
             or observation.get("invocation") != seal["invocation"]):
         raise ValueError("private identity discovery receipt context changed")
     _check_execution(receipt, task_spec["id"], args, report)
-    _check_observation(observation, report)
+    _check_observation(observation, report, require_fresh=require_fresh)
     return observation
 
 

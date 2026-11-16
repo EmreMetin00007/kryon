@@ -45,6 +45,19 @@ def isolated_cco_home(request):
     yield request.config._cco_test_home.name
 
 
+@pytest.fixture(autouse=True)
+def restore_python_discovery_env():
+    """Host discovery handoff env vars must never leak between tests."""
+    keys = ("CCO_PYTHON_DISCOVERY_INVOCATION", "CCO_PYTHON_DISCOVERY_STATE")
+    previous = {key: os.environ.get(key) for key in keys}
+    yield
+    for key, value in previous.items():
+        if value is None:
+            os.environ.pop(key, None)
+        else:
+            os.environ[key] = value
+
+
 def load_server(name: str):
     """mcp-<name>/server.py modülünü izole şekilde yükle, modülü döndür."""
     path = os.path.join(SERVERS_DIR, f"mcp-{name}", "server.py")

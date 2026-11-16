@@ -212,9 +212,15 @@ def bootstrap_plan(base, workdir, *, solver_mode="native"):
         from full_agent_python_broker import PHASE_CALL_LIMITS, REPORT_CARRYOVER_STEP
         from orchestration_spec import Step
         goals = {"recon": [("fetch-entry", "Fetch the scoped entry point and retain its HTTP response", False)],
-                 "enum": [("discover-surface", "Inventory observed routes and parameters; fetch any listed documentation", False)],
-                 "access": [("minimal-validation", "Validate a candidate with the supplied deterministic tools", False),
-                            ("broader-coverage", "Record remaining untested vectors explicitly", True)],
+                 "enum": [("discover-surface",
+                           "Crawl and fetch the discovery frontier (HTML, JSON links, pagination, docs) across anon and bound identities before summarizing",
+                           False)],
+                 "access": [("minimal-validation",
+                             "Run deterministic validation and entry discovery across observed candidates and bound identity pairs using supplied tools",
+                             False),
+                            ("broader-coverage",
+                             "Continue remaining pending candidates and identity pairs across profiles, recording untested vectors explicitly",
+                             True)],
                  "report": [("review-evidence", "Review the verified phase summaries and signed evidence", False),
                             (REPORT_CARRYOVER_STEP, "Host preserves unfinished work from verified prior summaries", True)]}
         for spec in specs:

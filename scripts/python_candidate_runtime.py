@@ -111,11 +111,25 @@ def parser_gaps(value: dict[str, Any], task: str, ref: dict[str, Any]) -> list[d
     return dedup_gaps(output)
 
 
+def recipe_arguments(row: dict[str, Any], tool: str) -> dict[str, Any] | None:
+    """Return the host-bound argument recipe for an allowed executor tool on this candidate."""
+    if row.get("tool") == tool:
+        args = row.get("arguments")
+        return args if isinstance(args, dict) else None
+    recipes = row.get("recipes")
+    if isinstance(recipes, dict):
+        args = recipes.get(tool)
+        return args if isinstance(args, dict) else None
+    return None
+
+
 def matches_model_call(row: dict[str, Any], tool: str, args: dict[str, Any]) -> bool:
     """A model can select a host slice, not widen it or supply raw identity data."""
-    if row["tool"] != tool or not row["eligible"] or row["executed"] or row["evidence_accepted"]:
+    if not row["eligible"] or row["executed"] or row["evidence_accepted"]:
         return False
-    expected = row["arguments"]
+    expected = recipe_arguments(row, tool)
+    if expected is None:
+        return False
     required = {"target", "validation_profile"} if tool == "hunter_run_web_loop" else {"target_url", "param"}
     if row["vector"] == "access-idor":
         required = {"target", "session_bindings"}
@@ -139,19 +153,28 @@ def matches_model_call(row: dict[str, Any], tool: str, args: dict[str, Any]) -> 
 
 def candidate(task: str, *, route: str, param: str = "", identity: Any = "anon",
               vector: str = "", tool: str = "", arguments: Any = None,
-              provenance: Any = None, reason: str = "") -> dict[str, Any]:
+              provenance: Any = None, reason: str = "",
+              validation_profile: str = "",
+              recipes: dict[str, dict[str, Any]] | None = None) -> dict[str, Any]:
     # Provenance is merged on the semantic key: repeated pages/sources do not
     # inflate the funnel. Task identity is part of the key, so branches cannot
     # spend each other's reservations or reuse each other's coverage.
     key = [task, "GET", route, param, identity, vector]
     ident = hashlib.sha256(json.dumps(key, sort_keys=True).encode()).hexdigest()
-    return {"candidate_id": ident, "task_spec_id": task, "method": "GET",
-            "route": route, "param": param, "identity_ref": identity,
-            "vector": vector, "tool": tool, "arguments": arguments or {},
-            "provenance": provenance or [], "observed": True, "eligible": not reason,
-            "admitted": False, "executed": False, "evidence_accepted": False,
-            "validation_state": "NOT TESTED", "reason_code": reason,
-            "evidence_refs": []}
+    row: dict[str, Any] = {
+        "candidate_id": ident, "task_spec_id": task, "method": "GET",
+        "route": route, "param": param, "identity_ref": identity,
+        "vector": vector, "tool": tool, "arguments": arguments or {},
+        "provenance": provenance or [], "observed": True, "eligible": not reason,
+        "admitted": False, "executed": False, "evidence_accepted": False,
+        "validation_state": "NOT TESTED", "reason_code": reason,
+        "evidence_refs": [],
+    }
+    if validation_profile:
+        row["validation_profile"] = validation_profile
+    if recipes:
+        row["recipes"] = recipes
+    return row
 
 
 def authorization_controls_complete(record: dict[str, Any]) -> bool:
@@ -264,24 +287,38 @@ def parameter_candidates(spec: Any, records: list[dict[str, Any]],
                 # Direct validators have no session-ref argument. Authenticated
                 # records use Hunter's existing vault-only profile rather than
                 # projecting credentials or silently testing anonymously.
-                tool = "hunter_run_web_loop" if (bindings and identity != "anon") or direct not in spec.tools else direct
-                args: dict[str, Any]
-                if tool == direct:
-                    args = {"target_url": url, "param": param, "method": "GET", "carrier": "query"}
-                    if profile == "readonly_sqli_boolean":
-                        args["boolean_only"] = True
-                else:
-                    args = {"target": url, "live": True, "crawl": False,
-                            "validation_profile": profile, "fuzz_limit": 4,
-                            "max_validations": 16, "candidate_sample_limit": 16, "sleep_s": 0.2}
-                    if identity in bindings:
-                        args["session_bindings"] = json.dumps({identity: bindings[identity]})
-                output.append(candidate(spec.id, route=url, param=param,
+                direct_args: dict[str, Any] = {
+                    "target_url": url, "param": param, "method": "GET", "carrier": "query",
+                }
+                if profile == "readonly_sqli_boolean":
+                    direct_args["boolean_only"] = True
+                hunter_args: dict[str, Any] = {
+                    "target": url, "live": True, "crawl": False,
+                    "validation_profile": profile, "fuzz_limit": 4,
+                    "max_validations": 16, "candidate_sample_limit": 16, "sleep_s": 0.2,
+                }
+                if identity in bindings:
+                    hunter_args["session_bindings"] = json.dumps({identity: bindings[identity]})
+                use_hunter = bool(bindings and identity != "anon") or direct not in spec.tools
+                tool = "hunter_run_web_loop" if use_hunter else direct
+                args = hunter_args if use_hunter else direct_args
+                recipes: dict[str, dict[str, Any]] = {}
+                if not (bindings and identity != "anon") and direct in spec.tools:
+                    recipes[direct] = copy.deepcopy(direct_args)
+                if "hunter_run_web_loop" in spec.tools:
+                    recipes["hunter_run_web_loop"] = copy.deepcopy(hunter_args)
+                output.append(candidate(
+                    spec.id, route=url, param=param,
                     identity=identity, vector=vector,
                     tool=tool, arguments=args, provenance=provenance,
-                    reason=(binding_reason if identity in bindings else "") or ("unsupported_parameter_carrier" if declared.get(param, "query") != "query"
+                    reason=(binding_reason if identity in bindings else "") or (
+                        "unsupported_parameter_carrier" if declared.get(param, "query") != "query"
                         else "missing_observed_query_sample" if param not in params
-                        else "validator_not_declared" if tool not in spec.tools else "")))
+                        else "validator_not_declared" if tool not in spec.tools else ""
+                    ),
+                    validation_profile=profile,
+                    recipes=recipes or None,
+                ))
     # Prefer a provenance-backed anonymous observation of the identical slice.
     # Invalid/contradictory rows remain visible and cannot be hidden by it.
     public = {(row["route"], row["param"], row["vector"]): row for row in output
@@ -342,3 +379,157 @@ def funnel(rows: list[dict[str, Any]]) -> dict[str, Any]:
     return {"schema": "python-validation-funnel/1", "unit": "deduplicated_task_candidate",
              **{stage: sum(bool(row[stage]) for row in rows) for stage in STAGES},
             "candidates": copy.deepcopy(rows)}
+
+
+LEAF_STATUSES = ("accepted", "pending", "indeterminate", "invalid_evidence")
+
+
+def leaf_outcome(
+    *,
+    task: str,
+    candidate_id: str,
+    vector: str,
+    url: str,
+    method: str = "GET",
+    param: str = "",
+    carrier: str = "",
+    identity: str = "anon",
+    resource_owner: str = "",
+    operation_id: str | None = None,
+    vuln_class: str = "",
+    pair_identities: list[str] | None = None,
+    url_sha256: str = "",
+    execution_state: str = "pending",
+    status: str = "pending",
+    verdict: str = "",
+    validation_id: str = "",
+    source_artifact: str = "",
+    source_sha256: str = "",
+    reason_code: str = "",
+) -> dict[str, Any]:
+    """Build a canonical leaf outcome record distinct from candidate-level aggregates."""
+    if status not in LEAF_STATUSES:
+        raise ValueError(f"unsupported leaf status: {status!r}")
+    key_parts = [
+        task,
+        vector,
+        method,
+        url,
+        url_sha256,
+        param,
+        carrier,
+        identity,
+        resource_owner,
+        operation_id,
+        vuln_class,
+        list(pair_identities or []),
+    ]
+    leaf_id = hashlib.sha256(json.dumps(key_parts, sort_keys=True).encode()).hexdigest()
+    accepted = status == "accepted"
+    signed_result: dict[str, Any] | None = None
+    if accepted:
+        signed_result = {
+            "validation_id": validation_id,
+            "verdict": verdict,
+            "source_artifact": source_artifact,
+            "source_sha256": source_sha256,
+        }
+    elif status == "indeterminate" and validation_id:
+        signed_result = {
+            "validation_id": validation_id,
+            "verdict": verdict or "INCONCLUSIVE",
+        }
+    row: dict[str, Any] = {
+        "leaf_id": leaf_id,
+        "task_spec_id": task,
+        "candidate_id": candidate_id,
+        "vector": vector,
+        "url": url,
+        "method": method,
+        "param": param,
+        "carrier": carrier,
+        "identity": identity,
+        "resource_owner": resource_owner,
+        "operation_id": operation_id,
+        "vuln_class": vuln_class,
+        "pair_identities": list(pair_identities or []),
+        "execution_state": execution_state,
+        "status": status,
+        "evidence_accepted": accepted,
+        "validation_state": "TESTED" if accepted else "NOT TESTED",
+        "verdict": verdict,
+        "validation_id": validation_id,
+        "signed_result": signed_result,
+        "reason_code": "" if accepted else reason_code,
+    }
+    if url_sha256:
+        row["url_sha256"] = url_sha256
+    return row
+
+
+def leaf_funnel(leaves: list[dict[str, Any]]) -> dict[str, Any]:
+    """Aggregate leaf outcomes without altering candidate-unit validation_funnel()."""
+    return {
+        "schema": "python-leaf-validation-funnel/1",
+        "unit": "signed_validation_leaf",
+        "observed": len(leaves),
+        "accepted": sum(1 for row in leaves if row.get("status") == "accepted"),
+        "pending": sum(1 for row in leaves if row.get("status") == "pending"),
+        "indeterminate": sum(1 for row in leaves if row.get("status") == "indeterminate"),
+        "invalid_evidence": sum(1 for row in leaves if row.get("status") == "invalid_evidence"),
+        "outcomes": copy.deepcopy(leaves),
+    }
+
+
+def pair_progress_entry(
+    identities: list[str],
+    leaves: list[dict[str, Any]],
+    *,
+    complete: bool = False,
+    categories: list[str] | None = None,
+    reason_code: str = "",
+) -> dict[str, Any]:
+    """Summarize leaf-level progress and completeness for one identity pair."""
+    observed = len(leaves)
+    accepted = sum(1 for row in leaves if row.get("status") == "accepted")
+    pending = sum(1 for row in leaves if row.get("status") == "pending")
+    indeterminate = sum(1 for row in leaves if row.get("status") == "indeterminate")
+    invalid = sum(1 for row in leaves if row.get("status") == "invalid_evidence")
+    partial = bool(not complete and accepted > 0 and invalid == 0)
+    coverage_state = (
+        "tested"
+        if complete
+        else ("partial_coverage" if partial else "not_tested")
+    )
+    return {
+        "identities": list(identities),
+        "categories": list(categories or []),
+        "observed": observed,
+        "accepted": accepted,
+        "pending": pending,
+        "indeterminate": indeterminate,
+        "invalid_evidence": invalid,
+        "complete": bool(complete),
+        "partial_coverage": partial,
+        "status": "TESTED" if complete else "NOT TESTED",
+        "coverage_state": coverage_state,
+        "reason_code": "" if complete else reason_code,
+        "leaves": copy.deepcopy(leaves),
+    }
+
+
+def pair_progress_summary(pairs: list[dict[str, Any]]) -> dict[str, Any]:
+    """Aggregate pair-level leaf progress across all identity pairs in a task."""
+    return {
+        "schema": "python-pair-progress/1",
+        "unit": "identity_pair_leaf",
+        "total_pairs": len(pairs),
+        "complete_pairs": sum(1 for row in pairs if row.get("complete")),
+        "partial_pairs": sum(1 for row in pairs if row.get("partial_coverage")),
+        "observed": sum(int(row.get("observed", 0)) for row in pairs),
+        "accepted": sum(int(row.get("accepted", 0)) for row in pairs),
+        "pending": sum(int(row.get("pending", 0)) for row in pairs),
+        "indeterminate": sum(int(row.get("indeterminate", 0)) for row in pairs),
+        "invalid_evidence": sum(int(row.get("invalid_evidence", 0)) for row in pairs),
+        "pairs": copy.deepcopy(pairs),
+    }

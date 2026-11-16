@@ -7,9 +7,11 @@ import hashlib
 import io
 import json
 import math
+import os
 import re
 import sqlite3
 import sys
+import tempfile
 import time
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -32,8 +34,11 @@ from full_agent_summary_feedback import summary_feedback
 from orchestration_spec import COMPILED_WORKFLOW_TOOL, TaskSpec, skeleton_summary, surface_errors, validate_chain
 from workflow_checkpoint import WorkflowCheckpoint, SCHEMA as CHECKPOINT_SCHEMA, file_ref
 from python_candidate_runtime import (PROFILES, candidate, compact_cards, compact_gaps, dedup_gaps, funnel, gap,
-                                      matches_model_call, parameter_candidates, parameter_declarations,
-                                      parser_gaps, query_parameters, upstream_ids)
+                                      leaf_funnel, leaf_outcome, matches_model_call, pair_progress_entry,
+                                      pair_progress_summary, parameter_candidates, parameter_declarations,
+                                      parser_gaps, query_parameters, recipe_arguments, upstream_ids)
+from python_discovery_runtime import (DISCOVERY_TOOLS, DiscoveryState, discovery_state_key,
+                                      extract_json_hypermedia, normalize_identity, project_discovery_frontier)
 
 SCHEMA = "python-workflow-v1"
 PHASE_IDS = ("recon-1", "enum-2", "access-3", "report-4")
@@ -115,7 +120,12 @@ class PythonSolver:
         self.access_dispatches = set()
         self.batches_by_task = {}
         self.candidates_by_task = {}
+        self.leaf_outcomes_by_task = {}
+        self.pair_progress_by_task = {}
+        self.discovery_states = {}
         self.coverage_gaps = {}
+        self._discovery_stagnation = {}
+        self._last_surface_truncated = {}
         for spec in broker.tasks.specs:
             if spec.phase == "enum" and "kali-tools_ledger_prepare_handoff" in spec.tools:
                 broker.runtime_policy.reserve_handoff(spec, len(broker.session_checks(spec)))
@@ -157,6 +167,9 @@ class PythonSolver:
                  'loop_events': self.loop_events, 'observations': self._observations,
                  'access_dispatches': sorted(self.access_dispatches),
                  'batches_by_task': self.batches_by_task, 'candidates_by_task': self.candidates_by_task,
+                 'leaf_outcomes_by_task': self.leaf_outcomes_by_task,
+                 'pair_progress_by_task': self.pair_progress_by_task,
+                 'discovery_states': {key: item.to_dict() for key, item in self.discovery_states.items()},
                  'coverage_gaps': self.coverage_gaps, 'branch_handoffs': broker.branch_handoffs,
                   'read_progress': broker.read_progress,
                   # HOST-PRIVATE signed/hash-bound state; never a model archive.
@@ -219,6 +232,21 @@ class PythonSolver:
         self.access_dispatches = set(state['access_dispatches'])
         self.batches_by_task = state.get('batches_by_task', self.batches_by_task)
         self.candidates_by_task = state.get('candidates_by_task', {})
+        self.leaf_outcomes_by_task = state.get('leaf_outcomes_by_task', {})
+        self.pair_progress_by_task = state.get('pair_progress_by_task', {})
+        self.discovery_states = {
+            key: DiscoveryState.from_dict(item)
+            for key, item in state.get('discovery_states', {}).items()
+        }
+        for state_obj in self.discovery_states.values():
+            for src in state_obj.sources:
+                ref = self.broker.references.get(src['source_artifact'])
+                if ref is None or ref['sha256'] != src['source_sha256']:
+                    raise WorkflowError('prior_phase_evidence_changed')
+                try:
+                    self.broker.read_reference(ref)
+                except (ValueError, OSError, TypeError):
+                    raise WorkflowError('prior_phase_evidence_changed') from None
         self.coverage_gaps = state.get('coverage_gaps', {})
         self.broker.branch_handoffs = state.get('branch_handoffs', {})
         self.broker.read_progress = state.get('read_progress', {})
@@ -247,8 +275,46 @@ class PythonSolver:
         budget.deadline = budget.clock() + remaining
         for spec in specs:
             if self.task_states.get(spec.id) == 'running':
+                for state_obj in self.discovery_states.values():
+                    if state_obj.task_spec_id == spec.id:
+                        state_obj.mark_interrupted_dispatched_indeterminate()
                 self.task_states[spec.id] = 'inconclusive'
                 self.summaries.pop(spec.id, None)
+                if spec.id in self.leaf_outcomes_by_task:
+                    cands = self.candidates_by_task.get(spec.id, {})
+                    updated_leaves = []
+                    for leaf in self.leaf_outcomes_by_task[spec.id]:
+                        cand = cands.get(leaf.get('candidate_id', ''), {})
+                        if leaf.get('status') == 'pending' and (
+                            leaf.get('execution_state') == 'dispatched'
+                            or (cand.get('dispatch_started') and not cand.get('executed'))
+                        ):
+                            leaf = {
+                                **leaf,
+                                'execution_state': 'interrupted',
+                                'status': 'indeterminate',
+                                'evidence_accepted': False,
+                                'validation_state': 'NOT TESTED',
+                                'reason_code': 'indeterminate_dispatch_not_replayed',
+                            }
+                        updated_leaves.append(leaf)
+                    self.leaf_outcomes_by_task[spec.id] = updated_leaves
+                if spec.id in self.pair_progress_by_task:
+                    by_cand: dict[tuple[str, ...], list[dict[str, Any]]] = {}
+                    for leaf in self.leaf_outcomes_by_task.get(spec.id, []):
+                        by_cand.setdefault(tuple(leaf.get('pair_identities') or ()), []).append(leaf)
+                    rebuilt_pairs = []
+                    for pair_row in self.pair_progress_by_task[spec.id].get('pairs', []):
+                        ident_key = tuple(pair_row.get('identities') or ())
+                        leaves = by_cand.get(ident_key, pair_row.get('leaves', []))
+                        rebuilt_pairs.append(pair_progress_entry(
+                            pair_row.get('identities', []),
+                            leaves,
+                            complete=bool(pair_row.get('complete')),
+                            categories=pair_row.get('categories', []),
+                            reason_code=pair_row.get('reason_code', ''),
+                        ))
+                    self.pair_progress_by_task[spec.id] = pair_progress_summary(rebuilt_pairs)
                 self.loop_event(spec, 'INCONCLUSIVE_indeterminate_dispatch_not_replayed')
             elif spec.id in self.summaries and not summary_feedback(self.summaries[spec.id], spec)['valid']:
                 raise ValueError('invalid checkpoint summary')
@@ -340,6 +406,13 @@ class PythonSolver:
         self.batches_by_task[self.broker.tasks.active_spec.id] = value
 
     def add_gap(self, spec, reason, category="prerequisites", row=None, provenance=None):
+        if row is not None and row.get("slice_candidate_ids") and spec.id in self.candidates_by_task:
+            row.update(validation_state="NOT TESTED", reason_code=reason)
+            for ident in row["slice_candidate_ids"]:
+                leaf = self.candidates_by_task[spec.id].get(ident)
+                if leaf is not None:
+                    self.add_gap(spec, reason, category, leaf, provenance=provenance)
+            return
         item = gap(reason, category=category, task=spec.id,
                    candidate=row["candidate_id"] if row else "", provenance=provenance or (row or {}).get("provenance"))
         self.coverage_gaps[spec.id] = dedup_gaps([*self.coverage_gaps.get(spec.id, []), item])
@@ -374,6 +447,214 @@ class PythonSolver:
         return {"records": [json.loads(raw) for raw in dict.fromkeys(provider_json(row).decode() for row in records)],
                 "coverage_gaps": dedup_gaps(gaps)}
 
+    def task_discovery_states(self, spec):
+        """Return host-private DiscoveryState instances keyed for this task."""
+        return {
+            key: state
+            for key, state in self.discovery_states.items()
+            if state.task_spec_id == spec.id and state.target == spec.target
+        }
+
+    def _discovery_state_for(self, spec, identity_ref="anon"):
+        identity = normalize_identity(identity_ref)
+        key = discovery_state_key(spec.id, spec.target, identity)
+        state = self.discovery_states.get(key)
+        if state is None:
+            state = DiscoveryState(task_spec_id=spec.id, target=spec.target, identity_ref=identity)
+            self.discovery_states[key] = state
+        return state
+
+    def _ingest_discovery_receipt(self, spec, row, *, source_spec_id, is_ancestor):
+        ref = row["content_ref"]
+        try:
+            value = self.broker.read_reference(ref)
+        except (ValueError, OSError, TypeError):
+            raise WorkflowError("prior_phase_evidence_changed") from None
+        if not isinstance(value, dict):
+            return
+        args = row.get("arguments") if isinstance(row.get("arguments"), dict) else {}
+        provenance = {
+            "source_spec_id": source_spec_id,
+            "source_artifact": ref["path"],
+            "source_sha256": ref["sha256"],
+            "tool": row["tool"],
+        }
+        base_identity = normalize_identity(args.get("identity"))
+        origin = urlsplit(spec.target)
+        parent_url = args.get("url") or args.get("target")
+        parent_action_id = None
+        if isinstance(parent_url, str) and parent_url:
+            parsed_parent = urlsplit(parent_url)
+            if (parsed_parent.scheme, parsed_parent.netloc) == (origin.scheme, origin.netloc) and parsed_parent.username is None:
+                if value.get("execution_failed"):
+                    exec_status, exec_reason, http_status = "indeterminate", "execution_failed", None
+                elif value.get("error"):
+                    exec_status = "blocked"
+                    exec_reason = str(value.get("reason_code") or "tool_error")[:96]
+                    http_status = None
+                else:
+                    raw_status = value.get("status_code", value.get("status"))
+                    http_status = raw_status if type(raw_status) is int and 100 <= raw_status <= 599 else None
+                    if http_status in {401, 403}:
+                        exec_status, exec_reason = "blocked", f"http_{http_status}"
+                    elif row["tool"] == CRAWL_TOOL and value.get("ok") is False:
+                        exec_status = "blocked"
+                        exec_reason = str(value.get("reason_code") or "crawl_failed")[:96]
+                    elif http_status is not None or row["tool"] == CRAWL_TOOL:
+                        exec_status, exec_reason = "completed", ""
+                    else:
+                        exec_status, exec_reason = "indeterminate", "unrecognized_tool_response"
+                parent_state = self._discovery_state_for(spec, base_identity)
+                parent_method = str(value.get("request_method") or args.get("method") or "GET").upper()
+                parent_kind = "crawl" if row["tool"] == CRAWL_TOOL else "http_request"
+                relation = "entry" if is_ancestor and source_spec_id.startswith("recon") else "observed"
+                parent_action = parent_state.record_action(
+                    url=parent_url,
+                    method=parent_method,
+                    kind=parent_kind,
+                    link_relation=relation,
+                    provenance=provenance,
+                    status=exec_status,
+                    reason_code=exec_reason,
+                    http_status=http_status,
+                    result_artifact=ref["path"],
+                    result_sha256=ref["sha256"],
+                )
+                parent_action_id = parent_action["action_id"]
+        if value.get("error") or value.get("execution_failed"):
+            return
+        crawled_statuses = {}
+        surface = value.get("surface", value)
+        if row["tool"] == CRAWL_TOOL and isinstance(surface, dict):
+            base = parent_url or spec.target
+            for key in ("records", "pages"):
+                items = surface.get(key)
+                if not isinstance(items, list):
+                    continue
+                for item in items:
+                    if not isinstance(item, dict):
+                        continue
+                    item_url = item.get("url") or item.get("href")
+                    st = item.get("status_code", item.get("status"))
+                    if isinstance(item_url, str) and type(st) is int and 100 <= st <= 599:
+                        resolved = urljoin(base, item_url)
+                        m = str(item.get("method") or "GET").upper()
+                        crawled_statuses[(m, resolved)] = (
+                            "blocked" if st in {401, 403} else "completed",
+                            st,
+                            f"http_{st}" if st in {401, 403} else "",
+                        )
+        for record in self.surface_records(value, args, spec, ref):
+            rec_identity = normalize_identity(record.get("identity_ref", base_identity))
+            rec_state = self._discovery_state_for(spec, rec_identity)
+            rec_method = str(record.get("method") or "GET").upper()
+            rec_url = record["url"]
+            rec_reason = str(record.get("candidate_reason") or "")
+            rec_http_status = None
+            if rec_reason:
+                rec_status = "blocked"
+            elif rec_method not in {"GET", "HEAD"}:
+                rec_status, rec_reason = "blocked", "unsupported_readonly_method"
+            elif (rec_method, rec_url) in crawled_statuses:
+                rec_status, rec_http_status, rec_reason = crawled_statuses[(rec_method, rec_url)]
+            else:
+                rec_status = "pending"
+            link_relation = (
+                record.get("link_relation")
+                or (
+                    "crawl_link"
+                    if row["tool"] == CRAWL_TOOL
+                    else ("form_action" if rec_method != "GET" else "discovered_link")
+                )
+            )
+            child_action = rec_state.record_action(
+                url=rec_url,
+                method=rec_method,
+                kind="form" if rec_method != "GET" else "http_request",
+                params=record.get("params", []),
+                link_relation=link_relation,
+                parent_action_id=parent_action_id,
+                provenance=provenance,
+                status=rec_status,
+                reason_code=rec_reason,
+                http_status=rec_http_status,
+            )
+            if self._last_surface_truncated.get(ref["path"]):
+                rec_state.continuation["slice_truncated"] = True
+            if parent_action_id and rec_identity != base_identity:
+                parent_state = self._discovery_state_for(spec, base_identity)
+                if parent_action_id in parent_state.actions:
+                    children = parent_state.actions[parent_action_id].setdefault("child_action_ids", [])
+                    if child_action["action_id"] not in children:
+                        children.append(child_action["action_id"])
+        if self._last_surface_truncated.get(ref["path"]):
+            self._discovery_state_for(spec, base_identity).continuation["slice_truncated"] = True
+
+    def hydrate_discovery_state(self, spec):
+        """Hydrate private DiscoveryState from admitted ancestors and current receipts."""
+        if spec.references or spec.compiled_workflows or spec.phase not in {"recon", "enum", "access"}:
+            return {}
+        for state_obj in self.task_discovery_states(spec).values():
+            for src in state_obj.sources:
+                ref = self.broker.references.get(src["source_artifact"])
+                if ref is None or ref["sha256"] != src["source_sha256"]:
+                    raise WorkflowError("prior_phase_evidence_changed")
+                try:
+                    self.broker.read_reference(ref)
+                except (ValueError, OSError, TypeError):
+                    raise WorkflowError("prior_phase_evidence_changed") from None
+        registry = {item.id: item for item in self.broker.tasks.specs}
+        for ident in upstream_ids(spec, self.broker.tasks.specs):
+            source = registry[ident]
+            if source.phase not in {"recon", "enum"} or ident not in self.summaries:
+                continue
+            previous = self.summaries[ident]
+            if (
+                not isinstance(previous, dict)
+                or previous.get("status") not in {"done", "partial"}
+                or (previous.get("target") is not None and previous.get("target") != spec.target)
+            ):
+                raise WorkflowError("prior_phase_summary_invalid")
+            for row in self.broker.results:
+                if row["spec_id"] == ident and row["tool"] in DISCOVERY_TOOLS:
+                    self._ingest_discovery_receipt(spec, row, source_spec_id=ident, is_ancestor=True)
+        for row in self.broker.results:
+            if row["spec_id"] == spec.id and row["tool"] in DISCOVERY_TOOLS:
+                self._ingest_discovery_receipt(spec, row, source_spec_id=spec.id, is_ancestor=False)
+        return self.task_discovery_states(spec)
+
+    def discovery_frontier(self, spec):
+        """Return compact redacted discovery frontier from verified private state."""
+        states = self.hydrate_discovery_state(spec)
+        if not states or not any(state.actions for state in states.values()):
+            return None
+        return project_discovery_frontier(states, task_spec_id=spec.id, target=spec.target)
+
+    def _entry_discovery_provenance(self, spec):
+        """Return verified upstream entry-response provenance without fabricating object provenance."""
+        registry = {item.id: item for item in self.broker.tasks.specs}
+        provenance = []
+        for ident in upstream_ids(spec, self.broker.tasks.specs):
+            source = registry[ident]
+            if source.phase not in {"recon", "enum"} or ident not in self.summaries:
+                continue
+            for row in self.broker.results:
+                if row["spec_id"] != ident or row["tool"] not in DISCOVERY_TOOLS:
+                    continue
+                ref = row["content_ref"]
+                try:
+                    value = self.broker.read_reference(ref)
+                except (ValueError, OSError, TypeError):
+                    raise WorkflowError("prior_phase_evidence_changed") from None
+                if not isinstance(value, dict) or value.get("error") or value.get("execution_failed"):
+                    continue
+                provenance.append({
+                    "source_spec_id": ident,
+                    "source_artifact": ref["path"],
+                    "source_sha256": ref["sha256"],
+                })
+        return [json.loads(raw) for raw in dict.fromkeys(provider_json(row).decode() for row in provenance)]
+
     def plan_candidates(self, spec):
         if spec.phase != "access" or spec.references or spec.compiled_workflows:
             return []
@@ -389,20 +670,40 @@ class PythonSolver:
         provenance = [{key: record[key] for key in ("source_spec_id", "source_artifact", "source_sha256")}
                       for record in records]
         provenance = [json.loads(raw) for raw in dict.fromkeys(provider_json(row).decode() for row in provenance)]
-        if records and spec.vector in ("", "access", "access-idor", "authz-idor"):
-            for batch in self.batches_by_task.get(spec.id, []):
+        entry_provenance = provenance if provenance else self._entry_discovery_provenance(spec)
+        idor_batches = self.batches_by_task.get(spec.id, [])
+        if idor_batches and spec.vector in ("", "access", "access-idor", "authz-idor"):
+            for batch in idor_batches:
+                batch_valid = all(
+                    ident in bindings
+                    and bindings[ident].get("target") == spec.target
+                    and bindings[ident].get("test_data_only") is True
+                    and bindings[ident].get("owned_objects_private") is True
+                    for ident in batch
+                )
                 args = {"target": spec.target, "live": True, "crawl": False,
                         "blind_discovery": True, "blind_max_requests": 24, "max_validations": 16,
                         "fuzz_limit": 0, "candidate_sample_limit": 0, "sleep_s": 0.2,
                         "session_bindings": provider_json(batch).decode()}
-                planned.append(candidate(spec.id, route=spec.target, identity=list(batch), vector="access-idor",
-                    tool="hunter_run_web_loop", arguments=args, provenance=provenance,
-                    reason="validator_not_declared" if "hunter_run_web_loop" not in spec.tools else ""))
-        if not records:
-            self.add_gap(spec, "missing_declared_upstream_observations")
+                reason = (
+                    "missing_synthetic_owned_session_prerequisite"
+                    if not batch_valid
+                    else ("validator_not_declared" if "hunter_run_web_loop" not in spec.tools else "")
+                )
+                row = candidate(spec.id, route=spec.target, identity=list(batch), vector="access-idor",
+                    tool="hunter_run_web_loop", arguments=args, provenance=entry_provenance,
+                    reason=reason)
+                if not records:
+                    row["entry_discovery"] = True
+                planned.append(row)
+        has_eligible_entry_discovery = any(
+            row["vector"] == "access-idor" and row["eligible"] for row in planned
+        )
+        if not records and not has_eligible_entry_discovery:
+            self.add_gap(spec, "missing_declared_upstream_observations", provenance=entry_provenance)
         elif not planned:
-            self.add_gap(spec, "missing_parameter_or_synthetic_identity_pair", provenance=provenance)
-        if not self.batches_by_task.get(spec.id) or spec.vector not in ("", "access", "access-idor", "authz-idor"):
+            self.add_gap(spec, "missing_parameter_or_synthetic_identity_pair", provenance=provenance or entry_provenance)
+        if not idor_batches or spec.vector not in ("", "access", "access-idor", "authz-idor"):
             for record in records:
                 if record.get("method", "GET") == "GET" and not record.get("params"):
                     self.add_gap(spec, "missing_parameter_or_synthetic_identity_pair", provenance=[{
@@ -427,12 +728,122 @@ class PythonSolver:
         self.refresh_candidate_evidence(spec)
         return list(state.values())
 
+    _LEAF_OUTCOME_GAP_REASONS = frozenset({
+        "partial_leaf_coverage",
+        "remaining_leaves_not_validated",
+        "remaining_leaf_not_validated",
+        "indeterminate_leaf_outcome",
+        "invalid_or_missing_signed_evidence",
+    })
+
+    def _clear_candidate_leaf_gaps(self, spec, candidate_id):
+        self.coverage_gaps[spec.id] = [
+            item for item in self.coverage_gaps.get(spec.id, [])
+            if not (item.get("candidate_id") == candidate_id
+                    and item.get("reason_code") in self._LEAF_OUTCOME_GAP_REASONS)
+        ]
+
+    def _validator_core(self):
+        from brain import runtime_root
+        validator_path = str(runtime_root() / "mcp-servers/mcp-validator")
+        if validator_path not in sys.path:
+            sys.path.append(validator_path)
+        import cco_validator_core
+        return cco_validator_core
+
+    def _param_leaf_inconclusive_state(self, spec, row, allowed_tools):
+        """Return ('indeterminate', validation_id) only for genuine current INCONCLUSIVE evidence."""
+        validator_core = self._validator_core()
+        oracle = next((value[2] for value in PROFILES.values() if value[0] == row["vector"]), None)
+        found_invalid = False
+        found_indeterminate = None
+        for res_row in self.broker.results:
+            if res_row["spec_id"] != spec.id or res_row["tool"] not in allowed_tools:
+                continue
+            expected = recipe_arguments(row, res_row["tool"])
+            if expected is None:
+                continue
+            args = res_row.get("arguments", {})
+            if res_row["tool"] == "hunter_run_web_loop":
+                def equal_binding(a, b):
+                    return json.loads(a or "{}") == json.loads(b or "{}")
+                if (args.get("validation_profile") != expected.get("validation_profile")
+                        or not equal_binding(args.get("session_bindings"), expected.get("session_bindings"))):
+                    continue
+                try:
+                    report = self.broker.read_reference(res_row["content_ref"])
+                except (ValueError, OSError, TypeError):
+                    found_invalid = True
+                    continue
+                if hasattr(self.broker, "private_discovery_report") and getattr(self.broker, "private_discovery_sources", None):
+                    try:
+                        report = self.broker.private_discovery_report(spec, res_row["content_ref"])
+                    except ValueError:
+                        found_invalid = True
+                        continue
+                if not isinstance(report, dict) or report.get("error") or report.get("execution_failed"):
+                    continue
+                matching = [
+                    item for item in report.get("validations", [])
+                    if (isinstance(item, dict) and item.get("url") == row["route"]
+                        and item.get("param") == row["param"] and item.get("method") == "GET"
+                        and item.get("carrier") == "query")
+                ]
+                for item in matching:
+                    vid = str(item.get("validation_id") or "")
+                    if item.get("verdict") != "INCONCLUSIVE":
+                        found_invalid = True
+                        continue
+                    if vid:
+                        record = validator_core.load_validation(vid)
+                        if (not record or not validator_core.artifact_is_current(record, expected_target=spec.target)
+                                or record.get("verdict") != "INCONCLUSIVE"
+                                or record.get("target") != row["route"]):
+                            found_invalid = True
+                            continue
+                    found_indeterminate = vid
+            else:
+                fields = ("target_url", "param", "method", "carrier")
+                if any(args.get(k, {"method": "GET", "carrier": "query"}.get(k))
+                       != expected.get(k, {"method": "GET", "carrier": "query"}.get(k)) for k in fields):
+                    continue
+                try:
+                    val = self.broker.read_reference(res_row["content_ref"])
+                except (ValueError, OSError, TypeError):
+                    found_invalid = True
+                    continue
+                if not isinstance(val, dict) or val.get("error") or val.get("execution_failed"):
+                    continue
+                vid = str(val.get("validation_id") or "")
+                if not vid:
+                    found_invalid = True
+                    continue
+                record = validator_core.load_validation(vid)
+                ctx = record.get("execution_context", {}) if isinstance(record, dict) else {}
+                if (not record or not validator_core.artifact_is_current(record, expected_target=spec.target)
+                        or record.get("verdict") != "INCONCLUSIVE"
+                        or record.get("target") != row["route"]
+                        or (oracle is not None and record.get("oracle") != oracle)
+                        or (ctx and (ctx.get("param", row["param"]) != row["param"]
+                                    or ctx.get("method", "GET") != "GET"
+                                    or ctx.get("carrier", "query") != "query"))):
+                    found_invalid = True
+                    continue
+                found_indeterminate = vid
+        if found_invalid:
+            return "invalid_evidence", ""
+        if found_indeterminate is not None:
+            return "indeterminate", found_indeterminate
+        return "invalid_evidence", ""
+
     def refresh_candidate_evidence(self, spec):
         # Never leave a cached TESTED claim visible if reference verification
         # itself fails. Dispatch history remains; current acceptance is revoked.
         for row in self.candidates_by_task.get(spec.id, {}).values():
             if row["evidence_accepted"]:
                 row.update(evidence_accepted=False, evidence_refs=[], validation_state="NOT TESTED")
+        self.leaf_outcomes_by_task.pop(spec.id, None)
+        self.pair_progress_by_task.pop(spec.id, None)
         sources = set(upstream_ids(spec, self.broker.tasks.specs))
         checked = set()
         for row in self.candidates_by_task.get(spec.id, {}).values():
@@ -450,24 +861,31 @@ class PythonSolver:
                         raise WorkflowError("prior_phase_evidence_changed") from None
                     checked.add(key)
         outcomes = self.broker.validation_attempts(spec)
+        trusted_by_id = {item["record"]["validation_id"]: item for item in outcomes}
+        batch_analyses: dict[str, dict[str, Any]] = {}
+        accepted_by_candidate: dict[str, list[dict[str, Any]]] = {}
+        param_states: dict[str, tuple[str, str]] = {}
         for row in self.candidates_by_task.get(spec.id, {}).values():
             if not row["eligible"]:
                 continue
+            allowed_tools = {row["tool"], *(row.get("recipes") or {}).keys()}
             for execution in self.broker.tools:
-                if (execution.get("task_spec_id") != spec.id or execution["tool"] != row["tool"]
+                if (execution.get("task_spec_id") != spec.id or execution["tool"] not in allowed_tools
                         or execution.get("origin") != "solver"):
                     continue
                 receipt = json.loads(Path(execution["artifact"]).read_bytes())
                 args = receipt.get("arguments", {})
-                expected = row["arguments"]
-                fields = ("target", "validation_profile", "blind_discovery", "session_bindings") if row["tool"] == "hunter_run_web_loop" else ("target_url", "param", "method", "carrier")
+                expected = recipe_arguments(row, execution["tool"])
+                if expected is None:
+                    continue
+                fields = ("target", "validation_profile", "blind_discovery", "session_bindings") if execution["tool"] == "hunter_run_web_loop" else ("target_url", "param", "method", "carrier")
                 def equal(key):
                     if key == "session_bindings":
-                        return json.loads(args.get(key, "{}")) == json.loads(expected.get(key, "{}"))
+                        return json.loads(args.get(key) or "{}") == json.loads(expected.get(key) or "{}")
                     return args.get(key, {"method": "GET", "carrier": "query", "blind_discovery": False}.get(key)) == expected.get(key, {"method": "GET", "carrier": "query", "blind_discovery": False}.get(key))
                 if all(equal(key) for key in fields):
                     row.update(admitted=True, executed=True)
-                elif row["param"] and row["tool"] == "hunter_run_web_loop":
+                elif row["param"] and execution["tool"] == "hunter_run_web_loop":
                     result = ((receipt.get("execution") or {}).get("result") or {}).get("output")
                     if isinstance(result, str):
                         try:
@@ -491,16 +909,22 @@ class PythonSolver:
                         if any(leaf(item) for item in result.get("validations", [])):
                             row.update(admitted=True, executed=True)
             accepted = []
+            analysis = None
             if row["vector"] == "access-idor":
                 batch: dict[str, Any] = next((batch for batch in self.batches_by_task.get(spec.id, [])
                               if list(batch) == row["identity_ref"]), {})
-                if batch and self.completed_member_batch(spec, batch):
-                    accepted = [item for item in outcomes if item["record"].get("execution_context", {}).get("identity") in batch
-                                and item["record"].get("execution_context", {}).get("resource_owner") in batch]
+                if batch:
+                    analysis = self._analyze_member_batch(
+                        spec, batch, candidate_id=row["candidate_id"], trusted_by_id=trusted_by_id
+                    )
+                    batch_analyses[row["candidate_id"]] = analysis
+                    if analysis["complete"]:
+                        accepted = [item for item in outcomes if item["record"].get("execution_context", {}).get("identity") in batch
+                                    and item["record"].get("execution_context", {}).get("resource_owner") in batch]
             else:
                 oracle = next((value[2] for value in PROFILES.values() if value[0] == row["vector"]), None)
                 accepted = [item for item in outcomes if item["vector"] == row["vector"]
-                    and item.get("tool", row["tool"]) == row["tool"]
+                    and item.get("tool", row["tool"]) in allowed_tools
                     and item["record"]["target"] == row["route"] and item["record"].get("oracle") == oracle
                     and item.get("execution_context", item["record"].get("execution_context", {})).get("param") == row["param"]
                     and item.get("execution_context", item["record"].get("execution_context", {})).get("method") == "GET"
@@ -510,15 +934,86 @@ class PythonSolver:
                           or isinstance(row["identity_ref"], list) and item.get("execution_context", item["record"].get("execution_context", {})).get("identity") in row["identity_ref"])]
             row["evidence_accepted"] = bool(accepted)
             if accepted:
+                accepted_by_candidate[row["candidate_id"]] = accepted
                 row.update(admitted=True, executed=True, validation_state="TESTED", reason_code="",
                            evidence_refs=[{"validation_id": item["record"]["validation_id"],
                                            "source_artifact": item["source_artifact"],
                                             "source_sha256": item["source_sha256"]} for item in accepted])
                 self.coverage_gaps[spec.id] = [item for item in self.coverage_gaps.get(spec.id, [])
                                                if item.get("candidate_id") != row["candidate_id"]]
+            elif analysis is not None and (analysis["leaves"] or analysis["saw_invalid_report"]):
+                row["evidence_refs"] = []
+                self._clear_candidate_leaf_gaps(spec, row["candidate_id"])
+                if analysis["invalid_evidence"] > 0 or analysis["saw_invalid_report"]:
+                    self.add_gap(spec, "invalid_or_missing_signed_evidence", "evidence", row)
+                elif analysis["partial_coverage"]:
+                    self.add_gap(spec, "partial_leaf_coverage", "partial_coverage", row)
+                elif analysis["indeterminate"] > 0 and analysis["pending"] == 0:
+                    self.add_gap(spec, "indeterminate_leaf_outcome", "evidence", row)
+                elif analysis["pending"] > 0:
+                    self.add_gap(spec, "remaining_leaves_not_validated", "admission_budget", row)
+                elif row["executed"]:
+                    self.add_gap(spec, "invalid_or_missing_signed_evidence", "evidence", row)
             elif row["executed"]:
                 row["evidence_refs"] = []
-                self.add_gap(spec, "invalid_or_missing_signed_evidence", "evidence", row)
+                self._clear_candidate_leaf_gaps(spec, row["candidate_id"])
+                if row["param"]:
+                    leaf_state, vid = self._param_leaf_inconclusive_state(spec, row, allowed_tools)
+                    param_states[row["candidate_id"]] = (leaf_state, vid)
+                    if leaf_state == "indeterminate":
+                        self.add_gap(spec, "indeterminate_leaf_outcome", "evidence", row)
+                    else:
+                        self.add_gap(spec, "invalid_or_missing_signed_evidence", "evidence", row)
+                else:
+                    self.add_gap(spec, "invalid_or_missing_signed_evidence", "evidence", row)
+        leaf_rows: list[dict[str, Any]] = []
+        for row in self.candidates_by_task.get(spec.id, {}).values():
+            if row["vector"] == "access-idor":
+                if row["candidate_id"] in batch_analyses:
+                    leaf_rows.extend(batch_analyses[row["candidate_id"]]["leaves"])
+                continue
+            identity = row["identity_ref"] if isinstance(row["identity_ref"], str) else ",".join(row["identity_ref"])
+            if row["evidence_accepted"]:
+                acc = accepted_by_candidate[row["candidate_id"]][0]
+                leaf_rows.append(leaf_outcome(
+                    task=spec.id, candidate_id=row["candidate_id"], vector=row["vector"],
+                    url=row["route"], method=row.get("method", "GET"), param=row["param"],
+                    carrier="query" if row["param"] else "", identity=identity,
+                    vuln_class=row["vector"], execution_state="executed", status="accepted",
+                    verdict=str(acc["record"].get("verdict") or ""),
+                    validation_id=acc["record"]["validation_id"],
+                    source_artifact=str(acc.get("source_artifact") or ""),
+                    source_sha256=str(acc.get("source_sha256") or ""),
+                ))
+            elif row["executed"]:
+                leaf_state, vid = param_states.get(row["candidate_id"], ("invalid_evidence", ""))
+                leaf_rows.append(leaf_outcome(
+                    task=spec.id, candidate_id=row["candidate_id"], vector=row["vector"],
+                    url=row["route"], method=row.get("method", "GET"), param=row["param"],
+                    carrier="query" if row["param"] else "", identity=identity,
+                    vuln_class=row["vector"], execution_state="executed", status=leaf_state,
+                    verdict="INCONCLUSIVE" if leaf_state == "indeterminate" else "",
+                    validation_id=vid, reason_code=row.get("reason_code", ""),
+                ))
+            elif row.get("dispatch_started") and self.task_states.get(spec.id) == "inconclusive":
+                leaf_rows.append(leaf_outcome(
+                    task=spec.id, candidate_id=row["candidate_id"], vector=row["vector"],
+                    url=row["route"], method=row.get("method", "GET"), param=row["param"],
+                    carrier="query" if row["param"] else "", identity=identity,
+                    vuln_class=row["vector"], execution_state="interrupted", status="indeterminate",
+                    reason_code=row.get("reason_code") or "indeterminate_dispatch_not_replayed",
+                ))
+            else:
+                leaf_rows.append(leaf_outcome(
+                    task=spec.id, candidate_id=row["candidate_id"], vector=row["vector"],
+                    url=row["route"], method=row.get("method", "GET"), param=row["param"],
+                    carrier="query" if row["param"] else "", identity=identity,
+                    vuln_class=row["vector"], execution_state="pending", status="pending",
+                    reason_code=row.get("reason_code") or "candidate_not_executed",
+                ))
+        self.leaf_outcomes_by_task[spec.id] = leaf_rows
+        if not spec.references and not spec.compiled_workflows:
+            self.pair_progress_by_task[spec.id] = self.member_pair_progress(spec, trusted_by_id=trusted_by_id)
 
     def observed_session_block(self, spec, row):
         """A host-observed stale primary session blocks repeats until refreshed."""
@@ -606,16 +1101,61 @@ class PythonSolver:
             categories.append("different_role")
         return categories
 
+    def _pair_reason_code(self, batch, analysis, shortfalls):
+        if analysis["complete"]:
+            return ""
+        if analysis["invalid_evidence"] > 0 or analysis["saw_invalid_report"]:
+            return "invalid_or_missing_signed_evidence"
+        shortfall = next(
+            (item["reason_code"] for item in reversed(shortfalls) if list(batch) in item.get("pending_batches", [])),
+            None,
+        )
+        if shortfall:
+            return shortfall
+        if analysis["partial_coverage"]:
+            return "partial_leaf_coverage"
+        if analysis["indeterminate"] > 0 and analysis["pending"] == 0:
+            return "indeterminate_leaf_outcome"
+        if analysis["pending"] > 0:
+            return "remaining_leaves_not_validated"
+        return "no_complete_current_signed_pair_queue"
+
+    def member_pair_progress(self, spec, *, trusted_by_id=None):
+        """Aggregate exact leaf outcomes per identity pair without loosening completeness."""
+        if trusted_by_id is None:
+            trusted_by_id = {item["record"]["validation_id"]: item for item in self.broker.validation_attempts(spec)}
+        shortfalls = [row["result"] for row in self.broker.results
+                      if row["spec_id"] == spec.id and row["tool"] == "host_access_batch"]
+        cands = self.candidates_by_task.get(spec.id, {})
+        cand_by_pair = {
+            tuple(row["identity_ref"]): row["candidate_id"]
+            for row in cands.values()
+            if row.get("vector") == "access-idor" and isinstance(row.get("identity_ref"), list)
+        }
+        pairs = []
+        for batch in self.member_batches(spec):
+            cand_id = cand_by_pair.get(tuple(batch), "")
+            analysis = self._analyze_member_batch(spec, batch, candidate_id=cand_id, trusted_by_id=trusted_by_id)
+            reason = self._pair_reason_code(batch, analysis, shortfalls)
+            pairs.append(pair_progress_entry(
+                list(batch),
+                analysis["leaves"],
+                complete=analysis["complete"],
+                categories=self.member_pair_categories(batch),
+                reason_code=reason,
+            ))
+        return pair_progress_summary(pairs)
+
     def member_comparison_coverage(self, spec):
         """A dispatched pair needs a complete, currently signed queue to count."""
+        trusted_by_id = {item["record"]["validation_id"]: item for item in self.broker.validation_attempts(spec)}
         rows = []
         shortfalls = [row["result"] for row in self.broker.results
                       if row["spec_id"] == spec.id and row["tool"] == "host_access_batch"]
         for batch in self.member_batches(spec):
-            complete = self.completed_member_batch(spec, batch)
-            reason = next((item["reason_code"] for item in reversed(shortfalls)
-                           if list(batch) in item.get("pending_batches", [])),
-                          "no_complete_current_signed_pair_queue")
+            analysis = self._analyze_member_batch(spec, batch, trusted_by_id=trusted_by_id)
+            complete = analysis["complete"]
+            reason = self._pair_reason_code(batch, analysis, shortfalls)
             rows.append({"identities": list(batch), "categories": self.member_pair_categories(batch),
                          "status": "TESTED" if complete else "NOT TESTED",
                          "reason_code": "" if complete else reason})
@@ -630,10 +1170,14 @@ class PythonSolver:
                                "total_pairs": len(matching)})
         return rows, dimensions
 
-    def completed_member_batch(self, spec, bindings):
-        """Only a fully observed queue with current signed outcomes avoids replay."""
-        trusted = {item["record"]["validation_id"]: item["record"]
-                   for item in self.broker.validation_attempts(spec)}
+    def _analyze_member_batch(self, spec, bindings, *, candidate_id="", trusted_by_id=None):
+        """Inspect leaf-level outcomes and strict full-queue completeness for one pair."""
+        from python_identity_discovery import public_export
+        validator_core = self._validator_core()
+        if trusted_by_id is None:
+            trusted_by_id = {item["record"]["validation_id"]: item for item in self.broker.validation_attempts(spec)}
+        best_partial: dict[str, Any] | None = None
+        saw_invalid_report = False
         for row in self.broker.results:
             if row["spec_id"] != spec.id or row["tool"] != "hunter_run_web_loop":
                 continue
@@ -646,7 +1190,11 @@ class PythonSolver:
                 continue
             if supplied != bindings:
                 continue
-            report = self.broker.read_reference(row["content_ref"])
+            try:
+                report = self.broker.read_reference(row["content_ref"])
+            except (ValueError, OSError, TypeError):
+                saw_invalid_report = True
+                continue
             sealed_report = False
             if hasattr(self.broker, "private_discovery_report"):
                 try:
@@ -654,50 +1202,227 @@ class PythonSolver:
                     sealed_report = True
                 except ValueError:
                     if getattr(self.broker, "private_discovery_sources", None):
+                        saw_invalid_report = True
                         continue
-            discovery = report.get("identity_discovery", {})
-            if (not report.get("ok") or discovery.get("status") != "ready" or discovery.get("reasons")
-                    or discovery.get("budget_limited") or report.get("errors")):
+            if not isinstance(report, dict) or report.get("error") or report.get("execution_failed"):
+                saw_invalid_report = True
                 continue
+            discovery = report.get("identity_discovery", {})
+            if not isinstance(discovery, dict):
+                discovery = {}
             queue = report.get("validation_queue", [])
             validations = report.get("validations", [])
+            if not isinstance(queue, list):
+                queue = []
+            if not isinstance(validations, list):
+                validations = []
             use_url_digest = not sealed_report and any(isinstance(item, dict) and "url_sha256" in item for item in queue)
+
             def key(item, *, include_digest=use_url_digest):
                 fields = ("url", "url_sha256") if include_digest else ("url",)
                 return tuple(item.get(name) for name in (*fields, "method", "vuln_class", "operation_id",
                                                          "resource_owner", "identity"))
-            def matches_trusted(item):
-                from python_identity_discovery import public_export
+
+            def match_trusted(item):
                 vid = item.get("validation_id")
-                record = trusted.get(vid)
+                attempt = trusted_by_id.get(vid)
+                record = attempt["record"] if attempt is not None else None
                 if record is not None:
                     ctx = record.get("execution_context", {})
                     if record["target"] == item.get("url") and key(ctx, include_digest=False) == key(item, include_digest=False):
-                        return True
+                        return attempt
                 elif not sealed_report and not getattr(self.broker, "private_discovery_sources", None):
-                    record = next((candidate for candidate_id, candidate in trusted.items()
-                                   if public_export({"validation_queue": [], "validation_id": candidate_id})["validation_id"] == vid), None)
+                    attempt = next(
+                        (cand for candidate_id_k, cand in trusted_by_id.items()
+                         if public_export({"validation_queue": [], "validation_id": candidate_id_k})["validation_id"] == vid),
+                        None,
+                    )
+                    record = attempt["record"] if attempt is not None else None
                 if (record is not None and not sealed_report
                         and not getattr(self.broker, "private_discovery_sources", None)
                         and isinstance(item.get("url_sha256"), str)
                         and hashlib.sha256(str(record["target"]).encode()).hexdigest() == item["url_sha256"]):
                     ctx = record.get("execution_context", {})
                     if public_export({"validation_queue": [], "url": record["target"]})["url"] != item.get("url"):
-                        return False
+                        return None
                     public_ctx = public_export({"validation_queue": [], **ctx, "url": ctx.get("url", record["target"])})
-                    return key(public_ctx, include_digest=True) == key(item, include_digest=True)
-                return False
-            completed = {key(item) for item in validations if matches_trusted(item)}
+                    if key(public_ctx, include_digest=True) == key(item, include_digest=True):
+                        return attempt
+                return None
+
+            def matches_inconclusive(item):
+                vid = str(item.get("validation_id") or "")
+                if not vid:
+                    return item.get("verdict") == "INCONCLUSIVE", ""
+                record = validator_core.load_validation(vid)
+                if (not record or not validator_core.artifact_is_current(record, expected_target=spec.target)
+                        or record.get("verdict") != "INCONCLUSIVE"):
+                    return False, ""
+                ctx = record.get("execution_context", {})
+                if record.get("target") == item.get("url") and key(ctx, include_digest=False) == key(item, include_digest=False):
+                    return True, vid
+                if (not sealed_report and not getattr(self.broker, "private_discovery_sources", None)
+                        and isinstance(item.get("url_sha256"), str)
+                        and hashlib.sha256(str(record["target"]).encode()).hexdigest() == item["url_sha256"]):
+                    if public_export({"validation_queue": [], "url": record["target"]})["url"] != item.get("url"):
+                        return False, ""
+                    public_ctx = public_export({"validation_queue": [], **ctx, "url": ctx.get("url", record["target"])})
+                    return key(public_ctx, include_digest=True) == key(item, include_digest=True), vid
+                return False, ""
+
+            validations_by_key: dict[tuple[Any, ...], list[dict[str, Any]]] = {}
+            for val_item in validations:
+                if isinstance(val_item, dict):
+                    validations_by_key.setdefault(key(val_item), []).append(val_item)
+
+            accepted_keys: set[tuple[Any, ...]] = set()
+            accepted_attempts: list[dict[str, Any]] = []
+            seen_attempt_ids: set[str] = set()
+            leaves: list[dict[str, Any]] = []
+            for item in queue:
+                if not isinstance(item, dict):
+                    continue
+                k = key(item)
+                leaf_base = {
+                    "task": spec.id,
+                    "candidate_id": candidate_id,
+                    "vector": "access-idor",
+                    "url": str(item.get("url") or ""),
+                    "method": str(item.get("method") or "GET"),
+                    "identity": str(item.get("identity") or ""),
+                    "resource_owner": str(item.get("resource_owner") or ""),
+                    "operation_id": item.get("operation_id"),
+                    "vuln_class": str(item.get("vuln_class") or "authz-idor"),
+                    "pair_identities": list(bindings),
+                    "url_sha256": str(item.get("url_sha256") or "") if use_url_digest else "",
+                }
+                val_candidates = validations_by_key.get(k, [])
+                matched_attempt = None
+                for val_item in val_candidates:
+                    matched_attempt = match_trusted(val_item)
+                    if matched_attempt is not None:
+                        break
+                if matched_attempt is not None:
+                    accepted_keys.add(k)
+                    vid = matched_attempt["record"]["validation_id"]
+                    if vid not in seen_attempt_ids:
+                        seen_attempt_ids.add(vid)
+                        accepted_attempts.append(matched_attempt)
+                    leaves.append(leaf_outcome(
+                        **leaf_base,
+                        execution_state="executed",
+                        status="accepted",
+                        verdict=str(matched_attempt["record"].get("verdict") or ""),
+                        validation_id=vid,
+                        source_artifact=str(matched_attempt.get("source_artifact") or ""),
+                        source_sha256=str(matched_attempt.get("source_sha256") or ""),
+                    ))
+                elif val_candidates:
+                    val_item = val_candidates[-1]
+                    is_indet, vid = matches_inconclusive(val_item)
+                    if is_indet:
+                        leaves.append(leaf_outcome(
+                            **leaf_base,
+                            execution_state="executed",
+                            status="indeterminate",
+                            verdict="INCONCLUSIVE",
+                            validation_id=vid,
+                            reason_code="indeterminate_leaf_outcome",
+                        ))
+                    else:
+                        leaves.append(leaf_outcome(
+                            **leaf_base,
+                            execution_state="executed",
+                            status="invalid_evidence",
+                            verdict=str(val_item.get("verdict") or ""),
+                            validation_id=str(val_item.get("validation_id") or ""),
+                            reason_code="invalid_or_missing_signed_evidence",
+                        ))
+                elif self.task_states.get(spec.id) == "inconclusive":
+                    leaves.append(leaf_outcome(
+                        **leaf_base,
+                        execution_state="interrupted",
+                        status="indeterminate",
+                        reason_code="indeterminate_dispatch_not_replayed",
+                    ))
+                else:
+                    leaves.append(leaf_outcome(
+                        **leaf_base,
+                        execution_state="pending",
+                        status="pending",
+                        reason_code="remaining_leaf_not_validated",
+                    ))
+
+            orphan_invalid = any(
+                isinstance(val_item, dict)
+                and key(val_item) not in {key(q) for q in queue if isinstance(q, dict)}
+                and match_trusted(val_item) is None
+                and not matches_inconclusive(val_item)[0]
+                for val_item in validations
+            )
             expected_bindings = set(bindings)
             if not sealed_report and not getattr(self.broker, "private_discovery_sources", None):
-                from python_identity_discovery import public_export
                 expected_bindings = {public_export({"validation_queue": [], "resource_owner": name})["resource_owner"]
                                      for name in bindings}
-            if (queue and {item.get("resource_owner") for item in queue} == expected_bindings
-                    and all({item.get("resource_owner"), item.get("identity")} == expected_bindings for item in queue)
-                    and all(key(item) in completed for item in queue)):
-                return True
-        return False
+            report_ready = (
+                bool(report.get("ok"))
+                and discovery.get("status") == "ready"
+                and not discovery.get("reasons")
+                and not discovery.get("budget_limited")
+                and not report.get("errors")
+                and not report.get("stopped")
+            )
+            report_complete = bool(
+                report_ready
+                and queue
+                and {item.get("resource_owner") for item in queue if isinstance(item, dict)} == expected_bindings
+                and all({item.get("resource_owner"), item.get("identity")} == expected_bindings
+                        for item in queue if isinstance(item, dict))
+                and all(key(item) in accepted_keys for item in queue if isinstance(item, dict))
+            )
+            accepted_count = sum(1 for leaf in leaves if leaf["status"] == "accepted")
+            pending_count = sum(1 for leaf in leaves if leaf["status"] == "pending")
+            indeterminate_count = sum(1 for leaf in leaves if leaf["status"] == "indeterminate")
+            invalid_count = sum(1 for leaf in leaves if leaf["status"] == "invalid_evidence")
+            analysis: dict[str, Any] = {
+                "complete": report_complete,
+                "leaves": leaves,
+                "accepted": accepted_count,
+                "pending": pending_count,
+                "indeterminate": indeterminate_count,
+                "invalid_evidence": invalid_count,
+                "partial_coverage": bool(not report_complete and accepted_count > 0 and invalid_count == 0 and not orphan_invalid),
+                "saw_invalid_report": saw_invalid_report or orphan_invalid,
+                "accepted_attempts": accepted_attempts,
+            }
+            if report_complete:
+                return analysis
+            if best_partial is None or (len(analysis["leaves"]), analysis["accepted"]) >= (len(best_partial["leaves"]), best_partial["accepted"]):
+                best_partial = analysis
+        if best_partial is not None:
+            best_partial["saw_invalid_report"] = best_partial["saw_invalid_report"] or saw_invalid_report
+            best_partial["partial_coverage"] = bool(
+                not best_partial["complete"]
+                and best_partial["accepted"] > 0
+                and best_partial["invalid_evidence"] == 0
+                and not best_partial["saw_invalid_report"]
+            )
+            return best_partial
+        return {
+            "complete": False,
+            "leaves": [],
+            "accepted": 0,
+            "pending": 0,
+            "indeterminate": 0,
+            "invalid_evidence": 0,
+            "partial_coverage": False,
+            "saw_invalid_report": saw_invalid_report,
+            "accepted_attempts": [],
+        }
+
+    def completed_member_batch(self, spec, bindings):
+        """Only a fully observed queue with current signed outcomes avoids replay."""
+        return self._analyze_member_batch(spec, bindings)["complete"]
 
     def _engine_utc_now(self) -> datetime:
         engine = self.broker.engine
@@ -967,8 +1692,19 @@ class PythonSolver:
         if spec.references:
             context['planning_only'] = True
             context['goal'] = 'Plan only the referenced P5 hypothesis dimension with hunter_run_web_loop live=false.'
-        discovery = self.discovery(spec) if spec.phase in {"access", "report"} else None
-        context["discovery"] = self.broker.view(discovery, "discovery") if spec.phase in {"access", "report"} and discovery else None
+        discovery = self.discovery(spec) if spec.phase in {"enum", "access", "report"} else None
+        has_discovery = bool(
+            discovery
+            and (
+                spec.phase in {"access", "report"}
+                or discovery.get("records")
+                or discovery.get("coverage_gaps")
+            )
+        )
+        context["discovery"] = self.broker.view(discovery, "discovery") if has_discovery else None
+        frontier = self.discovery_frontier(spec) if spec.phase in {"recon", "enum"} else None
+        if frontier is not None:
+            context["discovery_frontier"] = frontier
         candidates = self.plan_candidates(spec)
         context["candidate_cards"] = compact_cards(candidates)
         context["candidate_count"] = len(candidates)
@@ -1043,9 +1779,22 @@ class PythonSolver:
         from cco_surface_core.extract import extract_html
         base = args.get("url") or args.get("target") or spec.target
         records = []
+        json_records = []
+        truncated = False
         status = value.get("status_code", value.get("status"))
         if type(status) is int and 200 <= status < 300 and isinstance(value.get("text"), str):
-            records.extend(extract_html(value["text"], base))
+            body_text = value["text"]
+            records.extend(extract_html(body_text, base))
+            stripped = body_text.lstrip()
+            if stripped.startswith(("{", "[")):
+                try:
+                    parsed_body = json.loads(body_text)
+                except ValueError:
+                    parsed_body = None
+                if isinstance(parsed_body, (dict, list)):
+                    extracted, body_trunc = extract_json_hypermedia(parsed_body, base, origin_url=spec.target)
+                    json_records.extend(extracted)
+                    truncated = truncated or body_trunc
         surface = value.get("surface", value)
         if isinstance(surface, dict):
             for key in ("records", "work_queue", "pages", "urls_sample", "links", "internal_links"):
@@ -1054,22 +1803,34 @@ class PythonSolver:
                         records.append({"url": item, "method": "GET"})
                     elif isinstance(item, dict):
                         records.append(item)
-        output = []
+            extracted_surface, surf_trunc = extract_json_hypermedia(
+                surface, base, origin_url=spec.target, from_http_body=False
+            )
+            json_records.extend(extracted_surface)
+            truncated = truncated or surf_trunc
+        self._last_surface_truncated[ref["path"]] = truncated
+        output: list[dict[str, Any]] = []
+        seen_indices: dict[bytes, int] = {}
         origin = urlsplit(spec.target)
-        for record in records:
+        for record in [*records, *json_records]:
             url = record.get("url") or record.get("href")
             if not isinstance(url, str):
                 continue
             url = urljoin(base, url)
             parsed = urlsplit(url)
-            if (parsed.scheme, parsed.netloc) != (origin.scheme, origin.netloc) or parsed.username is not None:
+            if (
+                parsed.scheme.lower() not in {"http", "https"}
+                or (parsed.scheme, parsed.netloc) != (origin.scheme, origin.netloc)
+                or parsed.username is not None
+            ):
                 continue
-            reason = ""
+            url = parsed._replace(fragment="").geturl()
+            reason = str(record.get("candidate_reason") or "")
             try:
                 params = parameter_declarations(record.get("params", []))
                 query = query_parameters(url)
             except ValueError as exc:
-                reason, params, query = str(exc), [], {}
+                reason, params, query = reason or str(exc), [], {}
             names = {item["name"] for item in params}
             params.extend({"name": key, "in": "query", "sample": val} for key, val in query.items() if key not in names)
             has_identity = "identity_ref" in record or "identity" in record or "identity" in args
@@ -1077,11 +1838,27 @@ class PythonSolver:
             if not has_identity and "url" in args and not args.get("cookie") and not args.get("headers"):
                 identity = "anon"
                 has_identity = True
-            output.append({"url": url, "method": record.get("method", "GET"), "params": params,
-                            "candidate_reason": reason,
-                            **({"identity_ref": identity} if has_identity else {}),
-                             "source_artifact": ref["path"], "source_sha256": ref["sha256"]})
-        return [json.loads(raw) for raw in dict.fromkeys(provider_json(row).decode() for row in output)]
+            method = str(record.get("method", "GET") or "GET").upper()
+            dedup_key = provider_json([url, method, params, reason, identity if has_identity else None])
+            link_relation = record.get("link_relation")
+            if dedup_key in seen_indices:
+                existing = output[seen_indices[dedup_key]]
+                if link_relation == "pagination" or (link_relation == "json_link" and "link_relation" not in existing):
+                    existing["link_relation"] = link_relation
+                continue
+            seen_indices[dedup_key] = len(output)
+            row = {
+                "url": url,
+                "method": method,
+                "params": params,
+                "candidate_reason": reason,
+                **({"identity_ref": identity} if has_identity else {}),
+                **({"link_relation": link_relation} if isinstance(link_relation, str) and link_relation else {}),
+                "source_artifact": ref["path"],
+                "source_sha256": ref["sha256"],
+            }
+            output.append(row)
+        return output
 
     def compile_summary(self, spec, submitted):
         if not isinstance(submitted, dict):
@@ -1204,11 +1981,22 @@ class PythonSolver:
                        for item in outcomes if item.get("execution_context", item["record"].get("execution_context", {})).get("param")]
             summary["tested_parameters"] = tested
             candidates = self.plan_candidates(spec)
+            updated_gap = False
             for row in candidates:
                 if not row["evidence_accepted"] and not row["reason_code"]:
-                    self.add_gap(spec, "invalid_or_missing_signed_evidence" if row["executed"] else "candidate_not_executed",
-                                 "evidence" if row["executed"] else "admission_budget", row)
+                    if row.get("dispatch_started") and not row["executed"] and self.task_states.get(spec.id) == "inconclusive":
+                        self.add_gap(spec, "indeterminate_dispatch_not_replayed", "evidence", row)
+                    else:
+                        self.add_gap(spec, "invalid_or_missing_signed_evidence" if row["executed"] else "candidate_not_executed",
+                                     "evidence" if row["executed"] else "admission_budget", row)
+                    updated_gap = True
+            if updated_gap:
+                self.refresh_candidate_evidence(spec)
             summary["validation_funnel"] = funnel(candidates)
+            summary["leaf_outcomes"] = copy.deepcopy(self.leaf_outcomes_by_task.get(spec.id, []))
+            summary["leaf_validation_funnel"] = {
+                k: v for k, v in leaf_funnel(summary["leaf_outcomes"]).items() if k != "outcomes"
+            }
             summary["validation_outcomes"] = [{"vector": item["vector"],
                 "validation_id": item["record"]["validation_id"], "verdict": item["record"]["verdict"],
                 "url": item["record"]["target"], "source_artifact": item["source_artifact"],
@@ -1223,6 +2011,13 @@ class PythonSolver:
                 if row["spec_id"] == spec.id and row["tool"] == "host_access_batch"]
             if not spec.references:
                 summary["identity_comparisons"], summary["identity_comparison_dimensions"] = self.member_comparison_coverage(spec)
+                if not spec.compiled_workflows:
+                    pair_prog = copy.deepcopy(
+                        self.pair_progress_by_task.get(spec.id) or self.member_pair_progress(spec)
+                    )
+                    for pair_row in pair_prog.get("pairs", []):
+                        pair_row.pop("leaves", None)
+                    summary["pair_progress"] = pair_prog
             steps = summary.get("steps")
             if isinstance(steps, list):
                 for step in steps:
@@ -1237,10 +2032,42 @@ class PythonSolver:
         if spec.phase == "report":
             sources = set(upstream_ids(spec, self.broker.tasks.specs))
             summary["validation_funnels"] = {}
+            summary["leaf_validation_funnels"] = {}
+            summary["pair_progress_by_task"] = {}
+            report_leaves: list[dict[str, Any]] = []
             for source in self.broker.tasks.specs:
                 if source.id in sources and source.id in self.candidates_by_task:
                     self.refresh_candidate_evidence(source)
+                    source_leaves = self.leaf_outcomes_by_task.get(source.id, [])
+                    report_leaves.extend(copy.deepcopy(source_leaves))
                     summary["validation_funnels"][source.id] = funnel(list(self.candidates_by_task[source.id].values()))
+                    summary["leaf_validation_funnels"][source.id] = {
+                        k: v for k, v in leaf_funnel(source_leaves).items() if k != "outcomes"
+                    }
+                    if not source.references and not source.compiled_workflows:
+                        pair_prog = copy.deepcopy(
+                            self.pair_progress_by_task.get(source.id) or self.member_pair_progress(source)
+                        )
+                        for pair_row in pair_prog.get("pairs", []):
+                            pair_row.pop("leaves", None)
+                        summary["pair_progress_by_task"][source.id] = pair_prog
+                elif source.id in sources and source.id in self.leaf_outcomes_by_task:
+                    source_leaves = self.leaf_outcomes_by_task[source.id]
+                    report_leaves.extend(copy.deepcopy(source_leaves))
+                    summary["leaf_validation_funnels"][source.id] = {
+                        k: v for k, v in leaf_funnel(source_leaves).items() if k != "outcomes"
+                    }
+                    if source.id in self.pair_progress_by_task:
+                        pair_prog = copy.deepcopy(self.pair_progress_by_task[source.id])
+                        for pair_row in pair_prog.get("pairs", []):
+                            pair_row.pop("leaves", None)
+                        summary["pair_progress_by_task"][source.id] = pair_prog
+            summary["leaf_outcomes"] = report_leaves
+            summary["pair_progress"] = pair_progress_summary([
+                pair
+                for prog in summary["pair_progress_by_task"].values()
+                for pair in prog.get("pairs", [])
+            ])
             reports = [row for row in self.broker.results if row["spec_id"] == spec.id and row["tool"] == COVERAGE_TOOL]
             if reports:
                 row = reports[-1]
@@ -1252,11 +2079,39 @@ class PythonSolver:
             unfinished = [{"phase": ident, "step": step["id"], "status": step["status"]}
                            for ident, previous in self.summaries.items() if ident in sources
                           for step in previous.get("steps", []) if step["status"] in {"blocked", "not_tested"}]
+            refreshed_comparisons: list[dict[str, Any]] = []
+            refreshed_dimensions: list[dict[str, Any]] = []
+            source_map = {source.id: source for source in self.broker.tasks.specs}
+            for ident in upstream_ids(spec, self.broker.tasks.specs):
+                if ident not in sources:
+                    continue
+                source = source_map.get(ident)
+                previous = self.summaries.get(ident, {})
+                if (source is not None and source.phase == "access" and not source.references
+                        and not source.compiled_workflows and ident in self.candidates_by_task):
+                    comp_rows, dim_rows = self.member_comparison_coverage(source)
+                    prev_tested = {
+                        tuple(row.get("identities", []))
+                        for row in previous.get("identity_comparisons", [])
+                        if row.get("status") == "TESTED"
+                    }
+                    for row in comp_rows:
+                        if row["status"] == "NOT TESTED" and tuple(row["identities"]) in prev_tested:
+                            unfinished.append({"phase": ident, "step": "pair-comparison-revalidation", "status": "not_tested"})
+                    refreshed_comparisons.extend({"phase": ident, **row} for row in comp_rows if row["status"] == "NOT TESTED")
+                    refreshed_dimensions.extend({"phase": ident, **row} for row in dim_rows if row["status"] == "NOT TESTED")
+                elif ident in self.summaries:
+                    refreshed_comparisons.extend(
+                        {"phase": ident, **row} for row in previous.get("identity_comparisons", [])
+                        if row["status"] == "NOT TESTED"
+                    )
+                    refreshed_dimensions.extend(
+                        {"phase": ident, **row} for row in previous.get("identity_comparison_dimensions", [])
+                        if row["status"] == "NOT TESTED"
+                    )
             summary["unfinished_work"] = unfinished
-            for field in ("identity_comparisons", "identity_comparison_dimensions"):
-                summary[field] = [{"phase": ident, **row} for ident, previous in self.summaries.items()
-                                  if ident in sources for row in previous.get(field, [])
-                                  if row["status"] == "NOT TESTED"]
+            summary["identity_comparisons"] = refreshed_comparisons
+            summary["identity_comparison_dimensions"] = refreshed_dimensions
             steps = summary["steps"]
             if all(isinstance(step, dict) for step in steps):
                 summary["steps"] = [step for step in steps if step.get("id") != REPORT_CARRYOVER_STEP]
@@ -1277,13 +2132,17 @@ class PythonSolver:
         """
         if candidate.get("dispatch_started") or candidate["evidence_accepted"]:
             return False
+        allowed_tools = {candidate["tool"], *(candidate.get("recipes") or {}).keys()}
         for execution in reversed(self.broker.tools):
             if (execution.get("task_spec_id") != spec.id or execution.get("origin") != "solver"
-                    or execution["tool"] != candidate["tool"]):
+                    or execution["tool"] not in allowed_tools):
+                continue
+            expected = recipe_arguments(candidate, execution["tool"])
+            if expected is None:
                 continue
             receipt = json.loads(Path(execution["artifact"]).read_bytes())
             result = receipt.get("execution")
-            if receipt.get("arguments") != candidate["arguments"]:
+            if receipt.get("arguments") != expected:
                 continue
             if (receipt.get("error") or not isinstance(result, dict) or result.get("execution_failed")
                     or type(result.get("actual_request_cost")) is not int or result["actual_request_cost"] < 0):
@@ -1305,8 +2164,8 @@ class PythonSolver:
                 # Partial accepted work is not a reason to blindly repeat the
                 # entire slice; retain the remaining coverage gap instead.
                 return False
-            return any(row["spec_id"] == spec.id and row["tool"] == candidate["tool"]
-                       and row["arguments"] == candidate["arguments"]
+            return any(row["spec_id"] == spec.id and row["tool"] == execution["tool"]
+                       and row["arguments"] == expected
                        and self.broker.read_reference(row["content_ref"]) == value for row in self.broker.results)
         return False
 
@@ -1318,6 +2177,8 @@ class PythonSolver:
         """
         if profile not in PROFILES or spec.references or spec.compiled_workflows:
             return None
+        if "hunter_run_web_loop" not in spec.tools:
+            return None
         parsed = urlsplit(target)
         records = self.discovery(spec)["records"]
         if (parsed.query or parsed.fragment or target not in {spec.target, *(
@@ -1328,64 +2189,329 @@ class PythonSolver:
             prefix = parsed.path.rstrip("/")
             return ((url.scheme, url.netloc) == (parsed.scheme, parsed.netloc)
                     and (url.path == prefix or url.path.startswith(prefix + "/")))
-        rows = [row for row in candidates if below(row) and row["arguments"].get("validation_profile") == profile]
+        def hunter_args(row):
+            return recipe_arguments(row, "hunter_run_web_loop")
+        rows = [row for row in candidates if below(row) and (hunter_args(row) or {}).get("validation_profile") == profile]
         if (not rows or any(not row["eligible"] or row["executed"] and not row["evidence_accepted"]
                             or row.get("dispatch_started") and not row["evidence_accepted"] for row in rows)):
             return None
         pending = [row for row in rows if not row["evidence_accepted"]]
         if not pending or len(pending) != len(rows) or len({row["param"] for row in rows}) != 1:
             return None
-        args = {**pending[0]["arguments"], "target": target}
-        if any({**row["arguments"], "target": target} != args for row in rows):
+        first_args = hunter_args(pending[0])
+        if first_args is None:
+            return None
+        args = {**first_args, "target": target}
+        if any({**(hunter_args(row) or {}), "target": target} != args for row in rows):
             return None
         # Reject malformed/unsupported descendants rather than allowing a broad
         # prefix to bypass a leaf's eligibility gate.
         if any(below(row) and not row["eligible"] for row in candidates):
             return None
-        return {**copy.deepcopy(pending[0]), "arguments": args,
+        return {**copy.deepcopy(pending[0]), "tool": "hunter_run_web_loop", "arguments": args,
                 "slice_candidate_ids": [row["candidate_id"] for row in pending]}
 
-    def parameter_continuation(self, spec, candidates):
-        """Continue a measured model-selected index profile, not a blind replay."""
-        accepted = {item["record"]["validation_id"] for item in self.broker.validation_attempts(spec)}
-        for execution in reversed(self.broker.tools):
-            if execution.get("task_spec_id") != spec.id or execution.get("origin") != "solver" or execution["tool"] != "hunter_run_web_loop":
-                continue
-            receipt = json.loads(Path(execution["artifact"]).read_bytes())
-            args, result = receipt.get("arguments", {}), receipt.get("execution", {})
-            profile = args.get("validation_profile")
-            if (profile not in PROFILES or urlsplit(args.get("target", "")).query or receipt.get("error")
-                    or not isinstance(result, dict) or result.get("execution_failed")
-                    or type(result.get("actual_request_cost")) is not int or result["actual_request_cost"] < 0):
-                continue
-            view = next((row for row in self.broker.results if row["spec_id"] == spec.id
-                         and row["tool"] == execution["tool"] and row["arguments"] == args), None)
-            value = self.broker.read_reference(view["content_ref"]) if view else None
-            raw = result.get("result", {}).get("output")
-            if isinstance(raw, str):
-                try:
-                    raw = json.loads(raw)
-                except ValueError:
-                    continue
-            if not isinstance(value, dict) or raw != value or not any(
-                    item.get("validation_id") in accepted for item in value.get("validations", []) if isinstance(item, dict)):
-                continue
-            pending = [row for row in candidates if row["eligible"] and not row["executed"] and not row.get("dispatch_started")
-                       and not row["evidence_accepted"] and row["arguments"].get("validation_profile") == profile]
+    def parameter_continuation(self, spec, candidates, pending_params=None):
+        """Coalesce pending query leaves across all supported profiles plus exact residuals."""
+        if pending_params is None:
+            pending_params = [
+                row for row in candidates
+                if row["param"] and row["eligible"] and not row["evidence_accepted"]
+                and not row.get("dispatch_started")
+                and (not row["executed"] or self.deterministic_unaccepted_slice(spec, row))
+            ]
+        if not pending_params:
+            return []
+        pending_ids = {row["candidate_id"] for row in pending_params}
+        targets = list(dict.fromkeys([
+            spec.target,
+            *(record["url"] for record in self.discovery(spec)["records"]
+              if isinstance(record, dict) and isinstance(record.get("url"), str)),
+        ]))
+        selected = []
+        covered: set[str] = set()
+        for profile in PROFILES:
             slices = []
-            for record in self.discovery(spec)["records"]:
-                sliced = self.parameter_slice(spec, candidates, record["url"], profile)
+            for target in targets:
+                sliced = self.parameter_slice(spec, candidates, target, profile)
                 if sliced and 1 < len(sliced["slice_candidate_ids"]) <= sliced["arguments"]["fuzz_limit"]:
                     slices.append(sliced)
-            selected = []
-            covered: set[str] = set()
-            for sliced in sorted(slices, key=lambda row: len(row["arguments"]["target"]), reverse=True):
+            for sliced in sorted(slices, key=lambda row: (-len(row["arguments"]["target"]), row["arguments"]["target"])):
                 ids = set(sliced["slice_candidate_ids"])
-                if not ids & covered:
+                if not ids & covered and ids <= pending_ids:
                     selected.append(sliced)
                     covered.update(ids)
-            return [*selected, *(row for row in pending if row["candidate_id"] not in covered)]
-        return None
+        return [*selected, *(row for row in pending_params if row["candidate_id"] not in covered)]
+
+    def _is_premature_enum_summary(self, spec, submitted):
+        """True when an enum summary skips required discovery or leaves frontier continuation."""
+        if spec.phase != "enum" or spec.references or spec.compiled_workflows:
+            return False
+        if not isinstance(submitted, dict) or submitted.get("status") not in {"done", "partial"}:
+            return False
+        enum_results = [
+            row for row in self.broker.results
+            if row["spec_id"] == spec.id and row["tool"] in DISCOVERY_TOOLS
+        ]
+        if not enum_results:
+            return True
+        states = self.hydrate_discovery_state(spec)
+        pending = [action for state in states.values() for action in state.pending_actions()]
+        if not pending:
+            return False
+        if not any(row["tool"] == CRAWL_TOOL for row in enum_results):
+            return True
+        if any(action.get("link_relation") in {"pagination", "json_link", "next"} for action in pending):
+            return True
+        if submitted.get("status") == "done" and surface_errors(self.compile_summary(spec, submitted)):
+            return True
+        return False
+
+    def _crawl_tool_allowance_needed(self, spec, identity=None):
+        checks = self.broker.session_checks(spec)
+        if not checks:
+            return 1
+        members = [row for row in checks if self.broker.tasks.bindings[row["identity"]].get("role") == "member"]
+        selected_identity = identity or (members or checks)[0]["identity"]
+        try:
+            from cco_surface_core import session_store
+            if (
+                session_store.get_session(spec.target, selected_identity) is not None
+                and session_store.verified_session(spec.target, selected_identity) is None
+            ):
+                return 2
+        except (ImportError, OSError, ValueError):
+            return 2
+        return 1
+
+    def dispatch_discovery(self, spec, *, reason="continuation", max_actions=6):
+        """Execute bounded host discovery continuation in enum while preserving handoff reserves."""
+        if spec.phase != "enum" or spec.references or spec.compiled_workflows:
+            return False
+        states = self.hydrate_discovery_state(spec)
+        max_total = 10
+        total_dispatched = sum(int(state.continuation.get("dispatched_count", 0)) for state in states.values())
+        if total_dispatched >= max_total:
+            return False
+        policy = self.broker.runtime_policy
+        continued = False
+        dispatched_this_call = 0
+        policy.host_continuing.add(spec.id)
+        try:
+            def _available_tools():
+                return {tool["function"]["name"]: tool["function"]["parameters"] for tool in self.tool_schemas(spec)}
+
+            def _budget_ready(min_allowance=1):
+                if policy.consecutive_failures.get(spec.id, 0) >= 2:
+                    return False, "consecutive_tool_failure_limit"
+                if policy.tool_allowance(spec) < min_allowance:
+                    return False, "phase_tool_budget_exhausted"
+                if self.broker.budget.available("http") == 0:
+                    return False, "http_budget_exhausted"
+                if not self.broker.budget.remaining_seconds():
+                    return False, "wall_clock_budget_exhausted"
+                return True, ""
+
+            available = _available_tools()
+            enum_crawled = any(
+                row["spec_id"] == spec.id and row["tool"] == CRAWL_TOOL for row in self.broker.results
+            )
+            pending_now = [action for state in states.values() for action in state.pending_actions()]
+            if (
+                not enum_crawled
+                and CRAWL_TOOL in available
+                and dispatched_this_call < max_actions
+                and total_dispatched < max_total
+            ):
+                needed = self._crawl_tool_allowance_needed(spec)
+                ready, gap_reason = _budget_ready(needed)
+                if ready:
+                    crawl_args: dict[str, Any] = {"target": spec.target, "max_pages": 12}
+                    before_results = len(self.broker.results)
+                    try:
+                        self.broker.invoke(CRAWL_TOOL, crawl_args)
+                    except BudgetError:
+                        raise
+                    except ValueError as exc:
+                        error = (
+                            {"error": "session_binding_mismatch", "registered_session_checks": self.broker.session_checks(spec)}
+                            if isinstance(exc, SessionBindingError)
+                            else {"error": "tool invocation denied"}
+                        )
+                        if isinstance(exc, ArchiveSizeError):
+                            self.add_gap(spec, "archive_size_limit_exceeded", "archive")
+                        err_view = self.broker.view(error)
+                        self.broker.results.append({"spec_id": spec.id, "tool": CRAWL_TOOL, "arguments": {}, **err_view})
+                        dump(self.broker.private / "python-tool-results.json", self.broker.results)
+                        if policy.consecutive_failures.get(spec.id, 0) >= 2:
+                            raise BudgetError("consecutive_tool_failure_limit")
+                    else:
+                        if len(self.broker.results) > before_results:
+                            continued = True
+                            dispatched_this_call += 1
+                            total_dispatched += 1
+                        states = self.hydrate_discovery_state(spec)
+                        for state_obj in states.values():
+                            state_obj.continuation["last_reason"] = reason
+                        self.save_checkpoint()
+                elif not pending_now and gap_reason:
+                    self.add_gap(spec, gap_reason, "admission_budget")
+
+            pending_now = [action for state in states.values() for action in state.pending_actions()]
+            has_any_actions = any(state.actions for state in states.values())
+            if (
+                not pending_now
+                and not has_any_actions
+                and "kali-tools_curl_request" in available
+                and dispatched_this_call < max_actions
+                and total_dispatched < max_total
+            ):
+                ready, gap_reason = _budget_ready(1)
+                if ready:
+                    curl_schema = available["kali-tools_curl_request"]
+                    props = curl_schema.get("properties") if isinstance(curl_schema, dict) else {}
+                    curl_args: dict[str, Any] = {"url": spec.target}
+                    if isinstance(props, dict) and "follow_redirects" in props:
+                        curl_args["follow_redirects"] = False
+                    try:
+                        self.broker.invoke("kali-tools_curl_request", curl_args)
+                    except BudgetError:
+                        raise
+                    except ValueError as exc:
+                        if isinstance(exc, ArchiveSizeError):
+                            self.add_gap(spec, "archive_size_limit_exceeded", "archive")
+                        err_view = self.broker.view({"error": "tool invocation denied"})
+                        self.broker.results.append({"spec_id": spec.id, "tool": "kali-tools_curl_request", "arguments": {}, **err_view})
+                        dump(self.broker.private / "python-tool-results.json", self.broker.results)
+                        if policy.consecutive_failures.get(spec.id, 0) >= 2:
+                            raise BudgetError("consecutive_tool_failure_limit")
+                    else:
+                        continued = True
+                        dispatched_this_call += 1
+                        total_dispatched += 1
+                        states = self.hydrate_discovery_state(spec)
+                        self.save_checkpoint()
+                elif gap_reason:
+                    self.add_gap(spec, gap_reason, "admission_budget")
+
+            registered_identities = {item["identity"] for item in self.broker.session_checks(spec)}
+            while dispatched_this_call < max_actions and total_dispatched < max_total:
+                available = _available_tools()
+                candidates = []
+                for state_obj in states.values():
+                    for action in state_obj.pending_actions():
+                        candidates.append((state_obj, action))
+                if not candidates:
+                    break
+                candidates.sort(key=lambda pair: (
+                    0 if pair[1].get("link_relation") in {"pagination", "next", "json_link"} else 1,
+                    int(pair[1].get("continuation_depth", 0)),
+                    pair[1]["route_shape"],
+                    pair[1]["action_id"],
+                ))
+                state_obj, action = candidates[0]
+                action_id = action["action_id"]
+                identity_ref = action["identity_ref"]
+                if identity_ref == "anon":
+                    if "kali-tools_curl_request" in available:
+                        tool_name = "kali-tools_curl_request"
+                        curl_schema = available[tool_name]
+                        props = curl_schema.get("properties") if isinstance(curl_schema, dict) else {}
+                        tool_args = {"url": action["url"]}
+                        if isinstance(props, dict) and "follow_redirects" in props:
+                            tool_args["follow_redirects"] = False
+                        if isinstance(props, dict) and "method" in props and action["method"] != "GET":
+                            tool_args["method"] = action["method"]
+                        needed = 1
+                    elif CRAWL_TOOL in available:
+                        tool_name = CRAWL_TOOL
+                        tool_args = {"target": action["url"], "max_pages": 6}
+                        needed = self._crawl_tool_allowance_needed(spec)
+                    else:
+                        break
+                else:
+                    if identity_ref not in registered_identities:
+                        state_obj.mark_blocked(action_id, reason_code="missing_observed_identity_binding")
+                        self.save_checkpoint()
+                        continue
+                    if CRAWL_TOOL in available:
+                        tool_name = CRAWL_TOOL
+                        tool_args = {
+                            "target": action["url"],
+                            "max_pages": 6,
+                            "session_target": spec.target,
+                            "identity": identity_ref,
+                        }
+                        needed = self._crawl_tool_allowance_needed(spec, identity_ref)
+                    else:
+                        state_obj.mark_blocked(action_id, reason_code="authenticated_discovery_requires_crawl_or_access")
+                        self.save_checkpoint()
+                        continue
+
+                ready, gap_reason = _budget_ready(needed)
+                if not ready:
+                    if gap_reason:
+                        self.add_gap(spec, gap_reason, "admission_budget")
+                    break
+
+                state_obj.mark_dispatched(action_id)
+                state_obj.continuation["dispatched_count"] = int(state_obj.continuation.get("dispatched_count", 0)) + 1
+                state_obj.continuation["last_reason"] = reason
+                self.save_checkpoint()
+                try:
+                    view = self.broker.invoke(tool_name, tool_args)
+                except BudgetError:
+                    state_obj.mark_indeterminate(action_id, reason_code="discovery_budget_exhausted")
+                    self.save_checkpoint()
+                    raise
+                except ValueError as exc:
+                    error = (
+                        {"error": "session_binding_mismatch", "registered_session_checks": self.broker.session_checks(spec)}
+                        if isinstance(exc, SessionBindingError)
+                        else {"error": "tool invocation denied"}
+                    )
+                    if isinstance(exc, ArchiveSizeError):
+                        self.add_gap(spec, "archive_size_limit_exceeded", "archive")
+                    err_view = self.broker.view(error)
+                    self.broker.results.append({"spec_id": spec.id, "tool": tool_name, "arguments": {}, **err_view})
+                    dump(self.broker.private / "python-tool-results.json", self.broker.results)
+                    state_obj.mark_blocked(action_id, reason_code="discovery_execution_denied")
+                    self.save_checkpoint()
+                    if policy.consecutive_failures.get(spec.id, 0) >= 2:
+                        raise BudgetError("consecutive_tool_failure_limit")
+                    continue
+
+                continued = True
+                dispatched_this_call += 1
+                total_dispatched += 1
+                states = self.hydrate_discovery_state(spec)
+                current = states.get(state_obj.key, state_obj).actions.get(action_id)
+                if current is not None and current["status"] == "dispatched":
+                    res = view.get("result") if isinstance(view, dict) else {}
+                    if isinstance(res, dict) and (res.get("error") or res.get("ok") is False):
+                        states.get(state_obj.key, state_obj).mark_blocked(
+                            action_id, reason_code=str(res.get("reason_code") or "tool_error")[:96]
+                        )
+                    elif isinstance(res, dict) and res.get("execution_failed"):
+                        states.get(state_obj.key, state_obj).mark_indeterminate(
+                            action_id, reason_code="execution_failed"
+                        )
+                    else:
+                        states.get(state_obj.key, state_obj).mark_completed(
+                            action_id,
+                            result_artifact=view.get("content_ref", {}).get("path") if isinstance(view, dict) else None,
+                            result_sha256=view.get("content_ref", {}).get("sha256") if isinstance(view, dict) else None,
+                        )
+                self.save_checkpoint()
+
+            for state_obj in states.values():
+                if state_obj.pending_actions():
+                    state_obj.continuation["has_more_pending"] = True
+            self.save_checkpoint()
+        finally:
+            policy.host_continuing.discard(spec.id)
+            dump(self.broker.private / "runtime-policy.json", policy.snapshot())
+        return continued
 
     def dispatch_access_validation(self, spec):
         """An early summary cannot bypass the admitted, budgeted validation step."""
@@ -1396,9 +2522,11 @@ class PythonSolver:
         pending = [row for row in candidates if row["eligible"] and not row["evidence_accepted"]
                    and not row.get("dispatch_started")
                    and (not row["executed"] or self.deterministic_unaccepted_slice(spec, row))]
-        continuation = self.parameter_continuation(spec, candidates)
-        if continuation is not None:
-            pending = [*(row for row in pending if row["vector"] == "access-idor"), *continuation]
+        idor_pending = [row for row in pending if row["vector"] == "access-idor"]
+        param_pending = [row for row in pending if row["param"]]
+        if param_pending:
+            param_pending = self.parameter_continuation(spec, candidates, param_pending)
+        pending = [*idor_pending, *param_pending]
         # A model-selected slice spent the same rate window as host slices.
         # Only an actual task-bound executor receipt establishes that history.
         dispatched = any(row.get("task_spec_id") == spec.id and row.get("origin") == "solver"
@@ -1486,8 +2614,35 @@ class PythonSolver:
                 finally:
                     row["executed"] = len(self.broker.tools) > before
                     self.refresh_candidate_evidence(spec)
-                    if not row["evidence_accepted"] and not row["reason_code"]:
+                    if row.get("slice_candidate_ids"):
+                        slice_leaves = [
+                            self.candidates_by_task[spec.id].get(ident)
+                            for ident in row["slice_candidate_ids"]
+                        ]
+                        has_slice_partial = any(
+                            leaf is not None and (
+                                leaf["evidence_accepted"]
+                                or leaf.get("reason_code") == "indeterminate_leaf_outcome"
+                            )
+                            for leaf in slice_leaves
+                        )
+                        has_slice_queued = any(
+                            leaf is not None and leaf.get("admitted") and not leaf["executed"]
+                            for leaf in slice_leaves
+                        )
+                        slice_updated = False
+                        for leaf in slice_leaves:
+                            if leaf is not None and not leaf["evidence_accepted"] and not leaf["reason_code"]:
+                                if not leaf["executed"] and (has_slice_partial or has_slice_queued):
+                                    self.add_gap(spec, "remaining_leaf_not_validated", "admission_budget", leaf)
+                                else:
+                                    self.add_gap(spec, "invalid_or_missing_signed_evidence", "evidence", leaf)
+                                slice_updated = True
+                        if slice_updated:
+                            self.refresh_candidate_evidence(spec)
+                    elif not row["evidence_accepted"] and not row["reason_code"]:
                         self.add_gap(spec, "invalid_or_missing_signed_evidence", "evidence", row)
+                        self.refresh_candidate_evidence(spec)
                     self.save_checkpoint()
                 dispatched = True
                 continued = True
@@ -1639,6 +2794,10 @@ class PythonSolver:
                                 and args.get("live", True) is not False):
                             options = self.plan_candidates(spec)
                             selected = next((row for row in options if matches_model_call(row, name, args)), None)
+                            if selected is not None and selected["tool"] != name:
+                                recipe = recipe_arguments(selected, name)
+                                if recipe is not None:
+                                    selected = {**copy.deepcopy(selected), "tool": name, "arguments": copy.deepcopy(recipe)}
                             if selected is None and name == "hunter_run_web_loop":
                                 sliced = self.parameter_slice(spec, options, args.get("target", ""), args.get("validation_profile"))
                                 if sliced and matches_model_call(sliced, name, args):
@@ -1665,6 +2824,7 @@ class PythonSolver:
                             if name == READ_TOOL and view.get("result", {}).get("reason_code") == "archive_read_no_progress":
                                 self.add_gap(spec, "archive_read_no_progress", "archive", provenance=[view["result"]["content_ref"]])
                                 self.loop_event(spec, "archive_read_no_progress")
+                                self._discovery_stagnation[spec.id] = self._discovery_stagnation.get(spec.id, 0) + 1
                             if name != READ_TOOL and isinstance(view, dict):
                                 digest = view.get("content_ref", {}).get("sha256")
                                 if digest:
@@ -1690,7 +2850,28 @@ class PythonSolver:
                     submitted = json.loads(message.get("content") or "")
                 except (ValueError, TypeError):
                     submitted = "invalid JSON response"
+            stagnation_dispatched = False
+            if (
+                spec.phase == "enum"
+                and not spec.references
+                and not spec.compiled_workflows
+                and self._discovery_stagnation.get(spec.id, 0) >= 2
+            ):
+                self._discovery_stagnation[spec.id] = 0
+                stagnation_dispatched = self.dispatch_discovery(spec, reason="archive_read_no_progress")
+                if stagnation_dispatched and submitted is None:
+                    continue
             if submitted is None:
+                continue
+            if stagnation_dispatched:
+                continue
+            if (
+                spec.phase == "enum"
+                and not spec.references
+                and not spec.compiled_workflows
+                and self._is_premature_enum_summary(spec, submitted)
+                and self.dispatch_discovery(spec, reason="premature_enum_summary")
+            ):
                 continue
             if self.dispatch_access_validation(spec):
                 # A fresh model input contains real tool output; this is not
@@ -1701,7 +2882,18 @@ class PythonSolver:
             if feedback["valid"]:
                 path = self.broker.tasks.summary_path(spec)
                 path.parent.mkdir(exist_ok=True)
-                dump(path, summary)
+                pretty = json.dumps(summary, indent=2, ensure_ascii=False, allow_nan=False).encode() + b"\n"
+                if len(pretty) > 96 * 1024:
+                    with tempfile.NamedTemporaryFile(mode="wb", dir=path.parent, prefix=".host-", delete=False) as handle:
+                        temporary = Path(handle.name)
+                        try:
+                            handle.write(provider_json(summary))
+                            handle.flush()
+                            os.replace(temporary, path)
+                        finally:
+                            temporary.unlink(missing_ok=True)
+                else:
+                    dump(path, summary)
                 self.summaries[spec.id] = summary
                 return summary
             summary_ref = self.broker.archive({"summary": summary, "feedback": feedback}, "invalid-summary")
@@ -1851,7 +3043,10 @@ class PythonSolver:
                         self.add_gap(spec, "task_incomplete_or_indeterminate_no_replay")
                     for row in self.candidates_by_task.get(spec.id, {}).values():
                         if not row["evidence_accepted"] and not row["reason_code"]:
-                            self.add_gap(spec, "candidate_not_executed", "admission_budget", row)
+                            if row.get("dispatch_started") and not row["executed"] and self.task_states.get(spec.id) == "inconclusive":
+                                self.add_gap(spec, "indeterminate_dispatch_not_replayed", "evidence", row)
+                            else:
+                                self.add_gap(spec, "candidate_not_executed", "admission_budget", row)
                 if self._checkpoint_active:
                     self.save_checkpoint()
             except (ValueError, OSError, TypeError):
@@ -1868,6 +3063,8 @@ class PythonSolver:
                            run_id=self.run_id, checkpoint=str(self.checkpoint.path),
                            coverage_gaps=dedup_gaps([row for rows in self.coverage_gaps.values() for row in rows]),
                            validation_funnels={ident: funnel(list(rows.values())) for ident, rows in self.candidates_by_task.items()},
+                           leaf_validation_funnels={ident: leaf_funnel(self.leaf_outcomes_by_task.get(ident, [])) for ident in self.candidates_by_task},
+                           pair_progress={ident: copy.deepcopy(self.pair_progress_by_task[ident]) for ident in self.candidates_by_task if ident in self.pair_progress_by_task},
                           budget=self.broker.budget.snapshot())
             dump(self.broker.private.parent / "run-result.json", result)
             dump(self.broker.private.parent / "budget.json", self.broker.budget.snapshot())

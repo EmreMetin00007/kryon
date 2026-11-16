@@ -125,26 +125,28 @@ def test_observed_parameter_indexes_continue_bounded_profile_with_leaf_evidence(
     observe(broker, solver, source, [{"url": target + f"{stem}/{group}"} for group in ("one", "two")] + leaves, identity="first")
     broker.tasks.active_spec = spec
     validator = load_server("validator")
-    fn = getattr(validator, PROFILES[profile][1].removeprefix("validator_"))
-    completed = set()
+    completed: dict[str, set[str]] = {}
     def execute(self, task):
         self.tasks.append(task)
         args = json.loads(task["args_json"])
-        assert args["validation_profile"] == profile and args["fuzz_limit"] == 4
+        current_profile = args["validation_profile"]
+        assert current_profile in PROFILES and args["fuzz_limit"] == 4
+        fn = getattr(validator, PROFILES[current_profile][1].removeprefix("validator_"))
+        done = completed.setdefault(current_profile, set())
         prefix = args["target"].rstrip("/") + "/"
         queue, validations = [], []
         before = len(wire)
         for leaf in leaves:
             url = leaf["url"]
-            if not url.startswith(prefix) or url in completed or len(validations) == args["fuzz_limit"]:
+            if not url.startswith(prefix) or url in done or len(validations) == args["fuzz_limit"]:
                 continue
             item = {"url": url, "method": "GET", "param": "term", "carrier": "query", "identity": "first"}
             queue.append(item)
             with validation_context(item):
                 record = json.loads(fn(target_url=url, param="term", **(
-                    {"boolean_only": True} if profile == "readonly_sqli_boolean" else {})))
+                    {"boolean_only": True} if current_profile == "readonly_sqli_boolean" else {})))
             validations.append({**item, "validation_id": record["validation_id"]})
-            completed.add(url)
+            done.add(url)
         return {"actual_request_cost": len(wire) - before, "result": {"output": {
             "ok": True, "validation_queue": queue, "validations": validations}}}
     monkeypatch.setattr(type(broker.executor), "__call__", execute)
@@ -164,12 +166,12 @@ def test_observed_parameter_indexes_continue_bounded_profile_with_leaf_evidence(
     waits = []
     monkeypatch.setattr(solver, "wait_access_rate_window", lambda _spec: waits.append(True) or True)
     summary = solver.phase(spec)
-    assert len(turns) == 3 and len(broker.executor.tasks) == 2 and waits == [True]
-    assert len(summary["validation_outcomes"]) == summary["validation_funnel"]["evidence_accepted"] == 8
-    assert len(summary["tested_parameters"]) == 8 and len(completed) == 8
-    assert {row["vector"] for row in summary["validation_outcomes"]} == {PROFILES[profile][0]}
-    assert all(row["validation_state"] == "NOT TESTED" for row in solver.plan_candidates(spec)
-               if row["vector"] != PROFILES[profile][0])
+    assert len(turns) == 3 and len(broker.executor.tasks) == 4 and waits == [True, True, True]
+    assert len(summary["validation_outcomes"]) == summary["validation_funnel"]["evidence_accepted"] == 16
+    assert len(summary["tested_parameters"]) == 16
+    assert len(completed[profile]) == 8 and sum(len(v) for v in completed.values()) == 16
+    assert {row["vector"] for row in summary["validation_outcomes"]} == {"injection-sqli", "injection-ssti"}
+    assert all(row["validation_state"] == "TESTED" for row in solver.plan_candidates(spec))
     assert broker.budget.used["http"] == len(wire)
     before = len(wire)
     assert not solver.dispatch_access_validation(spec) and len(wire) == before
@@ -1403,5 +1405,136 @@ def test_holdout_validation_check_accounting_derives_pairs_and_parameters(tmp_pa
     assert len(expected_param) == 16
     assert sum(v == "CONFIRMED" for v in expected_param.values()) == 8
     assert sum(v == "UNCONFIRMED" for v in expected_param.values()) == 8
+
+
+def test_mixed_parameters_and_partially_accepted_or_ineligible_groups_never_drop_residuals(replay_lab, monkeypatch):
+    broker, target, wire = replay_lab
+    solver = PythonSolver(broker, model="model", recent_results=0)
+    source, spec = broker.tasks.specs[1:3]
+    pages = [
+        # Mixed params under /search/mixed -> must not slice, run as direct residuals.
+        {"url": target + "search/mixed"},
+        {"url": target + "search/mixed/0-unsafe?term=alpha"},
+        {"url": target + "search/mixed/1-safe?sort=alpha"},
+        # Partially accepted parent /search/parent with narrower /search/parent/pending sub-index.
+        {"url": target + "search/parent"},
+        {"url": target + "search/parent/done-0-safe?term=alpha"},
+        {"url": target + "search/parent/pending"},
+        {"url": target + "search/parent/pending/0-unsafe?term=alpha"},
+        {"url": target + "search/parent/pending/1-safe?term=alpha"},
+        # Group containing an ineligible descendant -> must not slice, eligible leaves run directly.
+        {"url": target + "search/guarded"},
+        {"url": target + "search/guarded/bad?term=alpha", "method": "POST"},
+        {"url": target + "search/guarded/0-safe?term=alpha"},
+        {"url": target + "search/guarded/1-unsafe?term=alpha"},
+    ]
+    observe(broker, solver, source, pages)
+    broker.tasks.active_spec = spec
+
+    # Pre-execute done-0-safe SQLi directly so /search/parent is partially accepted for SQLi.
+    done_sqli = next(row for row in solver.plan_candidates(spec)
+                     if row["route"] == target + "search/parent/done-0-safe?term=alpha"
+                     and row["vector"] == "injection-sqli")
+    broker.invoke(done_sqli["tool"], done_sqli["arguments"])
+    solver.refresh_candidate_evidence(spec)
+    assert done_sqli["evidence_accepted"]
+
+    # Parent group must refuse SQLi slice (would replay done-0-safe) and guarded group must refuse both.
+    rows = solver.plan_candidates(spec)
+    assert solver.parameter_slice(spec, rows, target + "search/parent", "readonly_sqli_boolean") is None
+    assert solver.parameter_slice(spec, rows, target + "search/guarded", "readonly_sqli_boolean") is None
+    assert solver.parameter_slice(spec, rows, target + "search/mixed", "readonly_sqli_boolean") is None
+    assert solver.parameter_slice(spec, rows, target + "search/parent/pending", "readonly_sqli_boolean") is not None
+
+    assert solver.dispatch_access_validation(spec)
+    # No replay of pre-executed done-0-safe SQLi.
+    assert sum(1 for t in broker.executor.tasks
+               if t["tool_name"] == "validator_validate_sqli"
+               and json.loads(t["args_json"])["target_url"] == done_sqli["route"]) == 1
+    # Narrower /search/parent/pending batched for both SQLi & SSTI; remaining done-0-safe SSTI runs as direct residual.
+    hunter_targets = {(json.loads(t["args_json"])["target"], json.loads(t["args_json"])["validation_profile"])
+                      for t in broker.executor.tasks if t["tool_name"] == "hunter_run_web_loop"}
+    assert hunter_targets == {
+        (target + "search/parent/pending", "readonly_sqli_boolean"),
+        (target + "search/parent/pending", "readonly_ssti_arithmetic"),
+    }
+    # Every eligible leaf across mixed/guarded/pending settled without dropping residuals; POST row stays ineligible.
+    final_rows = solver.plan_candidates(spec)
+    eligible = [r for r in final_rows if r["eligible"]]
+    ineligible = [r for r in final_rows if not r["eligible"]]
+    assert len(eligible) == 14 and all(r["evidence_accepted"] for r in eligible)
+    assert len(ineligible) == 1 and ineligible[0]["reason_code"] == "unsupported_readonly_method"
+    assert not ineligible[0]["executed"]
+
+
+@pytest.mark.parametrize("count,expected_tasks,expected_tool", [
+    (4, 2, "hunter_run_web_loop"),
+    (6, 12, "validator_validate_"),
+])
+def test_flat_surface_batches_within_fuzz_limit_and_falls_back_cleanly_above_limit(
+    replay_lab, monkeypatch, count, expected_tasks, expected_tool
+):
+    broker, target, _wire = replay_lab
+    solver = PythonSolver(broker, model="model", recent_results=0)
+    source, spec = broker.tasks.specs[1:3]
+    pages = [{"url": target + f"search/{idx}-{'unsafe' if idx % 2 == 0 else 'safe'}?term=alpha"}
+             for idx in range(count)]
+    observe(broker, solver, source, pages)
+    broker.tasks.active_spec = spec
+    assert solver.dispatch_access_validation(spec)
+    assert len(broker.executor.tasks) == expected_tasks
+    assert all(task["tool_name"].startswith(expected_tool) for task in broker.executor.tasks)
+    rows = solver.plan_candidates(spec)
+    assert len(rows) == count * 2
+    assert all(r["evidence_accepted"] and r["validation_state"] == "TESTED" for r in rows)
+
+
+def test_pairwise_partial_evidence_keeps_discovery_continuation_strict_and_tamper_revokes(replay_lab, monkeypatch):
+    import python_identity_discovery as discovery
+    from cco_validator_core import load_validation
+
+    broker, _target, _wire = replay_lab
+    solver, spec = prepare_identity_replay(broker)
+    solver.batches_by_task[spec.id] = solver.batches_by_task[spec.id][:1]
+    batch = solver.batches_by_task[spec.id][0]
+    row = solver.plan_candidates(spec)[0]
+
+    # Run a complete pair first, then construct a partial variant and verify discovery cache stays strict.
+    original = type(broker.executor).__call__
+    recorded_vids = []
+
+    def capture_execute(self, task):
+        result = original(self, task)
+        for item in result["result"]["output"].get("validations", []):
+            recorded_vids.append(item["validation_id"])
+        return result
+
+    monkeypatch.setattr(type(broker.executor), "__call__", capture_execute)
+    assert solver.dispatch_access_validation(spec)
+    assert solver.completed_member_batch(spec, batch) is True
+    access_summary = solver.compile_summary(spec, terminal(spec))
+    assert access_summary["pair_progress"]["complete_pairs"] == 1
+    assert access_summary["identity_comparisons"][0]["status"] == "TESTED"
+    solver.summaries[spec.id] = access_summary
+
+    # Tampering one signed leaf in the completed pair revokes pair & leaf acceptance on report and blocks discovery reuse.
+    assert recorded_vids
+    tampered_rec = load_validation(recorded_vids[0])
+    Path(tampered_rec["artifact"]["path"]).write_text("{}")
+
+    discovery_path = discovery.prepare_discovery(broker, spec, row["arguments"])
+    discovery_payload = json.loads(discovery_path.read_bytes())["payload"]
+    assert discovery_payload["states"] == {} and discovery_payload["sources"] == []
+
+    report_spec = broker.tasks.specs[3]
+    report = solver.compile_summary(report_spec, terminal(report_spec))
+    assert solver.completed_member_batch(spec, batch) is False
+    assert report["validation_funnels"][spec.id]["evidence_accepted"] == 0
+    assert report["leaf_validation_funnels"][spec.id]["invalid_evidence"] >= 1
+    assert report["pair_progress_by_task"][spec.id]["complete_pairs"] == 0
+    assert report["identity_comparisons"][0]["status"] == "NOT TESTED"
+    assert report["identity_comparisons"][0]["reason_code"] == "invalid_or_missing_signed_evidence"
+    assert report["status"] == "partial"
+    assert any(g["reason_code"] == "invalid_or_missing_signed_evidence" for g in report["coverage_gaps"])
 
 

@@ -41,7 +41,7 @@ def runtime_source(tmp_path, monkeypatch):
         "owned": {"npm": "@ai-sdk/openai-compatible", "options": {
             "apiKey": "synthetic-provider-secret", "baseURL": "https://provider.invalid/v1"},
                   "models": {"model": {"name": "Test model"}}}}}))
-    for name in ("scripts/brain.py", "mcp-servers/mcp-hunter/server.py", "AGENTS.md",
+    for name in ("scripts/brain.py", "scripts/python_discovery_runtime.py", "mcp-servers/mcp-hunter/server.py", "AGENTS.md",
                  "scripts/lab/blind_lab.py", "tests/answers.py", "docs/answers.md",
                  "scripts/blind-validate.py", "scripts/full_agent_preflight.py", ".codex/scope.json",
                  "graphify-out/graph.json", ".git/HEAD", ".env", "config/program-profiles/previous.json"):
@@ -170,6 +170,7 @@ def test_runtime_snapshot_excludes_evaluator_and_credentials(runtime_source, tmp
     assert "sensitive-evaluator-sentinel" not in text
     assert "synthetic-provider-secret" not in text
     assert (runtime / "scripts/brain.py").is_file()
+    assert (runtime / "scripts/python_discovery_runtime.py").is_file()
     assert not (runtime / "scripts/symlink.py").exists()
     assert not (runtime / "scripts/lab").exists()
     assert not result["runnable"]
@@ -250,7 +251,7 @@ def prepared_snapshot(baseline, runtime_source, tmp_path):
     return launcher.prepared_run(directory)
 
 
-@pytest.mark.parametrize("fault", ["contract", "runtime", "extra_file", "symlink", "baseline"])
+@pytest.mark.parametrize("fault", ["contract", "runtime", "discovery_runtime", "extra_file", "symlink", "baseline"])
 def test_launcher_rejects_changed_preflight_evidence(prepared_snapshot, fault):
     prepared = prepared_snapshot
     root = prepared["manifest_path"].parent
@@ -258,6 +259,8 @@ def test_launcher_rejects_changed_preflight_evidence(prepared_snapshot, fault):
         path = root / "contract.json"
     elif fault == "baseline":
         path = Path(prepared["contract"]["baseline"]["manifest"])
+    elif fault == "discovery_runtime":
+        path = prepared["runtime"] / "scripts/python_discovery_runtime.py"
     else:
         path = prepared["runtime"] / "scripts/brain.py"
     if fault == "extra_file":

@@ -219,6 +219,7 @@ for name in (
     "full_agent_preflight",
     "full_agent_launcher",
     "orchestration_spec",
+    "python_discovery_runtime",
 ):
     importlib.import_module(name)
 
@@ -278,6 +279,10 @@ def test_python_snapshot_rejects_opencode_json_and_excludes_new_host_modules(
     assert "scripts/full_agent_provider.py" in inventory
     assert "scripts/full_agent_executor.py" in inventory
     assert "scripts/full_agent_native_compat.py" in inventory
+    assert "scripts/python_discovery_runtime.py" in inventory
+    assert preflight.runtime_file(Path("scripts/python_discovery_runtime.py"))
+    assert (prepared["runtime"] / "scripts/python_discovery_runtime.py").is_file()
+    assert any(row["path"] == "scripts/python_discovery_runtime.py" for row in prepared["index"]["files"])
 
     # Adding opencode.json into a python_loop snapshot must be rejected even with matching index hash.
     runtime = prepared["runtime"]
@@ -293,6 +298,38 @@ def test_python_snapshot_rejects_opencode_json_and_excludes_new_host_modules(
     manifest["runtime_snapshot"]["files"] = len(index["files"])
     preflight_path.write_text(json.dumps(manifest, indent=2) + "\n")
     with pytest.raises(ValueError, match="invalid runtime inventory"):
+        launcher.prepared_run(preflight_path)
+
+
+def test_python_snapshot_includes_discovery_runtime_and_rejects_tamper(
+    config, baseline, tmp_path, monkeypatch
+):
+    monkeypatch.setattr(preflight, "browser_preflight", lambda: [{"name": "local_fixture", "ok": True}])
+    output = tmp_path.parent / (tmp_path.name + "-preflights-discovery")
+    assert agent_cli.main([
+        "preflight", "--baseline", str(baseline), "--provider-config", str(config),
+        "--token-budget", "150000", "--output-dir", str(output),
+    ]) == 0
+    preflight_path = next(output.glob("*/preflight.json"))
+    prepared = launcher.prepared_run(preflight_path)
+    assert "scripts/python_discovery_runtime.py" in prepared["manifest"]["host_runtime"]
+    assert any(row["path"] == "scripts/python_discovery_runtime.py" for row in prepared["index"]["files"])
+
+    # Drift in host inventory for python_discovery_runtime.py must be rejected.
+    monkeypatch.setattr(
+        preflight,
+        "python_host_inventory",
+        lambda: {**prepared["manifest"]["host_runtime"], "scripts/python_discovery_runtime.py": "0" * 64},
+    )
+    with pytest.raises(ValueError, match="host runtime changed"):
+        launcher.prepared_run(preflight_path)
+    monkeypatch.undo()
+
+    # Tampering with python_discovery_runtime.py inside the frozen python runtime snapshot must be rejected.
+    target = prepared["runtime"] / "scripts/python_discovery_runtime.py"
+    target.chmod(0o644)
+    target.write_text("# tampered\n")
+    with pytest.raises(ValueError, match="runtime file changed"):
         launcher.prepared_run(preflight_path)
 
 

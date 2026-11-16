@@ -31,6 +31,7 @@ from full_agent_runtime_policy import (MAX_CONTEXT_BYTES, MAX_PROMPT_TOKENS,
 from orchestration_spec import COMPILED_WORKFLOW_TOOL
 from python_candidate_runtime import (PROFILES, authorization_controls_complete, compact_gaps,
                                       page_cards, query_parameters, upstream_ids)
+from python_discovery_runtime import SUMMARY_FRONTIER_BYTES, SUMMARY_FRONTIER_LIMIT, compact_frontier
 
 PHASE_CALL_LIMITS = {"recon": 12, "enum": 16, "access": 14, "report": 6, "planner": 8}
 SUMMARY_TOOL = "submit_phase_summary"
@@ -83,6 +84,7 @@ class PythonRuntimePolicy(RuntimePolicy):
         self.validation_reserves = {}
         self.checkpoint_reserves = {}
         self.host_finalizing = set()
+        self.host_continuing = set()
         self.summary_prompt_tokens = {}
 
     def reserve_handoff(self, spec, session_count):
@@ -138,7 +140,8 @@ class PythonRuntimePolicy(RuntimePolicy):
     def allowed_tools(self, spec):
         allowed = {SUMMARY_TOOL}
         if (spec.id not in self.repairing
-                and (spec.id not in self.finalizing or spec.id in self.host_finalizing)
+                and (spec.id not in self.finalizing or spec.id in self.host_finalizing
+                     or spec.id in self.host_continuing)
                 and self.consecutive_failures.get(spec.id, 0) < 2
                 and self.tool_allowance(spec) > 0):
             allowed |= set(spec.tools) | {READ_TOOL}
@@ -177,7 +180,8 @@ class PythonRuntimePolicy(RuntimePolicy):
                 "handoff_tool_reserves": dict(self.handoff_reserves),
                 "validation_tool_reserves": dict(self.validation_reserves),
                 "checkpoint_tool_reserves": dict(self.checkpoint_reserves),
-                "host_finalizing": sorted(self.host_finalizing)}
+                "host_finalizing": sorted(self.host_finalizing),
+                "host_continuing": sorted(self.host_continuing)}
 
 
 def _close_fd_box(box: list[int | None]) -> None:
@@ -577,7 +581,8 @@ class PythonBroker(HostBroker):
                     projected['task_spec'] = {key: value for key, value in projected['task_spec'].items()
                                               if key in {'id', 'phase', 'target', 'steps', 'vector', 'references'}}
                     projected['task_spec']['steps'] = [
-                        {key: value for key, value in step.items() if key != 'goal'}
+                        {**{key: value for key, value in step.items() if key != 'goal'},
+                         **({'goal': str(step['goal'])[:160]} if isinstance(step.get('goal'), str) and step['goal'] else {})}
                         for step in projected['task_spec']['steps']]
                     # The exact current allowance is appended by the host in
                     # the final wire request. Do not send a duplicate copy.
@@ -595,7 +600,7 @@ class PythonBroker(HostBroker):
                         # retain the enum evidence. Avoid a third copy of its
                         # archive reference in the first validation turn.
                         projected.pop('previous_summary', None)
-                    if spec.phase in {'access', 'enum', 'report'}:
+                    if spec.phase in {'recon', 'access', 'enum', 'report'}:
                         # Keep semantic cards and fresh evidence readable. A
                         # compact workflow tool set retains discovery, session
                         # checks and validators even before the first read.
@@ -604,6 +609,12 @@ class PythonBroker(HostBroker):
                                            COMPILED_WORKFLOW_TOOL, 'validator_validate_sqli',
                                            'validator_validate_ssti', 'validator_validate_idor',
                                            'validator_validate_auth_bypass', 'validator_validate_open_redirect'}
+                        if spec.phase in {'recon', 'enum'}:
+                            reading_tools |= {
+                                'kali-tools_curl_request',
+                                'kali-tools_compose_js_routes',
+                                'kali-tools_discover_web_surface',
+                            }
                         candidate['tools'] = [row for row in candidate['tools']
                                                 if row['function']['name'] in reading_tools]
                     if (recent and recent[-1].get('tool') == READ_TOOL
@@ -612,6 +623,15 @@ class PythonBroker(HostBroker):
                         # but removes redundant indexes and optional arguments
                         # that the host fills canonically for candidate selection.
                         projected['candidate_cards'] = page_cards(projected.get('candidate_cards', []))
+                        if spec.phase in {'access', 'report'}:
+                            # The host drives validation/closure here; while a
+                            # full page is in context, step IDs are enough and
+                            # the freed bytes keep read_artifact advertised.
+                            projected['task_spec']['steps'] = [
+                                {key: value for key, value in step.items() if key != 'goal'}
+                                for step in projected['task_spec']['steps']]
+                        if projected.get('discovery_frontier'):
+                            projected['discovery_frontier'] = compact_frontier(projected['discovery_frontier'])
                         projected.pop('older_results', None)
                         projected.pop('older_index_ref', None)
                         # Exact safe binding/check maps remain in the archived
@@ -659,18 +679,66 @@ class PythonBroker(HostBroker):
                     # The host owns validation, handoff and the immutable spec.
                     # A closing model needs step IDs, current outcomes and
                     # repair feedback; the complete context remains archived.
+                    unfinished: dict[str, Any] = {}
+                    frontier = projected.get('discovery_frontier')
+                    if isinstance(frontier, dict) and isinstance(frontier.get('counts'), dict):
+                        counts = frontier['counts']
+                        pending_info = {
+                            k: int(counts.get(k, 0) or 0)
+                            for k in ('pending', 'dispatched', 'blocked', 'indeterminate')
+                            if int(counts.get(k, 0) or 0) > 0
+                        }
+                        if pending_info:
+                            unfinished['discovery'] = pending_info
+                    cards = projected.get('candidate_cards') or []
+                    candidate_count = int(projected.get('candidate_count') or 0)
+                    untested_cards = [
+                        card for card in cards
+                        if isinstance(card, dict) and card.get('validation_state') != 'TESTED'
+                    ]
+                    if candidate_count and (untested_cards or len(cards) < candidate_count):
+                        unfinished['candidates'] = {
+                            'total': candidate_count,
+                            'untested_in_view': len(untested_cards),
+                        }
+                    gap_count = int(projected.get('coverage_gap_count') or 0)
+                    if gap_count:
+                        unfinished['coverage_gaps'] = gap_count
                     task = projected['task_spec']
                     task = {key: task[key] for key in ('id', 'phase', 'target', 'steps')}
-                    task['steps'] = [{key: value for key, value in step.items()
-                                     if key != 'goal'} for step in task['steps']]
+                    task['steps'] = [
+                        {**{key: value for key, value in step.items() if key != 'goal'},
+                         **({'goal': str(step['goal'])[:80]} if isinstance(step.get('goal'), str) and step['goal'] else {})}
+                        for step in task['steps']]
+                    compact_summary_frontier = (
+                        compact_frontier(frontier, max_items=SUMMARY_FRONTIER_LIMIT, max_bytes=SUMMARY_FRONTIER_BYTES)
+                        if isinstance(frontier, dict) else None
+                    )
                     projected = {key: projected[key] for key in
                                    ('schema', 'context_archive_ref', 'recent_results', 'summary_feedback',
                                     'candidate_cards', 'candidate_count', 'coverage_gaps',
                                     'coverage_gap_count', 'coverage_gap_archive_ref') if key in projected}
+                    if compact_summary_frontier is not None:
+                        projected['discovery_frontier'] = compact_summary_frontier
+                    projected['unfinished_work'] = {'has_unfinished': bool(unfinished), **unfinished}
                     projected['task_spec'] = task
             candidate['messages'][1]['content'] = provider_json(projected).decode()
-            closing = {**candidate, 'tools': [row for row in candidate.get('tools', [])
-                                             if row['function']['name'] == SUMMARY_TOOL]}
+            closing_projected = projected
+            if level < 3 and any(row.get('tool') == READ_TOOL and 'text' in row.get('result', {})
+                                 for row in projected.get('recent_results', [])):
+                # Closing turns omit transient read_artifact page text (see level 3).
+                closing_projected = copy.deepcopy(projected)
+                for row in closing_projected.get('recent_results', []):
+                    if row.get('tool') == READ_TOOL and 'text' in row.get('result', {}):
+                        row['result'].pop('text')
+                        row['result']['text_archived'] = True
+            closing_messages = candidate['messages'] if closing_projected is projected else [
+                candidate['messages'][0],
+                {**candidate['messages'][1], 'content': provider_json(closing_projected).decode()},
+            ]
+            closing = {**candidate, 'messages': closing_messages,
+                       'tools': [row for row in candidate.get('tools', [])
+                                 if row['function']['name'] == SUMMARY_TOOL]}
             self.runtime_policy.summary_prompt_tokens[spec.id] = prompt_bound(provider_json(closing))[0]
             info = self.runtime_policy.prepare(spec, prompt_bound(provider_json(candidate))[0])
             if info['finalizing'] and spec.id not in initial_finalizing and level < 2:
@@ -1129,7 +1197,8 @@ class PythonBroker(HostBroker):
                           "private_reference": self.private_discovery_sources[str(execution_path)]}
                 try:
                     observation = _source_observation(source, spec.to_dict(), value,
-                                                      _read_reference(source["execution_reference"]))
+                                                      _read_reference(source["execution_reference"]),
+                                                      require_fresh=False)
                 except (ValueError, OSError, TypeError, KeyError):
                     continue
                 value = observation["operational_report"]

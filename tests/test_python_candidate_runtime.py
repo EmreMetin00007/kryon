@@ -58,7 +58,8 @@ def replay_lab(python_broker, monkeypatch):
 
         def do_GET(self):
             parsed = urlsplit(self.path)
-            value = parse_qs(parsed.query).get("term", [""])[0]
+            qs = parse_qs(parsed.query)
+            value = qs.get("term", next(iter(qs.values()), [""]))[0]
             status, result = 200, ""
             if parsed.path.startswith("/search/"):
                 with sqlite3.connect(":memory:") as db:
@@ -66,13 +67,13 @@ def replay_lab(python_broker, monkeypatch):
                     db.executemany("insert into records values (?)", [("alpha",), ("beta",)])
                     try:
                         result = json.dumps(db.execute("select name from records where name='" + value + "'").fetchall()
-                                            if parsed.path.endswith("unsafe") else
+                                            if "unsafe" in parsed.path else
                                             db.execute("select name from records where name=?", (value,)).fetchall())
                     except sqlite3.Error:
                         status, result = 400, "query rejected"
             elif parsed.path.startswith("/render/"):
                 try:
-                    result = Template(value).render() if parsed.path.endswith("unsafe") else "literal: " + value
+                    result = Template(value).render() if "unsafe" in parsed.path else "literal: " + value
                 except Exception:
                     status, result = 400, "template rejected"
             elif parsed.path.startswith("/objects/"):
@@ -108,10 +109,48 @@ def replay_lab(python_broker, monkeypatch):
         return method == "GET" and urlsplit(url).netloc == urlsplit(target).netloc, "owned offline replay lab"
 
     def execute(self, task):
+        from urllib.parse import parse_qsl, urljoin
+        from python_candidate_runtime import PROFILES
         self.tasks.append(task)
         args = json.loads(task["args_json"])
         with campaign_wire_budget(task["reserved_request_cost"], uuid.uuid4().hex) as budget, scoped_wire_gate(gate):
-            if task["tool_name"] == "hunter_run_web_loop":
+            if task["tool_name"] == "hunter_run_web_loop" and args.get("validation_profile") in PROFILES:
+                profile = args["validation_profile"]
+                fn = getattr(validator, PROFILES[profile][1].removeprefix("validator_"))
+                target_parsed = urlsplit(args["target"])
+                prefix = target_parsed.path.rstrip("/")
+                identity = next(iter(json.loads(args["session_bindings"]))) if args.get("session_bindings") else "anonymous"
+                fuzz_limit = max(1, int(args.get("fuzz_limit") or 4))
+                queue, validations, seen_urls = [], [], set()
+                for entry in python_broker.results:
+                    data = python_broker.read_reference(entry["content_ref"])
+                    if not isinstance(data, dict) or not isinstance(data.get("records"), list):
+                        continue
+                    for rec in data["records"]:
+                        if not isinstance(rec, dict) or not isinstance(rec.get("url"), str):
+                            continue
+                        full_url = urljoin(target, rec["url"])
+                        parsed = urlsplit(full_url)
+                        if (parsed.scheme, parsed.netloc) != (target_parsed.scheme, target_parsed.netloc):
+                            continue
+                        if not (parsed.path == prefix or parsed.path.startswith(prefix + "/")):
+                            continue
+                        if not parsed.query or full_url in seen_urls:
+                            continue
+                        seen_urls.add(full_url)
+                        for param, _ in parse_qsl(parsed.query, keep_blank_values=True):
+                            item = {"url": full_url, "method": "GET", "param": param, "carrier": "query", "identity": identity}
+                            queue.append(item)
+                            with validation_context(item):
+                                record = json.loads(fn(target_url=full_url, param=param, **(
+                                    {"boolean_only": True} if profile == "readonly_sqli_boolean" else {})))
+                            validations.append({**item, "validation_id": record["validation_id"]})
+                        if len(seen_urls) >= fuzz_limit:
+                            break
+                    if len(seen_urls) >= fuzz_limit:
+                        break
+                value = {"ok": True, "validation_queue": queue, "validations": validations}
+            elif task["tool_name"] == "hunter_run_web_loop":
                 names = list(json.loads(args["session_bindings"]))
                 queue, validations = [], []
                 for owner, actor in (names, names[::-1]):
@@ -172,7 +211,11 @@ def test_frozen_replay_early_summary_signed_positive_negative_paths(replay_lab, 
     assert [counts[stage] for stage in STAGES] == [expected] * 5
     assert len(turns) == 2 and turns[0]["candidate_cards"]
     assert broker.budget.used["http"] == len(wire) <= broker.budget.limits["http"]
-    assert len(broker.executor.tasks) == expected
+    assert len(broker.executor.tasks) == (1 if path == "identities" else 2)
+    if path == "parameters":
+        assert {task["tool_name"] for task in broker.executor.tasks} == {"hunter_run_web_loop"}
+        assert {json.loads(task["args_json"])["validation_profile"] for task in broker.executor.tasks} == {
+            "readonly_sqli_boolean", "readonly_ssti_arithmetic"}
     outcomes = summary["validation_outcomes"]
     assert sum(row["verdict"] == "CONFIRMED" for row in outcomes) == (1 if path == "identities" else 2)
     assert sum(row["verdict"] == "UNCONFIRMED" for row in outcomes) == (1 if path == "identities" else 6)
@@ -302,8 +345,82 @@ def test_level_two_retains_candidate_cards_crawler_and_direct_validators(python_
     assert {CRAWL_TOOL, "validator_validate_sqli", "validator_validate_ssti", "hunter_run_web_loop"} <= visible
     projected = json.loads(sent["messages"][1]["content"])
     assert projected["candidate_cards"] == compact_cards(solver.plan_candidates(spec))
+    assert all(step.get("goal") for step in projected["task_spec"]["steps"])
     assert projected["recent_results"][-1]["result"]["text"] == "fresh page"
     assert not broker.calls and not broker.budget.used["http"]
+
+
+def test_level_two_retains_enum_curl_goals_and_discovery_frontier_without_bypassing_allowlist(python_broker, monkeypatch):
+    import full_agent_python_broker as module
+    broker = python_broker
+    catalog(broker)
+    solver = PythonSolver(broker, model="model")
+    recon, enum_spec = broker.tasks.specs[:2]
+    assert "hunter_run_web_loop" not in enum_spec.tools
+    assert "kali-tools_curl_request" in enum_spec.tools
+    recon_view = broker.view({"status_code": 200, "text": '<a href="/items?q=secret-val">Items</a>'})
+    broker.results.append({"spec_id": recon.id, "tool": "kali-tools_curl_request",
+                           "arguments": {"url": recon.target}, **recon_view})
+    solver.summaries[recon.id] = solver.compile_summary(recon, terminal(recon))
+    broker.tasks.active_spec = enum_spec
+    context = solver.context(enum_spec)
+    ref = broker.archive({"text": "x" * 10000})
+    context["recent_results"] = [{"tool": READ_TOOL, "content_ref": ref,
+                                  "result": {"text": "fresh enum page", "offset": 0}}]
+    context["padding"] = "x" * 500
+    body = {"model": "model", "max_tokens": 1024, "tools": solver.tool_schemas(enum_spec), "messages": [
+        {"role": "system", "content": "offline"}, {"role": "user", "content": provider_json(context).decode()}]}
+    original = module.completion_request
+
+    def admission(wire, **kwargs):
+        projected = json.loads(wire["messages"][1]["content"])
+        if "remaining_phase_calls" in projected or len(projected["recent_results"]) > 1:
+            raise BudgetError("force compressed boundary")
+        return original(wire, **kwargs)
+
+    monkeypatch.setattr(module, "completion_request", admission)
+    sent, _info, projection = broker.project_runtime_context(body, enum_spec, None)
+    assert projection["level"] == 2
+    visible = {row["function"]["name"] for row in sent["tools"]}
+    assert {"kali-tools_curl_request", CRAWL_TOOL, READ_TOOL, SUMMARY_TOOL} <= visible
+    assert "hunter_run_web_loop" not in visible
+    projected = json.loads(sent["messages"][1]["content"])
+    assert projected["discovery_frontier"]["counts"]["pending"] == 1
+    assert "secret-val" not in json.dumps(projected["discovery_frontier"])
+    assert all(step.get("goal") for step in projected["task_spec"]["steps"])
+
+
+def test_level_three_summary_only_preserves_unfinished_work_visibility(python_broker, monkeypatch):
+    import full_agent_python_broker as module
+    broker = python_broker
+    catalog(broker)
+    solver = PythonSolver(broker, model="model")
+    recon, enum_spec = broker.tasks.specs[:2]
+    recon_view = broker.view({"status_code": 200, "text": '<a href="/items?q=secret-val">Items</a>'})
+    broker.results.append({"spec_id": recon.id, "tool": "kali-tools_curl_request",
+                           "arguments": {"url": recon.target}, **recon_view})
+    solver.summaries[recon.id] = solver.compile_summary(recon, terminal(recon))
+    broker.tasks.active_spec = enum_spec
+    context = solver.context(enum_spec)
+    body = {"model": "model", "max_tokens": 1024, "tools": solver.tool_schemas(enum_spec), "messages": [
+        {"role": "system", "content": "offline"}, {"role": "user", "content": provider_json(context).decode()}]}
+    original = module.completion_request
+
+    def admission(wire, **kwargs):
+        projected = json.loads(wire["messages"][1]["content"])
+        if "unfinished_work" not in projected:
+            raise BudgetError("force level 3 summary-only projection")
+        return original(wire, **kwargs)
+
+    monkeypatch.setattr(module, "completion_request", admission)
+    sent, _info, projection = broker.project_runtime_context(body, enum_spec, None)
+    assert projection["level"] == 3
+    assert {row["function"]["name"] for row in sent["tools"]} == {SUMMARY_TOOL}
+    projected = json.loads(sent["messages"][1]["content"])
+    assert projected["unfinished_work"]["has_unfinished"] is True
+    assert projected["unfinished_work"]["discovery"]["pending"] == 1
+    assert projected["discovery_frontier"]["counts"]["pending"] == 1
+    assert "secret-val" not in json.dumps(projected)
 
 
 @pytest.mark.parametrize("mode", ["unsigned", "invented", "tampered", "out_of_scope"])
@@ -946,3 +1063,255 @@ def test_final_refresh_failure_revokes_all_task_acceptance(replay_lab, monkeypat
                    for row in result["validation_funnels"][task.id]["candidates"])
         assert any(gap["task_spec_id"] == task.id and gap["reason_code"] == "prior_phase_evidence_changed"
                    for gap in result["coverage_gaps"])
+
+
+def test_anonymous_leaf_keeps_stable_candidate_id_across_direct_and_hunter_recipes(replay_lab):
+    from python_candidate_runtime import parameter_candidates
+    broker, target, wire = replay_lab
+    source, spec = broker.tasks.specs[1:3]
+    solver = PythonSolver(broker, model="model")
+    ref = observe(broker, solver, source, FROZEN["parameter_pages"][:1])
+    records = [{"url": target + "search/unsafe?term=alpha", "method": "GET",
+                "source_spec_id": source.id, "source_artifact": ref["path"], "source_sha256": ref["sha256"]}]
+    spec.tools = ["validator_validate_sqli", "validator_validate_ssti", "hunter_run_web_loop"]
+    both_rows = parameter_candidates(spec, records, {})
+    spec.tools = ["hunter_run_web_loop"]
+    hunter_only_rows = parameter_candidates(spec, records, {})
+    spec.tools = ["validator_validate_sqli", "validator_validate_ssti"]
+    direct_only_rows = parameter_candidates(spec, records, {})
+    assert [r["candidate_id"] for r in both_rows] == [r["candidate_id"] for r in hunter_only_rows]
+    assert [r["candidate_id"] for r in both_rows] == [r["candidate_id"] for r in direct_only_rows]
+    spec.tools = ["validator_validate_sqli", "validator_validate_ssti", "hunter_run_web_loop"]
+    sqli = next(r for r in both_rows if r["vector"] == "injection-sqli")
+    assert sqli["tool"] == "validator_validate_sqli"
+    assert sqli["validation_profile"] == "readonly_sqli_boolean"
+    assert "session_bindings" not in sqli["recipes"]["hunter_run_web_loop"]
+    assert matches_model_call(sqli, "validator_validate_sqli", sqli["arguments"])
+    assert matches_model_call(sqli, "hunter_run_web_loop", {
+        "target": sqli["route"], "live": True, "validation_profile": "readonly_sqli_boolean"})
+    assert not matches_model_call(sqli, "hunter_run_web_loop", {
+        "target": sqli["route"], "live": True, "validation_profile": "readonly_sqli_boolean",
+        "session_bindings": '{"first": {}}'})
+    assert "hunter_run_web_loop" not in (direct_only_rows[0].get("recipes") or {})
+
+    broker.tasks.active_spec = spec
+    rows = solver.plan_candidates(spec)
+    leaf = next(r for r in rows if r["vector"] == "injection-sqli")
+    expected_id = leaf["candidate_id"]
+    broker.invoke("hunter_run_web_loop", leaf["recipes"]["hunter_run_web_loop"])
+    solver.refresh_candidate_evidence(spec)
+    assert wire
+    assert leaf["candidate_id"] == expected_id
+    assert leaf["admitted"] and leaf["executed"] and leaf["evidence_accepted"]
+    assert leaf["validation_state"] == "TESTED" and not leaf["reason_code"]
+    assert not any(g["candidate_id"] == expected_id for g in solver.coverage_gaps.get(spec.id, []))
+
+
+def test_direct_leaf_first_followed_by_batched_remainder_without_replay(replay_lab, monkeypatch):
+    broker, target, wire = replay_lab
+    solver = PythonSolver(broker, model="model", recent_results=0)
+    source, spec = broker.tasks.specs[1:3]
+    pages = [
+        {"url": target + "search/g0"},
+        {"url": target + "search/g0/0-unsafe?term=alpha"},
+        {"url": target + "search/g0/1-safe?term=alpha"},
+        {"url": target + "search/g0/2-unsafe?term=alpha"},
+        {"url": target + "search/g0/3-safe?term=alpha"},
+        {"url": target + "render/g1"},
+        {"url": target + "render/g1/0-unsafe?term=hello"},
+        {"url": target + "render/g1/1-safe?term=hello"},
+        {"url": target + "render/g1/2-unsafe?term=hello"},
+        {"url": target + "render/g1/3-safe?term=hello"},
+    ]
+    observe(broker, solver, source, pages)
+    broker.tasks.active_spec = spec
+    first_leaf_url = target + "search/g0/0-unsafe?term=alpha"
+    original = broker.completion
+    turns = []
+
+    def completion(body):
+        turns.append(body)
+        if len(turns) == 1:
+            message = {"tool_calls": [{"function": {"name": "validator_validate_sqli", "arguments": json.dumps({
+                "target_url": first_leaf_url, "param": "term", "boolean_only": True})}}]}
+        else:
+            message = {"content": json.dumps(terminal(spec))}
+        mock_provider(monkeypatch, broker, {"choices": [{"message": message}], "usage": {
+            "prompt_tokens": 100, "completion_tokens": 10, "total_tokens": 110}})
+        return original(body)
+
+    monkeypatch.setattr(broker, "completion", completion)
+    summary = solver.phase(spec)
+    # 1 model direct + 3 SQLi residuals in g0 + 1 SSTI batch in g0 + 2 batches (SQLi+SSTI) in g1 = 7 tasks.
+    assert len(broker.executor.tasks) == 7
+    assert [task["tool_name"] for task in broker.executor.tasks].count("validator_validate_sqli") == 4
+    assert [task["tool_name"] for task in broker.executor.tasks].count("hunter_run_web_loop") == 3
+    # Accepted first_leaf_url SQLi must never be replayed.
+    assert sum(1 for task in broker.executor.tasks
+               if task["tool_name"] == "validator_validate_sqli"
+               and json.loads(task["args_json"])["target_url"] == first_leaf_url) == 1
+    assert [summary["validation_funnel"][stage] for stage in STAGES] == [16] * 5
+    assert len(summary["validation_outcomes"]) == 16
+    assert sum(r["verdict"] == "CONFIRMED" for r in summary["validation_outcomes"]) == 4
+    assert sum(r["verdict"] == "UNCONFIRMED" for r in summary["validation_outcomes"]) == 12
+    assert not any(g["reason_code"] == "invalid_or_missing_signed_evidence" for g in summary["coverage_gaps"])
+    before = len(wire)
+    assert not solver.dispatch_access_validation(spec) and len(wire) == before
+
+
+def test_grouped_16_endpoint_32_leaf_executes_all_positive_and_negative_controls(replay_lab, monkeypatch):
+    broker, target, wire = replay_lab
+    solver = PythonSolver(broker, model="model", recent_results=0)
+    source, spec = broker.tasks.specs[1:3]
+    pages = []
+    for stem, term_val in (("search", "alpha"), ("render", "hello")):
+        for grp in ("g0", "g1"):
+            pages.append({"url": target + f"{stem}/{grp}"})
+            for idx in range(4):
+                kind = "unsafe" if idx % 2 == 0 else "safe"
+                pages.append({"url": target + f"{stem}/{grp}/{idx}-{kind}?term={term_val}"})
+    observe(broker, solver, source, pages)
+    broker.tasks.active_spec = spec
+    original = broker.completion
+
+    def completion(body):
+        mock_provider(monkeypatch, broker, {"choices": [{"message": {"content": json.dumps(terminal(spec))}}],
+                      "usage": {"prompt_tokens": 100, "completion_tokens": 10, "total_tokens": 110}})
+        return original(body)
+
+    monkeypatch.setattr(broker, "completion", completion)
+    summary = solver.phase(spec)
+    assert len(broker.executor.tasks) == 8
+    assert broker.runtime_policy.tool_calls[spec.id] == 8
+    assert all(task["tool_name"] == "hunter_run_web_loop" for task in broker.executor.tasks)
+    assert [summary["validation_funnel"][stage] for stage in STAGES] == [32] * 5
+    outcomes = summary["validation_outcomes"]
+    assert len(outcomes) == 32
+    assert sum(r["verdict"] == "CONFIRMED" and r["vector"] == "injection-sqli" for r in outcomes) == 4
+    assert sum(r["verdict"] == "UNCONFIRMED" and r["vector"] == "injection-sqli" for r in outcomes) == 12
+    assert sum(r["verdict"] == "CONFIRMED" and r["vector"] == "injection-ssti" for r in outcomes) == 4
+    assert sum(r["verdict"] == "UNCONFIRMED" and r["vector"] == "injection-ssti" for r in outcomes) == 12
+    assert broker.budget.used["http"] == len(wire) <= 250
+    assert not any(g["reason_code"] == "invalid_or_missing_signed_evidence" for g in summary["coverage_gaps"])
+    before = len(wire)
+    assert not solver.dispatch_access_validation(spec) and len(wire) == before
+
+
+def test_partial_pair_checkpoint_report_rechecks_and_tamper_revocation(replay_lab, monkeypatch):
+    from cco_validator_core import load_validation
+    from cco_validator_core.evidence import persist_result
+    from test_python_holdout_regressions import prepare_identity_replay
+
+    broker, _target, wire = replay_lab
+    solver, spec = prepare_identity_replay(broker)
+    solver.batches_by_task[spec.id] = solver.batches_by_task[spec.id][:1]
+    batch = solver.batches_by_task[spec.id][0]
+    for ident, previous in solver.summaries.items():
+        path = broker.tasks.summary_path(next(s for s in broker.tasks.specs if s.id == ident))
+        path.parent.mkdir(exist_ok=True)
+        path.write_bytes(provider_json(previous))
+    solver.checkpoint.acquire()
+    solver._checkpoint_active = True
+    try:
+        original = type(broker.executor).__call__
+        accepted_vid = []
+
+        def partial_execute(self, task):
+            result = original(self, task)
+            report = result["result"]["output"]
+            validations = list(report.get("validations") or [])
+            assert len(validations) >= 2
+            accepted_vid.append(validations[0]["validation_id"])
+            if len(validations) >= 3:
+                rec = load_validation(validations[1]["validation_id"])
+                rec["verdict"] = "INCONCLUSIVE"
+                persist_result(rec, str(Path(rec["artifact"]["path"]).parent))
+                validations[1]["verdict"] = "INCONCLUSIVE"
+                report["validations"] = validations[:2]
+            else:
+                report["validations"] = validations[:1]
+            report["identity_discovery"]["budget_limited"] = True
+            return result
+
+        monkeypatch.setattr(type(broker.executor), "__call__", partial_execute)
+        assert solver.dispatch_access_validation(spec)
+        access_summary = solver.compile_summary(spec, terminal(spec, status="partial", steps=[
+            {"id": step.id, "status": "not_tested"} for step in spec.steps]))
+        solver.summaries[spec.id] = access_summary
+        access_path = broker.tasks.summary_path(spec)
+        access_path.parent.mkdir(exist_ok=True)
+        access_path.write_bytes(provider_json(access_summary))
+        solver.task_states[spec.id] = "completed"
+        solver.save_checkpoint()
+    finally:
+        solver._checkpoint_active = False
+        solver.checkpoint.release()
+
+    # Restore in a fresh PythonSolver and compile report: partial remainder persists without replay or invalid_or_missing_signed_evidence.
+    resumed = PythonSolver(broker, model="model", resume=True)
+    resumed.restore_checkpoint()
+    assert spec.id in resumed.leaf_outcomes_by_task and spec.id in resumed.pair_progress_by_task
+    assert resumed.pair_progress_by_task[spec.id]["partial_pairs"] == 1
+    before_wire = len(wire)
+    report_spec = broker.tasks.specs[3]
+    report = resumed.compile_summary(report_spec, terminal(report_spec))
+    assert len(wire) == before_wire
+    assert report["status"] == "partial"
+    assert report["validation_funnels"][spec.id]["evidence_accepted"] == 0
+    assert report["leaf_validation_funnels"][spec.id]["accepted"] == 1
+    assert report["pair_progress_by_task"][spec.id]["partial_pairs"] == 1
+    assert report["identity_comparisons"][0]["status"] == "NOT TESTED"
+    assert not any(g["reason_code"] == "invalid_or_missing_signed_evidence" for g in report["coverage_gaps"])
+    assert not resumed.dispatch_access_validation(spec) and len(wire) == before_wire
+
+    # Tampering the accepted leaf evidence revokes acceptance cleanly on refresh and report.
+    tampered_record = load_validation(accepted_vid[0])
+    Path(tampered_record["artifact"]["path"]).write_text("{}")
+    tampered_report = resumed.compile_summary(report_spec, terminal(report_spec))
+    assert tampered_report["leaf_validation_funnels"][spec.id]["accepted"] == 0
+    assert tampered_report["leaf_validation_funnels"][spec.id]["invalid_evidence"] >= 1
+    assert tampered_report["pair_progress_by_task"][spec.id]["partial_pairs"] == 0
+    assert tampered_report["pair_progress_by_task"][spec.id]["complete_pairs"] == 0
+    assert resumed.completed_member_batch(spec, batch) is False
+    assert any(g["reason_code"] == "invalid_or_missing_signed_evidence" for g in tampered_report["coverage_gaps"])
+
+
+def test_tampering_signed_inconclusive_leaf_revokes_indeterminate_state(replay_lab, monkeypatch):
+    from cco_validator_core import load_validation
+    from cco_validator_core.evidence import persist_result
+
+    broker, _target, _wire = replay_lab
+    solver = PythonSolver(broker, model="model")
+    source, spec = broker.tasks.specs[1:3]
+    observe(broker, solver, source, FROZEN["parameter_pages"][:1])
+    broker.tasks.active_spec = spec
+    row = next(r for r in solver.plan_candidates(spec) if r["vector"] == "injection-sqli")
+
+    original = type(broker.executor).__call__
+    recorded_path = []
+
+    def inconclusive_execute(self, task):
+        execution = original(self, task)
+        vid = execution["result"]["output"]["validation_id"]
+        record = load_validation(vid)
+        record["verdict"] = "INCONCLUSIVE"
+        record = persist_result(record, str(Path(record["artifact"]["path"]).parent))
+        recorded_path.append(record["artifact"]["path"])
+        execution["result"]["output"] = record
+        return execution
+
+    monkeypatch.setattr(type(broker.executor), "__call__", inconclusive_execute)
+    broker.invoke(row["tool"], row["arguments"])
+    summary = solver.compile_summary(spec, terminal(spec))
+    assert summary["leaf_validation_funnel"]["indeterminate"] == 1
+    assert summary["leaf_validation_funnel"]["invalid_evidence"] == 0
+    assert not any(g["reason_code"] == "invalid_or_missing_signed_evidence" for g in summary["coverage_gaps"])
+
+    # Tamper the signed INCONCLUSIVE artifact on disk -> must downgrade to invalid_evidence on refresh/report.
+    Path(recorded_path[0]).write_text("{}")
+    report_spec = broker.tasks.specs[3]
+    solver.summaries[spec.id] = summary
+    report = solver.compile_summary(report_spec, terminal(report_spec))
+    assert report["leaf_validation_funnels"][spec.id]["indeterminate"] == 0
+    assert report["leaf_validation_funnels"][spec.id]["invalid_evidence"] == 1
+    assert any(g["reason_code"] == "invalid_or_missing_signed_evidence" for g in report["coverage_gaps"])

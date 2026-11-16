@@ -1791,3 +1791,290 @@ def test_four_phase_real_subprocess_signed_closure_and_tamper(monkeypatch, basel
         server.shutdown()
         thread.join(timeout=5)
         server.server_close()
+
+
+def test_enum_continuation_preserves_handoff_reserve_and_empty_json_entry_member_batches(python_broker, monkeypatch):
+    target = python_broker.tasks.specs[0].target
+    python_broker.tasks.bindings = {
+        "member-a": {"target": target, "role": "member", "test_data_only": True, "owned_objects_private": True},
+        "member-b": {"target": target, "role": "member", "test_data_only": True, "owned_objects_private": True},
+    }
+    python_broker.catalog["hunter"] = [{
+        "name": "run_web_loop",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "target": {"type": "string"},
+                "live": {"type": "boolean"},
+                "crawl": {"type": "boolean"},
+                "blind_discovery": {"type": "boolean"},
+                "blind_max_requests": {"type": "integer"},
+                "max_validations": {"type": "integer"},
+                "fuzz_limit": {"type": "integer"},
+                "candidate_sample_limit": {"type": "integer"},
+                "sleep_s": {"type": "number"},
+                "session_bindings": {"type": "string"},
+            },
+            "required": ["target", "live", "session_bindings"],
+        },
+    }]
+    solver = PythonSolver(python_broker, model="model")
+    recon, enum_spec, access_spec = python_broker.tasks.specs[:3]
+    recon_view = python_broker.view({"status_code": 200, "text": '{"service":"record archive","links":[]}'})
+    python_broker.results.append({
+        "spec_id": recon.id,
+        "tool": "kali-tools_curl_request",
+        "arguments": {"url": recon.target, "follow_redirects": False},
+        **recon_view,
+    })
+    recon_summary = solver.compile_summary(recon, terminal(recon))
+    solver.summaries[recon.id] = recon_summary
+    recon_path = python_broker.tasks.summary_path(recon)
+    recon_path.parent.mkdir(parents=True, exist_ok=True)
+    dump(recon_path, recon_summary)
+
+    # Verify host_continuing keeps handoff reserve intact even during finalization.
+    policy = python_broker.runtime_policy
+    assert policy.handoff_reserves[enum_spec.id] == 3
+    policy.finalizing.add(enum_spec.id)
+    policy.host_continuing.add(enum_spec.id)
+    assert policy.tool_allowance(enum_spec) == PHASE_CALL_LIMITS["enum"] - 3
+    policy.host_continuing.discard(enum_spec.id)
+    policy.finalizing.discard(enum_spec.id)
+
+    enum_summary = solver.compile_summary(enum_spec, terminal(enum_spec))
+    solver.summaries[enum_spec.id] = enum_summary
+    dump(python_broker.tasks.summary_path(enum_spec), enum_summary)
+    python_broker.handoffs["access"] = {"producer_spec_id": enum_spec.id, "target": target, "files": {}}
+
+    candidates = solver.plan_candidates(access_spec)
+    assert len(candidates) == 1
+    assert candidates[0]["vector"] == "access-idor"
+    assert candidates[0]["eligible"] is True
+    assert candidates[0]["provenance"][0]["source_spec_id"] == recon.id
+    assert not any(
+        row["reason_code"] == "missing_declared_upstream_observations"
+        for row in solver.coverage_gaps.get(access_spec.id, [])
+    )
+
+
+def test_enum_launcher_goals_preserve_step_ids_and_exclude_hunter(tmp_path):
+    specs = launcher.bootstrap_plan("http://127.0.0.1:18765/", tmp_path / "solver", solver_mode="python_loop")
+    by_phase = {spec.phase: spec for spec in specs}
+    assert [step.id for step in by_phase["enum"].steps] == ["discover-surface"]
+    assert [step.id for step in by_phase["access"].steps] == ["minimal-validation", "broader-coverage"]
+    assert "hunter_run_web_loop" not in by_phase["enum"].tools
+    assert all(len(step.command) <= 160 for spec in specs for step in spec.steps)
+
+
+def test_first_dispatch_coalesces_both_profiles_and_retains_idor_and_residual_leaves(python_broker, monkeypatch):
+    from test_python_candidate_runtime import catalog, observe
+    catalog(python_broker)
+    solver, spec = member_solver(python_broker, monkeypatch, count=2)
+    pages = [
+        {"url": spec.target + "search/grp"},
+        {"url": spec.target + "search/grp/0?term=alpha"},
+        {"url": spec.target + "search/grp/1?term=alpha"},
+        {"url": spec.target + "other?sort=beta"},
+        {"url": spec.target + "indet"},
+        {"url": spec.target + "indet/0?term=alpha"},
+        {"url": spec.target + "indet/1?term=alpha"},
+    ]
+    observe(python_broker, solver, python_broker.tasks.specs[1], pages)
+    candidates = solver.plan_candidates(spec)
+    # Mark indet/0 SQLi as dispatch_started (interrupted/indeterminate) -> /indet SQLi cannot slice, indet/0 never replays.
+    indet_sqli = next(r for r in candidates
+                      if r["route"] == spec.target + "indet/0?term=alpha" and r["vector"] == "injection-sqli")
+    indet_sqli["dispatch_started"] = True
+
+    calls = []
+    def invoke(tool, args):
+        python_broker.runtime_policy.check_tool(spec, tool)
+        calls.append((tool, args))
+        return python_broker.view({"ok": True})
+    monkeypatch.setattr(python_broker, "invoke", invoke)
+    assert solver.dispatch_access_validation(spec)
+    # Expected calls:
+    # 1 IDOR pair (blind_discovery)
+    # + 2 /search/grp slices (SQLi + SSTI) + 1 /indet SSTI slice
+    # + 2 /other?sort=beta direct residuals (SQLi + SSTI) + 1 /indet/1?term=alpha SQLi direct residual = 7 calls.
+    assert len(calls) == 7
+    assert any(tool == "hunter_run_web_loop" and args.get("blind_discovery") for tool, args in calls)
+    hunter_slices = {(args["target"], args["validation_profile"])
+                     for tool, args in calls if tool == "hunter_run_web_loop" and args.get("validation_profile")}
+    assert hunter_slices == {
+        (spec.target + "search/grp", "readonly_sqli_boolean"),
+        (spec.target + "search/grp", "readonly_ssti_arithmetic"),
+        (spec.target + "indet", "readonly_ssti_arithmetic"),
+    }
+    direct_urls = {(tool, args["target_url"], args["param"])
+                   for tool, args in calls if tool.startswith("validator_validate_")}
+    assert direct_urls == {
+        ("validator_validate_sqli", spec.target + "other?sort=beta", "sort"),
+        ("validator_validate_ssti", spec.target + "other?sort=beta", "sort"),
+        ("validator_validate_sqli", spec.target + "indet/1?term=alpha", "term"),
+    }
+    assert indet_sqli["route"] not in {args.get("target_url") for _, args in calls}
+
+
+def test_flat_16_endpoint_32_leaf_residuals_respect_physical_14_call_ceiling(python_broker, monkeypatch):
+    from test_python_candidate_runtime import catalog, observe
+    catalog(python_broker)
+    solver = PythonSolver(python_broker, model="model")
+    source, spec = python_broker.tasks.specs[1:3]
+    pages = [{"url": spec.target + f"flat/{idx}?term=alpha"} for idx in range(16)]
+    observe(python_broker, solver, source, pages)
+    python_broker.tasks.active_spec = spec
+    monkeypatch.setattr(python_broker, "_check_handoff", lambda _spec: None)
+    monkeypatch.setattr(python_broker.engine, "tool_capability", lambda _tool: {"network": True})
+    assert solver.dispatch_access_validation(spec)
+    assert python_broker.runtime_policy.tool_calls[spec.id] == PHASE_CALL_LIMITS["access"] == 14
+    assert len(python_broker.executor.tasks) == 14
+    assert all(task["tool_name"].startswith("validator_validate_") for task in python_broker.executor.tasks)
+    rows = solver.plan_candidates(spec)
+    assert len(rows) == 32
+    exhausted = [r for r in rows if r["reason_code"] == "phase_tool_budget_exhausted"]
+    assert len(exhausted) == 18 and all(r["validation_state"] == "NOT TESTED" for r in exhausted)
+
+
+@pytest.fixture
+def solver_replay_lab(python_broker, monkeypatch):
+    from test_python_candidate_runtime import replay_lab
+
+    yield from getattr(replay_lab, "__wrapped__", replay_lab)(python_broker, monkeypatch)
+
+
+def test_partial_member_pair_tracks_leaf_progress_without_misleading_invalid_gap(solver_replay_lab, monkeypatch):
+    from cco_validator_core import load_validation
+    from cco_validator_core.evidence import persist_result
+    from test_python_holdout_regressions import prepare_identity_replay
+
+    broker, _target, wire = solver_replay_lab
+    solver, spec = prepare_identity_replay(broker)
+    solver.batches_by_task[spec.id] = solver.batches_by_task[spec.id][:1]
+    batch = solver.batches_by_task[spec.id][0]
+    row = solver.plan_candidates(spec)[0]
+
+    original = type(broker.executor).__call__
+
+    def partial_pair_execute(self, task):
+        result = original(self, task)
+        report = result["result"]["output"]
+        validations = list(report.get("validations") or [])
+        assert len(validations) >= 2
+        # Keep validations[0] as valid signed CONFIRMED/UNCONFIRMED.
+        # Make validations[1] genuinely INCONCLUSIVE (valid signature, INCONCLUSIVE verdict).
+        # Drop any remaining validations so they stay pending in validation_queue.
+        if len(validations) >= 3:
+            inc = validations[1]
+            rec = load_validation(inc["validation_id"])
+            rec["verdict"] = "INCONCLUSIVE"
+            persist_result(rec, str(Path(rec["artifact"]["path"]).parent))
+            inc["verdict"] = "INCONCLUSIVE"
+            report["validations"] = [validations[0], inc]
+            expected_pending = len(report["validation_queue"]) - 2
+            expected_indet = 1
+        else:
+            report["validations"] = [validations[0]]
+            expected_pending = len(report["validation_queue"]) - 1
+            expected_indet = 0
+        report["identity_discovery"]["budget_limited"] = True
+        partial_pair_execute.expected = (len(report["validation_queue"]), 1, expected_pending, expected_indet)
+        return result
+
+    monkeypatch.setattr(type(broker.executor), "__call__", partial_pair_execute)
+    assert solver.dispatch_access_validation(spec)
+    observed, accepted, pending, indeterminate = partial_pair_execute.expected
+
+    # Strict pair completeness remains False, and candidate-unit validation_funnel is unchanged.
+    assert solver.completed_member_batch(spec, batch) is False
+    summary = solver.compile_summary(spec, terminal(spec, status="partial", steps=[
+        {"id": step.id, "status": "not_tested"} for step in spec.steps]))
+    assert summary["validation_funnel"]["unit"] == "deduplicated_task_candidate"
+    assert summary["validation_funnel"]["evidence_accepted"] == 0
+    pair_cand = next(c for c in summary["validation_funnel"]["candidates"] if c["vector"] == "access-idor")
+    assert pair_cand["validation_state"] == "NOT TESTED"
+    assert pair_cand["reason_code"] == "partial_leaf_coverage"
+
+    # Explicit leaf-outcome and pair-progress metrics expose the valid partial coverage.
+    leaf_funnel = summary["leaf_validation_funnel"]
+    assert leaf_funnel["unit"] == "signed_validation_leaf"
+    assert (leaf_funnel["observed"], leaf_funnel["accepted"], leaf_funnel["pending"],
+            leaf_funnel["indeterminate"], leaf_funnel["invalid_evidence"]) == (
+        observed, accepted, pending, indeterminate, 0
+    )
+    pair_prog = summary["pair_progress"]
+    assert pair_prog["schema"] == "python-pair-progress/1"
+    assert pair_prog["total_pairs"] == 3 and pair_prog["complete_pairs"] == 0 and pair_prog["partial_pairs"] == 1
+    pair_entry = next(p for p in pair_prog["pairs"] if p["identities"] == list(batch))
+    assert pair_entry["complete"] is False and pair_entry["partial_coverage"] is True
+    assert pair_entry["status"] == "NOT TESTED" and pair_entry["coverage_state"] == "partial_coverage"
+    assert (pair_entry["observed"], pair_entry["accepted"], pair_entry["pending"],
+            pair_entry["indeterminate"], pair_entry["invalid_evidence"]) == (
+        observed, accepted, pending, indeterminate, 0
+    )
+    pair_comp = next(c for c in summary["identity_comparisons"] if c["identities"] == list(batch))
+    assert pair_comp["status"] == "NOT TESTED"
+    assert pair_comp["reason_code"] == "partial_leaf_coverage"
+    assert not any(g["reason_code"] == "invalid_or_missing_signed_evidence" for g in summary["coverage_gaps"])
+    import python_identity_discovery as discovery
+    prior_discovery_env = os.environ.get("CCO_PYTHON_DISCOVERY_INVOCATION")
+    try:
+        disc_payload = json.loads(discovery.prepare_discovery(broker, spec, row["arguments"]).read_bytes())["payload"]
+        assert disc_payload["states"] == {} and disc_payload["sources"] == []
+        before = len(wire)
+        assert not solver.dispatch_access_validation(spec) and len(wire) == before
+    finally:
+        if prior_discovery_env is None:
+            os.environ.pop("CCO_PYTHON_DISCOVERY_INVOCATION", None)
+        else:
+            os.environ["CCO_PYTHON_DISCOVERY_INVOCATION"] = prior_discovery_env
+
+
+def test_partial_parameter_slice_shortfall_tracks_leaf_outcomes_without_invalid_gap(solver_replay_lab, monkeypatch):
+    from cco_validator_core import load_validation
+    from cco_validator_core.evidence import persist_result
+    from test_python_candidate_runtime import observe
+
+    broker, target, wire = solver_replay_lab
+    solver = PythonSolver(broker, model="model", recent_results=0)
+    source, spec = broker.tasks.specs[1:3]
+    spec.vector = "injection-sqli"
+    pages = [
+        {"url": target + "search/part"},
+        {"url": target + "search/part/0-unsafe?term=alpha"},
+        {"url": target + "search/part/1-safe?term=alpha"},
+        {"url": target + "search/part/2-safe?term=alpha"},
+    ]
+    observe(broker, solver, source, pages)
+    broker.tasks.active_spec = spec
+
+    original = type(broker.executor).__call__
+
+    def partial_slice_execute(self, task):
+        result = original(self, task)
+        report = result["result"]["output"]
+        validations = list(report.get("validations") or [])
+        assert len(validations) == 3
+        # validations[0]: valid accepted; validations[1]: valid INCONCLUSIVE; validations[2]: unexecuted pending.
+        inc = validations[1]
+        rec = load_validation(inc["validation_id"])
+        rec["verdict"] = "INCONCLUSIVE"
+        persist_result(rec, str(Path(rec["artifact"]["path"]).parent))
+        inc["verdict"] = "INCONCLUSIVE"
+        report["validations"] = [validations[0], inc]
+        report["stopped"] = "http_budget_exhausted"
+        return result
+
+    monkeypatch.setattr(type(broker.executor), "__call__", partial_slice_execute)
+    assert solver.dispatch_access_validation(spec)
+    summary = solver.compile_summary(spec, terminal(spec, status="partial", steps=[
+        {"id": step.id, "status": "not_tested"} for step in spec.steps]))
+    assert summary["validation_funnel"]["observed"] == 3
+    assert summary["validation_funnel"]["executed"] == 2
+    assert summary["validation_funnel"]["evidence_accepted"] == 1
+    lf = summary["leaf_validation_funnel"]
+    assert (lf["observed"], lf["accepted"], lf["pending"], lf["indeterminate"], lf["invalid_evidence"]) == (3, 1, 1, 1, 0)
+    assert not any(g["reason_code"] == "invalid_or_missing_signed_evidence" for g in summary["coverage_gaps"])
+    before = len(wire)
+    assert not solver.dispatch_access_validation(spec) and len(wire) == before
