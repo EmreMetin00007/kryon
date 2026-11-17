@@ -22,16 +22,24 @@ from lab import (
     readonly_sqli_holdout,
     readonly_ssti_holdout,
     readonly_traversal_holdout,
+    readonly_xss_redirect_holdout,
 )
 
 FAMILIES = {module.FAMILY: module for module in (
-    readonly_api_holdout, readonly_sqli_holdout, readonly_ssti_holdout, readonly_traversal_holdout, post_carrier_holdout)}
+    readonly_api_holdout,
+    readonly_sqli_holdout,
+    readonly_ssti_holdout,
+    readonly_traversal_holdout,
+    post_carrier_holdout,
+    readonly_xss_redirect_holdout,
+)}
 
 
 def finding_type(family):
     return {readonly_api_holdout.FAMILY: "idor", readonly_sqli_holdout.FAMILY: "sql_injection",
             readonly_ssti_holdout.FAMILY: "ssti", readonly_traversal_holdout.FAMILY: "path_traversal",
-            post_carrier_holdout.FAMILY: "post_carrier_injection"}[family]
+            post_carrier_holdout.FAMILY: "post_carrier_injection",
+            readonly_xss_redirect_holdout.FAMILY: "xss_and_open_redirect"}[family]
 
 
 def digest(path):
@@ -321,6 +329,9 @@ def evaluate(truth, wire, artifacts, *, target, run_id, verify_artifact, claims=
         elif family == post_carrier_holdout.FAMILY:
             post_reason, matched = post_carrier_holdout.evidence_matches(case, record, wire, target)
             reason = reason or post_reason
+        elif family == readonly_xss_redirect_holdout.FAMILY:
+            xr_reason, matched = readonly_xss_redirect_holdout.evidence_matches(case, record, wire, target)
+            reason = reason or xr_reason
         else:
             if context.get("resource_owner") != case["owner"] or context.get("identity") not in case["denied_identities"]:
                 reason = "authorization identity binding mismatch"
@@ -659,7 +670,7 @@ def extract_access_receipts_and_run_ids(
                       if row["arguments"].get("live") and not row["error"]]
     run_ids = [row["run_id"] for row in native_reports]
     validator_receipts: dict[str, dict[str, Any]] = {}
-    if family == post_carrier_holdout.FAMILY:
+    if family in {post_carrier_holdout.FAMILY, readonly_xss_redirect_holdout.FAMILY}:
         for row in tool_index:
             if row.get("task_spec_id") == "access-3" and str(row.get("tool") or "").startswith("validator_validate_"):
                 receipt = json.loads(Path(row["artifact"]).read_text(encoding="utf-8"))
@@ -703,6 +714,24 @@ def verify_holdout_artifact(
     if family == post_carrier_holdout.FAMILY:
         vtype = str(record.get("vuln_type") or "").lower()
         expected_finding = "sql_injection" if "sql" in vtype else ("ssti" if "template" in vtype or "ssti" in vtype else "")
+        if not expected_finding or not artifact_is_current_fn(
+            record, trusted_root=trusted_root,
+            expected_target=record["target"], expected_finding_type=expected_finding,
+        ):
+            return False
+        receipt = validator_receipts.get(str(record.get("validation_id") or ""))
+        if receipt is not None:
+            args = receipt.get("arguments") or {}
+            ctx = record.get("execution_context") or {}
+            return (
+                args.get("target_url") == record.get("target")
+                and ctx.get("param") == args.get("param")
+                and ctx.get("method", "GET") == args.get("method", "GET")
+                and ctx.get("carrier", "query") == args.get("carrier", "query")
+            )
+    elif family == readonly_xss_redirect_holdout.FAMILY:
+        vtype = str(record.get("vuln_type") or "").lower()
+        expected_finding = "xss" if "xss" in vtype else ("open_redirect" if "redirect" in vtype else "")
         if not expected_finding or not artifact_is_current_fn(
             record, trusted_root=trusted_root,
             expected_target=record["target"], expected_finding_type=expected_finding,

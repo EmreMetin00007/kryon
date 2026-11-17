@@ -465,7 +465,8 @@ _PUBLIC_TYPES = {
     "candidate_source": {"light_oracle", "bounded_sampling", "surface_applicability", "identity_discovery",
                          "observed", "declared"},
     "candidate_reason": {"observed_signal", "valid_baseline_without_light_signal", "readonly_traversal_validator",
-                         "readonly_ssti_validator", "readonly_boolean_validator", "observed_access_surface"},
+                         "readonly_ssti_validator", "readonly_boolean_validator",
+                         "readonly_xss_validator", "readonly_redirect_validator", "observed_access_surface"},
 }
 _PUBLIC_PATH_WORDS = {"api", "v1", "v2", "v3", "users", "user", "objects", "object", "accounts",
                       "account", "resources", "resource", "profile", "me", "self", "search",

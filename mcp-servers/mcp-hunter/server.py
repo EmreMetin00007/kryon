@@ -1674,10 +1674,31 @@ def fuzz_attack_surface(target: str, limit: int = 8, max_requests: int = 40,
     queue = next_work(target, limit=1000 if profile_only else max(1, int(limit)), untested_only=False, db_path=MEM_DB)
     if profile_only:
         prefix = urlsplit(target).path.rstrip("/")
-        queue["queue"] = [record for record in queue.get("queue", [])
+        filtered_queue = [record for record in queue.get("queue", [])
                           if (urlsplit(record.get("url") or "").path == prefix
                               or urlsplit(record.get("url") or "").path.startswith(prefix + "/"))
-                          and record.get("params")][:max(1, int(limit))]
+                          and record.get("params")]
+        if xss_only or redirect_only:
+            try:
+                from python_candidate_runtime import surface_profile_applicability
+                prof_name = "readonly_xss_reflection" if xss_only else "readonly_open_redirect"
+                applicable_queue = [
+                    record for record in filtered_queue
+                    if any(
+                        surface_profile_applicability(
+                            str(record.get("url") or ""),
+                            str(p.get("name") if isinstance(p, dict) else p),
+                            str(p.get("sample", "") if isinstance(p, dict) else ""),
+                            prof_name,
+                        )[1]
+                        for p in (record.get("params") or [])
+                    )
+                ]
+                if applicable_queue:
+                    filtered_queue = applicable_queue
+            except ImportError:
+                pass
+        queue["queue"] = filtered_queue[:max(1, int(limit))]
     probes = []
     from policy_engine import PolicyEngine, ScopeResolver
     from cco_hunter_core.campaign_gaps import versions
