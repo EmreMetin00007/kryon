@@ -19,7 +19,7 @@ MAX_JSON_DISCOVERY_NODES = 1024
 _PAGINATION_KEYS = frozenset({"next", "next_url", "prev", "previous", "prev_url", "first", "last"})
 _DIRECT_LINK_KEYS = frozenset({"url", "href", "uri", "link", "action", "endpoint", "self"})
 _ENVELOPE_LINK_LIST_KEYS = frozenset({
-    "links", "internal_links", "urls_sample", "pages", "urls_with_params", "form_actions", "js_files",
+    "links", "internal_links", "urls_sample", "pages", "urls_with_params", "form_actions", "js_files", "actions", "forms",
 })
 _ENVELOPE_RECORD_LIST_KEYS = frozenset({"records", "work_queue"})
 _COLLECTION_CONTAINER_KEYS = frozenset({
@@ -178,6 +178,10 @@ def _public_action_item(action: dict[str, Any]) -> dict[str, Any]:
         "child_count": len(action.get("child_action_ids", [])),
         "provenance": copy.deepcopy(action.get("provenance", [])[:1]),
     }
+    if action.get("carrier"):
+        item["carrier"] = action["carrier"]
+    if action.get("content_type"):
+        item["content_type"] = action["content_type"]
     if action.get("reason_code"):
         item["reason_code"] = action["reason_code"]
     return item
@@ -255,6 +259,8 @@ class DiscoveryState:
         http_status: int | None = None,
         result_artifact: str | None = None,
         result_sha256: str | None = None,
+        carrier: str = "",
+        content_type: str = "",
     ) -> dict[str, Any]:
         if status not in ACTION_STATUSES:
             raise ValueError("invalid_discovery_action_status")
@@ -264,6 +270,8 @@ class DiscoveryState:
         normalized_prov = [self.add_source(item) for item in prov_items]
         norm_method = (method or "GET").upper()
         norm_kind = str(kind or "http_request")
+        norm_carrier = str(carrier or "").strip().lower()
+        norm_ctype = str(content_type or "").split(";", 1)[0].strip().lower()
         stored_params, param_names = _extract_param_names(url, params)
         action_id = stable_action_id(
             self.task_spec_id,
@@ -306,11 +314,23 @@ class DiscoveryState:
                 "result_sha256": result_sha256,
                 "continuation_depth": depth,
             }
+            if norm_carrier:
+                record["carrier"] = norm_carrier
+            if norm_ctype:
+                record["content_type"] = norm_ctype
             self.actions[action_id] = record
         else:
             existing["provenance"] = _dedup_dicts([*existing["provenance"], *normalized_prov])
             if relation not in existing["link_relations"]:
                 existing["link_relations"].append(relation)
+            if relation == "pagination" or (
+                relation == "json_link" and existing.get("link_relation") != "pagination"
+            ):
+                existing["link_relation"] = relation
+            if norm_carrier and not existing.get("carrier"):
+                existing["carrier"] = norm_carrier
+            if norm_ctype and not existing.get("content_type"):
+                existing["content_type"] = norm_ctype
             if parent_action_id and parent_action_id != action_id:
                 if existing.get("parent_action_id") is None:
                     existing["parent_action_id"] = parent_action_id
@@ -570,6 +590,8 @@ def compact_frontier(
                 "status",
                 "kind",
                 "method",
+                "carrier",
+                "content_type",
                 "route_shape",
                 "param_names",
                 "link_relation",
@@ -634,6 +656,50 @@ def _normalize_candidate_link(
     return parsed._replace(fragment="").geturl()
 
 
+def structured_params_from_node(node: dict[str, Any], method: str = "GET") -> tuple[list[dict[str, Any]] | None, str]:
+    """Extract normalized form/json param declarations and content_type from a descriptor object."""
+    norm_method = str(method or "GET").upper()
+    raw_ctype = node.get("content_type")
+    ctype = raw_ctype.split(";", 1)[0].strip().lower() if isinstance(raw_ctype, str) else ""
+    if isinstance(node.get("params"), list):
+        return copy.deepcopy(node["params"]), ctype
+    if norm_method == "GET":
+        return None, ctype
+    json_obj = node.get("json_body") if isinstance(node.get("json_body"), dict) else (
+        node.get("body") if isinstance(node.get("body"), dict) and ctype in {"", "application/json"} else None
+    )
+    if isinstance(json_obj, dict):
+        derived = [
+            {
+                "name": k,
+                "in": "json",
+                "sample": "" if v is None else ("true" if v is True else "false" if v is False else str(v)),
+            }
+            for k, v in json_obj.items()
+            if valid_parameter_name(k) and (v is None or isinstance(v, (str, int, float, bool)))
+        ]
+        return derived, ctype or "application/json"
+    form_obj = (
+        node.get("form") if isinstance(node.get("form"), dict)
+        else node.get("form_fields") if isinstance(node.get("form_fields"), dict)
+        else node.get("fields") if isinstance(node.get("fields"), dict)
+        else None
+    )
+    if isinstance(form_obj, dict):
+        param_in = "json" if ctype == "application/json" else "form"
+        derived = [
+            {
+                "name": k,
+                "in": param_in,
+                "sample": "" if v is None else ("true" if v is True else "false" if v is False else str(v)),
+            }
+            for k, v in form_obj.items()
+            if valid_parameter_name(k) and (v is None or isinstance(v, (str, int, float, bool)))
+        ]
+        return derived, ctype or ("application/json" if param_in == "json" else "application/x-www-form-urlencoded")
+    return None, ctype
+
+
 def extract_json_hypermedia(
     payload: Any,
     base_url: str,
@@ -652,7 +718,7 @@ def extract_json_hypermedia(
         return [], False
     effective_origin = origin_url or base_url
     extracted: list[dict[str, Any]] = []
-    seen: set[tuple[str, str, str, str]] = set()
+    seen: set[tuple[str, str, str, str, str]] = set()
     truncated = False
     nodes_visited = 0
 
@@ -681,10 +747,14 @@ def extract_json_hypermedia(
             return
         norm_method = str(method or "GET").upper()
         ident = ""
+        ctype = ""
         if isinstance(extra, dict):
             raw_ident = extra.get("identity_ref", extra.get("identity", ""))
             ident = str(raw_ident) if isinstance(raw_ident, str) else ""
-        dedup_key = (norm_method, resolved, ident, link_relation)
+            derived_params, ctype = structured_params_from_node(extra, norm_method)
+            if params is _unset and derived_params is not None:
+                params = derived_params
+        dedup_key = (norm_method, resolved, ident, link_relation, ctype)
         if dedup_key in seen:
             return
         seen.add(dedup_key)
@@ -696,8 +766,10 @@ def extract_json_hypermedia(
             item["link_relation"] = link_relation
         if params is not _unset:
             item["params"] = copy.deepcopy(params)
+        if ctype:
+            item["content_type"] = ctype
         if isinstance(extra, dict):
-            for field in ("identity_ref", "identity", "candidate_reason"):
+            for field in ("identity_ref", "identity", "candidate_reason", "operation_id"):
                 if field in extra:
                     item[field] = copy.deepcopy(extra[field])
         extracted.append(item)
@@ -730,7 +802,13 @@ def extract_json_hypermedia(
         rel_value = str(node.get("rel") or "").strip().lower()
         node_pagination = in_pagination or rel_value in _PAGINATION_KEYS
         default_rel = "json_link" if (from_http_body or parent_key in {"items", "results", "data", "entries", "_links", "links"}) else ""
-        direct_url = node.get("url") if "url" in node else node.get("href")
+        direct_url = (
+            node.get("url") if "url" in node
+            else node.get("href") if "href" in node
+            else (node.get("action") if "action" in node and "method" in node
+                  else node.get("endpoint") if "endpoint" in node and "method" in node
+                  else None)
+        )
         if isinstance(direct_url, str) and (
             parent_key in _ENVELOPE_LINK_LIST_KEYS
             or parent_key in _ENVELOPE_RECORD_LIST_KEYS
@@ -753,7 +831,7 @@ def extract_json_hypermedia(
             if not isinstance(key, str):
                 continue
             low = key.lower()
-            if low in {"url", "href"} and value is direct_url:
+            if low in {"url", "href", "action", "endpoint"} and value is direct_url:
                 continue
             if low in _PAGINATION_KEYS:
                 if isinstance(value, str):

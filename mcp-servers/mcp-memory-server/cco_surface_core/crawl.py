@@ -355,7 +355,21 @@ def _crawl_site_sync(start, max_pages, extra_headers, timeout_ms, allow_subdomai
                         title = page.title() or ""
                     except Exception:
                         title = ""
-                    pages.append({"url": current, "status": status, "title": title[:180], "identity": identity})
+                    pages.append({
+                        "url": current,
+                        "status": status,
+                        "title": title[:180],
+                        "identity": identity,
+                        **(
+                            {
+                                "content_type": (
+                                    (resp.headers.get("content-type") or "").split(";", 1)[0].strip().lower()
+                                )
+                            }
+                            if resp and (resp.headers.get("content-type") or "").strip()
+                            else {}
+                        ),
+                    })
                     frontier.finish(work)
                     collect()
                     capture_index = [len(captured)]
@@ -379,6 +393,13 @@ def _crawl_site_sync(start, max_pages, extra_headers, timeout_ms, allow_subdomai
                             typ = inp.get_attribute("type") or "text"
                             if name:
                                 field_item = {"name": name, "type": typ}
+                                if typ.lower() != "password":
+                                    raw_val = inp.get_attribute("value") or ""
+                                    if raw_val:
+                                        from .normalize import safe_sample
+                                        sampled = safe_sample(name, raw_val)
+                                        if sampled and sampled != "<redacted>":
+                                            field_item["value"] = sampled
                                 fields.append(field_item)
                         forms.append({
                             "page": current,

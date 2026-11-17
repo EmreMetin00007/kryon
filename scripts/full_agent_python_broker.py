@@ -757,10 +757,19 @@ class PythonBroker(HostBroker):
                         # bounded defaults; preserve required schema constraints.
                         # Do this before the first access turn too, so a large
                         # catalog alone cannot force premature summary-only mode.
+                        has_post_cards = any(
+                            isinstance(card, dict) and card.get('method', 'GET') != 'GET'
+                            for card in (context.get('candidate_cards') or [])
+                        )
+                        sqli_fields = {'target_url', 'param', 'method', 'carrier', 'boolean_only'}
+                        ssti_fields = {'target_url', 'param', 'method', 'carrier'}
+                        if has_post_cards:
+                            sqli_fields.update({'body_template', 'headers_json', 'baseline_value'})
+                            ssti_fields.update({'body_template', 'headers_json'})
                         fields = {'hunter_run_web_loop': {'target', 'live', 'session_bindings', 'validation_profile'},
                                    COVERAGE_TOOL: {'target', 'campaign_id'},
-                                   'validator_validate_sqli': {'target_url', 'param', 'method', 'carrier', 'boolean_only'},
-                                   'validator_validate_ssti': {'target_url', 'param', 'method', 'carrier'},
+                                   'validator_validate_sqli': sqli_fields,
+                                   'validator_validate_ssti': ssti_fields,
                                    'validator_validate_path_traversal': {'target_url', 'param', 'method', 'carrier'}}
                         for tool in candidate['tools']:
                             name = tool['function']['name']
@@ -1182,16 +1191,33 @@ class PythonBroker(HostBroker):
                     )
         self.results.append(row)
         dump(self.private / "python-tool-results.json", self.results)
-        if spec.phase == "access" and tool == "hunter_run_web_loop":
+        if spec.phase == "access" and (tool == "hunter_run_web_loop" or tool.startswith("validator_validate_")):
             reports = [json.loads((self.workdir / item["content_ref"]["path"]).read_bytes())
                        for item in self.results if item["spec_id"] == spec.id
-                       and item["tool"] == tool and item["arguments"].get("live") is True]
+                       and item["tool"] == "hunter_run_web_loop" and item["arguments"].get("live") is True]
             reports = [item for item in reports if isinstance(item, dict) and item.get("run_id")]
+            direct_vals = [json.loads((self.workdir / item["content_ref"]["path"]).read_bytes())
+                           for item in self.results if item["spec_id"] == spec.id
+                           and item["tool"].startswith("validator_validate_")]
+            direct_vals = [item for item in direct_vals if isinstance(item, dict) and item.get("validation_id")]
             (self.workdir / "access").mkdir(exist_ok=True)
-            dump(self.workdir / "access/live-result.json", {
-                "producer": "host", "run_ids": [item["run_id"] for item in reports],
-                "validations": [item for report in reports for item in report.get("validations", [])],
-                "confirmed": [item for report in reports for item in report.get("confirmed", [])]})
+            live_payload: dict[str, Any] = {
+                "producer": "host",
+                "run_ids": [item["run_id"] for item in reports],
+                "validations": [
+                    *[item for report in reports for item in report.get("validations", [])],
+                    *[{"validation_id": item["validation_id"], "verdict": item.get("verdict"), "url": item.get("target")}
+                      for item in direct_vals],
+                ],
+                "confirmed": [
+                    *[item for report in reports for item in report.get("confirmed", [])],
+                    *[{"validation_id": item["validation_id"], "verdict": item.get("verdict"), "url": item.get("target")}
+                      for item in direct_vals if item.get("verdict") == "CONFIRMED"],
+                ],
+            }
+            if direct_vals:
+                live_payload["direct_validation_ids"] = [item["validation_id"] for item in direct_vals]
+            dump(self.workdir / "access/live-result.json", live_payload)
         if spec.phase == "access":
             self.persist_validation_attempts(spec)
         self.write_attempt_ledger()
@@ -1339,8 +1365,13 @@ class PythonBroker(HostBroker):
                         # deterministic oracle, not just a valid artifact ID.
                         profile = ("readonly_sqli_boolean" if row["tool"] == "validator_validate_sqli"
                                    else "readonly_ssti_arithmetic")
-                        if (args.get("method", "GET") == "GET" and args.get("carrier", "query") == "query"
-                                and (row["tool"] != "validator_validate_sqli" or args.get("boolean_only") is True)):
+                        method_arg = str(args.get("method", "GET") or "GET").upper()
+                        carrier_arg = str(args.get("carrier", "query") or "query").lower()
+                        carrier_ok = (
+                            (method_arg == "GET" and carrier_arg == "query")
+                            or (method_arg == "POST" and carrier_arg in {"form", "json"})
+                        )
+                        if (carrier_ok and (row["tool"] != "validator_validate_sqli" or args.get("boolean_only") is True)):
                             if (record.get("oracle") != PROFILES[profile][2]
                                     or not {"param", "method", "carrier", "identity"} <= context.keys()
                                     or context.get("identity") not in {"anon", "anonymous"}):
@@ -1367,16 +1398,95 @@ class PythonBroker(HostBroker):
                     "source_artifact": ref["path"], "source_sha256": ref["sha256"]}
         return list(attempts.values())
 
-    def profile_eligibility(self, spec, url: str, param: str, carrier: str, profile: str) -> dict[str, Any]:
+    def _program_policy_map(self) -> dict[str, Any] | None:
+        policy_map = getattr(self.engine, "program_policy", None)
+        if isinstance(policy_map, dict):
+            return policy_map
+        if os.environ.get("CCO_PROGRAM_POLICY_FILE"):
+            try:
+                from policy_engine import PolicyEngine
+                return dict(PolicyEngine().program_policy)
+            except (ValueError, OSError, TypeError):
+                return None
+        return None
+
+    def is_readonly_post_authorized(
+        self,
+        url: str,
+        *,
+        carrier: str = "",
+        operation_id: str = "",
+    ) -> bool:
+        """Check whether private policy explicitly authorizes this exact read-only POST operation."""
+        policy_map = self._program_policy_map()
+        if not isinstance(policy_map, dict):
+            return False
+        declarations = policy_map.get("readonly_operations")
+        if not isinstance(declarations, list) or not declarations:
+            return False
+        parsed = urlsplit(url)
+        if parsed.scheme.lower() not in {"http", "https"} or not parsed.hostname:
+            return False
+        target_url = parsed._replace(fragment="").geturl()
+        if os.environ.get("CCO_SCOPE_FILE"):
+            try:
+                from policy_engine import ScopeResolver
+                if not ScopeResolver(scope_file=os.environ.get("CCO_SCOPE_FILE")).permits_url(target_url):
+                    return False
+            except (ValueError, OSError, TypeError):
+                return False
+        norm_carrier = {"body": "form"}.get(str(carrier or "").strip().lower(), str(carrier or "").strip().lower())
+        for row in declarations:
+            if not isinstance(row, dict):
+                continue
+            if str(row.get("method") or "").upper() != "POST" or row.get("read_only") is not True:
+                continue
+            row_url = urlsplit(str(row.get("url") or ""))._replace(fragment="").geturl()
+            if row_url != target_url:
+                continue
+            if operation_id and row.get("operation_id") != operation_id:
+                continue
+            allowed_carriers = row.get("carriers")
+            if norm_carrier and isinstance(allowed_carriers, list) and norm_carrier not in allowed_carriers:
+                continue
+            return True
+        return False
+
+    def profile_eligibility(
+        self,
+        spec,
+        url: str,
+        param: str,
+        carrier: str,
+        profile: str,
+        *,
+        method: str = "GET",
+    ) -> dict[str, Any]:
         """Evaluate private-policy eligibility inside the trusted host boundary.
 
         Exposes only an eligibility boolean and controlled reason code, never
         file names, policy fragments, markers, or suggested routes.
         """
-        if profile != "readonly_traversal_application_files":
-            return {"eligible": True, "reason_code": ""}
+        norm_method = str(method or "GET").upper()
         spec_origin = urlsplit(spec.target)
         cand_origin = urlsplit(url)
+        if norm_method == "POST":
+            if profile not in {"readonly_sqli_boolean", "readonly_ssti_arithmetic"}:
+                return {"eligible": False, "reason_code": "unsupported_readonly_method"}
+            if (cand_origin.scheme, cand_origin.netloc) != (spec_origin.scheme, spec_origin.netloc):
+                return {"eligible": False, "reason_code": "unsupported_readonly_method"}
+            if not self.is_readonly_post_authorized(url):
+                return {"eligible": False, "reason_code": "unsupported_readonly_method"}
+            norm_carrier = {"body": "form"}.get(str(carrier or "").strip().lower(), str(carrier or "").strip().lower())
+            if norm_carrier not in {"form", "json"}:
+                return {"eligible": False, "reason_code": "unsupported_parameter_carrier"}
+            if self.is_readonly_post_authorized(url, carrier=norm_carrier):
+                return {"eligible": True, "reason_code": ""}
+            return {"eligible": False, "reason_code": "unsupported_parameter_carrier"}
+        if norm_method != "GET":
+            return {"eligible": False, "reason_code": "unsupported_readonly_method"}
+        if profile != "readonly_traversal_application_files":
+            return {"eligible": True, "reason_code": ""}
         if (cand_origin.scheme, cand_origin.netloc) != (spec_origin.scheme, spec_origin.netloc):
             return {"eligible": False, "reason_code": "traversal_policy_invalid"}
         validator_path = str(Path(__file__).resolve().parents[1] / "mcp-servers/mcp-validator")
@@ -1384,19 +1494,12 @@ class PythonBroker(HostBroker):
             sys.path.append(validator_path)
         from cco_validator_core.traversal import check_traversal_policy_eligibility
 
-        rule: Any = None
-        policy_map = getattr(self.engine, "program_policy", None)
-        if isinstance(policy_map, dict):
-            rule = policy_map.get("path_traversal")
-        elif os.environ.get("CCO_PROGRAM_POLICY_FILE"):
-            try:
-                from policy_engine import PolicyEngine
-                engine = PolicyEngine()
-                rule = engine.program_policy.get("path_traversal")
-            except (ValueError, OSError, TypeError):
+        policy_map = self._program_policy_map()
+        if policy_map is None:
+            if os.environ.get("CCO_PROGRAM_POLICY_FILE"):
                 return {"eligible": False, "reason_code": "traversal_policy_invalid"}
-        else:
             return {"eligible": False, "reason_code": "traversal_policy_not_declared"}
+        rule: Any = policy_map.get("path_traversal")
 
         permits = lambda candidate_url: (
             urlsplit(candidate_url).scheme == spec_origin.scheme
@@ -1525,14 +1628,28 @@ class PythonBroker(HostBroker):
     def direct_request_context(self, record, args):
         """Infer a slice only from signed wire traces, not unsigned tool metadata."""
         target = urlsplit(args.get("target_url", ""))
+        param = args.get("param")
+        method = str(args.get("method", "GET") or "GET").upper()
+        carrier = str(args.get("carrier", "query") or "query").lower()
+        if not param:
+            return {}
+        probes = record.get("request_evidence", [])
+        if method == "POST" and carrier in {"form", "json"}:
+            template = args.get("body_template")
+            if not isinstance(template, str) or "{{PAYLOAD}}" not in template or not probes:
+                return {}
+            for probe in probes:
+                url = urlsplit(probe.get("request_url", ""))
+                if ((url.scheme, url.netloc, url.path) != (target.scheme, target.netloc, target.path)
+                        or probe.get("method") != "POST" or not probe.get("transport_ok")):
+                    return {}
+            return {"param": param, "method": "POST", "carrier": carrier, "identity": "anon"}
         try:
             baseline = query_parameters(args.get("target_url", ""))
         except ValueError:
             return {}
-        param = args.get("param")
-        if not param or param not in baseline or args.get("method", "GET") != "GET" or args.get("carrier", "query") != "query":
+        if param not in baseline or method != "GET" or carrier != "query":
             return {}
-        probes = record.get("request_evidence", [])
         changed = False
         for probe in probes:
             url = urlsplit(probe.get("request_url", ""))

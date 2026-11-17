@@ -1154,6 +1154,44 @@ class PolicyEngine:
                             or re.search(r"[%\\\s]", login["login_url"])
                             or not re.search(r"/(?:quick-)?login$", parsed_login.path, re.I)):
                         raise ValueError("member_login.login_url must be an exact login URL")
+            if "readonly_operations" in raw:
+                ro_ops = raw["readonly_operations"]
+                if not isinstance(ro_ops, list):
+                    raise ValueError(
+                        f"malformed program policy file {self.program_policy_file}: readonly_operations must be an array"
+                    )
+                for item in ro_ops:
+                    if (not isinstance(item, dict)
+                            or set(item) - {"method", "url", "operation_id", "read_only", "carriers", "test_data_only"}
+                            or str(item.get("method") or "").upper() != "POST"
+                            or item.get("read_only") is not True
+                            or not isinstance(item.get("url"), str) or not item["url"]
+                            or not isinstance(item.get("operation_id"), str) or not item["operation_id"].strip()):
+                        raise ValueError(
+                            f"malformed program policy file {self.program_policy_file}: "
+                            "readonly_operations entries require method=POST, read_only=true, url, and operation_id"
+                        )
+                    parsed_op = urlparse(item["url"])
+                    if (parsed_op.scheme not in {"http", "https"} or not parsed_op.hostname
+                            or parsed_op.username is not None or parsed_op.fragment
+                            or re.search(r"[\s]", item["url"])):
+                        raise ValueError(
+                            f"malformed program policy file {self.program_policy_file}: "
+                            "readonly_operations url must be a valid HTTP(S) URL"
+                        )
+                    if "carriers" in item:
+                        carriers = item["carriers"]
+                        if (not isinstance(carriers, list) or not carriers
+                                or any(not isinstance(c, str) or c not in {"form", "json"} for c in carriers)):
+                            raise ValueError(
+                                f"malformed program policy file {self.program_policy_file}: "
+                                "readonly_operations carriers must be a non-empty subset of ['form', 'json']"
+                            )
+                    if "test_data_only" in item and not isinstance(item["test_data_only"], bool):
+                        raise ValueError(
+                            f"malformed program policy file {self.program_policy_file}: "
+                            "readonly_operations test_data_only must be a boolean"
+                        )
             rules.update(raw)
         scope_rules = self.scope.get("raw", {}).get("rules", {})
         if scope_rules:
@@ -2372,6 +2410,69 @@ class PolicyEngine:
             return None
         return tokens[dash_c[-1] + 1]
 
+    def _readonly_operation_allows(
+        self,
+        tool_name: str,
+        args: dict[str, Any],
+        urls: list[str],
+        methods: list[str],
+        *,
+        wire_request: bool = False,
+    ) -> bool:
+        """Allow POST only when an exact readonly_operations policy declaration matches."""
+        if methods != ["POST"] or len(urls) != 1:
+            return False
+        if tool_name not in {"hunter_run_web_loop", "validator_validate_sqli", "validator_validate_ssti"}:
+            return False
+        declarations = self.program_policy.get("readonly_operations")
+        if not isinstance(declarations, list) or not declarations:
+            return False
+        target_url = urlparse(urls[0])._replace(fragment="").geturl()
+        raw_carrier = str(args.get("carrier") or "").strip().lower()
+        carrier = {"body": "form"}.get(raw_carrier, raw_carrier)
+        if not carrier:
+            headers_obj: dict[str, Any] = {}
+            raw_headers = args.get("headers")
+            if isinstance(raw_headers, dict):
+                headers_obj = raw_headers
+            elif isinstance(args.get("headers_json"), str) and args["headers_json"].strip():
+                try:
+                    parsed_hdrs = json.loads(args["headers_json"])
+                    if isinstance(parsed_hdrs, dict):
+                        headers_obj = parsed_hdrs
+                except ValueError:
+                    headers_obj = {}
+            ctype = next(
+                (str(v).split(";", 1)[0].strip().lower()
+                 for k, v in headers_obj.items() if str(k).lower() == "content-type"),
+                "",
+            )
+            if ctype == "application/json":
+                carrier = "json"
+            elif ctype == "application/x-www-form-urlencoded":
+                carrier = "form"
+        if not wire_request and tool_name.startswith("validator_validate_") and carrier not in {"form", "json"}:
+            return False
+        if carrier and carrier not in {"form", "json"}:
+            return False
+        op_id = str(args.get("operation_id") or "")
+        for row in declarations:
+            if not isinstance(row, dict):
+                continue
+            if str(row.get("method") or "").upper() != "POST" or row.get("read_only") is not True:
+                continue
+            row_url = str(row.get("url") or "")
+            if urlparse(row_url)._replace(fragment="").geturl() != target_url:
+                continue
+            if op_id and row.get("operation_id") != op_id:
+                continue
+            allowed_carriers = row.get("carriers")
+            if isinstance(allowed_carriers, list):
+                if not carrier or carrier not in allowed_carriers:
+                    continue
+            return True
+        return False
+
     def validate_tool_invocation(self, tool_name: str, args: dict[str, Any] | None = None,
                                  action: str = "execute", extra_metadata: dict[str, Any] | None = None,
                                  *, _wire_request: bool = False, _policy_preflight: bool = False) -> dict[str, Any]:
@@ -2546,6 +2647,9 @@ class PolicyEngine:
         elif (any(method in {m.upper() for m in self.program_policy.get("blocked_http_methods", [])}
                   for method in methods)
               and not sealed_mutation_ok
+              and not self._readonly_operation_allows(
+                  tool_name, args, urls, methods, wire_request=_wire_request
+              )
               and not (_wire_request and tool_name == "kali-tools_member_login"
                        and methods == ["POST"] and len(urls) == 1
                        and self.program_policy.get("member_login", {}).get("test_data_only") is True

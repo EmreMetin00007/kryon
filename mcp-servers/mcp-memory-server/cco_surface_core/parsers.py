@@ -309,7 +309,7 @@ def parse_browser_crawl(payload, target: str = "", base: str = "") -> list[dict]
         if not url:
             continue
         status = page.get("status")
-        _add({
+        page_rec = {
             "url": url,
             "method": "GET",
             "status": status,
@@ -317,7 +317,10 @@ def parse_browser_crawl(payload, target: str = "", base: str = "") -> list[dict]
             "auth_required": True if status == 401 else None,
             "params": params_from_url(url),
             "sources": ["crawl"],
-        })
+        }
+        if page.get("content_type"):
+            page_rec["content_type"] = str(page["content_type"])
+        _add(page_rec)
     for form in data.get("forms") or []:
         if not isinstance(form, dict):
             continue

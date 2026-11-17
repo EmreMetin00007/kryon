@@ -40,7 +40,8 @@ from python_candidate_runtime import (BUDGET_DEFERRED_REASONS, PROFILES, candida
                                       parameter_declarations, parser_gaps, query_parameters, recipe_arguments,
                                       upstream_ids)
 from python_discovery_runtime import (DISCOVERY_TOOLS, DiscoveryState, discovery_state_key,
-                                      extract_json_hypermedia, normalize_identity, project_discovery_frontier)
+                                      extract_json_hypermedia, normalize_identity, project_discovery_frontier,
+                                      structured_params_from_node)
 from python_scheduler import MAX_SCHEDULER_QUEUE, interleave_fair_work
 
 SCHEMA = "python-workflow-v1"
@@ -539,6 +540,9 @@ class PythonSolver:
                         continue
                     item_url = item.get("url") or item.get("href")
                     st = item.get("status_code", item.get("status"))
+                    item_ctype = str(item.get("content_type") or "").split(";", 1)[0].strip().lower()
+                    if item_ctype == "application/json":
+                        continue
                     if isinstance(item_url, str) and type(st) is int and 100 <= st <= 599:
                         resolved = urljoin(base, item_url)
                         m = str(item.get("method") or "GET").upper()
@@ -547,17 +551,71 @@ class PythonSolver:
                             st,
                             f"http_{st}" if st in {401, 403} else "",
                         )
+            if crawled_statuses:
+                anon_state = self._discovery_state_for(spec, "anon")
+                for action in list(anon_state.actions.values()):
+                    if action.get("status") != "pending" or action.get("link_relation") == "json_link":
+                        continue
+                    match = crawled_statuses.get((action.get("method"), action.get("url")))
+                    if match is not None and match[0] == "completed":
+                        anon_state.mark_completed(
+                            action["action_id"],
+                            http_status=match[1],
+                            result_artifact=ref["path"],
+                            result_sha256=ref["sha256"],
+                        )
+        crawled_json_urls: set[str] = set()
         for record in self.surface_records(value, args, spec, ref):
             rec_identity = normalize_identity(record.get("identity_ref", base_identity))
             rec_state = self._discovery_state_for(spec, rec_identity)
             rec_method = str(record.get("method") or "GET").upper()
             rec_url = record["url"]
             rec_reason = str(record.get("candidate_reason") or "")
+            rec_ctype = str(record.get("content_type") or "").split(";", 1)[0].strip().lower()
+            if row["tool"] == CRAWL_TOOL and rec_method == "GET" and rec_ctype == "application/json":
+                crawled_json_urls.add(rec_url)
+                anon_state = self._discovery_state_for(spec, "anon")
+                existing_anon = next(
+                    (a for a in anon_state.actions.values() if a["method"] == "GET" and a["url"] == rec_url),
+                    None,
+                )
+                if existing_anon is None or existing_anon.get("status") != "completed":
+                    anon_state.record_action(
+                        url=rec_url,
+                        method="GET",
+                        kind="http_request",
+                        params=record.get("params", []),
+                        link_relation="json_link",
+                        parent_action_id=parent_action_id,
+                        provenance=provenance,
+                        status="pending",
+                        carrier="json",
+                        content_type=rec_ctype,
+                    )
+                continue
+            if row["tool"] == CRAWL_TOOL and rec_method == "GET" and not rec_ctype and rec_url in crawled_json_urls:
+                continue
+            rec_params = record.get("params") if isinstance(record.get("params"), list) else []
+            rec_carrier = (
+                "json" if rec_ctype == "application/json" or any(isinstance(p, dict) and p.get("in") == "json" for p in rec_params)
+                else ("form" if rec_method == "POST" and (rec_ctype == "application/x-www-form-urlencoded" or any(isinstance(p, dict) and p.get("in") in {"body", "form"} for p in rec_params)) else "")
+            )
             rec_http_status = None
+            post_authorized = (
+                rec_method == "POST"
+                and callable(getattr(self.broker, "is_readonly_post_authorized", None))
+                and self.broker.is_readonly_post_authorized(
+                    rec_url,
+                    carrier=rec_carrier,
+                    operation_id=str(record.get("operation_id") or ""),
+                )
+            )
             if rec_reason:
                 rec_status = "blocked"
-            elif rec_method not in {"GET", "HEAD"}:
+            elif rec_method not in {"GET", "HEAD"} and not post_authorized:
                 rec_status, rec_reason = "blocked", "unsupported_readonly_method"
+            elif post_authorized:
+                rec_status, rec_reason = "completed", ""
             elif (rec_method, rec_url) in crawled_statuses:
                 rec_status, rec_http_status, rec_reason = crawled_statuses[(rec_method, rec_url)]
             else:
@@ -581,6 +639,8 @@ class PythonSolver:
                 status=rec_status,
                 reason_code=rec_reason,
                 http_status=rec_http_status,
+                carrier=rec_carrier,
+                content_type=rec_ctype,
             )
             if self._last_surface_truncated.get(ref["path"]):
                 rec_state.continuation["slice_truncated"] = True
@@ -769,6 +829,8 @@ class PythonSolver:
         oracle = next((value[2] for value in PROFILES.values() if value[0] == row["vector"]), None)
         found_invalid = False
         found_indeterminate = None
+        row_method = str(row.get("method", "GET") or "GET").upper()
+        row_carrier = str(row.get("carrier") or ("query" if row["param"] else "")).lower()
         for res_row in self.broker.results:
             if res_row["spec_id"] != spec.id or res_row["tool"] not in allowed_tools:
                 continue
@@ -798,8 +860,8 @@ class PythonSolver:
                 matching = [
                     item for item in report.get("validations", [])
                     if (isinstance(item, dict) and item.get("url") == row["route"]
-                        and item.get("param") == row["param"] and item.get("method") == "GET"
-                        and item.get("carrier") == "query")
+                        and item.get("param") == row["param"] and item.get("method", "GET") == row_method
+                        and item.get("carrier", "query") == row_carrier)
                 ]
                 for item in matching:
                     vid = str(item.get("validation_id") or "")
@@ -815,7 +877,9 @@ class PythonSolver:
                             continue
                     found_indeterminate = vid
             else:
-                fields = ("target_url", "param", "method", "carrier")
+                fields: tuple[str, ...] = ("target_url", "param", "method", "carrier")
+                if row_method != "GET":
+                    fields = ("target_url", "param", "method", "carrier", "body_template")
                 if any(args.get(k, {"method": "GET", "carrier": "query"}.get(k))
                        != expected.get(k, {"method": "GET", "carrier": "query"}.get(k)) for k in fields):
                     continue
@@ -837,8 +901,8 @@ class PythonSolver:
                         or record.get("target") != row["route"]
                         or (oracle is not None and record.get("oracle") != oracle)
                         or (ctx and (ctx.get("param", row["param"]) != row["param"]
-                                    or ctx.get("method", "GET") != "GET"
-                                    or ctx.get("carrier", "query") != "query"))):
+                                    or ctx.get("method", "GET") != row_method
+                                    or ctx.get("carrier", "query") != row_carrier))):
                     found_invalid = True
                     continue
                 found_indeterminate = vid
@@ -885,6 +949,8 @@ class PythonSolver:
             if not row["eligible"]:
                 row["outcome"] = "ineligible"
                 continue
+            row_method = str(row.get("method", "GET") or "GET").upper()
+            row_carrier = str(row.get("carrier") or ("query" if row["param"] else "")).lower()
             allowed_tools = {row["tool"], *(row.get("recipes") or {}).keys()}
             for execution in self.broker.tools:
                 if (execution.get("task_spec_id") != spec.id or execution["tool"] not in allowed_tools
@@ -895,7 +961,13 @@ class PythonSolver:
                 expected = recipe_arguments(row, execution["tool"])
                 if expected is None:
                     continue
-                fields = ("target", "validation_profile", "blind_discovery", "session_bindings") if execution["tool"] == "hunter_run_web_loop" else ("target_url", "param", "method", "carrier")
+                fields: tuple[str, ...]
+                if execution["tool"] == "hunter_run_web_loop":
+                    fields = ("target", "validation_profile", "blind_discovery", "session_bindings")
+                elif expected.get("method", "GET") != "GET":
+                    fields = ("target_url", "param", "method", "carrier", "body_template")
+                else:
+                    fields = ("target_url", "param", "method", "carrier")
                 def equal(key):
                     if key == "session_bindings":
                         return json.loads(args.get(key) or "{}") == json.loads(expected.get(key) or "{}")
@@ -917,8 +989,9 @@ class PythonSolver:
                     if isinstance(result, dict) and args.get("validation_profile") == expected.get("validation_profile") and equal("session_bindings"):
                         def leaf(item):
                             return (isinstance(item, dict) and item.get("url") == row["route"]
-                                    and item.get("param") == row["param"] and item.get("method") == "GET"
-                                    and item.get("carrier") == "query")
+                                    and item.get("param") == row["param"]
+                                    and item.get("method", "GET") == row_method
+                                    and item.get("carrier", "query") == row_carrier)
                         if any(leaf(item) for item in result.get("validation_queue", [])):
                             # A queue can outlive an interrupted validator. Keep
                             # its intent without claiming execution or replaying.
@@ -931,8 +1004,8 @@ class PythonSolver:
                             and isinstance(env["payload"].get("execution_context"), dict)
                             and env["payload"]["execution_context"].get("url") == row["route"]
                             and env["payload"]["execution_context"].get("param", "") == row["param"]
-                            and env["payload"]["execution_context"].get("method", "GET") == "GET"
-                            and env["payload"]["execution_context"].get("carrier", "query") == "query"
+                            and env["payload"]["execution_context"].get("method", "GET") == row_method
+                            and env["payload"]["execution_context"].get("carrier", "query") == row_carrier
                             for env in (
                                 *(result.get("signed_completions") or []),
                                 *([result["signed_completion"]] if isinstance(result.get("signed_completion"), dict) else []),
@@ -959,8 +1032,8 @@ class PythonSolver:
                     and item.get("tool", row["tool"]) in allowed_tools
                     and item["record"]["target"] == row["route"] and item["record"].get("oracle") == oracle
                     and item.get("execution_context", item["record"].get("execution_context", {})).get("param") == row["param"]
-                    and item.get("execution_context", item["record"].get("execution_context", {})).get("method") == "GET"
-                    and item.get("execution_context", item["record"].get("execution_context", {})).get("carrier") == "query"
+                    and item.get("execution_context", item["record"].get("execution_context", {})).get("method") == row_method
+                    and item.get("execution_context", item["record"].get("execution_context", {})).get("carrier") == row_carrier
                      and (isinstance(row["identity_ref"], str) and (row["identity_ref"] == "anon" and item.get("execution_context", item["record"].get("execution_context", {})).get("identity", "anon") in {"anon", "anonymous"}
                           or row["identity_ref"] != "anon" and item.get("execution_context", item["record"].get("execution_context", {})).get("identity") == row["identity_ref"])
                           or isinstance(row["identity_ref"], list) and item.get("execution_context", item["record"].get("execution_context", {})).get("identity") in row["identity_ref"])]
@@ -975,8 +1048,8 @@ class PythonSolver:
                             pl.get("profile") == row.get("validation_profile")
                             and ctx.get("url") == row["route"]
                             and ctx.get("param", "") == row["param"]
-                            and ctx.get("method", "GET") == "GET"
-                            and ctx.get("carrier", "query") == "query"
+                            and ctx.get("method", "GET") == row_method
+                            and ctx.get("carrier", "query") == row_carrier
                             and (not pl.get("candidate_id") or pl.get("candidate_id") == row["candidate_id"])
                         ):
                             if row["identity_ref"] == "anon" and ctx.get("identity", "anon") not in {"anon", "anonymous"}:
@@ -1050,13 +1123,14 @@ class PythonSolver:
                     leaf_rows.extend(batch_analyses[row["candidate_id"]]["leaves"])
                 continue
             identity = row["identity_ref"] if isinstance(row["identity_ref"], str) else ",".join(row["identity_ref"])
+            leaf_carrier = str(row.get("carrier") or ("query" if row["param"] else "")).lower()
             if row["evidence_accepted"]:
                 if row["candidate_id"] in accepted_by_candidate:
                     acc = accepted_by_candidate[row["candidate_id"]][0]
                     leaf_rows.append(leaf_outcome(
                         task=spec.id, candidate_id=row["candidate_id"], vector=row["vector"],
                         url=row["route"], method=row.get("method", "GET"), param=row["param"],
-                        carrier="query" if row["param"] else "", identity=identity,
+                        carrier=leaf_carrier, identity=identity,
                         vuln_class=row["vector"], execution_state="executed", status="accepted",
                         verdict=str(acc["record"].get("verdict") or ""),
                         validation_id=acc["record"]["validation_id"],
@@ -1068,7 +1142,7 @@ class PythonSolver:
                     leaf_rows.append(leaf_outcome(
                         task=spec.id, candidate_id=row["candidate_id"], vector=row["vector"],
                         url=row["route"], method=row.get("method", "GET"), param=row["param"],
-                        carrier="query" if row["param"] else "", identity=identity,
+                        carrier=leaf_carrier, identity=identity,
                         vuln_class=row["vector"], execution_state="executed", status="accepted",
                         verdict="UNCONFIRMED",
                         validation_id=str(ev_ref.get("validation_id") or ""),
@@ -1080,7 +1154,7 @@ class PythonSolver:
                 leaf_rows.append(leaf_outcome(
                     task=spec.id, candidate_id=row["candidate_id"], vector=row["vector"],
                     url=row["route"], method=row.get("method", "GET"), param=row["param"],
-                    carrier="query" if row["param"] else "", identity=identity,
+                    carrier=leaf_carrier, identity=identity,
                     vuln_class=row["vector"], execution_state="executed", status=leaf_state,
                     verdict="INCONCLUSIVE" if leaf_state == "indeterminate" else "",
                     validation_id=vid, reason_code=row.get("reason_code", ""),
@@ -1089,7 +1163,7 @@ class PythonSolver:
                 leaf_rows.append(leaf_outcome(
                     task=spec.id, candidate_id=row["candidate_id"], vector=row["vector"],
                     url=row["route"], method=row.get("method", "GET"), param=row["param"],
-                    carrier="query" if row["param"] else "", identity=identity,
+                    carrier=leaf_carrier, identity=identity,
                     vuln_class=row["vector"], execution_state="interrupted", status="indeterminate",
                     reason_code=row.get("reason_code") or "indeterminate_dispatch_not_replayed",
                 ))
@@ -1097,7 +1171,7 @@ class PythonSolver:
                 leaf_rows.append(leaf_outcome(
                     task=spec.id, candidate_id=row["candidate_id"], vector=row["vector"],
                     url=row["route"], method=row.get("method", "GET"), param=row["param"],
-                    carrier="query" if row["param"] else "", identity=identity,
+                    carrier=leaf_carrier, identity=identity,
                     vuln_class=row["vector"], execution_state="pending", status="pending",
                     reason_code=row.get("reason_code") or "candidate_not_executed",
                 ))
@@ -1887,9 +1961,19 @@ class PythonSolver:
                     truncated = truncated or body_trunc
         surface = value.get("surface", value)
         if isinstance(surface, dict):
+            raw_records = surface.get("records")
+            record_list = raw_records if isinstance(raw_records, list) else []
+            known_record_urls = {
+                urljoin(base, str(item.get("url") or item.get("href") or ""))
+                for item in record_list
+                if isinstance(item, dict) and (item.get("url") or item.get("href"))
+            }
             for key in ("records", "work_queue", "pages", "urls_sample", "links", "internal_links"):
-                for item in surface.get(key, []) if isinstance(surface.get(key), list) else []:
+                bucket = surface.get(key, [])
+                for item in bucket if isinstance(bucket, list) else []:
                     if isinstance(item, str):
+                        if key == "urls_sample" and urljoin(base, item) in known_record_urls:
+                            continue
                         records.append({"url": item, "method": "GET"})
                     elif isinstance(item, dict):
                         records.append(item)
@@ -1915,9 +1999,14 @@ class PythonSolver:
             ):
                 continue
             url = parsed._replace(fragment="").geturl()
+            method = str(record.get("method", "GET") or "GET").upper()
+            derived_params, content_type = structured_params_from_node(record, method)
+            if not content_type and isinstance(record.get("content_type"), str):
+                content_type = record["content_type"].split(";", 1)[0].strip().lower()
+            raw_params = record.get("params") if "params" in record else (derived_params if derived_params is not None else [])
             reason = str(record.get("candidate_reason") or "")
             try:
-                params = parameter_declarations(record.get("params", []))
+                params = parameter_declarations(raw_params)
                 query = query_parameters(url)
             except ValueError as exc:
                 reason, params, query = reason or str(exc), [], {}
@@ -1928,13 +2017,15 @@ class PythonSolver:
             if not has_identity and "url" in args and not args.get("cookie") and not args.get("headers"):
                 identity = "anon"
                 has_identity = True
-            method = str(record.get("method", "GET") or "GET").upper()
-            dedup_key = provider_json([url, method, params, reason, identity if has_identity else None])
+            operation_id = record.get("operation_id") if isinstance(record.get("operation_id"), str) and record.get("operation_id") else ""
+            dedup_key = provider_json([url, method, content_type, params, reason, identity if has_identity else None])
             link_relation = record.get("link_relation")
             if dedup_key in seen_indices:
                 existing = output[seen_indices[dedup_key]]
                 if link_relation == "pagination" or (link_relation == "json_link" and "link_relation" not in existing):
                     existing["link_relation"] = link_relation
+                if operation_id and "operation_id" not in existing:
+                    existing["operation_id"] = operation_id
                 continue
             seen_indices[dedup_key] = len(output)
             row = {
@@ -1942,6 +2033,8 @@ class PythonSolver:
                 "method": method,
                 "params": params,
                 "candidate_reason": reason,
+                **({"content_type": content_type} if content_type else {}),
+                **({"operation_id": operation_id} if operation_id else {}),
                 **({"identity_ref": identity} if has_identity else {}),
                 **({"link_relation": link_relation} if isinstance(link_relation, str) and link_relation else {}),
                 "source_artifact": ref["path"],
@@ -2292,14 +2385,24 @@ class PythonSolver:
         if (parsed.query or parsed.fragment or target not in {spec.target, *(
                 r["url"] for r in records if r.get("method") == "GET" and not r.get("params"))}):
             return None
-        def below(row):
+        def under_prefix(row):
             url = urlsplit(row["route"])
             prefix = parsed.path.rstrip("/")
             return ((url.scheme, url.netloc) == (parsed.scheme, parsed.netloc)
                     and (url.path == prefix or url.path.startswith(prefix + "/")))
+        def below(row):
+            if (row.get("method", "GET"), row.get("carrier", "query")) not in {("GET", "query"), ("POST", "form")}:
+                return False
+            return under_prefix(row)
         def hunter_args(row):
             return recipe_arguments(row, "hunter_run_web_loop")
         rows = [row for row in candidates if below(row) and (hunter_args(row) or {}).get("validation_profile") == profile]
+        transports = {(row.get("method", "GET"), row.get("carrier", "query")) for row in rows}
+        if len(transports) != 1:
+            return None
+        slice_transport = next(iter(transports))
+        if slice_transport == ("POST", "form") and any(row.get("tool") != "hunter_run_web_loop" for row in rows):
+            return None
         if (not rows or any(not row["eligible"] or row["executed"] and not row["evidence_accepted"]
                             or row.get("dispatch_started") and not row["evidence_accepted"] for row in rows)):
             return None
@@ -2315,7 +2418,7 @@ class PythonSolver:
         # Reject malformed/unsupported descendants rather than allowing a broad
         # prefix to bypass a leaf's eligibility gate.
         if any(
-            below(row)
+            under_prefix(row)
             and not row["eligible"]
             and (not row.get("validation_profile") or row.get("validation_profile") == profile)
             for row in candidates

@@ -179,6 +179,35 @@ def _request(method: str, url: str, *, params=None, data=None, headers=None,
                           extra_hosts=extra, request_budget=budget, observe_session=observe_session)
 
 
+def _normalize_carrier(carrier: str, method: str = "GET") -> str:
+    norm = {"body": "form"}.get(str(carrier or "").strip().lower(), str(carrier or "").strip().lower())
+    if norm:
+        return norm
+    return "query" if str(method or "GET").upper() == "GET" else "form"
+
+
+def _apply_body_content_type(headers: dict, carrier: str, body_template: str) -> dict:
+    hdrs = dict(headers or {})
+    if body_template and not any(k.lower() == "content-type" for k in hdrs):
+        norm = _normalize_carrier(carrier, "POST")
+        if norm == "json":
+            hdrs["Content-Type"] = "application/json"
+        elif norm == "form":
+            hdrs["Content-Type"] = "application/x-www-form-urlencoded"
+    return hdrs
+
+
+def _render_body_template(body_template: str, payload: str, headers: dict) -> str:
+    ctype = next((str(v) for k, v in (headers or {}).items() if str(k).lower() == "content-type"), "")
+    if "json" in ctype.lower():
+        replacement = json.dumps(payload)[1:-1]
+    elif "x-www-form-urlencoded" in ctype.lower():
+        replacement = quote_plus(payload)
+    else:
+        replacement = payload
+    return body_template.replace("{{PAYLOAD}}", replacement)
+
+
 def _send_payload(url: str, payload: str, *, param: str = "", method: str = "GET",
                   body_template: str = "", headers: dict = None,
                   allow_redirects: bool = True, timeout: int = DEFAULT_TIMEOUT,
@@ -190,8 +219,9 @@ def _send_payload(url: str, payload: str, *, param: str = "", method: str = "GET
       • POST + param  → form alanına yaz
       • carrier='cookie' + param → Cookie başlığına yaz (ör. TrackingId)
     """
-    headers = dict(headers or {})
     request_method = method.upper()
+    norm_carrier = _normalize_carrier(carrier, request_method)
+    headers = _apply_body_content_type(headers or {}, norm_carrier, body_template)
     if request_method not in {"GET", "POST", "PUT", "PATCH", "HEAD", "OPTIONS"}:
         return {"ok": False, "status": None, "error": "unsupported request method"}
     from cco_validator_core.experiment_context import payload_request
@@ -215,14 +245,7 @@ def _send_payload(url: str, payload: str, *, param: str = "", method: str = "GET
     def body_data() -> bytes | None:
         if not body_template:
             return None
-        ctype = next((v for k, v in headers.items() if k.lower() == "content-type"), "")
-        if "json" in ctype.lower():
-            replacement = json.dumps(payload)[1:-1]
-        elif "x-www-form-urlencoded" in ctype.lower():
-            replacement = quote_plus(payload)
-        else:
-            replacement = payload
-        return body_template.replace("{{PAYLOAD}}", replacement).encode("utf-8")
+        return _render_body_template(body_template, payload, headers).encode("utf-8")
 
     if carrier == "cookie" and param:
         hdrs = dict(headers)
@@ -325,7 +348,8 @@ def _reproduction(method: str, url: str, *, param: str = "", payload: str = "",
             url = url.replace("{{PAYLOAD}}", quote(payload, safe=""))
         return _curl("GET", url, headers=headers)
     if body_template and "{{PAYLOAD}}" in body_template:
-        return _curl(method, url, body_template.replace("{{PAYLOAD}}", payload), headers)
+        hdrs = _apply_body_content_type(headers or {}, carrier, body_template)
+        return _curl(method, url, _render_body_template(body_template, payload, hdrs), hdrs)
     if param:
         return _curl(method, url, urlencode({param: payload}), headers)
     return _curl(method, url, urlencode({"q": payload}), headers)
@@ -336,6 +360,73 @@ def _persist(res: dict) -> None:
     stored = persist_result(res, VALID_DIR)
     res.clear()
     res.update(stored)
+
+
+def _build_validator_completion(
+    *,
+    target_url: str,
+    param: str,
+    method: str,
+    carrier: str,
+    profile: str,
+    required_checks: list[str],
+) -> dict | None:
+    try:
+        from cco_validator_core.evidence import (
+            current_policy_hash,
+            current_scope_revision,
+            current_validation_context,
+            redact_url,
+        )
+        import evidence_trust as _trust
+        if _trust.public_only():
+            return None
+        from signed_completion import build_signed_completion, compute_check_revision
+        ctx = current_validation_context()
+        scope_rev = current_scope_revision()
+        pol_hash = current_policy_hash()
+        safe_url = redact_url(target_url)
+        return build_signed_completion(
+            run_id=str(ctx.get("run_id") or "validator-standalone"),
+            target=safe_url,
+            url=safe_url,
+            param=param,
+            method=method.upper(),
+            carrier=_normalize_carrier(carrier, method),
+            identity=str(ctx.get("identity") or "anonymous"),
+            profile=profile,
+            target_scope=scope_rev,
+            check_revision=compute_check_revision(scope_rev, pol_hash, profile, required_checks),
+            required_checks=required_checks,
+            completed_checks=required_checks,
+            completion_status="completed_clean",
+            findings_count=0,
+        )
+    except (ImportError, ValueError, OSError):
+        return None
+
+
+def _direct_context_scope(
+    *,
+    target_url: str,
+    param: str,
+    method: str,
+    carrier: str,
+    vuln_class: str,
+):
+    from contextlib import nullcontext
+    from cco_validator_core.evidence import current_validation_context, validation_context
+    if current_validation_context() or not param:
+        return nullcontext()
+    return validation_context({
+        "url": target_url,
+        "param": param,
+        "method": method.upper(),
+        "carrier": _normalize_carrier(carrier, method),
+        "identity": "anon",
+        "vuln_class": vuln_class,
+        "run_id": "validator-standalone",
+    })
 
 
 def _result(vuln_type: str, target: str, verdict: str, oracle: str,
@@ -603,7 +694,8 @@ def _oob_host_in_scope(host: str) -> bool:
 @mcp.tool()
 def validate_sqli(target_url: str, param: str = "", method: str = "GET",
                   body_template: str = "", headers_json: str = "{}",
-                  carrier: str = "query", boolean_only: bool = False) -> str:
+                  carrier: str = "query", boolean_only: bool = False,
+                  baseline_value: str = "") -> str:
     """SQL Injection'ı DETERMİNİSTİK doğrula — differential (boolean) + error +
     time-based oracle. LLM tahmini değil; TRUE/FALSE koşul yanıt farkı ölçülür.
 
@@ -613,22 +705,24 @@ def validate_sqli(target_url: str, param: str = "", method: str = "GET",
         method: GET veya POST
         body_template: POST için '{{PAYLOAD}}' içeren gövde şablonu
         headers_json: Ek HTTP başlıkları (JSON; örn auth cookie)
-        carrier: 'query' (varsayılan) veya 'cookie' (payload Cookie başlığına)
+        carrier: 'query' (varsayılan), 'form', 'json' veya 'cookie'
         boolean_only: Only SELECT-compatible boolean comparisons; no timing probes.
+        baseline_value: Observed benign value when payload is injected in a POST body template.
     """
-    from cco_validator_core.controls import ControlTrace, usable_control
+    from cco_validator_core.controls import ControlTrace
 
     H = _headers(headers_json)
+    norm_carrier = _normalize_carrier(carrier, method)
     trace = ControlTrace()
 
     def send(payload, role="sql-probe", baseline=False, **kwargs):
         response = _send_payload(target_url, payload, param=param, method=method,
-                                 body_template=body_template, headers=H, carrier=carrier, **kwargs)
+                                 body_template=body_template, headers=H, carrier=norm_carrier, **kwargs)
         return trace.observe(response, role, baseline=baseline)
 
     # orijinal/control değer
     base_val = ""
-    if carrier == "cookie" and param:
+    if norm_carrier == "cookie" and param:
         # Baz, çağıranın Cookie başlığındaki gerçek taşıyıcı değeri olmalı;
         # yoksa TRUE/FALSE çiftleri anlamsız bir değere eklenir.
         for part in (H.get("Cookie", "") or "").split(";"):
@@ -639,8 +733,34 @@ def validate_sqli(target_url: str, param: str = "", method: str = "GET",
     if method.upper() == "GET" and param and not base_val:
         q = dict(parse_qsl(urlparse(target_url).query, keep_blank_values=True))
         base_val = q.get(param, "1")
+    if not base_val and baseline_value:
+        base_val = str(baseline_value)
     from cco_validator_core.experiment_context import observed_baseline
     base_val = observed_baseline(base_val or "1")
+    with _direct_context_scope(
+        target_url=target_url, param=param, method=method, carrier=norm_carrier, vuln_class="sql_injection",
+    ):
+        return _validate_sqli_inner(
+            target_url=target_url, param=param, method=method, body_template=body_template,
+            H=H, carrier=norm_carrier, boolean_only=boolean_only, trace=trace, send=send, base_val=base_val,
+        )
+
+
+def _validate_sqli_inner(
+    *,
+    target_url: str,
+    param: str,
+    method: str,
+    body_template: str,
+    H: dict,
+    carrier: str,
+    boolean_only: bool,
+    trace,
+    send,
+    base_val: str,
+) -> str:
+    from cco_validator_core.controls import usable_control
+
     base = send(base_val, role="baseline-1", baseline=True)
     meaningful_baseline = bool(base.get("text", "").strip())
     try:
@@ -765,16 +885,30 @@ def validate_sqli(target_url: str, param: str = "", method: str = "GET",
                                   response_evidence(tr2, "true-2", 0)])
 
     if boolean_only:
+        verdict = UNCONFIRMED if trace.complete and not differential_candidates else INCONCLUSIVE
+        completion_env = (
+            _build_validator_completion(
+                target_url=target_url,
+                param=param,
+                method=method,
+                carrier=carrier,
+                profile="readonly_sqli_boolean",
+                required_checks=["baseline", "differential_boolean"],
+            )
+            if verdict == UNCONFIRMED
+            else None
+        )
         return _result(
             "SQL Injection", target_url,
-            UNCONFIRMED if trace.complete and not differential_candidates else INCONCLUSIVE,
+            verdict,
             "differential_boolean", {"tested": "repeated-boolean-only",
                                      "baseline_stability": round(baseline_stability, 4)}, "-",
             notes="Bounded boolean controls completed; timing and error oracles were not exercised.",
             guard={"transport_ok": trace.complete,
                    "controls": ["repeated baseline", "two boolean pairs", "reversed candidate order"],
                    "limitations": ["numeric and single-quoted boolean comparisons only"]},
-            request_evidence=trace.evidence)
+            request_evidence=trace.evidence,
+            signed_completion=completion_env)
 
     # 2) Error-based imzalar
     err_sig = re.compile(
@@ -868,7 +1002,8 @@ def validate_sqli(target_url: str, param: str = "", method: str = "GET",
 
 @mcp.tool()
 def validate_ssti(target_url: str, param: str = "", method: str = "GET",
-                  body_template: str = "", headers_json: str = "{}", carrier: str = "query") -> str:
+                  body_template: str = "", headers_json: str = "{}", carrier: str = "query",
+                  baseline_value: str = "") -> str:
     """Server-Side Template Injection'ı aritmetik oracle ile doğrula. Rastgele
     a,b seçilir; yanıtta a*b SONUCU görünür ama '<a>*<b>' ifadesi GÖRÜNMEZSE
     template render edilmiş demektir (coincidence olasılığı sıfıra yakın).
@@ -879,19 +1014,46 @@ def validate_ssti(target_url: str, param: str = "", method: str = "GET",
         method: GET/POST
         body_template: POST için '{{PAYLOAD}}' içeren gövde
         headers_json: Ek başlıklar (JSON)
+        carrier: query/form/json/cookie/header/path taşıyıcısı
+        baseline_value: Observed benign value when payload is injected in a POST body template.
     """
-    from cco_validator_core.controls import ControlTrace, usable_control
+    from cco_validator_core.controls import ControlTrace
 
     H = _headers(headers_json)
+    norm_carrier = _normalize_carrier(carrier, method)
     trace = ControlTrace()
 
     def send(payload, role, *, baseline=False):
         response = _send_payload(target_url, payload, param=param, method=method,
-                                 body_template=body_template, headers=H, carrier=carrier)
+                                 body_template=body_template, headers=H, carrier=norm_carrier)
         return trace.observe(response, role, baseline=baseline)
 
     from cco_validator_core.experiment_context import observed_baseline
-    base = send(observed_baseline("cco_probe"), "baseline", baseline=True)
+    with _direct_context_scope(
+        target_url=target_url, param=param, method=method, carrier=norm_carrier, vuln_class="ssti",
+    ):
+        return _validate_ssti_inner(
+            target_url=target_url, param=param, method=method, body_template=body_template,
+            H=H, carrier=norm_carrier, trace=trace, send=send,
+            baseline_sample=observed_baseline(baseline_value or "cco_probe"),
+        )
+
+
+def _validate_ssti_inner(
+    *,
+    target_url: str,
+    param: str,
+    method: str,
+    body_template: str,
+    H: dict,
+    carrier: str,
+    trace,
+    send,
+    baseline_sample: str,
+) -> str:
+    from cco_validator_core.controls import usable_control
+
+    base = send(baseline_sample, "baseline", baseline=True)
     if not usable_control(base, baseline=True):
         return _result("Server-Side Template Injection", target_url, INCONCLUSIVE,
                        "arithmetic_eval", {"error": base.get("error")}, "-",
@@ -1017,14 +1179,28 @@ def validate_ssti(target_url: str, param: str = "", method: str = "GET",
                 "limitations": ["coincidental rendering or reflective formatting possible"],
             },
         )
-    return _result("Server-Side Template Injection", target_url, UNCONFIRMED if trace.complete else INCONCLUSIVE,
+    ssti_verdict = UNCONFIRMED if trace.complete else INCONCLUSIVE
+    ssti_completion = (
+        _build_validator_completion(
+            target_url=target_url,
+            param=param,
+            method=method,
+            carrier=carrier,
+            profile="readonly_ssti_arithmetic",
+            required_checks=["baseline", "arithmetic_eval"],
+        )
+        if ssti_verdict == UNCONFIRMED
+        else None
+    )
+    return _result("Server-Side Template Injection", target_url, ssti_verdict,
                    "arithmetic_eval", {"operands": [[a, b], [a2, b2]], "engines_tested": list(engines)},
                    "-", notes="Completed arithmetic probes did not evaluate." if trace.complete
                    else "Arithmetic controls did not complete.",
                    guard={"transport_ok": trace.complete,
                           "controls": ["successful baseline", "arithmetic probes for each tested engine"],
                           "limitations": ["only the submitted parameter and listed template syntaxes were covered"]},
-                   request_evidence=trace.evidence)
+                   request_evidence=trace.evidence,
+                   signed_completion=ssti_completion)
 
 
 @mcp.tool()

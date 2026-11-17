@@ -380,7 +380,10 @@ def _coverage_context(item):
         "vuln_class": _norm_class(str(item.get("vuln_class") or "")),
         "method": str(item.get("method") or "GET").upper(),
         "param": str(item.get("param") or "")[:128],
-        "carrier": str(item.get("location") or item.get("carrier") or "query")[:32],
+        "carrier": {"body": "form"}.get(
+            str(item.get("location") or item.get("carrier") or "query").lower(),
+            str(item.get("location") or item.get("carrier") or "query").lower(),
+        )[:32],
         "identity": _coverage_label(item.get("identity") or item.get("attacker_identity")),
         "resource_owner": _coverage_label(item.get("resource_owner") or item.get("owner_identity")),
         "run_id": _coverage_label(item.get("run_id")),
@@ -1697,6 +1700,17 @@ def fuzz_attack_surface(target: str, limit: int = 8, max_requests: int = 40,
                                "observation_id": rec.get("observation_id"),
                                "reason": unavailable + ", ".join(missing)})
         else:
+            if rec.get("params"):
+                from cco_surface_core.normalize import suggested_classes as _suggested_classes
+                classes = list(hydrated.get("suggested_classes") or _suggested_classes(hydrated) or [])
+                if sql_only and "sql_injection" not in classes:
+                    classes.append("sql_injection")
+                if ssti_only and "ssti" not in classes:
+                    classes.append("ssti")
+                if traversal_only and "path_traversal" not in classes:
+                    classes.append("path_traversal")
+                if classes:
+                    hydrated["suggested_classes"] = classes
             probes.extend(bind_file_probes(hydrated, build_canary_plan(hydrated, already_tested=[]),
                                           file_rule, file_scope, file_revision))
 
@@ -2701,8 +2715,8 @@ def _loop_validate(item, headers="", cookie=""):
             return {"verdict": "INCONCLUSIVE", "error": "validator cannot preserve request body"}
         kwargs["body_template"] = template
     if "carrier" in params:
-        loc = str(item.get("location") or "").lower()
-        kwargs["carrier"] = loc if loc in ("cookie", "header", "path") else "query"
+        loc = {"body": "form"}.get(str(item.get("location") or "").lower(), str(item.get("location") or "").lower())
+        kwargs["carrier"] = loc if loc in ("cookie", "header", "path", "form", "json") else "query"
     elif str(item.get("location") or "").lower() in {"cookie", "header", "path"}:
         return {"verdict": "INCONCLUSIVE", "error": "validator cannot preserve parameter carrier"}
     if vclass == "sql_injection" and item.get("boolean_only"):
@@ -2730,7 +2744,13 @@ def _loop_validate(item, headers="", cookie=""):
                     response, context.get("operation") or {}, allow_redirect=vclass == "open_redirect")["eligible"])
         except (ValueError, TypeError, KeyError, IndexError):
             return {"verdict": "INCONCLUSIVE", "error": "observed request slot missing or ambiguous"}
-    with capture_wire_guard(context or {}), readonly_operation(item.get("operation_id")), payload_scope:
+    op_id_for_gate = (
+        item.get("operation_id")
+        if (((context or {}).get("operation") or {}).get("protocol") == "graphql"
+            or str(item.get("location") or "").lower() not in {"body", "form", "json"})
+        else ""
+    )
+    with capture_wire_guard(context or {}), readonly_operation(op_id_for_gate), payload_scope:
         return _validator_call(fn, (context.get("url") if context else item.get("url")) or "",
                                execution_context=_coverage_context(item), **kwargs)
 

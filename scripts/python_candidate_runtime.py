@@ -2,11 +2,12 @@
 from __future__ import annotations
 
 import hashlib
+import inspect
 import json
 import copy
 import re
 from typing import Any
-from urllib.parse import parse_qsl, urlsplit
+from urllib.parse import parse_qsl, urlencode, urlsplit
 
 PROFILES = {
     "readonly_sqli_boolean": ("injection-sqli", "validator_validate_sqli", "differential_boolean"),
@@ -52,6 +53,87 @@ _TEMPLATE_PATH_RE = re.compile(r"/(?:templates?|ssti[-_/])(?:/|$)", re.I)
 _SQL_LOOKUP_PATH_RE = re.compile(r"/(?:lookup|items/sqli[-_/])(?:/|$)", re.I)
 CARD_LIMIT = 8
 CARD_BYTES = 2000
+
+
+def normalize_carrier(value: Any, *, method: str = "GET", content_type: str = "") -> str:
+    """Normalize parameter carrier without implicitly coercing GET body declarations."""
+    norm_method = str(method or "GET").upper()
+    raw = str(value or "").strip().lower()
+    if raw == "body":
+        return "form" if norm_method != "GET" else "body"
+    if raw:
+        return raw
+    if norm_method == "GET":
+        return "query"
+    norm_ctype = str(content_type or "").split(";", 1)[0].strip().lower()
+    if norm_ctype == "application/json":
+        return "json"
+    if norm_ctype == "application/x-www-form-urlencoded":
+        return "form"
+    return ""
+
+
+def build_post_body_template(
+    declarations: list[dict[str, Any]],
+    param: str,
+    carrier: str,
+) -> tuple[str, str, str]:
+    """Build a deterministic POST body template and Content-Type header from observed fields."""
+    norm_carrier = normalize_carrier(carrier, method="POST")
+    fields = [
+        item for item in declarations
+        if normalize_carrier(item.get("in", ""), method="POST") == norm_carrier
+    ]
+    target_item = next((item for item in fields if item.get("name") == param), None)
+    if target_item is None:
+        raise ValueError("missing_observed_body_parameter")
+    baseline_value = str(target_item.get("sample", ""))
+    if norm_carrier == "form":
+        pairs = [
+            (item["name"], "{{PAYLOAD}}" if item["name"] == param else str(item.get("sample", "")))
+            for item in fields
+        ]
+        body_template = urlencode(pairs).replace("%7B%7BPAYLOAD%7D%7D", "{{PAYLOAD}}")
+        headers_json = json.dumps({"Content-Type": "application/x-www-form-urlencoded"}, separators=(",", ":"))
+        return body_template, headers_json, baseline_value
+    if norm_carrier == "json":
+        obj = {
+            item["name"]: ("{{PAYLOAD}}" if item["name"] == param else str(item.get("sample", "")))
+            for item in fields
+        }
+        body_template = json.dumps(obj, ensure_ascii=False, separators=(",", ":"))
+        headers_json = json.dumps({"Content-Type": "application/json"}, separators=(",", ":"))
+        return body_template, headers_json, baseline_value
+    raise ValueError("unsupported_parameter_carrier")
+
+
+def _call_profile_eligibility(
+    profile_eligibility: Any,
+    spec: Any,
+    url: str,
+    param: str,
+    carrier: str,
+    profile: str,
+    method: str,
+) -> dict[str, Any] | None:
+    if not callable(profile_eligibility):
+        return None
+    try:
+        sig = inspect.signature(profile_eligibility)
+        params = sig.parameters
+        accepts_method = (
+            "method" in params
+            or any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
+        )
+    except (ValueError, TypeError):
+        accepts_method = False
+    if accepts_method:
+        res = profile_eligibility(spec, url, param, carrier, profile, method=method)
+    elif str(method or "GET").upper() == "GET":
+        res = profile_eligibility(spec, url, param, carrier, profile)
+    else:
+        return {"eligible": False, "reason_code": "unsupported_readonly_method"}
+    return res if isinstance(res, dict) else None
 
 
 def surface_profile_applicability(url: str, param: str, sample: str, profile: str) -> tuple[bool, bool, str]:
@@ -217,6 +299,8 @@ def matches_model_call(row: dict[str, Any], tool: str, args: dict[str, Any]) -> 
         required.add("session_bindings")
     if tool == "validator_validate_sqli":
         required.add("boolean_only")
+    if expected.get("method", "GET") != "GET" and tool != "hunter_run_web_loop":
+        required.update({"method", "carrier", "body_template"})
     if not required <= args.keys():
         return False
     for key, value in args.items():
@@ -226,7 +310,13 @@ def matches_model_call(row: dict[str, Any], tool: str, args: dict[str, Any]) -> 
                     return False
             except (ValueError, TypeError):
                 return False
-        elif value != expected.get(key, {"headers_json": "{}", "body_template": ""}.get(key)):
+        elif key == "headers_json" and expected.get("headers_json"):
+            try:
+                if not isinstance(value, str) or json.loads(value) != json.loads(expected["headers_json"]):
+                    return False
+            except (ValueError, TypeError):
+                return False
+        elif value != expected.get(key, {"headers_json": "{}", "body_template": "", "baseline_value": ""}.get(key)):
             return False
     return True
 
@@ -235,14 +325,19 @@ def candidate(task: str, *, route: str, param: str = "", identity: Any = "anon",
               vector: str = "", tool: str = "", arguments: Any = None,
               provenance: Any = None, reason: str = "",
               validation_profile: str = "",
-              recipes: dict[str, dict[str, Any]] | None = None) -> dict[str, Any]:
+              recipes: dict[str, dict[str, Any]] | None = None,
+              method: str = "GET",
+              carrier: str = "") -> dict[str, Any]:
     # Provenance is merged on the semantic key: repeated pages/sources do not
     # inflate the funnel. Task identity is part of the key, so branches cannot
     # spend each other's reservations or reuse each other's coverage.
-    key = [task, "GET", route, param, identity, vector]
+    norm_method = str(method or "GET").upper()
+    norm_carrier = str(carrier if carrier != "" else ("query" if norm_method == "GET" else "")).strip().lower()
+    key = [task, norm_method, route, param, identity, vector]
     ident = hashlib.sha256(json.dumps(key, sort_keys=True).encode()).hexdigest()
     row: dict[str, Any] = {
-        "candidate_id": ident, "task_spec_id": task, "method": "GET",
+        "candidate_id": ident, "task_spec_id": task, "method": norm_method,
+        "carrier": norm_carrier,
         "route": route, "param": param, "identity_ref": identity,
         "vector": vector, "tool": tool, "arguments": arguments or {},
         "provenance": provenance or [], "observed": True, "eligible": not reason,
@@ -353,15 +448,42 @@ def parameter_candidates(spec: Any, records: list[dict[str, Any]],
             identity = "anon"
         if identity not in ("anon", "anonymous") and (not isinstance(identity, str) or identity not in bindings):
             reason = reason or "missing_observed_identity_binding"
+        method = str(record.get("method", "GET") or "GET").upper()
         if reason:
-            output.append(candidate(spec.id, route=url, provenance=provenance, reason=reason))
+            output.append(candidate(spec.id, route=url, provenance=provenance, reason=reason, method=method,
+                                    carrier="query" if method == "GET" else ""))
             continue
-        if record.get("method", "GET") != "GET":
+        if method not in {"GET", "POST"}:
             output.append(candidate(spec.id, route=url, provenance=provenance,
-                                    reason="unsupported_readonly_method"))
+                                    reason="unsupported_readonly_method", method=method, carrier=""))
             continue
-        declared = {item["name"]: item.get("in", "query") for item in declarations}
+        ctype = str(record.get("content_type") or "").split(";", 1)[0].strip().lower()
+        if method == "POST":
+            probe_carrier = "json" if ctype == "application/json" else "form"
+            post_auth = _call_profile_eligibility(
+                profile_eligibility, spec, url, "", probe_carrier, "readonly_sqli_boolean", "POST"
+            )
+            if not isinstance(post_auth, dict) or (
+                post_auth.get("eligible") is not True
+                and post_auth.get("reason_code") == "unsupported_readonly_method"
+            ):
+                output.append(candidate(
+                    spec.id, route=url, identity=identity, provenance=provenance,
+                    reason="unsupported_readonly_method", method="POST", carrier="",
+                ))
+                continue
+        declared = {
+            item["name"]: normalize_carrier(item.get("in", ""), method=method, content_type=ctype)
+            for item in declarations
+        }
         declared_samples = {item["name"]: str(item.get("sample", "")) for item in declarations}
+        if method == "POST" and not declared:
+            output.append(candidate(
+                spec.id, route=url, identity=identity, provenance=provenance,
+                reason="missing_parameter_or_synthetic_identity_pair", method="POST",
+                carrier="json" if ctype == "application/json" else ("form" if params else ""),
+            ))
+            continue
         for param in dict.fromkeys([*params, *declared]):
             sample = params.get(param, declared_samples.get(param, ""))
             for profile, (vector, direct, _) in PROFILES.items():
@@ -372,13 +494,26 @@ def parameter_candidates(spec: Any, records: list[dict[str, Any]],
                     continue
                 carrier = declared.get(param, "query")
                 policy_reason = ""
-                if surface_ok and profile == "readonly_traversal_application_files":
-                    if callable(profile_eligibility):
-                        decision = profile_eligibility(spec, url, param, carrier, profile)
+                if method == "POST":
+                    if profile == "readonly_traversal_application_files":
+                        policy_reason = "unsupported_readonly_method"
+                    elif surface_ok:
+                        decision = _call_profile_eligibility(
+                            profile_eligibility, spec, url, param, carrier, profile, method
+                        )
                         if not isinstance(decision, dict) or decision.get("eligible") is not True:
                             policy_reason = str(
                                 (decision or {}).get("reason_code") if isinstance(decision, dict) else ""
-                            ) or "traversal_policy_not_declared"
+                            ) or "unsupported_readonly_method"
+                        elif carrier not in {"form", "json"}:
+                            policy_reason = "unsupported_parameter_carrier"
+                elif surface_ok and profile == "readonly_traversal_application_files":
+                    decision = _call_profile_eligibility(
+                        profile_eligibility, spec, url, param, carrier, profile, method
+                    )
+                    if isinstance(decision, dict):
+                        if decision.get("eligible") is not True:
+                            policy_reason = str(decision.get("reason_code") or "") or "traversal_policy_not_declared"
                     else:
                         policy_reason = "traversal_policy_not_declared"
                 if not surface_ok or policy_reason:
@@ -388,14 +523,31 @@ def parameter_candidates(spec: Any, records: list[dict[str, Any]],
                         provenance=provenance,
                         reason=surface_reason or policy_reason,
                         validation_profile=profile,
+                        method=method,
+                        carrier=carrier,
                     ))
                     continue
                 # Direct validators have no session-ref argument. Authenticated
                 # records use Hunter's existing vault-only profile rather than
                 # projecting credentials or silently testing anonymously.
-                direct_args: dict[str, Any] = {
-                    "target_url": url, "param": param, "method": "GET", "carrier": "query",
-                }
+                if method == "POST":
+                    body_template, headers_json, baseline_val = build_post_body_template(
+                        declarations, param, carrier
+                    )
+                    direct_args = {
+                        "target_url": url,
+                        "param": param,
+                        "method": "POST",
+                        "carrier": carrier,
+                        "body_template": body_template,
+                        "headers_json": headers_json,
+                    }
+                    if baseline_val and profile == "readonly_sqli_boolean":
+                        direct_args["baseline_value"] = baseline_val
+                else:
+                    direct_args = {
+                        "target_url": url, "param": param, "method": "GET", "carrier": "query",
+                    }
                 if profile == "readonly_sqli_boolean":
                     direct_args["boolean_only"] = True
                 hunter_args: dict[str, Any] = {
@@ -413,6 +565,15 @@ def parameter_candidates(spec: Any, records: list[dict[str, Any]],
                     recipes[direct] = copy.deepcopy(direct_args)
                 if "hunter_run_web_loop" in spec.tools:
                     recipes["hunter_run_web_loop"] = copy.deepcopy(hunter_args)
+                carrier_or_sample_reason = (
+                    ""
+                    if method == "POST"
+                    else (
+                        "unsupported_parameter_carrier" if carrier != "query"
+                        else "missing_observed_query_sample" if param not in params
+                        else ""
+                    )
+                )
                 output.append(candidate(
                     spec.id, route=url, param=param,
                     identity=identity, vector=vector,
@@ -421,22 +582,33 @@ def parameter_candidates(spec: Any, records: list[dict[str, Any]],
                         (binding_reason if identity in bindings else "")
                         or surface_reason
                         or policy_reason
-                        or (
-                            "unsupported_parameter_carrier" if carrier != "query"
-                            else "missing_observed_query_sample" if param not in params
-                            else "validator_not_declared" if tool not in spec.tools else ""
-                        )
+                        or carrier_or_sample_reason
+                        or ("validator_not_declared" if tool not in spec.tools else "")
                     ),
                     validation_profile=profile,
                     recipes=recipes or None,
+                    method=method,
+                    carrier=carrier,
                 ))
+    # Conflicting carriers on the same (candidate_id) slice must fail closed.
+    carriers_by_id: dict[str, set[str]] = {}
+    for row in output:
+        if row.get("carrier"):
+            carriers_by_id.setdefault(row["candidate_id"], set()).add(row["carrier"])
+    for row in output:
+        if len(carriers_by_id.get(row["candidate_id"], set())) > 1:
+            row["eligible"] = False
+            row["reason_code"] = "conflicting_parameter_carrier"
+            row["tool"] = ""
+            row["arguments"] = {}
+            row.pop("recipes", None)
     # Prefer a provenance-backed anonymous observation of the identical slice.
     # Invalid/contradictory rows remain visible and cannot be hidden by it.
-    public = {(row["route"], row["param"], row["vector"]): row for row in output
+    public = {(row.get("method", "GET"), row["route"], row["param"], row["vector"]): row for row in output
               if row["identity_ref"] == "anon" and row["eligible"]}
     selected = []
     for row in output:
-        anonymous = public.get((row["route"], row["param"], row["vector"]))
+        anonymous = public.get((row.get("method", "GET"), row["route"], row["param"], row["vector"]))
         if anonymous is not None and row["identity_ref"] != "anon" and row["eligible"]:
             anonymous["provenance"].extend(row["provenance"])
         else:

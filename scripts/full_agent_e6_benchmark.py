@@ -47,6 +47,7 @@ DEFAULT_SEEDS = {
     "readonly-sql-injection": 271828,
     "readonly-template-injection": 141421,
     "readonly-path-traversal": 161803,
+    "post-carrier-injection": 424242,
 }
 MINIMUM_FAMILIES = 3
 LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1"}
@@ -1773,8 +1774,8 @@ def _audit_run_readonly(manifest_path: str | Path) -> tuple[dict[str, Any], dict
         metrics.update(
             closure_verified=False,
             accounting_matches=bool(
-                wire_file.is_file() and len(wire) == manifest.get("target_requests")
-                and all(row.get("method") == "GET" for row in wire)),
+                wire_file.is_file() and holdout.wire_accounting_matches(selected["family"], wire, manifest, truth)
+            ),
             target_requests=len(wire) if wire_file.is_file() else manifest.get("target_requests"),
             paid_provider_calls=paid_calls,
             provider_kind=provider_kind,
@@ -1797,19 +1798,9 @@ def _audit_run_readonly(manifest_path: str | Path) -> tuple[dict[str, Any], dict
     _verify_run_manifest_and_artifacts(directory, manifest, prepared, truth, verified_run=True, wire=wire)
     live = json.loads((work / "access/live-result.json").read_text(encoding="utf-8"))
     tool_index = json.loads((private / "tool-index.json").read_text(encoding="utf-8"))
-    live_tools = [
-        json.loads(Path(row["artifact"]).read_text(encoding="utf-8"))
-        for row in tool_index
-        if row["tool"] == "hunter_run_web_loop" and row["task_spec_id"] == "access-3"
-    ]
-    native_reports = [
-        json.loads(row["execution"]["result"]["output"])
-        for row in live_tools
-        if row["arguments"].get("live") and not row["error"]
-    ]
-    run_ids = [row["run_id"] for row in native_reports]
-    if not run_ids or live.get("run_ids") != run_ids:
-        raise ValueError("solver run IDs do not match production executor receipts")
+    run_ids, native_reports, validator_receipts = holdout.extract_access_receipts_and_run_ids(
+        selected["family"], live, tool_index, manifest
+    )
     artifacts = [
         {"path": str(path), "sha256": holdout.digest(path), "record": json.loads(path.read_text(encoding="utf-8"))}
         for path in sorted((private / "state/validations").glob("*.json"))
@@ -1833,20 +1824,13 @@ def _audit_run_readonly(manifest_path: str | Path) -> tuple[dict[str, Any], dict
                         signed_events.append(signed)
 
         def verified(record: dict[str, Any]) -> bool:
-            expected_finding = holdout.finding_type(selected["family"])
-            if not artifact_is_current(
-                record, trusted_root=str(private / "state/validations"),
-                expected_target=record["target"], expected_finding_type=expected_finding,
-            ):
-                return False
-            return any(
-                event["payload"].get("validation_id") == record["validation_id"]
-                and event["payload"].get("artifact_sha256") == record["artifact"]["content_sha256"]
-                and all(event["payload"].get(key) == value
-                        for key, value in record.get("execution_context", {}).items())
-                and event["payload"].get("status") == {
-                    "CONFIRMED": "confirmed", "UNCONFIRMED": "tested_clean"}.get(record["verdict"])
-                for event in signed_events
+            return holdout.verify_holdout_artifact(
+                selected["family"],
+                record,
+                trusted_root=str(private / "state/validations"),
+                signed_events=signed_events,
+                validator_receipts=validator_receipts,
+                artifact_is_current_fn=artifact_is_current,
             )
 
         metrics = holdout.evaluate(
@@ -1880,10 +1864,7 @@ def _audit_run_readonly(manifest_path: str | Path) -> tuple[dict[str, Any], dict
         if not observed_checks or observed_checks != checks or any(row["status"] != "fresh" for row in checks.values()):
             raise ValueError("attestation evidence does not match fresh native session checks")
 
-    accounting = (
-        len(wire) == manifest["target_requests"] == manifest["budget"]["used"]["http"]
-        and all(row["method"] == "GET" for row in wire)
-    )
+    accounting = holdout.wire_accounting_matches(selected["family"], wire, manifest, truth)
     if not closure_verified or not accounting:
         raise ValueError("holdout requires signed closure and exact read-only wire accounting")
     python = manifest.get("solver_mode") == "python_loop"

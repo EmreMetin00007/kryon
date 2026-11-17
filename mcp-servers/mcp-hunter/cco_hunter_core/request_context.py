@@ -116,8 +116,17 @@ def policy_scoped(tool_name: str):
                             from policy_engine import PolicyEngine
                             engine = PolicyEngine()
                         from .experiments import readonly_permission
+                        ctype = next(
+                            (str(v).split(";", 1)[0].strip().lower()
+                             for k, v in (headers or {}).items() if str(k).lower() == "content-type"),
+                            "",
+                        )
+                        req_carrier = (
+                            "json" if ctype == "application/json"
+                            else ("form" if ctype == "application/x-www-form-urlencoded" else "")
+                        )
                         if not readonly_permission({"url": url, "method": method}, engine.program_policy,
-                                                   _READONLY_OPERATION.get()):
+                                                   _READONLY_OPERATION.get(), carrier=req_carrier):
                             return False, "blocked policy: hunter permits read-only methods only; exact POST declaration required"
                         result = engine.validate_wire_invocation(tool_name, {
                             "target": url, "endpoint": url, "url": url,

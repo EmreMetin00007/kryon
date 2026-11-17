@@ -15,6 +15,7 @@ FORM_RE = re.compile(
 )
 FORM_ACTION_RE = re.compile(r"""action\s*=\s*['"]([^'"]+)['"]""", re.I)
 FORM_METHOD_RE = re.compile(r"""method\s*=\s*['"]([^'"]+)['"]""", re.I)
+FORM_ENCTYPE_RE = re.compile(r"""enctype\s*=\s*['"]([^'"]+)['"]""", re.I)
 INPUT_TAG_RE = re.compile(
     r"<(?:input|textarea|select)\b([^>]*)>",
     re.I,
@@ -64,11 +65,18 @@ def extract_html(html: str, base: str, allow_subdomains: bool = False) -> list[d
         attrs, body = form.group(1), form.group(2)
         action_m = FORM_ACTION_RE.search(attrs or "")
         method_m = FORM_METHOD_RE.search(attrs or "")
+        enctype_m = FORM_ENCTYPE_RE.search(attrs or "")
         action = action_m.group(1) if action_m else ""
         method = (method_m.group(1) if method_m else "GET").upper() or "GET"
+        enctype = (enctype_m.group(1) if enctype_m else "").split(";", 1)[0].strip().lower()
         url = normalize_url(action or ".", base=base)
         if not url or not same_host(url, base, allow_subdomains=allow_subdomains):
             continue
+        norm_method = method if method in {"GET", "POST", "PUT", "PATCH", "DELETE"} else "POST"
+        content_type = ""
+        if norm_method != "GET":
+            content_type = enctype or "application/x-www-form-urlencoded"
+        param_in = "query" if norm_method == "GET" else ("json" if content_type == "application/json" else "body")
         params = []
         for tag_m in INPUT_TAG_RE.finditer(body or ""):
             tag_attrs = tag_m.group(1) or ""
@@ -79,13 +87,13 @@ def extract_html(html: str, base: str, allow_subdomains: bool = False) -> list[d
             val = safe_sample(nm.group(1), unescape(vm.group(1))) if vm else ""
             params.append({
                 "name": nm.group(1),
-                "in": "query" if method == "GET" else "body",
+                "in": param_in,
                 "sample": val,
             })
-        if method == "GET":
+        if norm_method == "GET":
             params = params or params_from_url(url)
-        rec = _record(url, method if method in {"GET", "POST", "PUT", "PATCH", "DELETE"} else "POST",
-                      "form", params)
+        extra = {"content_type": content_type} if content_type else None
+        rec = _record(url, norm_method, "form", params, extra=extra)
         records.append(rec)
     return records
 
@@ -359,6 +367,8 @@ def extract_js_calls(text: str, base: str, allow_subdomains: bool = False,
             continue
         seen.add(key)
         record = _record(url, method, "graphql" if is_graphql else "js-call", params)
+        if method != "GET" and any(p.get("in") == "json" for p in params):
+            record["content_type"] = "application/json"
         if operation:
             record["operation"] = operation
         records.append(record)

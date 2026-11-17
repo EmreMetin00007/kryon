@@ -86,17 +86,20 @@ def route_experiment(item, capabilities, prerequisites=None):
         available=available, applicable=applicable, runnable=not reason, reason=reason)}
 
 
-def readonly_permission(request, policy, operation_id=""):
+def readonly_permission(request, policy, operation_id="", *, carrier=""):
     """Only exact operator policy declarations admit POST; schema flags cannot."""
     method = str(request.get("method") or "").upper()
     if method in {"GET", "HEAD", "OPTIONS"}:
         return True
-    if method != "POST" or not operation_id:
+    norm_carrier = {"body": "form"}.get(str(carrier or "").strip().lower(), str(carrier or "").strip().lower())
+    if method != "POST" or (not operation_id and norm_carrier not in {"form", "json"}):
         return False
     declarations = policy.get("readonly_operations") or []
     return isinstance(declarations, list) and any(
         isinstance(row, dict) and row.get("method") == method and row.get("url") == request.get("url")
-        and row.get("operation_id") == operation_id and row.get("read_only") is True
+        and (row.get("operation_id") == operation_id if operation_id else True)
+        and row.get("read_only") is True
+        and (not norm_carrier or not isinstance(row.get("carriers"), list) or norm_carrier in row["carriers"])
         for row in declarations)
 
 

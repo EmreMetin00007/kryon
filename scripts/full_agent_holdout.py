@@ -16,15 +16,22 @@ import sys
 from typing import Any
 from urllib.parse import urlsplit
 
-from lab import readonly_api_holdout, readonly_sqli_holdout, readonly_ssti_holdout, readonly_traversal_holdout
+from lab import (
+    post_carrier_holdout,
+    readonly_api_holdout,
+    readonly_sqli_holdout,
+    readonly_ssti_holdout,
+    readonly_traversal_holdout,
+)
 
 FAMILIES = {module.FAMILY: module for module in (
-    readonly_api_holdout, readonly_sqli_holdout, readonly_ssti_holdout, readonly_traversal_holdout)}
+    readonly_api_holdout, readonly_sqli_holdout, readonly_ssti_holdout, readonly_traversal_holdout, post_carrier_holdout)}
 
 
 def finding_type(family):
     return {readonly_api_holdout.FAMILY: "idor", readonly_sqli_holdout.FAMILY: "sql_injection",
-            readonly_ssti_holdout.FAMILY: "ssti", readonly_traversal_holdout.FAMILY: "path_traversal"}[family]
+            readonly_ssti_holdout.FAMILY: "ssti", readonly_traversal_holdout.FAMILY: "path_traversal",
+            post_carrier_holdout.FAMILY: "post_carrier_injection"}[family]
 
 
 def digest(path):
@@ -53,11 +60,15 @@ def private_policy_contract(family: str) -> dict[str, Any]:
     if not isinstance(family, str) or (family and family not in FAMILIES):
         raise ValueError("unknown independent family")
     requires_traversal = family == readonly_traversal_holdout.FAMILY
+    requires_post = family == post_carrier_holdout.FAMILY
     return {
         "schema": "holdout-private-policy-contract/1",
         "family": family,
-        "requires_private_policy": requires_traversal,
-        "policy_section": "path_traversal" if requires_traversal else None,
+        "requires_private_policy": requires_traversal or requires_post,
+        "policy_section": (
+            "path_traversal" if requires_traversal
+            else ("readonly_operations" if requires_post else None)
+        ),
         "host_only": True,
         "public_policy_unchanged": True,
         "test_data_only": True,
@@ -78,18 +89,32 @@ def verify_run_scoped_policy(policy_path: Path, expected_base: str) -> bool:
         if not path.is_file():
             return False
         data = json.loads(path.read_text(encoding="utf-8"))
-        rule = data.get("path_traversal") if isinstance(data, dict) else None
+        if not isinstance(data, dict):
+            return False
+        expected = urlsplit(expected_base)
+        permits = lambda url: (
+            urlsplit(url).scheme == expected.scheme
+            and urlsplit(url).netloc == expected.netloc
+        )
+        ro_ops = data.get("readonly_operations")
+        if isinstance(ro_ops, list) and ro_ops:
+            for op in ro_ops:
+                if (
+                    not isinstance(op, dict)
+                    or str(op.get("method") or "").upper() != "POST"
+                    or op.get("read_only") is not True
+                    or op.get("test_data_only") is not True
+                    or not permits(str(op.get("url") or ""))
+                ):
+                    return False
+            return True
+        rule = data.get("path_traversal")
         if not isinstance(rule, dict):
             return False
         validator_dir = str(Path(__file__).resolve().parents[1] / "mcp-servers/mcp-validator")
         if validator_dir not in sys.path:
             sys.path.append(validator_dir)
         from cco_validator_core.traversal import check_traversal_policy_eligibility
-        expected = urlsplit(expected_base)
-        permits = lambda url: (
-            urlsplit(url).scheme == expected.scheme
-            and urlsplit(url).netloc == expected.netloc
-        )
         files = rule.get("files") if isinstance(rule.get("files"), list) else []
         if not files:
             return False
@@ -143,6 +168,45 @@ def provision_private_policy(
             "family": family,
             "target": base,
             "policy_file": None,
+            "host_only": True,
+        }
+    if contract["policy_section"] == "readonly_operations":
+        if lab is None or lab.blind_state.get("lab_version") != post_carrier_holdout.VERSION:
+            raise ValueError("post carrier provisioning requires post-carrier/1 lab")
+        expected_origin = urlsplit(base)
+        if (expected_origin.scheme != "http" or expected_origin.hostname != "127.0.0.1"
+                or not expected_origin.port or expected_origin.path != "/"):
+            raise ValueError("post carrier private policy requires exact loopback run base URL")
+        if not isinstance(base_policy, dict):
+            raise ValueError("base_policy must be a mapping")
+        decl = post_carrier_holdout.declaration(lab.blind_state, base)
+        for row in decl.get("readonly_operations", []):
+            row_origin = urlsplit(str(row.get("url") or ""))
+            if (row_origin.scheme, row_origin.netloc) != (expected_origin.scheme, expected_origin.netloc):
+                raise ValueError("post policy declaration cross-target mismatch")
+            if row.get("method") != "POST" or row.get("read_only") is not True or row.get("test_data_only") is not True:
+                raise ValueError("post policy declaration requires read_only=True and test_data_only=True")
+        policy = copy.deepcopy(base_policy)
+        policy["readonly_operations"] = decl["readonly_operations"]
+        dump(policy_path, policy)
+        os.chmod(policy_path, 0o600)
+        policy_digest = digest(policy_path)
+        dump(private / "fixture-policy-verification.json", {
+            "before_traffic": True,
+            "declarations_validated": len(decl["readonly_operations"]),
+            "sha256": policy_digest,
+            "public_policy_unchanged": True,
+            "host_only": True,
+            "family": family,
+            "target_origin": expected_origin.netloc,
+        })
+        return {
+            "provisioned": True,
+            "family": family,
+            "target": base,
+            "policy_file": str(policy_path),
+            "sha256": policy_digest,
+            "declarations_validated": len(decl["readonly_operations"]),
             "host_only": True,
         }
     if lab is None or lab.blind_state.get("lab_version") != readonly_traversal_holdout.VERSION:
@@ -254,6 +318,9 @@ def evaluate(truth, wire, artifacts, *, target, run_id, verify_artifact, claims=
         elif family == readonly_traversal_holdout.FAMILY:
             traversal_reason, matched = readonly_traversal_holdout.evidence_matches(case, record, wire, target)
             reason = reason or traversal_reason
+        elif family == post_carrier_holdout.FAMILY:
+            post_reason, matched = post_carrier_holdout.evidence_matches(case, record, wire, target)
+            reason = reason or post_reason
         else:
             if context.get("resource_owner") != case["owner"] or context.get("identity") not in case["denied_identities"]:
                 reason = "authorization identity binding mismatch"
@@ -396,7 +463,12 @@ def _extract_not_tested(metrics, work, *, provider_kind, paid_calls, closure_pay
         access_summary = json.loads(access_path.read_text())
         access_reasons = list(access_summary.get("not_tested_reasons", []))
     closure_vectors = list((closure_payload or {}).get("not_tested", []))
-    dimensions = ["readonly_get_only", "synthetic_fixture_boundaries",
+    transport_dim = (
+        "readonly_get_and_declared_post_only"
+        if metrics.get("family") == post_carrier_holdout.FAMILY
+        else "readonly_get_only"
+    )
+    dimensions = [transport_dim, "synthetic_fixture_boundaries",
                   "out_of_band_and_multi_step_business_logic"]
     if provider_kind != "remote" or not paid_calls:
         dimensions.append("paid_remote_model_generalization")
@@ -574,6 +646,113 @@ def verify_python_snapshot(work, manifest, records):
         raise ValueError("Python holdout handoff changed")
 
 
+def extract_access_receipts_and_run_ids(
+    family: str,
+    live: dict[str, Any],
+    tool_index: list[dict[str, Any]],
+    manifest: dict[str, Any],
+) -> tuple[list[Any], list[dict[str, Any]], dict[str, dict[str, Any]]]:
+    """Resolve and verify access-3 execution receipts and run IDs for the given holdout family."""
+    live_tools = [json.loads(Path(row["artifact"]).read_text(encoding="utf-8")) for row in tool_index
+                  if row["tool"] == "hunter_run_web_loop" and row["task_spec_id"] == "access-3"]
+    native_reports = [json.loads(row["execution"]["result"]["output"]) for row in live_tools
+                      if row["arguments"].get("live") and not row["error"]]
+    run_ids = [row["run_id"] for row in native_reports]
+    validator_receipts: dict[str, dict[str, Any]] = {}
+    if family == post_carrier_holdout.FAMILY:
+        for row in tool_index:
+            if row.get("task_spec_id") == "access-3" and str(row.get("tool") or "").startswith("validator_validate_"):
+                receipt = json.loads(Path(row["artifact"]).read_text(encoding="utf-8"))
+                if receipt.get("error"):
+                    continue
+                out = (receipt.get("execution") or {}).get("result", {}).get("output")
+                if isinstance(out, str):
+                    try:
+                        out = json.loads(out)
+                    except ValueError:
+                        out = None
+                if isinstance(out, dict) and isinstance(out.get("validation_id"), str) and out["validation_id"]:
+                    validator_receipts[out["validation_id"]] = receipt
+        if validator_receipts:
+            if live.get("direct_validation_ids") != list(validator_receipts):
+                raise ValueError("solver validation IDs do not match production executor receipts")
+            if manifest.get("run_id") and manifest["run_id"] not in run_ids:
+                run_ids.append(manifest["run_id"])
+            if "validator-standalone" not in run_ids:
+                run_ids.append("validator-standalone")
+        if native_reports and live.get("run_ids") != [row["run_id"] for row in native_reports]:
+            raise ValueError("solver run IDs do not match production executor receipts")
+        if not run_ids or (not native_reports and not validator_receipts):
+            raise ValueError("solver run IDs do not match production executor receipts")
+        return run_ids, native_reports, validator_receipts
+    if not run_ids or live.get("run_ids") != run_ids:
+        raise ValueError("solver run IDs do not match production executor receipts")
+    return run_ids, native_reports, validator_receipts
+
+
+def verify_holdout_artifact(
+    family: str,
+    record: dict[str, Any],
+    *,
+    trusted_root: str,
+    signed_events: list[dict[str, Any]],
+    validator_receipts: dict[str, dict[str, Any]],
+    artifact_is_current_fn: Any,
+) -> bool:
+    """Verify signed validator artifact integrity and match it to production executor receipts."""
+    if family == post_carrier_holdout.FAMILY:
+        vtype = str(record.get("vuln_type") or "").lower()
+        expected_finding = "sql_injection" if "sql" in vtype else ("ssti" if "template" in vtype or "ssti" in vtype else "")
+        if not expected_finding or not artifact_is_current_fn(
+            record, trusted_root=trusted_root,
+            expected_target=record["target"], expected_finding_type=expected_finding,
+        ):
+            return False
+        receipt = validator_receipts.get(str(record.get("validation_id") or ""))
+        if receipt is not None:
+            args = receipt.get("arguments") or {}
+            ctx = record.get("execution_context") or {}
+            return (
+                args.get("target_url") == record.get("target")
+                and ctx.get("param") == args.get("param")
+                and ctx.get("method", "GET") == args.get("method", "GET")
+                and ctx.get("carrier", "query") == args.get("carrier", "query")
+            )
+    else:
+        expected_finding = finding_type(family)
+        if not artifact_is_current_fn(
+            record, trusted_root=trusted_root,
+            expected_target=record["target"], expected_finding_type=expected_finding,
+        ):
+            return False
+    return any(event["payload"].get("validation_id") == record["validation_id"]
+               and event["payload"].get("artifact_sha256") == record["artifact"]["content_sha256"]
+               and all(event["payload"].get(key) == value
+                       for key, value in record.get("execution_context", {}).items())
+               and event["payload"].get("status") == {
+                   "CONFIRMED": "confirmed", "UNCONFIRMED": "tested_clean"}.get(record["verdict"])
+               for event in signed_events)
+
+
+def wire_accounting_matches(
+    family: str,
+    wire: list[dict[str, Any]],
+    manifest: dict[str, Any],
+    truth: list[dict[str, Any]],
+) -> bool:
+    """Verify exact wire request counts and allowed HTTP methods for the audited family."""
+    if len(wire) != manifest.get("target_requests") or len(wire) != (manifest.get("budget") or {}).get("used", {}).get("http"):
+        return False
+    if family == post_carrier_holdout.FAMILY:
+        authorized_post_paths = {case["path"] for case in truth}
+        return all(
+            row.get("method") == "GET"
+            or (row.get("method") == "POST" and row.get("path") in authorized_post_paths)
+            for row in wire
+        )
+    return all(row.get("method") == "GET" for row in wire)
+
+
 def audit_run(manifest_path):
     """Read completed native or Python artifacts under original trust; no traffic."""
     import full_agent_launcher as launcher
@@ -596,13 +775,9 @@ def audit_run(manifest_path):
     wire = json.loads((evaluator / "wire.json").read_text())
     live = json.loads((work / "access/live-result.json").read_text())
     tool_index = json.loads((private / "tool-index.json").read_text())
-    live_tools = [json.loads(Path(row["artifact"]).read_text()) for row in tool_index
-                  if row["tool"] == "hunter_run_web_loop" and row["task_spec_id"] == "access-3"]
-    native_reports = [json.loads(row["execution"]["result"]["output"]) for row in live_tools
-                      if row["arguments"].get("live") and not row["error"]]
-    run_ids = [row["run_id"] for row in native_reports]
-    if not run_ids or live.get("run_ids") != run_ids:
-        raise ValueError("solver run IDs do not match production executor receipts")
+    run_ids, native_reports, validator_receipts = extract_access_receipts_and_run_ids(
+        selected["family"], live, tool_index, manifest
+    )
     artifacts = [{"path": str(path), "sha256": digest(path), "record": json.loads(path.read_text())}
                  for path in sorted((private / "state/validations").glob("*.json"))]
     validator_dir = str(Path(__file__).resolve().parents[1] / "mcp-servers/mcp-validator")
@@ -622,17 +797,14 @@ def audit_run(manifest_path):
                     if evidence_trust.verify(evidence_trust.canonical_bytes(payload), signed, "coverage-attempt"):
                         signed_events.append(signed)
         def verified(record):
-            expected_finding = finding_type(selected["family"])
-            if not artifact_is_current(record, trusted_root=str(private / "state/validations"),
-                                       expected_target=record["target"], expected_finding_type=expected_finding):
-                return False
-            return any(event["payload"].get("validation_id") == record["validation_id"]
-                       and event["payload"].get("artifact_sha256") == record["artifact"]["content_sha256"]
-                       and all(event["payload"].get(key) == value
-                               for key, value in record.get("execution_context", {}).items())
-                       and event["payload"].get("status") == {
-                           "CONFIRMED": "confirmed", "UNCONFIRMED": "tested_clean"}.get(record["verdict"])
-                       for event in signed_events)
+            return verify_holdout_artifact(
+                selected["family"],
+                record,
+                trusted_root=str(private / "state/validations"),
+                signed_events=signed_events,
+                validator_receipts=validator_receipts,
+                artifact_is_current_fn=artifact_is_current,
+            )
         metrics = evaluate(truth, wire, artifacts, target=manifest["target"],
                            run_id=run_ids, verify_artifact=verified,
                            claims=[claim for row in native_reports for claim in row.get("confirmed", [])])
@@ -661,8 +833,7 @@ def audit_run(manifest_path):
             observed_checks[receipt["arguments"]["identity"]] = check
         if not observed_checks or observed_checks != checks or any(row["status"] != "fresh" for row in checks.values()):
             raise ValueError("attestation evidence does not match fresh native session checks")
-    accounting = (len(wire) == manifest["target_requests"] == manifest["budget"]["used"]["http"]
-                  and all(row["method"] == "GET" for row in wire))
+    accounting = wire_accounting_matches(selected["family"], wire, manifest, truth)
     if not closure_verified or not accounting:
         raise ValueError("holdout requires signed closure and exact read-only wire accounting")
     python = manifest.get("solver_mode") == "python_loop"
@@ -734,8 +905,9 @@ def audit_run_status(manifest_path):
         metrics, work, provider_kind=provider_kind, paid_calls=paid_calls,
         closure_payload=None, closure_verified=False)
     metrics.update(closure_verified=False,
-                   accounting_matches=bool(wire_file.is_file() and len(wire) == manifest.get("target_requests")
-                                           and all(row.get("method") == "GET" for row in wire)),
+                   accounting_matches=bool(
+                       wire_file.is_file() and wire_accounting_matches(selected["family"], wire, manifest, truth)
+                   ),
                    target_requests=len(wire) if wire_file.is_file() else manifest.get("target_requests"),
                    paid_provider_calls=paid_calls, provider_kind=provider_kind, full_acceptance=False,
                    failed=True, failure_reason=failure_reason,
