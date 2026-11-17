@@ -12,6 +12,10 @@ from orchestration_spec import (TaskSpec, render_task_prompt, skeleton_summary,
                                 validate_chain, validate_summary, validate_worker_prompt)
 
 
+# Bounded summary limit: host-compiled validation_funnel and leaf_outcomes exceed 128 KiB on 80+ candidate leaves.
+MAX_SUMMARY_BYTES = 1024 * 1024
+
+
 class TaskRegistry:
     """Bounded, workspace-confined frozen TaskSpec and summary registry."""
 
@@ -44,8 +48,8 @@ class TaskRegistry:
     def read_summary(self, spec):
         path = self.summary_path(spec)
         with path.open("rb") as handle:
-            raw = handle.read(128 * 1024 + 1)
-        if len(raw) > 128 * 1024:
+            raw = handle.read(MAX_SUMMARY_BYTES + 1)
+        if len(raw) > MAX_SUMMARY_BYTES:
             raise ValueError("native summary too large")
         summary = json.loads(raw)
         if not isinstance(summary, dict):
@@ -107,8 +111,8 @@ class TaskRegistry:
         summary: Any = None
         if path.exists():
             with path.open("rb") as handle:
-                raw = handle.read(128 * 1024 + 1)
-            if len(raw) > 128 * 1024:
+                raw = handle.read(MAX_SUMMARY_BYTES + 1)
+            if len(raw) > MAX_SUMMARY_BYTES:
                 raise ValueError("native summary too large")
             try:
                 summary = json.loads(raw)

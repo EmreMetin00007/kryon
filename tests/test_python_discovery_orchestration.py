@@ -502,3 +502,73 @@ def test_launcher_bootstrap_strengthens_python_loop_goals_without_changing_ids_o
     for spec in specs:
         for step in spec.steps:
             assert len(step.command) <= 160
+
+
+def test_premature_blocked_enum_without_discovery_triggers_host_discovery(python_broker, monkeypatch):
+    """Submitting status='blocked' in enum-2 with zero DISCOVERY_TOOLS must dispatch host discovery first."""
+    solver = PythonSolver(python_broker, model="model")
+    _, enum_spec = _setup_enum_with_recon(
+        python_broker,
+        solver,
+        '{"items":[{"href":"/api/orders/1"}],"next":"/api/orders?page=2"}',
+    )
+    visited: list[str] = []
+
+    def fake_exec(self, task):
+        self.tasks.append(task)
+        url = json.loads(task["args_json"])["url"]
+        visited.append(url)
+        return {"actual_request_cost": 1, "result": {"output": {"status_code": 200, "text": '{"items":[]}'}}}
+
+    monkeypatch.setattr(type(python_broker.executor), "__call__", fake_exec)
+    original_completion = python_broker.completion
+    seen_frontiers = []
+
+    def completion(body):
+        ctx = json.loads(body["messages"][1]["content"])
+        seen_frontiers.append(ctx["discovery_frontier"]["counts"])
+        msg_payload = (
+            terminal(enum_spec, status="blocked", steps=[{"id": "discover-surface", "status": "not_tested"}])
+            if len(seen_frontiers) == 1
+            else terminal(enum_spec, status="done")
+        )
+        mock_provider(
+            monkeypatch,
+            python_broker,
+            {
+                "choices": [{"message": {"content": json.dumps(msg_payload)}}],
+                "usage": {"prompt_tokens": 100, "completion_tokens": 10, "total_tokens": 110},
+            },
+        )
+        return original_completion(body)
+
+    monkeypatch.setattr(python_broker, "completion", completion)
+    summary = solver.phase(enum_spec)
+    assert summary["status"] == "done"
+    assert len(seen_frontiers) == 2
+    assert seen_frontiers[1]["pending"] == 0
+    assert seen_frontiers[1]["completed"] == 3
+    assert set(visited) == {enum_spec.target + "api/orders/1", enum_spec.target + "api/orders?page=2"}
+
+
+def test_blocked_enum_after_discovery_attempt_remains_blocked(python_broker, monkeypatch):
+    """Submitting status='blocked' after DISCOVERY_TOOLS already ran must preserve blocked status."""
+    solver = PythonSolver(python_broker, model="model")
+    _, enum_spec = _setup_enum_with_recon(python_broker, solver, "<html><body>restricted</body></html>")
+    view = python_broker.view({"ok": False, "error": "crawl stopped: http_403"})
+    python_broker.results.append(
+        {"spec_id": enum_spec.id, "tool": "kali-tools_crawl_web_surface", "arguments": {"target": enum_spec.target}, **view}
+    )
+    submitted = terminal(enum_spec, status="blocked", steps=[{"id": "discover-surface", "status": "blocked"}])
+    assert solver._is_premature_enum_summary(enum_spec, submitted) is False
+    mock_provider(
+        monkeypatch,
+        python_broker,
+        {
+            "choices": [{"message": {"content": json.dumps(submitted)}}],
+            "usage": {"prompt_tokens": 100, "completion_tokens": 10, "total_tokens": 110},
+        },
+    )
+    summary = solver.phase(enum_spec)
+    assert summary["status"] == "blocked"
+    assert not python_broker.executor.tasks

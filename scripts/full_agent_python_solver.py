@@ -2363,12 +2363,17 @@ class PythonSolver:
         """True when an enum summary skips required discovery or leaves frontier continuation."""
         if spec.phase != "enum" or spec.references or spec.compiled_workflows:
             return False
-        if not isinstance(submitted, dict) or submitted.get("status") not in {"done", "partial"}:
+        if not isinstance(submitted, dict):
             return False
         enum_results = [
             row for row in self.broker.results
             if row["spec_id"] == spec.id and row["tool"] in DISCOVERY_TOOLS
         ]
+        status = submitted.get("status")
+        if status == "blocked":
+            return not enum_results
+        if status not in {"done", "partial"}:
+            return False
         if not enum_results:
             return True
         states = self.hydrate_discovery_state(spec)

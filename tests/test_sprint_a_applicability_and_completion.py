@@ -297,3 +297,74 @@ def test_task2_partial_or_incomplete_checks_rejected_at_builder_and_verifier(tru
             completed_checks=["check_a"],
             findings_count=1,
         )
+
+
+def test_task_registry_read_and_finalize_support_compacted_summaries_over_128kb(tmp_path):
+    """Summaries exceeding 128 KiB (e.g. 80-candidate funnels in seal) load cleanly under bounded MAX_SUMMARY_BYTES."""
+    import full_agent_launcher as launcher
+    from full_agent_tasks import MAX_SUMMARY_BYTES, TaskRegistry
+
+    base = "http://127.0.0.1:41000/"
+    workdir = tmp_path / "solver"
+    private = tmp_path / "private"
+    workdir.mkdir()
+    private.mkdir()
+    specs = launcher.bootstrap_plan(base, workdir, solver_mode="python_loop")
+    registry = TaskRegistry(specs, workdir, {}, setup_checks_passed=False)
+    access_spec = specs[2]
+    report_spec = specs[3]
+    summary_path = registry.summary_path(access_spec)
+    summary_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # Simulate an 80-candidate / ~180 KiB host-compiled access summary like readonly-path-traversal live run.
+    filler_candidates = [
+        {"candidate_id": f"cand-{i:03d}", "note": "x" * 2048}
+        for i in range(90)
+    ]
+    payload = {
+        "phase": access_spec.phase,
+        "target": base,
+        "status": "partial",
+        "evidence": [],
+        "findings": [],
+        "next": "Broader coverage remains NOT TESTED.",
+        "steps": [
+            {"id": step.id, "status": "not_tested" if step.id == "broader-coverage" else "done"}
+            for step in access_spec.steps
+        ],
+        "validation_funnel": {"candidates": filler_candidates},
+    }
+    raw = json.dumps(payload, separators=(",", ":")).encode()
+    assert 128 * 1024 < len(raw) < MAX_SUMMARY_BYTES
+    summary_path.write_bytes(raw)
+
+    loaded = registry.read_summary(access_spec)
+    assert len(loaded["validation_funnel"]["candidates"]) == 90
+
+    # finalize_active also preserves valid > 128 KiB terminal report summary without raising.
+    report_path = registry.summary_path(report_spec)
+    report_payload = {
+        "phase": report_spec.phase,
+        "target": base,
+        "status": "partial",
+        "evidence": [{"kind": "host_tool_result", "artifact": "context-archive/a.json"}],
+        "findings": [],
+        "next": "Broader coverage remains NOT TESTED.",
+        "steps": [
+            {"id": step.id, "status": "not_tested" if step.id == "unresolved-work" else "done"}
+            for step in report_spec.steps
+        ],
+        "validation_funnels": {"access-3": {"candidates": filler_candidates}},
+    }
+    report_raw = json.dumps(report_payload, separators=(",", ":")).encode()
+    assert 128 * 1024 < len(report_raw) < MAX_SUMMARY_BYTES
+    report_path.write_bytes(report_raw)
+    registry.active_spec = report_spec
+    finalized = registry.finalize_active("test_stop", [], private)
+    assert finalized["action"] == "terminal_summary_preserved"
+
+    # Hard upper cap MAX_SUMMARY_BYTES is still enforced against unbounded inputs.
+    oversized = tmp_path / "solver" / "summaries" / f"{access_spec.id}.json"
+    oversized.write_bytes(b"{" + b" " * MAX_SUMMARY_BYTES + b"}")
+    with pytest.raises(ValueError, match="native summary too large"):
+        registry.read_summary(access_spec)
