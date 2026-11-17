@@ -337,6 +337,8 @@ def broker_vector_template(vector: str) -> dict:
     tools = [tool for tool in template["tools"] if tool in allowed]
     if vector == "authz-idor":
         tools.append("validator_validate_idor")
+    elif vector == "authn-session" and "validator_validate_open_redirect" not in tools:
+        tools.append("validator_validate_open_redirect")
     return {"tools": tools, "commands": [
         command for command in template["commands"] if "validator_validate_finding" not in command]}
 
@@ -833,6 +835,7 @@ _VALIDATOR_VECTOR_ALIASES = {
     "authz-idor": ("bola", "bfla", "broken_access_control"),
     "authn-session": ("open_redirect", "token_differential_opaque_carrier",
                       "token_round_trip_application_flow"),
+    "xss-stored": ("xss_reflected", "reflected_xss", "dom_xss"),
     "file-access": ("unrestricted_file_upload", "xxe"),
 }
 

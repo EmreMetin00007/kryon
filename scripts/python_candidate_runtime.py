@@ -13,7 +13,24 @@ PROFILES = {
     "readonly_sqli_boolean": ("injection-sqli", "validator_validate_sqli", "differential_boolean"),
     "readonly_ssti_arithmetic": ("injection-ssti", "validator_validate_ssti", "arithmetic_eval"),
     "readonly_traversal_application_files": ("file-access", "validator_validate_path_traversal", "file_signature"),
+    "readonly_xss_reflection": ("xss-stored", "validator_validate_xss_reflection", "browser_execution"),
+    "readonly_open_redirect": ("authn-session", "validator_validate_open_redirect", "redirect_location"),
 }
+
+
+def profile_oracles(profile: str, verdict: str = "") -> frozenset[str]:
+    """Return acceptable validator oracles for a profile and verdict.
+
+    Reflected XSS confirmation strictly requires browser_execution; clean
+    negative/inconclusive reflection controls may report unescaped_reflection.
+    """
+    entry = PROFILES.get(profile)
+    if entry is None:
+        return frozenset()
+    primary = entry[2]
+    if profile == "readonly_xss_reflection" and str(verdict or "").upper() != "CONFIRMED":
+        return frozenset({primary, "unescaped_reflection"})
+    return frozenset({primary})
 STAGES = ("observed", "eligible", "admitted", "executed", "evidence_accepted")
 OUTCOME_BUCKETS = (
     "ineligible",
@@ -51,6 +68,25 @@ _TRAVERSAL_PATH_RE = re.compile(r"/(?:files?|downloads?|exports?|documents?|atta
 _FILENAME_SAMPLE_RE = re.compile(r"^[A-Za-z0-9_.-]+\.[A-Za-z0-9]{1,8}\Z")
 _TEMPLATE_PATH_RE = re.compile(r"/(?:templates?|ssti[-_/])(?:/|$)", re.I)
 _SQL_LOOKUP_PATH_RE = re.compile(r"/(?:lookup|items/sqli[-_/])(?:/|$)", re.I)
+_XSS_PARAM_NAMES = frozenset({
+    "xss", "html", "comment", "msg", "message", "bio", "title",
+    "label", "banner", "snippet", "heading", "caption", "description",
+    "preview", "echo", "tag", "badge", "highlight", "keyword",
+})
+_XSS_PATH_RE = re.compile(
+    r"/(?:xss[-_/]?|reflect(?:ion|ed)?|comments?|messages?|preview|echo|banner|dom[-_/]?|feedback|guestbook|highlight|widget)(?:/|$)",
+    re.I,
+)
+_REDIRECT_PARAM_NAMES = frozenset({
+    "redirect", "redirect_to", "redirect_url", "redirect_uri",
+    "next", "return", "return_to", "returnto", "return_url",
+    "goto", "dest", "destination", "continue", "url", "uri", "rurl", "out",
+})
+_REDIRECT_PATH_RE = re.compile(
+    r"/(?:go|redirects?|out|bounce|jump|leave|forward)(?:/|$)",
+    re.I,
+)
+_REDIRECT_SAMPLE_RE = re.compile(r"^(?:/[A-Za-z0-9_./-]*|https?://[^\s]+|//[^\s]+)\Z", re.I)
 CARD_LIMIT = 8
 CARD_BYTES = 2000
 
@@ -164,16 +200,44 @@ def surface_profile_applicability(url: str, param: str, sample: str, profile: st
         and "search" not in lower_path
         and "render" not in lower_path
     )
+    is_redirect_surface = (
+        not is_traversal_surface
+        and not is_sql_lookup_only
+        and not is_template_only
+        and (
+            lower_param in _REDIRECT_PARAM_NAMES
+            or bool(_REDIRECT_PATH_RE.search(lower_path))
+            or (bool(sample_text) and bool(_REDIRECT_SAMPLE_RE.fullmatch(sample_text)))
+        )
+    )
+    is_xss_surface = (
+        not is_traversal_surface
+        and not is_sql_lookup_only
+        and not is_template_only
+        and not is_redirect_surface
+        and (
+            lower_param in _XSS_PARAM_NAMES
+            or bool(_XSS_PATH_RE.search(lower_path))
+        )
+    )
     if profile == "readonly_traversal_application_files":
         if not is_traversal_surface:
             return False, False, "profile_not_applicable_to_surface"
         return True, True, ""
+    if profile == "readonly_xss_reflection":
+        if not is_xss_surface:
+            return False, False, "profile_not_applicable_to_surface"
+        return True, True, ""
+    if profile == "readonly_open_redirect":
+        if not is_redirect_surface:
+            return False, False, "profile_not_applicable_to_surface"
+        return True, True, ""
     if profile == "readonly_sqli_boolean":
-        if is_traversal_surface or is_template_only:
+        if is_traversal_surface or is_template_only or is_xss_surface or is_redirect_surface:
             return True, False, "profile_not_applicable_to_surface"
         return True, True, ""
     if profile == "readonly_ssti_arithmetic":
-        if is_traversal_surface or is_sql_lookup_only:
+        if is_traversal_surface or is_sql_lookup_only or is_xss_surface or is_redirect_surface:
             return True, False, "profile_not_applicable_to_surface"
         return True, True, ""
     return True, True, ""
@@ -495,7 +559,11 @@ def parameter_candidates(spec: Any, records: list[dict[str, Any]],
                 carrier = declared.get(param, "query")
                 policy_reason = ""
                 if method == "POST":
-                    if profile == "readonly_traversal_application_files":
+                    if profile in {
+                        "readonly_traversal_application_files",
+                        "readonly_xss_reflection",
+                        "readonly_open_redirect",
+                    }:
                         policy_reason = "unsupported_readonly_method"
                     elif surface_ok:
                         decision = _call_profile_eligibility(
@@ -516,6 +584,17 @@ def parameter_candidates(spec: Any, records: list[dict[str, Any]],
                             policy_reason = str(decision.get("reason_code") or "") or "traversal_policy_not_declared"
                     else:
                         policy_reason = "traversal_policy_not_declared"
+                elif surface_ok and profile in {"readonly_xss_reflection", "readonly_open_redirect"}:
+                    decision = _call_profile_eligibility(
+                        profile_eligibility, spec, url, param, carrier, profile, method
+                    )
+                    if isinstance(decision, dict) and decision.get("eligible") is not True:
+                        default_reason = (
+                            "xss_execution_disabled"
+                            if profile == "readonly_xss_reflection"
+                            else "redirect_policy_invalid"
+                        )
+                        policy_reason = str(decision.get("reason_code") or "") or default_reason
                 if not surface_ok or policy_reason:
                     output.append(candidate(
                         spec.id, route=url, param=param,

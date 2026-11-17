@@ -698,6 +698,11 @@ class PythonBroker(HostBroker):
                             and (card.get('vector') == 'file-access' or card.get('tool') == 'validator_validate_path_traversal')
                             for card in (context.get('candidate_cards') or [])
                         )
+                        has_xss_cards = any(
+                            isinstance(card, dict)
+                            and (card.get('vector') == 'xss-stored' or card.get('tool') == 'validator_validate_xss_reflection')
+                            for card in (context.get('candidate_cards') or [])
+                        )
                         reading_tools = {READ_TOOL, SUMMARY_TOOL, SESSION_CHECK_TOOL,
                                            COVERAGE_TOOL, 'hunter_run_web_loop', CRAWL_TOOL,
                                            COMPILED_WORKFLOW_TOOL, 'validator_validate_sqli',
@@ -706,6 +711,8 @@ class PythonBroker(HostBroker):
                                            'validator_validate_auth_bypass', 'validator_validate_open_redirect'}
                         if has_traversal_cards:
                             reading_tools.add('validator_validate_path_traversal')
+                        if has_xss_cards:
+                            reading_tools.add('validator_validate_xss_reflection')
                         if spec.phase in {'recon', 'enum'}:
                             reading_tools |= {
                                 'kali-tools_curl_request',
@@ -740,9 +747,23 @@ class PythonBroker(HostBroker):
                             isinstance(card, dict) and card.get('vector') == 'file-access'
                             for card in (context.get('candidate_cards') or [])
                         )
-                        trimmed_tools = {'validator_validate_open_redirect', 'validator_validate_auth_bypass'}
+                        has_xss_cards = any(
+                            isinstance(card, dict)
+                            and (card.get('vector') == 'xss-stored' or card.get('tool') == 'validator_validate_xss_reflection')
+                            for card in (context.get('candidate_cards') or [])
+                        )
+                        has_redirect_cards = any(
+                            isinstance(card, dict)
+                            and (card.get('vector') == 'authn-session' or card.get('tool') == 'validator_validate_open_redirect')
+                            for card in (context.get('candidate_cards') or [])
+                        )
+                        trimmed_tools = {'validator_validate_auth_bypass'}
+                        if not has_redirect_cards:
+                            trimmed_tools.add('validator_validate_open_redirect')
                         if not has_traversal_cards:
                             trimmed_tools.add('validator_validate_path_traversal')
+                        if not has_xss_cards:
+                            trimmed_tools.add('validator_validate_xss_reflection')
                         candidate['tools'] = [row for row in candidate['tools'] if row['function']['name'] not in trimmed_tools]
                         latest = projected['recent_results'][-1]
                         if latest.get('result', {}).get('content_ref'):
@@ -770,7 +791,9 @@ class PythonBroker(HostBroker):
                                    COVERAGE_TOOL: {'target', 'campaign_id'},
                                    'validator_validate_sqli': sqli_fields,
                                    'validator_validate_ssti': ssti_fields,
-                                   'validator_validate_path_traversal': {'target_url', 'param', 'method', 'carrier'}}
+                                   'validator_validate_path_traversal': {'target_url', 'param', 'method', 'carrier'},
+                                   'validator_validate_xss_reflection': {'target_url', 'param', 'method', 'carrier'},
+                                   'validator_validate_open_redirect': {'target_url', 'param', 'method', 'carrier'}}
                         for tool in candidate['tools']:
                             name = tool['function']['name']
                             params = tool['function']['parameters']
@@ -1485,6 +1508,60 @@ class PythonBroker(HostBroker):
             return {"eligible": False, "reason_code": "unsupported_parameter_carrier"}
         if norm_method != "GET":
             return {"eligible": False, "reason_code": "unsupported_readonly_method"}
+        if profile == "readonly_xss_reflection":
+            if (cand_origin.scheme, cand_origin.netloc) != (spec_origin.scheme, spec_origin.netloc):
+                return {"eligible": False, "reason_code": "xss_policy_invalid"}
+            if str(carrier or "query").strip().lower() != "query":
+                return {"eligible": False, "reason_code": "unsupported_parameter_carrier"}
+            if os.environ.get("CCO_SCOPE_FILE"):
+                try:
+                    from policy_engine import ScopeResolver
+                    if not ScopeResolver(scope_file=os.environ.get("CCO_SCOPE_FILE")).permits_url(url):
+                        return {"eligible": False, "reason_code": "xss_policy_invalid"}
+                except (ValueError, OSError, TypeError):
+                    return {"eligible": False, "reason_code": "xss_policy_invalid"}
+            policy_map = self._program_policy_map()
+            if policy_map is None:
+                if os.environ.get("CCO_PROGRAM_POLICY_FILE"):
+                    return {"eligible": False, "reason_code": "xss_policy_invalid"}
+                return {"eligible": True, "reason_code": ""}
+            xss_rule: Any = policy_map.get("xss_execution")
+            if xss_rule is None or (isinstance(xss_rule, dict) and xss_rule.get("enabled") is False):
+                return {"eligible": False, "reason_code": "xss_execution_disabled"}
+            validator_path = str(Path(__file__).resolve().parents[1] / "mcp-servers/mcp-validator")
+            if validator_path not in sys.path:
+                sys.path.append(validator_path)
+            from cco_validator_core.xss_execution import options as xss_options
+            try:
+                xss_options(xss_rule)
+            except ValueError:
+                return {"eligible": False, "reason_code": "xss_policy_invalid"}
+            return {"eligible": True, "reason_code": ""}
+        if profile == "readonly_open_redirect":
+            if (cand_origin.scheme, cand_origin.netloc) != (spec_origin.scheme, spec_origin.netloc):
+                return {"eligible": False, "reason_code": "redirect_policy_invalid"}
+            if str(carrier or "query").strip().lower() != "query":
+                return {"eligible": False, "reason_code": "unsupported_parameter_carrier"}
+            if os.environ.get("CCO_SCOPE_FILE"):
+                try:
+                    from policy_engine import ScopeResolver
+                    if not ScopeResolver(scope_file=os.environ.get("CCO_SCOPE_FILE")).permits_url(url):
+                        return {"eligible": False, "reason_code": "redirect_policy_invalid"}
+                except (ValueError, OSError, TypeError):
+                    return {"eligible": False, "reason_code": "redirect_policy_invalid"}
+            policy_map = self._program_policy_map()
+            if policy_map is None and os.environ.get("CCO_PROGRAM_POLICY_FILE"):
+                return {"eligible": False, "reason_code": "redirect_policy_invalid"}
+            if isinstance(policy_map, dict) and "open_redirect" in policy_map:
+                redir_rule: Any = policy_map.get("open_redirect")
+                if not isinstance(redir_rule, dict) or set(redir_rule) - {"allowed_hosts", "enabled"}:
+                    return {"eligible": False, "reason_code": "redirect_policy_invalid"}
+                if redir_rule.get("enabled") is False:
+                    return {"eligible": False, "reason_code": "redirect_policy_disabled"}
+                hosts = redir_rule.get("allowed_hosts")
+                if hosts is not None and (not isinstance(hosts, list) or any(not isinstance(h, str) for h in hosts)):
+                    return {"eligible": False, "reason_code": "redirect_policy_invalid"}
+            return {"eligible": True, "reason_code": ""}
         if profile != "readonly_traversal_application_files":
             return {"eligible": True, "reason_code": ""}
         if (cand_origin.scheme, cand_origin.netloc) != (spec_origin.scheme, spec_origin.netloc):
