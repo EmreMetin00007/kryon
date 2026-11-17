@@ -90,7 +90,7 @@ def test_hunter_facade_preserves_mcp_contract():
     ]
     assert list(inspect.signature(module.fuzz_attack_surface).parameters) == [
         "target", "limit", "max_requests", "live", "headers", "sleep_s", "sample_limit", "sql_only",
-        "ssti_only", "traversal_only"
+        "ssti_only", "traversal_only", "xss_only", "redirect_only"
     ]
     assert list(inspect.signature(module.coverage_report).parameters) == [
         "target", "enqueue_gaps", "campaign_id", "session_bindings", "headers", "request_cost", "max_attempts"
