@@ -37,8 +37,8 @@ from python_candidate_runtime import (BUDGET_DEFERRED_REASONS, PROFILES, candida
                                       classify_candidate_outcome, compact_cards, compact_gaps, dedup_gaps,
                                       funnel, gap, leaf_funnel, leaf_outcome, matches_model_call,
                                       pair_progress_entry, pair_progress_summary, parameter_candidates,
-                                      parameter_declarations, parser_gaps, query_parameters, recipe_arguments,
-                                      upstream_ids)
+                                      parameter_declarations, parser_gaps, profile_oracles, query_parameters,
+                                      recipe_arguments, upstream_ids)
 from python_discovery_runtime import (DISCOVERY_TOOLS, DiscoveryState, discovery_state_key,
                                       extract_json_hypermedia, normalize_identity, project_discovery_frontier,
                                       structured_params_from_node)
@@ -795,6 +795,10 @@ class PythonSolver:
                 "profile_not_applicable_to_surface",
                 "traversal_policy_not_declared",
                 "traversal_policy_invalid",
+                "xss_execution_disabled",
+                "xss_policy_invalid",
+                "redirect_policy_invalid",
+                "redirect_policy_disabled",
             }:
                 self.add_gap(spec, row["reason_code"], row=state[row["candidate_id"]])
         self.refresh_candidate_evidence(spec)
@@ -826,7 +830,10 @@ class PythonSolver:
     def _param_leaf_inconclusive_state(self, spec, row, allowed_tools):
         """Return ('indeterminate', validation_id) only for genuine current INCONCLUSIVE evidence."""
         validator_core = self._validator_core()
-        oracle = next((value[2] for value in PROFILES.values() if value[0] == row["vector"]), None)
+        profile_key = row.get("validation_profile") or next(
+            (k for k, v in PROFILES.items() if v[0] == row["vector"]), ""
+        )
+        allowed_oracles = profile_oracles(profile_key, "INCONCLUSIVE")
         found_invalid = False
         found_indeterminate = None
         row_method = str(row.get("method", "GET") or "GET").upper()
@@ -899,7 +906,7 @@ class PythonSolver:
                 if (not record or not validator_core.artifact_is_current(record, expected_target=spec.target)
                         or record.get("verdict") != "INCONCLUSIVE"
                         or record.get("target") != row["route"]
-                        or (oracle is not None and record.get("oracle") != oracle)
+                        or (allowed_oracles and record.get("oracle") not in allowed_oracles)
                         or (ctx and (ctx.get("param", row["param"]) != row["param"]
                                     or ctx.get("method", "GET") != row_method
                                     or ctx.get("carrier", "query") != row_carrier))):
@@ -1027,10 +1034,13 @@ class PythonSolver:
                         accepted = [item for item in outcomes if item["record"].get("execution_context", {}).get("identity") in batch
                                     and item["record"].get("execution_context", {}).get("resource_owner") in batch]
             else:
-                oracle = next((value[2] for value in PROFILES.values() if value[0] == row["vector"]), None)
+                profile_key = row.get("validation_profile") or next(
+                    (k for k, v in PROFILES.items() if v[0] == row["vector"]), ""
+                )
                 accepted = [item for item in outcomes if item["vector"] == row["vector"]
                     and item.get("tool", row["tool"]) in allowed_tools
-                    and item["record"]["target"] == row["route"] and item["record"].get("oracle") == oracle
+                    and item["record"]["target"] == row["route"]
+                    and item["record"].get("oracle") in profile_oracles(profile_key, str(item["record"].get("verdict") or ""))
                     and item.get("execution_context", item["record"].get("execution_context", {})).get("param") == row["param"]
                     and item.get("execution_context", item["record"].get("execution_context", {})).get("method") == row_method
                     and item.get("execution_context", item["record"].get("execution_context", {})).get("carrier") == row_carrier
@@ -2762,6 +2772,8 @@ class PythonSolver:
                              "validator_validate_sqli",
                              "validator_validate_ssti",
                              "validator_validate_path_traversal",
+                             "validator_validate_xss_reflection",
+                             "validator_validate_open_redirect",
                          }
                          for row in self.broker.tools)
         continued = False
@@ -3053,6 +3065,8 @@ class PythonSolver:
                                     "validator_validate_sqli",
                                     "validator_validate_ssti",
                                     "validator_validate_path_traversal",
+                                    "validator_validate_xss_reflection",
+                                    "validator_validate_open_redirect",
                                     "hunter_run_web_loop",
                                 }
                                 and args.get("live", True) is not False):

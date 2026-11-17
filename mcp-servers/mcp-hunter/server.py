@@ -1635,7 +1635,8 @@ def _parse_header_string(headers: str) -> dict:
 def fuzz_attack_surface(target: str, limit: int = 8, max_requests: int = 40,
                         live: bool = False, headers: str = "", sleep_s: float = 0.15,
                         sample_limit: int = 4, sql_only: bool = False, ssti_only: bool = False,
-                        traversal_only: bool = False) -> str:
+                        traversal_only: bool = False, xss_only: bool = False,
+                        redirect_only: bool = False) -> str:
     """P1 — SURFACE CANARY FUZZ. `next_surface_work` kuyruğundaki kayıtlı paramlara
     sınıf-bilinçli canary basar (SQLi/XSS/SSTI/LFI/open-redirect). LLM parse etmez.
 
@@ -1669,8 +1670,9 @@ def fuzz_attack_surface(target: str, limit: int = 8, max_requests: int = 40,
     hdr_dict = _parse_header_string(headers)
     # Historical class flags do not prove which request/identity was tested.
     from urllib.parse import urlsplit
-    queue = next_work(target, limit=1000 if (sql_only or ssti_only or traversal_only) else max(1, int(limit)), untested_only=False, db_path=MEM_DB)
-    if sql_only or ssti_only or traversal_only:
+    profile_only = sql_only or ssti_only or traversal_only or xss_only or redirect_only
+    queue = next_work(target, limit=1000 if profile_only else max(1, int(limit)), untested_only=False, db_path=MEM_DB)
+    if profile_only:
         prefix = urlsplit(target).path.rstrip("/")
         queue["queue"] = [record for record in queue.get("queue", [])
                           if (urlsplit(record.get("url") or "").path == prefix
@@ -1709,6 +1711,10 @@ def fuzz_attack_surface(target: str, limit: int = 8, max_requests: int = 40,
                     classes.append("ssti")
                 if traversal_only and "path_traversal" not in classes:
                     classes.append("path_traversal")
+                if xss_only and "xss_reflected" not in classes:
+                    classes.append("xss_reflected")
+                if redirect_only and "open_redirect" not in classes:
+                    classes.append("open_redirect")
                 if classes:
                     hydrated["suggested_classes"] = classes
             probes.extend(bind_file_probes(hydrated, build_canary_plan(hydrated, already_tested=[]),
@@ -1738,6 +1744,22 @@ def fuzz_attack_surface(target: str, limit: int = 8, max_requests: int = 40,
             if probe.get("vuln_class") in {"path_traversal", "lfi"} and key not in seen_traversal:
                 single_probes.append(probe)
                 seen_traversal.add(key)
+        probes = single_probes
+    elif xss_only:
+        single_probes, seen_xss = [], set()
+        for probe in probes:
+            key = (probe.get("fingerprint"), probe.get("param"), probe.get("location"))
+            if probe.get("vuln_class") == "xss_reflected" and probe.get("param") and key not in seen_xss:
+                single_probes.append(probe)
+                seen_xss.add(key)
+        probes = single_probes
+    elif redirect_only:
+        single_probes, seen_redirect = [], set()
+        for probe in probes:
+            key = (probe.get("fingerprint"), probe.get("param"), probe.get("location"))
+            if probe.get("vuln_class") == "open_redirect" and probe.get("param") and key not in seen_redirect:
+                single_probes.append(probe)
+                seen_redirect.add(key)
         probes = single_probes
     probes = interleave_probes(probes)
     results = []
@@ -1824,15 +1846,30 @@ def fuzz_attack_surface(target: str, limit: int = 8, max_requests: int = 40,
                                    str(probe.get("method") or "GET").upper() + ")"})
             results.append(item)
             continue
-        if live and (sql_only or ssti_only or traversal_only):
-            # The read-only boolean / arithmetic validator owns baseline eligibility
-            # and confirmation rounds. Extra light probes duplicate those
-            # controls and can trip the unchanged per-endpoint stuck gate.
-            item.update({"live": False, "triage_verdict": "DEFERRED",
-                         "coverage_status": "not_tested",
-                         "candidate_source": "surface_applicability",
-                         "candidate_reason": "readonly_traversal_validator" if traversal_only else "readonly_ssti_validator" if ssti_only else "readonly_boolean_validator",
-                         "evidence": "observed file parameter; declared fixture controls pending" if traversal_only else "observed SSTI parameter; arithmetic controls pending" if ssti_only else "observed SQL parameter; boolean controls pending"})
+        if live and profile_only:
+            # The read-only boolean / arithmetic / browser / redirect validator owns
+            # baseline eligibility and confirmation rounds. Extra light probes duplicate
+            # those controls and can trip the unchanged per-endpoint stuck gate.
+            item.update({
+                "live": False,
+                "triage_verdict": "DEFERRED",
+                "coverage_status": "not_tested",
+                "candidate_source": "surface_applicability",
+                "candidate_reason": (
+                    "readonly_traversal_validator" if traversal_only
+                    else "readonly_ssti_validator" if ssti_only
+                    else "readonly_xss_validator" if xss_only
+                    else "readonly_open_redirect_validator" if redirect_only
+                    else "readonly_boolean_validator"
+                ),
+                "evidence": (
+                    "observed file parameter; declared fixture controls pending" if traversal_only
+                    else "observed SSTI parameter; arithmetic controls pending" if ssti_only
+                    else "observed XSS parameter; reflection and browser controls pending" if xss_only
+                    else "observed redirect parameter; Location controls pending" if redirect_only
+                    else "observed SQL parameter; boolean controls pending"
+                ),
+            })
             results.append(item)
             continue
         if live and requests_sent + 2 <= max_requests and not stopped:
@@ -1992,7 +2029,7 @@ def fuzz_attack_surface(target: str, limit: int = 8, max_requests: int = 40,
     likely = [row for row in results if row.get("triage_verdict") == "LIKELY"]
     waf_blocked_rows = [row for row in results if row.get("triage_verdict") == "WAF_BLOCKED"]
     from cco_hunter_core.candidates import select_candidates
-    if live and (sql_only or ssti_only or traversal_only):
+    if live and profile_only:
         selected = [row for row in results if row.get("triage_verdict") == "DEFERRED"][:sample_limit]
     else:
         selected = select_candidates(results, sample_limit=sample_limit)
@@ -2001,7 +2038,7 @@ def fuzz_attack_surface(target: str, limit: int = 8, max_requests: int = 40,
     # resources as candidates; the loop requires explicit own-object metadata
     # and two identities before calling the validator.
     for record in queue.get("queue") or []:
-        if sql_only or ssti_only or traversal_only:
+        if profile_only:
             continue
         classes = set(record.get("suggested_classes") or []) | set(record.get("queued_classes") or [])
         kind = _resource_kind(str(record.get("url") or ""))
@@ -2548,8 +2585,10 @@ def _loop_blind_discover(target, identities, *, max_requests=24, sleep_s=0.15,
                  "reasons": ["identity discovery policy unavailable"]}, identities, [])
 
 
-def _loop_discover(target, cookie="", headers="", sql_only=False, ssti_only=False, traversal_only=False):
-    if sql_only or ssti_only or traversal_only:
+def _loop_discover(target, cookie="", headers="", sql_only=False, ssti_only=False, traversal_only=False,
+                   xss_only=False, redirect_only=False):
+    profile_only = sql_only or ssti_only or traversal_only or xss_only or redirect_only
+    if profile_only:
         from urllib.parse import urlsplit
         prefix = urlsplit(target).path.rstrip("/")
         existing = next_work(target, limit=1000, untested_only=False, db_path=MEM_DB)
@@ -2568,10 +2607,10 @@ def _loop_discover(target, cookie="", headers="", sql_only=False, ssti_only=Fals
     try:
         with scoped_surface_requests(gate, target):
             return kali.discover_web_surface(
-                target, mode="passive" if (sql_only or ssti_only or traversal_only) else "active", include_historic=False, include_browser=False,
+                target, mode="passive" if profile_only else "active", include_historic=False, include_browser=False,
                 # Observed links already carry parameter samples. Leave
                 # linked endpoint GETs to the validator's controls.
-                probe_limit=0 if (sql_only or ssti_only or traversal_only) else 32, timeout=8, cookie=cookie, headers=headers,
+                probe_limit=0 if profile_only else 32, timeout=8, cookie=cookie, headers=headers,
             )
     except SurfaceBlocked as exc:
         return json.dumps({"error": "discovery blocked", "stop_reason": str(exc)})
@@ -2602,12 +2641,14 @@ def _loop_zap(target):
 
 
 def _loop_fuzz(target, live=True, limit=8, headers="", cookie="", sleep_s=0.15,
-               request_field_values=None, sample_limit=4, sql_only=False, ssti_only=False, traversal_only=False):
+               request_field_values=None, sample_limit=4, sql_only=False, ssti_only=False,
+               traversal_only=False, xss_only=False, redirect_only=False):
     with request_fields(request_field_values):
         return fuzz_attack_surface(
             target, limit=int(limit), max_requests=max(20, int(limit) * 5),
             live=bool(live), headers=_headers_json(headers, cookie), sleep_s=float(sleep_s),
-            sample_limit=sample_limit, sql_only=sql_only, ssti_only=ssti_only, traversal_only=traversal_only,
+            sample_limit=sample_limit, sql_only=sql_only, ssti_only=ssti_only,
+            traversal_only=traversal_only, xss_only=xss_only, redirect_only=redirect_only,
         )
 
 
@@ -2721,6 +2762,8 @@ def _loop_validate(item, headers="", cookie=""):
         return {"verdict": "INCONCLUSIVE", "error": "validator cannot preserve parameter carrier"}
     if vclass == "sql_injection" and item.get("boolean_only"):
         kwargs["boolean_only"] = True
+    if vclass == "open_redirect" and item.get("bounded_controls") and "bounded_controls" in params:
+        kwargs["bounded_controls"] = True
     if vclass == "ssrf":
         if (not context or str(item.get("method") or "GET").upper() != "GET"
                 or item.get("location") not in {None, "query"} or template):
@@ -3078,11 +3121,21 @@ def run_web_loop(
     """
     if not (target or "").strip():
         return json.dumps({"ok": False, "error": "target gerekli"}, ensure_ascii=False)
-    if validation_profile not in {"", "readonly_sqli_boolean", "readonly_ssti_arithmetic", "readonly_traversal_application_files"}:
+    if validation_profile not in {
+        "",
+        "readonly_sqli_boolean",
+        "readonly_ssti_arithmetic",
+        "readonly_traversal_application_files",
+        "readonly_xss_reflection",
+        "readonly_open_redirect",
+    }:
         return json.dumps({"ok": False, "error": "unknown validation profile", "requests_authorized": 0})
     sql_only = validation_profile == "readonly_sqli_boolean"
     ssti_only = validation_profile == "readonly_ssti_arithmetic"
     traversal_only = validation_profile == "readonly_traversal_application_files"
+    xss_only = validation_profile == "readonly_xss_reflection"
+    redirect_only = validation_profile == "readonly_open_redirect"
+    profile_only = sql_only or ssti_only or traversal_only or xss_only or redirect_only
     if traversal_only:
         # This profile never falls back to the legacy system-file corpus.
         validator_dir = os.path.join(os.path.dirname(_SERVER_DIR), "mcp-validator")
@@ -3099,6 +3152,17 @@ def run_web_loop(
                 application_files(rule, row["url"], row["param"], row["carrier"], scope.permits_url)
         except (KeyError, TypeError, ValueError):
             return json.dumps({"ok": False, "error": "declared synthetic traversal files unavailable",
+                               "requests_authorized": 0})
+    if xss_only:
+        validator_dir = os.path.join(os.path.dirname(_SERVER_DIR), "mcp-validator")
+        if validator_dir not in sys.path:
+            sys.path.insert(0, validator_dir)
+        from policy_engine import PolicyEngine
+        from cco_validator_core.xss_execution import options as xss_options
+        try:
+            xss_options(PolicyEngine().program_policy.get("xss_execution"))
+        except (KeyError, TypeError, ValueError):
+            return json.dumps({"ok": False, "error": "browser XSS execution policy unavailable or disabled",
                                "requests_authorized": 0})
     from cco_hunter_core.candidates import sampling_limit
     try:
@@ -3192,18 +3256,30 @@ def run_web_loop(
         fuzz_limit=int(fuzz_limit),
         max_validations=int(max_validations),
         sleep_s=float(sleep_s),
-        discover=(lambda *args, **kwargs: _loop_discover(*args, **kwargs, sql_only=sql_only, ssti_only=ssti_only, traversal_only=traversal_only))
-                 if live and (sql_only or ssti_only or traversal_only) else _loop_discover if live else None,
+        discover=(lambda *args, **kwargs: _loop_discover(
+            *args, **kwargs, sql_only=sql_only, ssti_only=ssti_only,
+            traversal_only=traversal_only, xss_only=xss_only, redirect_only=redirect_only
+        )) if live and profile_only else _loop_discover if live else None,
         crawl_fn=_loop_crawl if live else None,
         zap_fn=None,
-        fuzz=(lambda *args, **kwargs: _loop_fuzz(*args, **kwargs, sample_limit=candidate_sample_limit,
-                                               **({"sql_only": True} if sql_only else {"ssti_only": True} if ssti_only else {"traversal_only": True} if traversal_only else {}))) if live else None,
+        fuzz=(lambda *args, **kwargs: _loop_fuzz(
+            *args, **kwargs, sample_limit=candidate_sample_limit,
+            **({"sql_only": True} if sql_only
+               else {"ssti_only": True} if ssti_only
+               else {"traversal_only": True} if traversal_only
+               else {"xss_only": True} if xss_only
+               else {"redirect_only": True} if redirect_only
+               else {})
+        )) if live else None,
         validate=(lambda item, **kwargs: _loop_validate(
-            {**item, "boolean_only": True} if sql_only else item, **kwargs)) if live else None,
-        # Repeated boolean/arithmetic evidence is already complete for this profile;
+            {**item, "boolean_only": True} if sql_only
+            else ({**item, "bounded_controls": True} if redirect_only else item),
+            **kwargs,
+        )) if live else None,
+        # Repeated boolean/arithmetic/browser/redirect evidence is already complete for this profile;
         # post-confirmation readbacks would exceed the endpoint probe budget.
         exploit=(lambda validation_id: _loop_exploit(validation_id, headers=effective_headers, cookie=cookie))
-                if live and not (sql_only or ssti_only or traversal_only) else None,
+                if live and not profile_only else None,
         identities=ident_map or None,
         authz_validate=_loop_authz_validate if live else None,
         oob_validate=(lambda item: _loop_ssrf_validate(item, headers=effective_headers, cookie=cookie)) if live else None,
@@ -3265,7 +3341,13 @@ def run_web_loop(
     operational_report = compact_loop_discover(report)
     if (
         live
-        and validation_profile in {"readonly_sqli_boolean", "readonly_ssti_arithmetic", "readonly_traversal_application_files"}
+        and validation_profile in {
+            "readonly_sqli_boolean",
+            "readonly_ssti_arithmetic",
+            "readonly_traversal_application_files",
+            "readonly_xss_reflection",
+            "readonly_open_redirect",
+        }
         and operational_report.get("ok") is True
         and not operational_report.get("errors")
         and not operational_report.get("stopped")
@@ -3295,6 +3377,10 @@ def run_web_loop(
                     if validation_profile == "readonly_traversal_application_files"
                     else ["baseline", "differential_boolean"]
                     if validation_profile == "readonly_sqli_boolean"
+                    else ["baseline", "unescaped_reflection"]
+                    if validation_profile == "readonly_xss_reflection"
+                    else ["baseline", "redirect_location"]
+                    if validation_profile == "readonly_open_redirect"
                     else ["baseline", "arithmetic_eval"]
                 )
                 check_rev = compute_check_revision(scope_rev, pol_hash, validation_profile, req_checks)

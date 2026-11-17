@@ -32,7 +32,7 @@ from full_agent_runtime_policy import (MAX_CONTEXT_BYTES, MAX_PROMPT_TOKENS,
                                        MIN_OUTPUT_TOKENS, PHASE_WEIGHTS, RuntimePolicy)
 from orchestration_spec import COMPILED_WORKFLOW_TOOL
 from python_candidate_runtime import (PROFILES, authorization_controls_complete, compact_gaps,
-                                      page_cards, query_parameters, upstream_ids)
+                                      page_cards, profile_oracles, query_parameters, upstream_ids)
 from python_discovery_runtime import SUMMARY_FRONTIER_BYTES, SUMMARY_FRONTIER_LIMIT, compact_frontier
 
 PHASE_CALL_LIMITS = {"recon": 12, "enum": 16, "access": 14, "report": 6, "planner": 8}
@@ -1377,25 +1377,39 @@ class PythonBroker(HostBroker):
                 args = row["arguments"]
                 if row["tool"].startswith("validator_validate_"):
                     expected_kind = row["tool"].removeprefix("validator_validate_")
-                    aliases = {"sqli": "SQL Injection", "ssti": "SSTI"}
+                    aliases = {
+                        "sqli": "SQL Injection",
+                        "ssti": "SSTI",
+                        "xss_reflection": "Reflected XSS",
+                        "open_redirect": "Open Redirect",
+                    }
                     if expected_kind in aliases and kind != normalize_finding_type(aliases[expected_kind]):
                         continue
-                    if not context and row["tool"] in {"validator_validate_sqli", "validator_validate_ssti"}:
+                    direct_profile_tools = {
+                        "validator_validate_sqli": "readonly_sqli_boolean",
+                        "validator_validate_ssti": "readonly_ssti_arithmetic",
+                        "validator_validate_xss_reflection": "readonly_xss_reflection",
+                        "validator_validate_open_redirect": "readonly_open_redirect",
+                    }
+                    if not context and row["tool"] in direct_profile_tools:
                         context = self.direct_request_context(record, args)
-                    if row["tool"] in {"validator_validate_sqli", "validator_validate_ssti"}:
+                    if row["tool"] in direct_profile_tools:
                         # Read-only host slices require a complete signed (or
                         # signed-wire-derived) request context and the selected
                         # deterministic oracle, not just a valid artifact ID.
-                        profile = ("readonly_sqli_boolean" if row["tool"] == "validator_validate_sqli"
-                                   else "readonly_ssti_arithmetic")
+                        profile = direct_profile_tools[row["tool"]]
                         method_arg = str(args.get("method", "GET") or "GET").upper()
                         carrier_arg = str(args.get("carrier", "query") or "query").lower()
                         carrier_ok = (
                             (method_arg == "GET" and carrier_arg == "query")
-                            or (method_arg == "POST" and carrier_arg in {"form", "json"})
+                            or (
+                                profile in {"readonly_sqli_boolean", "readonly_ssti_arithmetic"}
+                                and method_arg == "POST"
+                                and carrier_arg in {"form", "json"}
+                            )
                         )
                         if (carrier_ok and (row["tool"] != "validator_validate_sqli" or args.get("boolean_only") is True)):
-                            if (record.get("oracle") != PROFILES[profile][2]
+                            if (record.get("oracle") not in profile_oracles(profile, str(record.get("verdict") or ""))
                                     or not {"param", "method", "carrier", "identity"} <= context.keys()
                                     or context.get("identity") not in {"anon", "anonymous"}):
                                 continue
@@ -1729,6 +1743,11 @@ class PythonBroker(HostBroker):
             return {}
         changed = False
         for probe in probes:
+            role = str(probe.get("role") or "")
+            if role.startswith("redirect-hop-") and role != "redirect-hop-0":
+                if probe.get("method") != "GET" or not probe.get("transport_ok"):
+                    return {}
+                continue
             url = urlsplit(probe.get("request_url", ""))
             try:
                 query = query_parameters(probe.get("request_url", ""))

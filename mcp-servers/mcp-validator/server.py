@@ -1516,6 +1516,25 @@ def validate_xss_reflection(target_url: str, param: str = "", method: str = "GET
         body_template: POST gövde şablonu ('{{PAYLOAD}}')
         headers_json: Ek başlıklar (JSON)
     """
+    norm_carrier = _normalize_carrier(carrier, method)
+    with _direct_context_scope(
+        target_url=target_url, param=param, method=method, carrier=norm_carrier, vuln_class="xss_reflected",
+    ):
+        return _validate_xss_reflection_inner(
+            target_url=target_url, param=param, method=method,
+            body_template=body_template, headers_json=headers_json, carrier=norm_carrier,
+        )
+
+
+def _validate_xss_reflection_inner(
+    *,
+    target_url: str,
+    param: str,
+    method: str,
+    body_template: str,
+    headers_json: str,
+    carrier: str,
+) -> str:
     from cco_validator_core.controls import usable_control
     from cco_validator_core.evidence import current_scope_revision, current_policy_hash
 
@@ -1548,7 +1567,7 @@ def validate_xss_reflection(target_url: str, param: str = "", method: str = "GET
             if not response_is_waf_block(r):
                 raw = mutated
                 break
-    if not usable_control(r, baseline=True):
+    if not usable_control(r, baseline=not has_experiment()):
         return _result("Reflected XSS", target_url, INCONCLUSIVE, "unescaped_reflection",
                        {"error": r.get("error")}, "-", notes="Reflection probe did not reach a successful response.",
                        guard={"transport_ok": False},
@@ -1614,19 +1633,32 @@ def validate_xss_reflection(target_url: str, param: str = "", method: str = "GET
             },
             request_evidence=trace,
         )
+    xss_completion = _build_validator_completion(
+        target_url=target_url,
+        param=param,
+        method=method,
+        carrier=carrier,
+        profile="readonly_xss_reflection",
+        required_checks=["baseline", "unescaped_reflection"],
+    )
     if enc_tag in txt:
         return _result("Reflected XSS", target_url, UNCONFIRMED, "unescaped_reflection",
                        {"marker": canary, "reflected_raw": False, "html_encoded": True},
                        "-", notes="Marker yansıdı ama HTML-encode edildi (&lt;) → korumalı.",
                        guard={"transport_ok": True, "controls": ["successful reflection probe", "encoded marker"],
                               "limitations": ["only this reflection payload was tested; browser execution was not checked"]},
-                       request_evidence=trace)
+                       request_evidence=trace,
+                       signed_completion=xss_completion)
     return _result("Reflected XSS", target_url, UNCONFIRMED, "unescaped_reflection",
                    {"marker": canary, "reflected": False}, "-",
                    notes="Marker yanıtta yansımadı.",
                    guard={"transport_ok": True, "controls": ["successful reflection probe", "marker absent"],
                           "limitations": ["only this reflection payload was tested; browser execution was not checked"]},
-                   request_evidence=trace)
+                   request_evidence=trace,
+                   signed_completion=xss_completion)
+
+
+validate_xss = validate_xss_reflection
 
 
 @mcp.tool()
@@ -1701,7 +1733,9 @@ def validate_stored_reflection(write_url: str, read_url: str, field: str = "comm
 
 
 @mcp.tool()
-def validate_open_redirect(target_url: str, param: str = "", headers_json: str = "{}") -> str:
+def validate_open_redirect(target_url: str, param: str = "", headers_json: str = "{}",
+                           method: str = "GET", carrier: str = "query",
+                           bounded_controls: bool = False) -> str:
     """Open Redirect'i Location-header oracle'ı ile doğrula. Sentinel bir dış host
     enjekte edilir; 3xx yanıtın Location'ı bu host'a gidiyorsa → onaylı (deterministik).
 
@@ -1709,7 +1743,33 @@ def validate_open_redirect(target_url: str, param: str = "", headers_json: str =
         target_url: Yönlendirme yapan URL (örn http://t/go?url=...)
         param: Yönlendirme parametresi (örn 'url','next','redirect')
         headers_json: Ek başlıklar (JSON)
+        method: HTTP metodu (varsayılan GET)
+        carrier: Parametre taşıyıcısı (varsayılan query)
+        bounded_controls: Profil kapsamında bounded 3-payload + tek negatif kontrol modu
     """
+    norm_method = str(method or "GET").upper()
+    norm_carrier = _normalize_carrier(carrier, norm_method)
+    with _direct_context_scope(
+        target_url=target_url, param=param, method=norm_method, carrier=norm_carrier, vuln_class="open_redirect",
+    ):
+        if norm_method != "GET" or norm_carrier != "query":
+            return _result(
+                "Open Redirect", target_url, INCONCLUSIVE, "redirect_location", {}, "-",
+                notes="Open Redirect validation requires a read-only GET query parameter.",
+                guard={"transport_ok": False}, request_evidence=[],
+            )
+        return _validate_open_redirect_inner(
+            target_url=target_url, param=param, headers_json=headers_json, bounded_controls=bounded_controls,
+        )
+
+
+def _validate_open_redirect_inner(
+    *,
+    target_url: str,
+    param: str,
+    headers_json: str,
+    bounded_controls: bool = False,
+) -> str:
     from cco_validator_core.controls import ControlTrace, usable_control
 
     H = _headers(headers_json)
@@ -1735,13 +1795,15 @@ def validate_open_redirect(target_url: str, param: str = "", headers_json: str =
     payloads = [f"https://{sentinel}/", f"//{sentinel}/", f"/\\{sentinel}/",
                 f"https://{sentinel}%2f..", f"https://target@{sentinel}/",
                 f"http://{sentinel}/"]
+    if bounded_controls:
+        payloads = payloads[:3]
     for pl in payloads:
         r = _send_payload(target_url, pl, param=param, method="GET", headers=H,
                           allow_redirects=False)
         # Preserve the sent probe even when its following control fails or is
         # denied. Evidence follows wire order, including incomplete rounds.
         trace.observe(r, "redirect-hop-0", redirects=True)
-        if has_experiment():
+        if has_experiment() and not bounded_controls:
             control = _send_payload(target_url, observed_baseline(""), param=param, headers=H, allow_redirects=False)
             trace.observe(control, "negative-control", baseline=True, redirects=True)
             control_host = urlparse(urljoin(target_url, control.get("location") or "")).hostname
@@ -1765,6 +1827,14 @@ def validate_open_redirect(target_url: str, param: str = "", headers_json: str =
             valid_scheme = parsed_location.scheme in {"http", "https"} or loc.startswith("//")
             is_redirect = isinstance(r.get("status"), int) and 300 <= r["status"] < 400
             if is_redirect and valid_scheme and host == sentinel and host not in allowed_hosts:
+                if has_experiment() and bounded_controls:
+                    control = _send_payload(target_url, observed_baseline(""), param=param, headers=H, allow_redirects=False)
+                    trace.observe(control, "negative-control", baseline=True, redirects=True)
+                    control_host = urlparse(urljoin(target_url, control.get("location") or "")).hostname
+                    if not trace.complete or control_host == sentinel:
+                        return _result("Open Redirect", target_url, INCONCLUSIVE, "redirect_location", {}, "-",
+                            notes="Redirect negative control failed or reproduced the sentinel.",
+                            guard={"transport_ok": False}, request_evidence=trace.evidence)
                 return _result("Open Redirect", target_url, CONFIRMED, "redirect_location",
                                {"payload": pl, "status": r.get("status"),
                                  "location_header": loc, "redirect_host": host,
@@ -1793,15 +1863,37 @@ def validate_open_redirect(target_url: str, param: str = "", headers_json: str =
             if _hop == 3:
                 incomplete_chain = True
             current_url = urljoin(current_url, loc)
+    if has_experiment() and bounded_controls and trace.complete and not incomplete_chain:
+        control = _send_payload(target_url, observed_baseline(""), param=param, headers=H, allow_redirects=False)
+        trace.observe(control, "negative-control", baseline=True, redirects=True)
+        control_host = urlparse(urljoin(target_url, control.get("location") or "")).hostname
+        if not trace.complete or control_host == sentinel:
+            return _result("Open Redirect", target_url, INCONCLUSIVE, "redirect_location", {}, "-",
+                notes="Redirect negative control failed or reproduced the sentinel.",
+                guard={"transport_ok": False}, request_evidence=trace.evidence)
     complete = trace.complete and not incomplete_chain
-    return _result("Open Redirect", target_url, UNCONFIRMED if complete else INCONCLUSIVE, "redirect_location",
+    verdict = UNCONFIRMED if complete else INCONCLUSIVE
+    redirect_completion = (
+        _build_validator_completion(
+            target_url=target_url,
+            param=param,
+            method="GET",
+            carrier="query",
+            profile="readonly_open_redirect",
+            required_checks=["baseline", "redirect_location"],
+        )
+        if verdict == UNCONFIRMED
+        else None
+    )
+    return _result("Open Redirect", target_url, verdict, "redirect_location",
                    {"payloads_tested": len(payloads)}, "-",
                    notes="Completed redirect controls did not reach the sentinel." if complete
                    else "Redirect controls failed or ended at an unobserved hop.",
                    guard={"transport_ok": complete,
                           "controls": ["random sentinel host", "all submitted payloads", "bounded same-host hops"],
                           "limitations": ["external destinations were not followed; only the listed payloads were tested"]},
-                   request_evidence=trace.evidence)
+                   request_evidence=trace.evidence,
+                   signed_completion=redirect_completion)
 
 
 def _oob_sent_request_binding(target_url: str, param: str, payload: str, response: dict,
