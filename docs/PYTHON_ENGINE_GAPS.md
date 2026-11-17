@@ -488,6 +488,27 @@ Dış kanıtlar: `/root/cco-work/wf-eb9f69a9/live-e6-plan-v5/`,
 `/root/cco-work/wf-eb9f69a9/e6-meta-after-v5/` (`cohort/cohort-report.json`,
 `cohort/cohort-report.md`, `reaudit/cohort-report.json`, `logs/live-cohort.log`).
 
+#### Sprint A tamamlama kaydı — 2026-11-17 (`main@ae2d1c9`, 4-aile `E6 v7`)
+
+Deterministik uygulanabilirlik kapısı (`scripts/python_candidate_runtime.py`),
+`signed_completion` v1 imzalı negatif kanıt zarfı (`scripts/signed_completion.py`),
+tembel bütçe-farkında sıralayıcı (`scripts/python_scheduler.py`), `>128 KiB`
+görev özeti desteği, keşifsiz/sıfır-gözlem `enum` blokajında discovery dağıtımı
+ve salt-okunur path traversal entegrasyonu (`d98b5e1` → `ae2d1c9`) sonrasında,
+dört bağımsız ailede (`readonly-api-access-control:314159`,
+`readonly-sql-injection:271828`, `readonly-template-injection:141421`,
+`readonly-path-traversal:161803`; aynı `250 HTTP / 150000 token / 900 sn`
+tavanlarıyla `meta/muse-spark-1.3-contributor` üzerinde `e6-sprint-a-4fam-v7`)
+**`32/32` recall (`1.000`), `32/32` negatif kapsam (`1.000`), `0/32` yanlış pozitif
+(`0.000`) ve `0/4` başarısız koşu (`0.000`)** elde edildi (`53` LLM çağrısı, `471`
+hedef HTTP isteği, `178421` token, `1038,373 s`, bulgu başına `14,719` istek ve
+`5575,656` token, `funnel`: `observed=182, eligible=54, admitted=54, executed=54,
+evidence_accepted=54`, `aggregate_status="passed"`, `cost_usd: None`). Kalan
+`NOT TESTED` sınırları: `readonly_get_only`, `synthetic_fixture_boundaries`,
+`out_of_band_and_multi_step_business_logic`. Dış kanıtlar:
+`/root/cco-work/wf-eb9f69a9/live-e6-plan-v7-4fam/` ve
+`/root/cco-work/wf-eb9f69a9/e6-meta-after-v7-4fam/`.
+
 ### E7 — Ortak modüllerde kalan tarihsel native kod
 
 **Durum: kapandı; ortak provider/executor/budget katmanı ile geriye dönük native uyumluluk sınırı ayrıştırıldı.**
