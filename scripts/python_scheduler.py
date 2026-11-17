@@ -156,7 +156,8 @@ def interleave_fair_work(
         by_bucket.setdefault(key, []).append(row)
 
     def _slice_sort_key(row: dict[str, Any]) -> tuple[str, str, str]:
-        args = row.get("arguments") if isinstance(row.get("arguments"), dict) else {}
+        raw_args = row.get("arguments")
+        args: dict[str, Any] = raw_args if isinstance(raw_args, dict) else {}
         target = str(args.get("target") or args.get("target_url") or row.get("route") or "")
         param = str(row.get("param") or args.get("param") or "")
         return (urlsplit(target).path or "/", target, param)
