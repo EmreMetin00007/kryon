@@ -141,6 +141,22 @@ _AXIOS_CONFIG_RE = re.compile(r"axios\s*\(\s*\{", re.I)
 _METHOD_OPT_RE = re.compile(r"method\s*:\s*['\"]([A-Za-z]+)['\"]")
 _CONFIG_URL_RE = re.compile(r"url\s*:\s*(['\"`])([^'\"`]+)\1")
 _BODY_OBJECT_RE = re.compile(r"(?:body|data)\s*:\s*(?:JSON\.stringify\s*\(\s*)?\{")
+_QUERY_PARAMS_OBJECT_RE = re.compile(r"\bparams\s*:\s*\{")
+_FORM_URLENCODED_RE = re.compile(r"application/x-www-form-urlencoded|URLSearchParams", re.I)
+_URLSEARCHPARAMS_STR_RE = re.compile(r"new\s+URLSearchParams\s*\(\s*['\"]([^'\"]+)['\"]\s*\)", re.I)
+_INLINE_SCRIPT_RE = re.compile(r"<script\b([^>]*)>([\s\S]*?)</script>", re.I)
+_SCRIPT_SRC_ATTR_RE = re.compile(r"\bsrc\s*=", re.I)
+_SPA_HASH_ROUTE_RE = re.compile(r"""(?:href\s*=\s*['"]|['"`])(#/[A-Za-z0-9._~:/?@!$&'()*+,;=%-]+)['"`]?""", re.I)
+_SPA_ROUTER_CALL_RE = re.compile(
+    r"""(?:router\.(?:push|replace)|navigate|history\.pushState\s*\([^,]*,[^,]*,)\s*\(\s*['"`](/[A-Za-z0-9._~:/?@!$&'()*+,;=%{}-]+)['"`]""",
+    re.I,
+)
+_SPA_ROUTE_PATH_RE = re.compile(
+    r"""\bpath\s*:\s*['"`](/[A-Za-z0-9._~:/?@!$&'()*+,;=%{}-]{2,})['"`]""",
+    re.I,
+)
+_SPA_COLON_PARAM_RE = re.compile(r":([A-Za-z_][A-Za-z0-9_]*)")
+_STATIC_SPA_EXT_RE = re.compile(r"\.(?:png|jpe?g|gif|css|ico|svg|woff2?|ttf|map|js|mjs)(?:\?|$)", re.I)
 _GRAPHQL_VAR_RE = re.compile(
     r"(?:query|mutation|subscription)\s*(?:[A-Za-z_]\w*\s*)?\(([^)]*)\)", re.S)
 _GRAPHQL_VAR_NAME_RE = re.compile(r"\$([A-Za-z_]\w*)\s*:")
@@ -295,9 +311,19 @@ def extract_js_calls(text: str, base: str, allow_subdomains: bool = False,
             # axios.<metot>(url, {gövde}) — gövde ikinci konum argümanıdır.
             match = re.search(r"\(\s*(['\"`])[^'\"`]+\1\s*,\s*\{", slice_text)
         if not match:
+            usp = _URLSEARCHPARAMS_STR_RE.search(slice_text)
+            if usp:
+                from urllib.parse import parse_qsl as _parse_qsl
+                return [k for k, _ in _parse_qsl(usp.group(1), keep_blank_values=True) if k]
             return []
         brace = match.end() - 1  # desen eşleşmesi gövde "{" ile biter
         return _top_level_keys(_object_span(slice_text, brace))
+
+    def query_option_keys(slice_text: str) -> list[str]:
+        match = _QUERY_PARAMS_OBJECT_RE.search(slice_text)
+        if not match:
+            return []
+        return _top_level_keys(_object_span(slice_text, match.end() - 1))
 
     for match in _FETCH_CALL_RE.finditer(source):
         opts = option_slice(match.start())
@@ -305,8 +331,10 @@ def extract_js_calls(text: str, base: str, allow_subdomains: bool = False,
         method = (method_match.group(1).upper() if method_match else "GET")
         calls.append((match.group(2), method, body_keys(opts), opts))
     for match in _AXIOS_METHOD_RE.finditer(source):
-        calls.append((match.group(3), match.group(1).upper(),
-                      body_keys(option_slice(match.start()), axios_positional=True), option_slice(match.start())))
+        opts = option_slice(match.start())
+        meth = match.group(1).upper()
+        bkeys = [] if meth == "GET" else body_keys(opts, axios_positional=True)
+        calls.append((match.group(3), meth, bkeys, opts))
     for match in _AXIOS_CONFIG_RE.finditer(source):
         opts = option_slice(match.start())
         url_match = _CONFIG_URL_RE.search(opts[:600])
@@ -326,17 +354,23 @@ def extract_js_calls(text: str, base: str, allow_subdomains: bool = False,
                          ".svg", ".woff", ".woff2", ".js")):
             continue
         is_graphql = "graphql" in urlparse(url).path.lower()
+        is_form_encoded = method != "GET" and bool(_FORM_URLENCODED_RE.search(opts))
         params = params_from_url(url)
         present = {param["name"] for param in params}
+        for name in query_option_keys(opts):
+            if name not in present:
+                params.append({"name": name, "in": "query", "sample": ""})
+                present.add(name)
         for name in template_names:
             if name not in present:
                 params.append({"name": name, "in": "path", "sample": ""})
                 present.add(name)
+        body_in = "body" if is_form_encoded else "json"
         for name in keys:
             if is_graphql and name in {"query", "variables", "operationName"}:
                 continue
             if name not in present:
-                params.append({"name": name, "in": "json", "sample": ""})
+                params.append({"name": name, "in": body_in, "sample": ""})
                 present.add(name)
         if is_graphql:
             query_match = re.search(r"\bquery\s*:\s*(['\"`])((?:\\.|(?!\1)[\s\S])*?)\1", opts)
@@ -367,13 +401,73 @@ def extract_js_calls(text: str, base: str, allow_subdomains: bool = False,
             continue
         seen.add(key)
         record = _record(url, method, "graphql" if is_graphql else "js-call", params)
-        if method != "GET" and any(p.get("in") == "json" for p in params):
-            record["content_type"] = "application/json"
+        if method != "GET":
+            if is_form_encoded and any(p.get("in") == "body" for p in params):
+                record["content_type"] = "application/x-www-form-urlencoded"
+            elif any(p.get("in") == "json" for p in params):
+                record["content_type"] = "application/json"
         if operation:
             record["operation"] = operation
         records.append(record)
         if limit is not None and len(records) >= limit:
             break
+    return records
+
+
+def extract_inline_scripts(html: str) -> list[str]:
+    """Return non-empty inline <script> bodies from HTML without fetching external srcs."""
+    scripts: list[str] = []
+    for match in _INLINE_SCRIPT_RE.finditer(html or ""):
+        attrs, body = match.group(1) or "", match.group(2) or ""
+        if _SCRIPT_SRC_ATTR_RE.search(attrs):
+            continue
+        if body.strip():
+            scripts.append(body)
+    return scripts
+
+
+def extract_spa_routes(
+    text: str,
+    base: str,
+    allow_subdomains: bool = False,
+    limit: int | None = 80,
+) -> list[dict]:
+    """Extract SPA hash routes (#/path?q=1) and client router route definitions."""
+    source = text or ""
+    records: list[dict] = []
+    seen: set[str] = set()
+
+    def _emit_route(raw_path: str, source_tag: str) -> None:
+        if limit is not None and len(records) >= limit:
+            return
+        cleaned = _SPA_COLON_PARAM_RE.sub(r"{\1}", str(raw_path or "").strip())
+        if not cleaned or _STATIC_SPA_EXT_RE.search(cleaned):
+            return
+        if cleaned.startswith("#/"):
+            cleaned = cleaned[1:]
+        if not cleaned.startswith("/"):
+            return
+        url = normalize_url(cleaned, base=base)
+        if not url or not same_host(url, base, allow_subdomains=allow_subdomains):
+            return
+        if urlparse(url).path == "/" and not urlparse(url).query:
+            return
+        if url in seen:
+            return
+        seen.add(url)
+        params = params_from_url(url)
+        present = {p["name"] for p in params}
+        for pname in re.findall(r"\{([A-Za-z_][A-Za-z0-9_]*)\}", cleaned):
+            if pname not in present:
+                params.append({"name": pname, "in": "path", "sample": ""})
+                present.add(pname)
+        records.append(_record(url, "GET", source_tag, params))
+
+    for match in _SPA_HASH_ROUTE_RE.finditer(source):
+        _emit_route(match.group(1), "spa-hash")
+    for pattern in (_SPA_ROUTER_CALL_RE, _SPA_ROUTE_PATH_RE):
+        for match in pattern.finditer(source):
+            _emit_route(match.group(1), "spa-route")
     return records
 
 

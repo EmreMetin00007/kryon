@@ -612,6 +612,8 @@ class PythonSolver:
             )
             if rec_reason:
                 rec_status = "blocked"
+            elif "{" in rec_url or "}" in rec_url:
+                rec_status, rec_reason = "blocked", "requires_request_context"
             elif rec_method not in {"GET", "HEAD"} and not post_authorized:
                 rec_status, rec_reason = "blocked", "unsupported_readonly_method"
             elif post_authorized:
@@ -1950,7 +1952,15 @@ class PythonSolver:
         surface_path = str(runtime_root() / "mcp-servers/mcp-memory-server")
         if surface_path not in sys.path:
             sys.path.append(surface_path)
-        from cco_surface_core.extract import extract_html
+        from cco_surface_core.extract import (
+            extract_html,
+            extract_inline_scripts,
+            extract_js,
+            extract_js_calls,
+            extract_spa_routes,
+            find_spec_urls,
+        )
+        from cco_surface_core.parsers import parse_openapi
         base = args.get("url") or args.get("target") or spec.target
         records = []
         json_records = []
@@ -1958,17 +1968,51 @@ class PythonSolver:
         status = value.get("status_code", value.get("status"))
         if type(status) is int and 200 <= status < 300 and isinstance(value.get("text"), str):
             body_text = value["text"]
-            records.extend(extract_html(body_text, base))
             stripped = body_text.lstrip()
+            raw_headers = value.get("headers") if isinstance(value.get("headers"), dict) else {}
+            resp_ctype = next(
+                (str(v).split(";", 1)[0].strip().lower()
+                 for k, v in raw_headers.items() if str(k).lower() == "content-type"),
+                "",
+            )
+            base_path = urlsplit(base).path.lower()
+            is_js_resp = (
+                base_path.endswith((".js", ".mjs"))
+                or "javascript" in resp_ctype
+                or resp_ctype == "application/ecmascript"
+            ) and not stripped.startswith("<")
             if stripped.startswith(("{", "[")):
                 try:
                     parsed_body = json.loads(body_text)
                 except ValueError:
                     parsed_body = None
-                if isinstance(parsed_body, (dict, list)):
+                if isinstance(parsed_body, dict) and isinstance(parsed_body.get("paths"), dict) and (
+                    "openapi" in parsed_body or "swagger" in parsed_body
+                ):
+                    records.extend(parse_openapi(
+                        parsed_body,
+                        target=urlsplit(spec.target).hostname or "",
+                        base=spec.target,
+                    ))
+                elif isinstance(parsed_body, (dict, list)):
                     extracted, body_trunc = extract_json_hypermedia(parsed_body, base, origin_url=spec.target)
                     json_records.extend(extracted)
                     truncated = truncated or body_trunc
+            elif is_js_resp:
+                records.extend(extract_js(body_text, spec.target))
+                records.extend(extract_js_calls(body_text, spec.target))
+                records.extend(extract_spa_routes(body_text, spec.target))
+                for spec_url in find_spec_urls(body_text, spec.target):
+                    records.append({"url": spec_url, "method": "GET", "link_relation": "schema"})
+            else:
+                records.extend(extract_html(body_text, base))
+                records.extend(extract_spa_routes(body_text, base))
+                for inline_js in extract_inline_scripts(body_text):
+                    records.extend(extract_js(inline_js, base))
+                    records.extend(extract_js_calls(inline_js, base))
+                    records.extend(extract_spa_routes(inline_js, base))
+                    for spec_url in find_spec_urls(inline_js, base):
+                        records.append({"url": spec_url, "method": "GET", "link_relation": "schema"})
         surface = value.get("surface", value)
         if isinstance(surface, dict):
             raw_records = surface.get("records")
@@ -1978,15 +2022,24 @@ class PythonSolver:
                 for item in record_list
                 if isinstance(item, dict) and (item.get("url") or item.get("href"))
             }
-            for key in ("records", "work_queue", "pages", "urls_sample", "links", "internal_links"):
+            for key in ("records", "work_queue", "pages", "urls_sample", "links", "internal_links", "js_files"):
                 bucket = surface.get(key, [])
                 for item in bucket if isinstance(bucket, list) else []:
                     if isinstance(item, str):
-                        if key == "urls_sample" and urljoin(base, item) in known_record_urls:
+                        if key in {"urls_sample", "js_files"} and urljoin(base, item) in known_record_urls:
                             continue
                         records.append({"url": item, "method": "GET"})
                     elif isinstance(item, dict):
                         records.append(item)
+            for hroute in surface.get("hash_routes") or []:
+                if isinstance(hroute, str) and hroute.strip():
+                    cleaned = hroute.strip()[1:] if hroute.strip().startswith("#/") else hroute.strip()
+                    records.append({"url": cleaned, "method": "GET", "link_relation": "spa_hash"})
+            if not record_list:
+                for bucket_key in ("routes", "next_probes", "templates"):
+                    for item in surface.get(bucket_key) or []:
+                        if isinstance(item, str) and item.strip():
+                            records.append({"url": item.strip(), "method": "GET"})
             extracted_surface, surf_trunc = extract_json_hypermedia(
                 surface, base, origin_url=spec.target, from_http_body=False
             )
@@ -2638,7 +2691,8 @@ class PythonSolver:
                 if not candidates:
                     break
                 candidates.sort(key=lambda pair: (
-                    0 if pair[1].get("link_relation") in {"pagination", "next", "json_link"} else 1,
+                    0 if pair[1].get("link_relation") in {"pagination", "next", "json_link", "schema"} else 1,
+                    0 if urlsplit(pair[1]["url"]).path.lower().endswith((".js", ".mjs", ".json")) else 1,
                     int(pair[1].get("continuation_depth", 0)),
                     pair[1]["route_shape"],
                     pair[1]["action_id"],

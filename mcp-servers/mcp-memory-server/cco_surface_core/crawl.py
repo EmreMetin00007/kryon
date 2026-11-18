@@ -219,6 +219,7 @@ def _crawl_site_sync(start, max_pages, extra_headers, timeout_ms, allow_subdomai
     pages = []
     forms = []
     links = []
+    hash_routes = []
     js_files = []
     errors = []
     from feature_frontier import UnifiedFrontier, metadata_url
@@ -237,13 +238,28 @@ def _crawl_site_sync(start, max_pages, extra_headers, timeout_ms, allow_subdomai
     def permitted(url):
         return _origin(url) == origin and scope.permits_url(url)
 
+    def _safe_body_fields(post_data: str | None, ctype: str) -> list[str]:
+        if not post_data or not isinstance(post_data, str):
+            return []
+        try:
+            from .serialization import body_parameters
+            return [
+                str(p["name"])
+                for p in body_parameters(post_data, ctype)
+                if isinstance(p, dict) and p.get("name")
+            ][:32]
+        except Exception:
+            return []
+
     def _on_response(resp):
         try:
             req = resp.request
-            if (req.resource_type in ("xhr", "fetch") and str(req.method).upper() in {"GET", "HEAD", "OPTIONS"}
+            req_method = str(req.method or "GET").upper()
+            if (req.resource_type in ("xhr", "fetch")
+                    and req_method in {"GET", "HEAD", "OPTIONS", "POST", "PUT", "PATCH"}
                     and permitted(req.url)):
                 item = {
-                    "method": req.method,
+                    "method": req_method,
                     "url": req.url,
                     "resource_type": req.resource_type,
                     "identity": identity,
@@ -258,8 +274,16 @@ def _crawl_site_sync(start, max_pages, extra_headers, timeout_ms, allow_subdomai
                 ctype = headers_map.get("content-type") or headers_map.get("Content-Type") or ""
                 if ctype:
                     item["content_type"] = ctype
+                if req_method in {"POST", "PUT", "PATCH"}:
+                    try:
+                        post_data = req.post_data
+                    except Exception:
+                        post_data = None
+                    fields = _safe_body_fields(post_data, str(ctype))
+                    if fields:
+                        item["body_fields"] = fields
                 captured.append(item)
-                frontier.add(req.url, source="runtime-xhr", kind="operation", method=req.method)
+                frontier.add(req.url, source="runtime-xhr", kind="operation", method=req_method)
             elif req.resource_type == "script":
                 frontier.add(req.url, source="runtime-bundle", kind="bundle")
         except Exception:
@@ -317,17 +341,26 @@ def _crawl_site_sync(start, max_pages, extra_headers, timeout_ms, allow_subdomai
                     raise ValueError("crawl navigated outside allowed scope")
 
             def collect():
+                from urllib.parse import urljoin
+                frag = urlsplit(page.url).fragment
+                if frag.startswith("/"):
+                    hash_url = urljoin(start, frag)
+                    if permitted(hash_url):
+                        hash_routes.append(hash_url)
                 for anchor in page.query_selector_all("a[href]"):
                     href = anchor.get_attribute("href") or ""
                     if not href or href.startswith(("javascript:", "mailto:", "data:")):
                         continue
-                    from urllib.parse import urljoin
+                    if href.startswith("#/"):
+                        hash_url = urljoin(start, href[1:])
+                        if permitted(hash_url):
+                            hash_routes.append(hash_url)
+                        continue
                     absolute = urljoin(page.url, href)
                     frontier.add(absolute, source="runtime-link", kind="page" if _is_enqueueable(absolute) else "bundle")
                     if permitted(absolute):
                         links.append(absolute)
                 for script in page.query_selector_all("script[src]"):
-                    from urllib.parse import urljoin
                     absolute = urljoin(page.url, script.get_attribute("src") or "")
                     frontier.add(absolute, source="runtime-bundle", kind="bundle")
                     if permitted(absolute):
@@ -387,6 +420,10 @@ def _crawl_site_sync(start, max_pages, extra_headers, timeout_ms, allow_subdomai
                         if not permitted(action):
                             continue
                         method = (form.get_attribute("method") or "GET").upper()
+                        enctype = (form.get_attribute("enctype") or "").split(";", 1)[0].strip().lower()
+                        content_type = ""
+                        if method != "GET":
+                            content_type = enctype or "application/x-www-form-urlencoded"
                         fields = []
                         for inp in form.query_selector_all("input, textarea, select"):
                             name = inp.get_attribute("name") or ""
@@ -401,12 +438,15 @@ def _crawl_site_sync(start, max_pages, extra_headers, timeout_ms, allow_subdomai
                                         if sampled and sampled != "<redacted>":
                                             field_item["value"] = sampled
                                 fields.append(field_item)
-                        forms.append({
+                        form_entry = {
                             "page": current,
                             "action": action,
                             "method": method,
                             "fields": fields,
-                        })
+                        }
+                        if content_type:
+                            form_entry["content_type"] = content_type
+                        forms.append(form_entry)
 
                 except Exception as exc:
                     errors.append({"url": current, "error": str(exc)[:160]})
@@ -434,6 +474,7 @@ def _crawl_site_sync(start, max_pages, extra_headers, timeout_ms, allow_subdomai
         "pages": pages,
         "forms": forms,
         "links": list(dict.fromkeys(links)),
+        "hash_routes": list(dict.fromkeys(hash_routes)),
         "js_files": list(dict.fromkeys(js_files)),
         "xhr": xhr,
         "api_requests": xhr,

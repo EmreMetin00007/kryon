@@ -39,7 +39,10 @@ if _SURFACE_DIR not in sys.path:
     sys.path.insert(0, _SURFACE_DIR)
 try:
     from cco_surface_core.crawl import HAS_PLAYWRIGHT, crawl_site, playwright_missing_msg
-    from cco_surface_core.extract import extract_html, extract_js, extract_js_calls, extract_robots, extract_sitemap, find_spec_urls, is_sitemap_index
+    from cco_surface_core.extract import (
+        extract_html, extract_inline_scripts, extract_js, extract_js_calls,
+        extract_robots, extract_sitemap, extract_spa_routes, find_spec_urls, is_sitemap_index,
+    )
     from cco_surface_core.normalize import discovery_link_skip_reason, normalize_url, params_from_url, same_host
     from cco_surface_core.parsers import (
         parse_browser_crawl, parse_ffuf, parse_gau, parse_nuclei, parse_openapi, parse_sqlmap, parse_xhr, parse_zap,
@@ -61,7 +64,8 @@ except Exception:
         return None
 
     crawl_site = playwright_missing_msg = is_sitemap_index = None
-    extract_html = extract_js = extract_js_calls = extract_robots = extract_sitemap = find_spec_urls = None
+    extract_html = extract_inline_scripts = extract_js = extract_js_calls = None
+    extract_robots = extract_sitemap = extract_spa_routes = find_spec_urls = None
     discovery_link_skip_reason = normalize_url = params_from_url = same_host = None
     parse_browser_crawl = parse_xhr = parse_zap = None
     parse_ffuf = parse_gau = parse_nuclei = parse_openapi = parse_sqlmap = None
@@ -2420,8 +2424,15 @@ def discover_web_surface(
             records.extend(parse_openapi(body, target=surface_target, base=origin))
             break
 
-    html_records = extract_html(pages.get(base, ""), base, allow_subdomains=allow_subdomains)
+    base_html = pages.get(base, "")
+    html_records = extract_html(base_html, base, allow_subdomains=allow_subdomains)
     records.extend(html_records)
+    records.extend(extract_spa_routes(base_html, base, allow_subdomains=allow_subdomains))
+    for inline_js in extract_inline_scripts(base_html):
+        js_texts.append(inline_js)
+        records.extend(extract_js(inline_js, base, allow_subdomains=allow_subdomains))
+        records.extend(extract_js_calls(inline_js, base, allow_subdomains=allow_subdomains))
+        records.extend(extract_spa_routes(inline_js, base, allow_subdomains=allow_subdomains))
     scripts_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "scripts"))
     if scripts_dir not in sys.path:
         sys.path.insert(0, scripts_dir)
@@ -2429,7 +2440,7 @@ def discover_web_surface(
     from policy_engine import ScopeResolver
     frontier = UnifiedFrontier(base, ScopeResolver().permits_url if current_surface_guard() else lambda _: True,
                                "authenticated" if cookie or headers else "anonymous")
-    frontier.add_html(pages.get(base, ""), base)
+    frontier.add_html(base_html, base)
     frontier.add_records(records)
 
     def sync_frontier():
@@ -2450,12 +2461,13 @@ def discover_web_surface(
         if js_resp is None or js_resp.status_code >= 400:
             frontier.finish(work, 'source_unavailable')
             continue
-        js_texts.append(js_resp.text or "")
-        records.extend(extract_js(js_resp.text or "", base, allow_subdomains=allow_subdomains))
+        js_body = js_resp.text or ""
+        js_texts.append(js_body)
+        records.extend(extract_js(js_body, base, allow_subdomains=allow_subdomains))
         # WS2 şema hasadı: metot + gövde anahtarları + GraphQL değişkenleri.
-        records.extend(extract_js_calls(js_resp.text or "", base,
-                                        allow_subdomains=allow_subdomains))
-        frontier.add_js_imports(js_resp.text or '', js_url)
+        records.extend(extract_js_calls(js_body, base, allow_subdomains=allow_subdomains))
+        records.extend(extract_spa_routes(js_body, base, allow_subdomains=allow_subdomains))
+        frontier.add_js_imports(js_body, js_url)
         frontier.finish(work)
         sync_frontier()
 

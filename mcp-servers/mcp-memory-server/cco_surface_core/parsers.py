@@ -191,10 +191,12 @@ def _params_from_post(post_data: str, content_type: str = "") -> list[dict]:
     return body_parameters(post_data, content_type) if post_data else []
 
 
-def _form_params(fields, method: str) -> list[dict]:
+def _form_params(fields, method: str, content_type: str = "") -> list[dict]:
     params = []
     seen = set()
-    location = "query" if (method or "GET").upper() == "GET" else "body"
+    norm_method = (method or "GET").upper()
+    norm_ctype = str(content_type or "").split(";", 1)[0].strip().lower()
+    location = "query" if norm_method == "GET" else ("json" if norm_ctype == "application/json" else "body")
     for field in fields or []:
         sample = ""
         if isinstance(field, str):
@@ -246,6 +248,15 @@ def parse_xhr(payload, target: str = "", base: str = "") -> list[dict]:
         params = pair_parameters(parse_qsl(urlparse(url).query, keep_blank_values=True), "query")
         if method != "GET":
             params += body_parameters(post, str(ctype)) if post != "" else []
+            if isinstance(item, dict) and isinstance(item.get("body_fields"), list):
+                present_names = {p.get("name") for p in params if isinstance(p, dict)}
+                body_loc = "json" if "json" in str(ctype).lower() else "body"
+                for fname in item["body_fields"]:
+                    if isinstance(fname, str) and fname and fname not in present_names:
+                        params.append({"name": fname, "in": body_loc, "sample": ""})
+                        present_names.add(fname)
+                if not ctype and body_loc == "body":
+                    ctype = "application/x-www-form-urlencoded"
         envelope = graphql_envelope(post, ctype, url, method, resolve_files=False)
         from .operation import graphql_operation
         operation = (graphql_operation(envelope.get("query"), envelope.get("operationName") or "")
@@ -331,16 +342,31 @@ def parse_browser_crawl(payload, target: str = "", base: str = "") -> list[dict]
         method = str(form.get("method") or "GET").upper() or "GET"
         if method not in {"GET", "POST", "PUT", "PATCH", "DELETE"}:
             method = "POST"
-        params = _form_params(form.get("fields") or form.get("inputs") or [], method)
+        form_ctype = str(form.get("content_type") or form.get("enctype") or "").split(";", 1)[0].strip().lower()
+        if method != "GET" and not form_ctype:
+            form_ctype = "application/x-www-form-urlencoded"
+        params = _form_params(form.get("fields") or form.get("inputs") or [], method, content_type=form_ctype)
         if method == "GET":
             params = params or params_from_url(url)
-        _add({"url": url, "method": method, "params": params, "sources": ["form", "crawl"]})
+        form_rec = {"url": url, "method": method, "params": params, "sources": ["form", "crawl"]}
+        if form_ctype and method != "GET":
+            form_rec["content_type"] = form_ctype
+        _add(form_rec)
     for href in (data.get("links") or []) + (data.get("internal_links") or []) + (data.get("urls_with_params") or []):
         if isinstance(href, dict):
             href = href.get("url") or ""
         href = str(href or "").strip()
         if href:
             _add({"url": href, "method": "GET", "params": params_from_url(href), "sources": ["crawl"]})
+    for hroute in data.get("hash_routes") or []:
+        raw_h = str(hroute or "").strip()
+        if not raw_h:
+            continue
+        if raw_h.startswith("#/"):
+            raw_h = raw_h[1:]
+        resolved_h = raw_h if raw_h.startswith("http") else urljoin(start or "", raw_h)
+        if resolved_h.startswith("http"):
+            _add({"url": resolved_h, "method": "GET", "params": params_from_url(resolved_h), "sources": ["spa-hash", "crawl"]})
     for href in data.get("form_actions") or []:
         href = str(href or "").strip()
         if href:

@@ -513,6 +513,8 @@ def parameter_candidates(spec: Any, records: list[dict[str, Any]],
         if identity not in ("anon", "anonymous") and (not isinstance(identity, str) or identity not in bindings):
             reason = reason or "missing_observed_identity_binding"
         method = str(record.get("method", "GET") or "GET").upper()
+        if not reason and ("{" in url or "}" in url):
+            reason = "requires_request_context"
         if reason:
             output.append(candidate(spec.id, route=url, provenance=provenance, reason=reason, method=method,
                                     carrier="query" if method == "GET" else ""))

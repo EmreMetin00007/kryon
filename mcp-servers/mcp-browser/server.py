@@ -439,6 +439,9 @@ def browser_extract_links(url: str, wait_seconds: float = 2.0) -> str:
     () => {
         const origin = location.origin;
         const links = Array.from(document.querySelectorAll('a[href]')).map(a => a.href);
+        const rawHrefs = Array.from(document.querySelectorAll('a[href]')).map(a => a.getAttribute('href') || '');
+        const hashRoutes = rawHrefs.filter(h => h.startsWith('#/'));
+        if (location.hash && location.hash.startsWith('#/')) hashRoutes.push(location.hash);
         const scripts = Array.from(document.querySelectorAll('script[src]')).map(s => s.src);
         const forms = Array.from(document.querySelectorAll('form')).map(f => f.action || location.href);
         const internal = [], external = [];
@@ -449,6 +452,7 @@ def browser_extract_links(url: str, wait_seconds: float = 2.0) -> str:
         return {
             internal_links: internal.slice(0, 300),
             external_links: external.slice(0, 200),
+            hash_routes: [...new Set(hashRoutes)].slice(0, 100),
             js_files: [...new Set(scripts)].slice(0, 100),
             form_actions: [...new Set(forms)],
             urls_with_params: withParams.slice(0, 150),
