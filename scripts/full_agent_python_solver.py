@@ -2570,7 +2570,10 @@ class PythonSolver:
             if row["spec_id"] == spec.id and row["tool"] in DISCOVERY_TOOLS
         ]
         status = submitted.get("status")
-        if status == "blocked":
+        if status == "blocked" or (
+            status == "partial"
+            and any(isinstance(s, dict) and s.get("status") == "blocked" for s in (submitted.get("steps") or []))
+        ):
             return not enum_results
         if status not in {"done", "partial"}:
             return False

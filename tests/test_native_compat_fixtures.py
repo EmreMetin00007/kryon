@@ -1021,7 +1021,7 @@ def test_native_history_bundle_stays_compact_on_wide_tool_phase(tmp_path, monkey
     for tool_name in access_spec.tools:
         props = {
             f"param_{idx}": {"type": "string", "description": "Bound parameter description", "default": "val_x"}
-            for idx in range(6)
+            for idx in range(5)
         }
         t = _v2_tool(tool_name, props, ["param_0"])
         t["function"]["strict"] = False

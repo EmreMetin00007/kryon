@@ -23,7 +23,7 @@ EXPECTED_TOOL_COUNTS = {
     "kali-tools": 93,
     "web-advanced": 30,
     "ctf-platform": 14,
-    "validator": 27,
+    "validator": 28,
     "ad-tools": 12,
     "memory-server": 15,
     "container-tools": 10,
