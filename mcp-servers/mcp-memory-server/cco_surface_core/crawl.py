@@ -221,6 +221,7 @@ def _crawl_site_sync(start, max_pages, extra_headers, timeout_ms, allow_subdomai
     links = []
     hash_routes = []
     js_files = []
+    asset_texts = []
     errors = []
     from feature_frontier import UnifiedFrontier, metadata_url
     from crawl_auth import CrawlAuthBoundary
@@ -403,6 +404,25 @@ def _crawl_site_sync(start, max_pages, extra_headers, timeout_ms, allow_subdomai
                             else {}
                         ),
                     })
+                    if resp is not None and 200 <= status < 300:
+                        resp_ctype = (resp.headers.get("content-type") or "").split(";", 1)[0].strip().lower()
+                        cur_path = urlsplit(current).path.lower()
+                        if (
+                            "javascript" in resp_ctype
+                            or resp_ctype == "application/ecmascript"
+                            or "json" in resp_ctype
+                            or cur_path.endswith((".js", ".mjs", ".json"))
+                        ):
+                            try:
+                                body_text = resp.text()
+                            except Exception:
+                                body_text = ""
+                            if isinstance(body_text, str) and body_text:
+                                asset_texts.append({
+                                    "url": current,
+                                    "content_type": resp_ctype,
+                                    "text": body_text[:200_000],
+                                })
                     frontier.finish(work)
                     collect()
                     capture_index = [len(captured)]
@@ -488,5 +508,5 @@ def _crawl_site_sync(start, max_pages, extra_headers, timeout_ms, allow_subdomai
     elif not pages:
         payload["error"] = "crawl did not complete a scoped page"
     host = urlparse(start).hostname or ""
-    payload["records"] = parse_browser_crawl(payload, target=host, base=start)
+    payload["records"] = parse_browser_crawl({**payload, "asset_texts": asset_texts}, target=host, base=start)
     return payload

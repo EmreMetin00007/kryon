@@ -565,6 +565,11 @@ class PythonSolver:
                             result_sha256=ref["sha256"],
                         )
         crawled_json_urls: set[str] = set()
+        resolved_parent = (
+            urljoin(spec.target, parent_url)
+            if isinstance(parent_url, str) and parent_url
+            else ""
+        )
         for record in self.surface_records(value, args, spec, ref):
             rec_identity = normalize_identity(record.get("identity_ref", base_identity))
             rec_state = self._discovery_state_for(spec, rec_identity)
@@ -572,7 +577,12 @@ class PythonSolver:
             rec_url = record["url"]
             rec_reason = str(record.get("candidate_reason") or "")
             rec_ctype = str(record.get("content_type") or "").split(";", 1)[0].strip().lower()
-            if row["tool"] == CRAWL_TOOL and rec_method == "GET" and rec_ctype == "application/json":
+            if (
+                row["tool"] == CRAWL_TOOL
+                and rec_method == "GET"
+                and rec_ctype == "application/json"
+                and rec_url != resolved_parent
+            ):
                 crawled_json_urls.add(rec_url)
                 anon_state = self._discovery_state_for(spec, "anon")
                 existing_anon = next(
@@ -2013,11 +2023,21 @@ class PythonSolver:
                     json_records.extend(extracted)
                     truncated = truncated or body_trunc
             elif is_js_resp:
-                records.extend(extract_js(body_text, spec.target))
-                records.extend(extract_js_calls(body_text, spec.target))
-                records.extend(extract_spa_routes(body_text, spec.target))
                 for spec_url in find_spec_urls(body_text, spec.target):
                     records.append({"url": spec_url, "method": "GET", "link_relation": "schema"})
+                call_recs = extract_js_calls(body_text, spec.target)
+                mutating_urls = {
+                    str(r.get("url") or "").split("?", 1)[0]
+                    for r in call_recs
+                    if isinstance(r, dict) and str(r.get("method") or "GET").upper() in {"POST", "PUT", "PATCH"}
+                }
+                js_recs = [
+                    r for r in extract_js(body_text, spec.target)
+                    if str(r.get("url") or "").split("?", 1)[0] not in mutating_urls
+                ]
+                records.extend(call_recs)
+                records.extend(extract_spa_routes(body_text, spec.target))
+                records.extend(js_recs)
             else:
                 records.extend(extract_html(body_text, base))
                 records.extend(extract_spa_routes(body_text, base))
@@ -2562,7 +2582,11 @@ class PythonSolver:
             return False
         if not any(row["tool"] == CRAWL_TOOL for row in enum_results):
             return True
-        if any(action.get("link_relation") in {"pagination", "json_link", "next"} for action in pending):
+        if any(
+            action.get("link_relation") in {"pagination", "json_link", "next", "schema"}
+            or urlsplit(action["url"]).path.lower().endswith((".js", ".mjs", ".json"))
+            for action in pending
+        ):
             return True
         if submitted.get("status") == "done" and surface_errors(self.compile_summary(spec, submitted)):
             return True
@@ -2707,6 +2731,7 @@ class PythonSolver:
                 candidates.sort(key=lambda pair: (
                     0 if pair[1].get("link_relation") in {"pagination", "next", "json_link", "schema"} else 1,
                     0 if urlsplit(pair[1]["url"]).path.lower().endswith((".js", ".mjs", ".json")) else 1,
+                    0 if pair[1].get("params") else 1,
                     int(pair[1].get("continuation_depth", 0)),
                     pair[1]["route_shape"],
                     pair[1]["action_id"],

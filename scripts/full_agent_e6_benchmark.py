@@ -49,6 +49,7 @@ DEFAULT_SEEDS = {
     "readonly-path-traversal": 161803,
     "post-carrier-injection": 424242,
     "readonly-xss-redirect": 515151,
+    "spa-business-logic": 616161,
 }
 MINIMUM_FAMILIES = 3
 LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1"}

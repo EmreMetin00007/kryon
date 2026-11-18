@@ -146,13 +146,13 @@ _FORM_URLENCODED_RE = re.compile(r"application/x-www-form-urlencoded|URLSearchPa
 _URLSEARCHPARAMS_STR_RE = re.compile(r"new\s+URLSearchParams\s*\(\s*['\"]([^'\"]+)['\"]\s*\)", re.I)
 _INLINE_SCRIPT_RE = re.compile(r"<script\b([^>]*)>([\s\S]*?)</script>", re.I)
 _SCRIPT_SRC_ATTR_RE = re.compile(r"\bsrc\s*=", re.I)
-_SPA_HASH_ROUTE_RE = re.compile(r"""(?:href\s*=\s*['"]|['"`])(#/[A-Za-z0-9._~:/?@!$&'()*+,;=%-]+)['"`]?""", re.I)
+_SPA_HASH_ROUTE_RE = re.compile(r"""(?:href\s*=\s*)?(['"`])(#/[^'"`\s<>]+)\1""", re.I)
 _SPA_ROUTER_CALL_RE = re.compile(
-    r"""(?:router\.(?:push|replace)|navigate|history\.pushState\s*\([^,]*,[^,]*,)\s*\(\s*['"`](/[A-Za-z0-9._~:/?@!$&'()*+,;=%{}-]+)['"`]""",
+    r"""(?:router\.(?:push|replace)|navigate|history\.pushState\s*\([^,]*,[^,]*,)\s*\(\s*(['"`])(/[^'"`\s<>]+)\1""",
     re.I,
 )
 _SPA_ROUTE_PATH_RE = re.compile(
-    r"""\bpath\s*:\s*['"`](/[A-Za-z0-9._~:/?@!$&'()*+,;=%{}-]{2,})['"`]""",
+    r"""\bpath\s*:\s*(['"`])(/[^'"`\s<>]{2,})\1""",
     re.I,
 )
 _SPA_COLON_PARAM_RE = re.compile(r":([A-Za-z_][A-Za-z0-9_]*)")
@@ -464,10 +464,10 @@ def extract_spa_routes(
         records.append(_record(url, "GET", source_tag, params))
 
     for match in _SPA_HASH_ROUTE_RE.finditer(source):
-        _emit_route(match.group(1), "spa-hash")
+        _emit_route(match.group(2), "spa-hash")
     for pattern in (_SPA_ROUTER_CALL_RE, _SPA_ROUTE_PATH_RE):
         for match in pattern.finditer(source):
-            _emit_route(match.group(1), "spa-route")
+            _emit_route(match.group(2), "spa-route")
     return records
 
 

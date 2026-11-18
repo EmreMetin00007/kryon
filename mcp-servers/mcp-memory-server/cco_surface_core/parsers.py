@@ -375,6 +375,55 @@ def parse_browser_crawl(payload, target: str = "", base: str = "") -> list[dict]
         src = str(src or "").strip()
         if src:
             _add({"url": src, "method": "GET", "params": params_from_url(src), "sources": ["js", "crawl"]})
+    for asset in data.get("asset_texts") or []:
+        if not isinstance(asset, dict):
+            continue
+        asset_url = str(asset.get("url") or "").strip()
+        body_text = asset.get("text")
+        if not asset_url or not isinstance(body_text, str) or not body_text:
+            continue
+        ctype = str(asset.get("content_type") or "").split(";", 1)[0].strip().lower()
+        stripped = body_text.lstrip()
+        asset_path = urlparse(asset_url).path.lower()
+        asset_origin = urljoin(start or asset_url, "/")
+        if ("json" in ctype or asset_path.endswith(".json") or stripped.startswith(("{", "["))) and stripped.startswith(("{", "[")):
+            try:
+                parsed_body = json.loads(body_text)
+            except ValueError:
+                parsed_body = None
+            if isinstance(parsed_body, dict) and isinstance(parsed_body.get("paths"), dict) and (
+                "openapi" in parsed_body or "swagger" in parsed_body
+            ):
+                for rec in parse_openapi(parsed_body, target=target, base=asset_origin):
+                    rec["sources"] = list(dict.fromkeys((rec.get("sources") or []) + ["crawl"]))
+                    _add(rec)
+        elif (
+            "javascript" in ctype
+            or ctype == "application/ecmascript"
+            or asset_path.endswith((".js", ".mjs"))
+        ) and not stripped.startswith("<"):
+            from .extract import extract_js, extract_js_calls, extract_spa_routes, find_spec_urls
+            for spec_url in find_spec_urls(body_text, asset_origin):
+                _add({
+                    "url": spec_url,
+                    "method": "GET",
+                    "params": params_from_url(spec_url),
+                    "link_relation": "schema",
+                    "sources": ["js", "crawl"],
+                })
+            call_recs = extract_js_calls(body_text, asset_origin)
+            mutating_urls = {
+                str(r.get("url") or "").split("?", 1)[0]
+                for r in call_recs
+                if isinstance(r, dict) and str(r.get("method") or "GET").upper() in {"POST", "PUT", "PATCH"}
+            }
+            js_recs = [
+                r for r in extract_js(body_text, asset_origin)
+                if str(r.get("url") or "").split("?", 1)[0] not in mutating_urls
+            ]
+            for rec in call_recs + extract_spa_routes(body_text, asset_origin) + js_recs:
+                rec["sources"] = list(dict.fromkeys((rec.get("sources") or []) + ["crawl"]))
+                _add(rec)
     for rec in parse_xhr(data, target=target, base=start):
         rec["sources"] = list(dict.fromkeys((rec.get("sources") or []) + ["crawl"]))
         # Captures carry values and ordering, including A -> B -> A. Route
