@@ -2098,3 +2098,32 @@ def test_access_with_accepted_outcomes_promotes_blocked_to_partial_while_empty_s
     assert promoted["status"] == "partial"
     assert promoted["steps"][0] == {"id": "minimal-validation", "status": "done"}
     assert promoted["validation_funnel"]["evidence_accepted"] > 0
+
+
+def test_report_with_accepted_access_outcomes_promotes_blocked_to_partial(solver_replay_lab):
+    from test_python_candidate_runtime import observe
+    broker, target, _wire = solver_replay_lab
+    source, access_spec, report_spec = broker.tasks.specs[1:4]
+    solver = PythonSolver(broker, model="model")
+    observe(broker, solver, source, [{"url": target + "search/part/0-unsafe?term=alpha"}])
+    broker.tasks.active_spec = access_spec
+    assert solver.dispatch_access_validation(access_spec)
+    access_summary = solver.compile_summary(access_spec, terminal(access_spec, status="partial", steps=[
+        {"id": "minimal-validation", "status": "done"},
+        {"id": "broader-coverage", "status": "not_tested"},
+    ]))
+    assert summary_feedback(access_summary, access_spec)["valid"]
+    solver.summaries[access_spec.id] = access_summary
+
+    broker.tasks.active_spec = report_spec
+    report_summary = solver.compile_summary(report_spec, {
+        "status": "blocked",
+        "next": "host handoff for unresolved-work and closure; archive preserves incomplete evidence review",
+        "steps": [{"id": "review-evidence", "status": "blocked"}],
+    })
+    assert report_summary["status"] == "partial"
+    assert summary_feedback(report_summary, report_spec)["valid"]
+    assert report_summary["steps"] == [
+        {"id": "review-evidence", "status": "blocked"},
+        {"id": REPORT_CARRYOVER_STEP, "status": "not_tested"},
+    ]

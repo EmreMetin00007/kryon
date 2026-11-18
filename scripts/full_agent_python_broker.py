@@ -885,6 +885,66 @@ class PythonBroker(HostBroker):
                     if row.get('tool') == READ_TOOL and 'text' in row.get('result', {}):
                         row['result'].pop('text')
                         row['result']['text_archived'] = True
+            def _attempt_level(req_candidate, req_closing):
+                self.runtime_policy.summary_prompt_tokens[spec.id] = prompt_bound(provider_json(req_closing))[0]
+                lvl_info = self.runtime_policy.prepare(spec, prompt_bound(provider_json(req_candidate))[0])
+                if lvl_info['finalizing'] and spec.id not in initial_finalizing and level < 2:
+                    return None
+                allowed = self.runtime_policy.allowed_tools(spec)
+                req_candidate['tools'] = [row for row in req_candidate['tools']
+                                          if row['function']['name'] in allowed]
+                lvl_info = self.runtime_policy.prepare(spec, prompt_bound(provider_json(req_candidate))[0])
+                wire = runtime_allowance_request(
+                    req_candidate, lvl_info, instruction=PYTHON_ALLOWANCE_INSTRUCTION
+                )
+                if (len(provider_json(wire['messages'])) > MAX_CONTEXT_BYTES
+                        or prompt_bound(provider_json(wire))[0] > MAX_PROMPT_TOKENS):
+                    raise BudgetError('context_limit_exhausted')
+                completion_request(wire, models=self.models, remaining=lvl_info['request_token_allowance'],
+                                   minimum_output_tokens=MIN_OUTPUT_TOKENS)
+                return req_candidate, lvl_info
+
+            def _compact_read_retry(base_candidate, base_projected, *, trim_tools):
+                retry_proj = copy.deepcopy(base_projected)
+                for drop_key in ('handoff', 'previous_summary', 'discovery_frontier', 'candidate_cards'):
+                    retry_proj.pop(drop_key, None)
+                for empty_key in ('summary_feedback', 'protocol_feedback', 'coverage_gaps',
+                                  'coverage_gap_archive_ref', 'older_results', 'older_index_ref'):
+                    if not retry_proj.get(empty_key):
+                        retry_proj.pop(empty_key, None)
+                if isinstance(retry_proj.get('task_spec'), dict):
+                    for ts_key in ('references', 'vector'):
+                        if not retry_proj['task_spec'].get(ts_key):
+                            retry_proj['task_spec'].pop(ts_key, None)
+                retry_cand = copy.deepcopy(base_candidate)
+                retry_cand['messages'][1]['content'] = provider_json(retry_proj).decode()
+                if trim_tools:
+                    core_tools = {
+                        READ_TOOL, SUMMARY_TOOL, SESSION_CHECK_TOOL, COVERAGE_TOOL, 'hunter_run_web_loop'
+                    } if spec.phase in {'access', 'report'} else {
+                        READ_TOOL, SUMMARY_TOOL, CRAWL_TOOL, 'kali-tools_curl_request'
+                    }
+                    retry_cand['tools'] = [
+                        row for row in retry_cand.get('tools', [])
+                        if row['function']['name'] in core_tools
+                    ]
+                retry_close_proj = copy.deepcopy(retry_proj)
+                for row in retry_close_proj.get('recent_results', []):
+                    if row.get('tool') == READ_TOOL and 'text' in row.get('result', {}):
+                        row['result'].pop('text')
+                        row['result']['text_archived'] = True
+                retry_close = {
+                    **retry_cand,
+                    'messages': [
+                        retry_cand['messages'][0],
+                        {**retry_cand['messages'][1], 'content': provider_json(retry_close_proj).decode()},
+                    ],
+                    'tools': [row for row in retry_cand.get('tools', [])
+                              if row['function']['name'] == SUMMARY_TOOL],
+                }
+                self.runtime_policy.finalizing = set(initial_finalizing)
+                return _attempt_level(retry_cand, retry_close)
+
             closing_messages = candidate['messages'] if closing_projected is projected else [
                 candidate['messages'][0],
                 {**candidate['messages'][1], 'content': provider_json(closing_projected).decode()},
@@ -892,29 +952,30 @@ class PythonBroker(HostBroker):
             closing = {**candidate, 'messages': closing_messages,
                        'tools': [row for row in candidate.get('tools', [])
                                  if row['function']['name'] == SUMMARY_TOOL]}
-            self.runtime_policy.summary_prompt_tokens[spec.id] = prompt_bound(provider_json(closing))[0]
-            info = self.runtime_policy.prepare(spec, prompt_bound(provider_json(candidate))[0])
-            if info['finalizing'] and spec.id not in initial_finalizing and level < 2:
+            try:
+                fitted = _attempt_level(candidate, closing)
+            except BudgetError as exc:
+                fitted = None
+                if (level == 2 and str(exc) == 'context_limit_exhausted'
+                        and recent and recent[-1].get('tool') == READ_TOOL
+                        and 'text' in recent[-1].get('result', {})):
+                    for trim_flag in (False, True):
+                        if trim_flag and recent[-1].get('result', {}).get('eof') is not False:
+                            continue
+                        try:
+                            fitted = _compact_read_retry(candidate, projected, trim_tools=trim_flag)
+                            break
+                        except BudgetError:
+                            fitted = None
+                if fitted is None:
+                    if level == 3:
+                        raise
+                    continue
+            if fitted is None:
                 # Try less history before committing a budget transition.
                 # No model or tool calls have been made for these previews.
                 continue
-            allowed = self.runtime_policy.allowed_tools(spec)
-            candidate['tools'] = [row for row in candidate['tools']
-                                  if row['function']['name'] in allowed]
-            info = self.runtime_policy.prepare(spec, prompt_bound(provider_json(candidate))[0])
-            wire = runtime_allowance_request(
-                candidate, info, instruction=PYTHON_ALLOWANCE_INSTRUCTION
-            )
-            try:
-                if (len(provider_json(wire['messages'])) > MAX_CONTEXT_BYTES
-                        or prompt_bound(provider_json(wire))[0] > MAX_PROMPT_TOKENS):
-                    raise BudgetError('context_limit_exhausted')
-                completion_request(wire, models=self.models, remaining=info['request_token_allowance'],
-                                   minimum_output_tokens=MIN_OUTPUT_TOKENS)
-            except BudgetError:
-                if level == 3:
-                    raise
-                continue
+            candidate, info = fitted
             projection = ({'schema': 'python-context-projection/1', 'level': level,
                            'source_ref': source_ref, 'latest_result_text_retained': level < 3}
                           if level else None)

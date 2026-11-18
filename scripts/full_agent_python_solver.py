@@ -528,9 +528,23 @@ class PythonSolver:
         if value.get("error") or value.get("execution_failed"):
             return
         crawled_statuses = {}
+        parsed_json_asset_urls: set[str] = set()
         surface = value.get("surface", value)
         if row["tool"] == CRAWL_TOOL and isinstance(surface, dict):
             base = parent_url or spec.target
+            _, _, parsed_json_asset_urls, _ = self._extract_json_asset_texts(value, surface, base, spec)
+            for key in ("records", "pages"):
+                items = surface.get(key)
+                if not isinstance(items, list):
+                    continue
+                for item in items:
+                    if not isinstance(item, dict) or item.get("json_body_parsed") is not True:
+                        continue
+                    item_url = item.get("url") or item.get("href")
+                    if isinstance(item_url, str) and item_url:
+                        parsed_json_asset_urls.add(
+                            urlsplit(urljoin(base, item_url))._replace(fragment="").geturl()
+                        )
             for key in ("records", "pages"):
                 items = surface.get(key)
                 if not isinstance(items, list):
@@ -541,10 +555,10 @@ class PythonSolver:
                     item_url = item.get("url") or item.get("href")
                     st = item.get("status_code", item.get("status"))
                     item_ctype = str(item.get("content_type") or "").split(";", 1)[0].strip().lower()
-                    if item_ctype == "application/json":
-                        continue
                     if isinstance(item_url, str) and type(st) is int and 100 <= st <= 599:
-                        resolved = urljoin(base, item_url)
+                        resolved = urlsplit(urljoin(base, item_url))._replace(fragment="").geturl()
+                        if item_ctype == "application/json" and resolved not in parsed_json_asset_urls:
+                            continue
                         m = str(item.get("method") or "GET").upper()
                         crawled_statuses[(m, resolved)] = (
                             "blocked" if st in {401, 403} else "completed",
@@ -582,6 +596,7 @@ class PythonSolver:
                 and rec_method == "GET"
                 and rec_ctype == "application/json"
                 and rec_url != resolved_parent
+                and rec_url not in parsed_json_asset_urls
             ):
                 crawled_json_urls.add(rec_url)
                 anon_state = self._discovery_state_for(spec, "anon")
@@ -1970,12 +1985,69 @@ class PythonSolver:
                     "records": self.surface_records(value, row["arguments"], spec, ref)})
         return observations
 
-    def surface_records(self, value, args, spec, ref):
-        """Parse actual tool output; a discovered link is never a tested route."""
+    @staticmethod
+    def _ensure_surface_path() -> None:
         from brain import runtime_root
         surface_path = str(runtime_root() / "mcp-servers/mcp-memory-server")
         if surface_path not in sys.path:
             sys.path.append(surface_path)
+
+    def _extract_json_asset_texts(self, value, surface, base, spec):
+        """Parse captured JSON asset texts from crawl payloads without duplicating hypermedia logic."""
+        asset_records: list[dict[str, Any]] = []
+        asset_json_records: list[dict[str, Any]] = []
+        parsed_json_urls: set[str] = set()
+        asset_truncated = False
+        raw_assets = (
+            value.get("asset_texts")
+            if isinstance(value, dict) and isinstance(value.get("asset_texts"), list)
+            else (surface.get("asset_texts") if isinstance(surface, dict) and isinstance(surface.get("asset_texts"), list) else [])
+        )
+        if not raw_assets:
+            return asset_records, asset_json_records, parsed_json_urls, asset_truncated
+        self._ensure_surface_path()
+        from cco_surface_core.parsers import parse_openapi
+        for asset in raw_assets:
+            if not isinstance(asset, dict):
+                continue
+            asset_url = str(asset.get("url") or "").strip()
+            body_text = asset.get("text")
+            if not asset_url or not isinstance(body_text, str) or not body_text:
+                continue
+            resolved_asset = urlsplit(urljoin(base, asset_url))._replace(fragment="").geturl()
+            ctype = str(asset.get("content_type") or "").split(";", 1)[0].strip().lower()
+            stripped = body_text.lstrip()
+            asset_path = urlsplit(resolved_asset).path.lower()
+            if not (
+                ("json" in ctype or asset_path.endswith(".json") or stripped.startswith(("{", "[")))
+                and stripped.startswith(("{", "["))
+            ):
+                continue
+            try:
+                parsed_body = json.loads(body_text)
+            except ValueError:
+                continue
+            if isinstance(parsed_body, dict) and isinstance(parsed_body.get("paths"), dict) and (
+                "openapi" in parsed_body or "swagger" in parsed_body
+            ):
+                asset_records.extend(parse_openapi(
+                    parsed_body,
+                    target=urlsplit(spec.target).hostname or "",
+                    base=spec.target,
+                ))
+                if len(body_text) < 200_000:
+                    parsed_json_urls.add(resolved_asset)
+            elif isinstance(parsed_body, (dict, list)):
+                extracted, body_trunc = extract_json_hypermedia(parsed_body, resolved_asset, origin_url=spec.target)
+                asset_json_records.extend(extracted)
+                asset_truncated = asset_truncated or body_trunc
+                if len(body_text) < 200_000 and not body_trunc:
+                    parsed_json_urls.add(resolved_asset)
+        return asset_records, asset_json_records, parsed_json_urls, asset_truncated
+
+    def surface_records(self, value, args, spec, ref):
+        """Parse actual tool output; a discovered link is never a tested route."""
+        self._ensure_surface_path()
         from cco_surface_core.extract import (
             extract_html,
             extract_inline_scripts,
@@ -2064,7 +2136,10 @@ class PythonSolver:
                             continue
                         records.append({"url": item, "method": "GET"})
                     elif isinstance(item, dict):
-                        records.append(item)
+                        if key == "work_queue" and isinstance(item.get("operation"), dict):
+                            records.append({k: v for k, v in item.items() if k != "operation_id"})
+                        else:
+                            records.append(item)
             for hroute in surface.get("hash_routes") or []:
                 if isinstance(hroute, str) and hroute.strip():
                     cleaned = hroute.strip()[1:] if hroute.strip().startswith("#/") else hroute.strip()
@@ -2079,6 +2154,12 @@ class PythonSolver:
             )
             json_records.extend(extracted_surface)
             truncated = truncated or surf_trunc
+        asset_recs, asset_json_recs, _, asset_trunc = self._extract_json_asset_texts(
+            value, surface if isinstance(surface, dict) else None, base, spec
+        )
+        records.extend(asset_recs)
+        json_records.extend(asset_json_recs)
+        truncated = truncated or asset_trunc
         self._last_surface_truncated[ref["path"]] = truncated
         output: list[dict[str, Any]] = []
         seen_indices: dict[bytes, int] = {}
@@ -2114,7 +2195,15 @@ class PythonSolver:
             if not has_identity and "url" in args and not args.get("cookie") and not args.get("headers"):
                 identity = "anon"
                 has_identity = True
-            operation_id = record.get("operation_id") if isinstance(record.get("operation_id"), str) and record.get("operation_id") else ""
+            operation_id = (
+                record.get("operation_id")
+                if (
+                    isinstance(record.get("operation_id"), str)
+                    and record.get("operation_id")
+                    and not isinstance(record.get("operation"), dict)
+                )
+                else ""
+            )
             dedup_key = provider_json([url, method, content_type, params, reason, identity if has_identity else None])
             link_relation = record.get("link_relation")
             if dedup_key in seen_indices:
@@ -2415,6 +2504,32 @@ class PythonSolver:
                 summary["steps"] = [step for step in steps if step.get("id") != REPORT_CARRYOVER_STEP]
                 summary["steps"].append({"id": REPORT_CARRYOVER_STEP, "status": "not_tested" if unfinished else "done"})
                 if unfinished and summary.get("status") == "done":
+                    summary["status"] = "partial"
+                has_accepted_validations = (
+                    any(
+                        int(funnel_row.get("evidence_accepted", 0) or 0) > 0
+                        for funnel_row in summary["validation_funnels"].values()
+                    )
+                    or any(
+                        int(leaf_row.get("accepted", 0) or 0) > 0
+                        for leaf_row in summary["leaf_validation_funnels"].values()
+                    )
+                    or any(
+                        isinstance(self.summaries.get(ident), dict)
+                        and (
+                            bool(self.summaries[ident].get("findings"))
+                            or bool(self.summaries[ident].get("validation_outcomes"))
+                        )
+                        for ident in sources
+                    )
+                )
+                if (
+                    summary.get("status") == "blocked"
+                    and has_accepted_validations
+                    and any(step.get("status") in {"blocked", "not_tested"} for step in summary["steps"])
+                ):
+                    # Host-accepted signed access validations exist; closing into
+                    # ledger seal preserves verified evidence while keeping unfinished work NOT TESTED.
                     summary["status"] = "partial"
         inherited_gaps = [row for ident in upstream_ids(spec, self.broker.tasks.specs)
                           for row in [*self.summaries.get(ident, {}).get("coverage_gaps", []),

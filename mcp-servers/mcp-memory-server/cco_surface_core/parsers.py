@@ -298,6 +298,7 @@ def parse_browser_crawl(payload, target: str = "", base: str = "") -> list[dict]
     start = data.get("url") or data.get("base") or base or ""
     records = []
     seen = set()
+    parsed_json_urls: set[str] = set()
 
     def _add(rec):
         url = rec.get("url") or ""
@@ -397,6 +398,18 @@ def parse_browser_crawl(payload, target: str = "", base: str = "") -> list[dict]
                 for rec in parse_openapi(parsed_body, target=target, base=asset_origin):
                     rec["sources"] = list(dict.fromkeys((rec.get("sources") or []) + ["crawl"]))
                     _add(rec)
+                if len(body_text) < 200_000:
+                    parsed_json_urls.add(asset_url.split("#", 1)[0])
+            elif isinstance(parsed_body, (dict, list)):
+                from .extract import extract_json_hypermedia
+                extracted_hypermedia, body_trunc = extract_json_hypermedia(
+                    parsed_body, asset_url, origin_url=asset_origin
+                )
+                for rec in extracted_hypermedia:
+                    rec["sources"] = list(dict.fromkeys((rec.get("sources") or []) + ["crawl"]))
+                    _add(rec)
+                if len(body_text) < 200_000 and not body_trunc:
+                    parsed_json_urls.add(asset_url.split("#", 1)[0])
         elif (
             "javascript" in ctype
             or ctype == "application/ecmascript"
@@ -429,6 +442,12 @@ def parse_browser_crawl(payload, target: str = "", base: str = "") -> list[dict]
         # Captures carry values and ordering, including A -> B -> A. Route
         # deduplication would lose them; persistence merges observation IDs.
         records.append(rec)
+    if parsed_json_urls:
+        for rec in records:
+            if (rec.get("method") or "GET").upper() == "GET":
+                rec_url = str(rec.get("url") or "").split("#", 1)[0]
+                if rec_url in parsed_json_urls:
+                    rec["json_body_parsed"] = True
     return records
 
 

@@ -5,27 +5,30 @@ import copy
 import hashlib
 import json
 import re
+import sys
+from pathlib import Path
 from typing import Any, Sequence
 from urllib.parse import parse_qsl, urljoin, urlsplit
 
 from python_candidate_runtime import card_route, valid_parameter_name
+from runtime_paths import runtime_root
+
+_LOCAL_SURFACE_DIR = Path(__file__).resolve().parents[1] / "mcp-servers" / "mcp-memory-server"
+_SURFACE_DIR = str(_LOCAL_SURFACE_DIR if _LOCAL_SURFACE_DIR.is_dir() else (runtime_root() / "mcp-servers" / "mcp-memory-server"))
+if _SURFACE_DIR not in sys.path:
+    sys.path.append(_SURFACE_DIR)
+
+from cco_surface_core.extract import (  # noqa: E402
+    MAX_JSON_DISCOVERY_DEPTH,
+    MAX_JSON_DISCOVERY_ITEMS,
+    MAX_JSON_DISCOVERY_NODES,
+    extract_json_hypermedia,
+    structured_params_from_node,
+)
 
 SCHEMA = "python-discovery-state/1"
 FRONTIER_SCHEMA = "python-discovery-frontier/1"
 ACTION_STATUSES = ("pending", "dispatched", "completed", "blocked", "indeterminate")
-MAX_JSON_DISCOVERY_ITEMS = 64
-MAX_JSON_DISCOVERY_DEPTH = 5
-MAX_JSON_DISCOVERY_NODES = 1024
-_PAGINATION_KEYS = frozenset({"next", "next_url", "prev", "previous", "prev_url", "first", "last"})
-_DIRECT_LINK_KEYS = frozenset({"url", "href", "uri", "link", "action", "endpoint", "self"})
-_ENVELOPE_LINK_LIST_KEYS = frozenset({
-    "links", "internal_links", "urls_sample", "pages", "urls_with_params", "form_actions", "js_files", "actions", "forms",
-})
-_ENVELOPE_RECORD_LIST_KEYS = frozenset({"records", "work_queue"})
-_COLLECTION_CONTAINER_KEYS = frozenset({
-    "items", "results", "data", "entries", "pagination", "paging", "page_info", "meta", "_links", "hal", "surface",
-})
-_PAGINATION_CONTAINER_KEYS = frozenset({"pagination", "paging", "page_info"})
 _STATUS_RANK = {
     "pending": 0,
     "dispatched": 1,
@@ -622,247 +625,14 @@ def compact_frontier(
     }
 
 
-def _normalize_candidate_link(
-    raw: Any,
-    base_url: str,
-    origin_url: str,
-    *,
-    allow_bare_relative: bool = True,
-) -> str | None:
-    """Resolve explicit relative/same-origin URLs without inventing links from arbitrary scalars."""
-    if not isinstance(raw, str):
-        return None
-    text = raw.strip()
-    if not text or len(text) > 2048 or text.startswith("#"):
-        return None
-    if any(ch.isspace() or ord(ch) < 32 for ch in text):
-        return None
-    if not allow_bare_relative and not text.startswith(("http://", "https://", "/", "./", "../", "?")):
-        return None
-    if text.isdigit():
-        return None
-    parsed_raw = urlsplit(text)
-    if parsed_raw.scheme and parsed_raw.scheme.lower() not in {"http", "https"}:
-        return None
-    resolved = urljoin(base_url, text)
-    parsed = urlsplit(resolved)
-    origin = urlsplit(origin_url)
-    if (
-        parsed.scheme.lower() not in {"http", "https"}
-        or (parsed.scheme, parsed.netloc) != (origin.scheme, origin.netloc)
-        or parsed.username is not None
-    ):
-        return None
-    return parsed._replace(fragment="").geturl()
-
-
-def structured_params_from_node(node: dict[str, Any], method: str = "GET") -> tuple[list[dict[str, Any]] | None, str]:
-    """Extract normalized form/json param declarations and content_type from a descriptor object."""
-    norm_method = str(method or "GET").upper()
-    raw_ctype = node.get("content_type")
-    ctype = raw_ctype.split(";", 1)[0].strip().lower() if isinstance(raw_ctype, str) else ""
-    if isinstance(node.get("params"), list):
-        return copy.deepcopy(node["params"]), ctype
-    if norm_method == "GET":
-        return None, ctype
-    json_obj = node.get("json_body") if isinstance(node.get("json_body"), dict) else (
-        node.get("body") if isinstance(node.get("body"), dict) and ctype in {"", "application/json"} else None
-    )
-    if isinstance(json_obj, dict):
-        derived = [
-            {
-                "name": k,
-                "in": "json",
-                "sample": "" if v is None else ("true" if v is True else "false" if v is False else str(v)),
-            }
-            for k, v in json_obj.items()
-            if valid_parameter_name(k) and (v is None or isinstance(v, (str, int, float, bool)))
-        ]
-        return derived, ctype or "application/json"
-    form_obj = (
-        node.get("form") if isinstance(node.get("form"), dict)
-        else node.get("form_fields") if isinstance(node.get("form_fields"), dict)
-        else node.get("fields") if isinstance(node.get("fields"), dict)
-        else None
-    )
-    if isinstance(form_obj, dict):
-        param_in = "json" if ctype == "application/json" else "form"
-        derived = [
-            {
-                "name": k,
-                "in": param_in,
-                "sample": "" if v is None else ("true" if v is True else "false" if v is False else str(v)),
-            }
-            for k, v in form_obj.items()
-            if valid_parameter_name(k) and (v is None or isinstance(v, (str, int, float, bool)))
-        ]
-        return derived, ctype or ("application/json" if param_in == "json" else "application/x-www-form-urlencoded")
-    return None, ctype
-
-
-def extract_json_hypermedia(
-    payload: Any,
-    base_url: str,
-    *,
-    origin_url: str | None = None,
-    from_http_body: bool = True,
-    max_items: int = MAX_JSON_DISCOVERY_ITEMS,
-    max_depth: int = MAX_JSON_DISCOVERY_DEPTH,
-    max_nodes: int = MAX_JSON_DISCOVERY_NODES,
-) -> tuple[list[dict[str, Any]], bool]:
-    """Bounded extraction of relative/same-origin JSON hypermedia and pagination links.
-
-    Never invents request URLs from arbitrary scalars or object IDs.
-    """
-    if not isinstance(payload, (dict, list)) or not isinstance(base_url, str) or not base_url:
-        return [], False
-    effective_origin = origin_url or base_url
-    extracted: list[dict[str, Any]] = []
-    seen: set[tuple[str, str, str, str, str]] = set()
-    truncated = False
-    nodes_visited = 0
-
-    _unset = object()
-
-    def _emit(
-        raw_url: Any,
-        *,
-        method: str = "GET",
-        params: Any = _unset,
-        link_relation: str = "json_link",
-        extra: dict[str, Any] | None = None,
-        allow_bare_relative: bool = True,
-    ) -> None:
-        nonlocal truncated
-        if len(extracted) >= max_items:
-            truncated = True
-            return
-        resolved = _normalize_candidate_link(
-            raw_url,
-            base_url,
-            effective_origin,
-            allow_bare_relative=allow_bare_relative,
-        )
-        if not resolved:
-            return
-        norm_method = str(method or "GET").upper()
-        ident = ""
-        ctype = ""
-        if isinstance(extra, dict):
-            raw_ident = extra.get("identity_ref", extra.get("identity", ""))
-            ident = str(raw_ident) if isinstance(raw_ident, str) else ""
-            derived_params, ctype = structured_params_from_node(extra, norm_method)
-            if params is _unset and derived_params is not None:
-                params = derived_params
-        dedup_key = (norm_method, resolved, ident, link_relation, ctype)
-        if dedup_key in seen:
-            return
-        seen.add(dedup_key)
-        item: dict[str, Any] = {
-            "url": resolved,
-            "method": norm_method,
-        }
-        if link_relation:
-            item["link_relation"] = link_relation
-        if params is not _unset:
-            item["params"] = copy.deepcopy(params)
-        if ctype:
-            item["content_type"] = ctype
-        if isinstance(extra, dict):
-            for field in ("identity_ref", "identity", "candidate_reason", "operation_id"):
-                if field in extra:
-                    item[field] = copy.deepcopy(extra[field])
-        extracted.append(item)
-
-    def _walk(node: Any, *, depth: int, parent_key: str, in_pagination: bool) -> None:
-        nonlocal nodes_visited, truncated
-        if truncated:
-            return
-        if depth > max_depth:
-            return
-        nodes_visited += 1
-        if nodes_visited > max_nodes:
-            truncated = True
-            return
-        if isinstance(node, list):
-            for element in node:
-                if truncated:
-                    return
-                if isinstance(element, str) and parent_key in _ENVELOPE_LINK_LIST_KEYS:
-                    rel = "pagination" if in_pagination else ("json_link" if from_http_body or parent_key == "links" else "")
-                    _emit(element, link_relation=rel)
-                elif isinstance(element, dict):
-                    _walk(element, depth=depth + 1, parent_key=parent_key, in_pagination=in_pagination)
-                elif isinstance(element, list):
-                    _walk(element, depth=depth + 1, parent_key=parent_key, in_pagination=in_pagination)
-            return
-        if not isinstance(node, dict):
-            return
-
-        rel_value = str(node.get("rel") or "").strip().lower()
-        node_pagination = in_pagination or rel_value in _PAGINATION_KEYS
-        default_rel = "json_link" if (from_http_body or parent_key in {"items", "results", "data", "entries", "_links", "links"}) else ""
-        direct_url = (
-            node.get("url") if "url" in node
-            else node.get("href") if "href" in node
-            else (node.get("action") if "action" in node and "method" in node
-                  else node.get("endpoint") if "endpoint" in node and "method" in node
-                  else None)
-        )
-        if isinstance(direct_url, str) and (
-            parent_key in _ENVELOPE_LINK_LIST_KEYS
-            or parent_key in _ENVELOPE_RECORD_LIST_KEYS
-            or parent_key in _COLLECTION_CONTAINER_KEYS
-            or parent_key in _PAGINATION_KEYS
-            or parent_key in _DIRECT_LINK_KEYS
-            or depth == 0
-        ):
-            _emit(
-                direct_url,
-                method=str(node.get("method") or "GET"),
-                params=node["params"] if "params" in node else _unset,
-                link_relation="pagination" if node_pagination else ("self" if rel_value == "self" else default_rel),
-                extra=node,
-            )
-
-        for key, value in node.items():
-            if truncated:
-                return
-            if not isinstance(key, str):
-                continue
-            low = key.lower()
-            if low in {"url", "href", "action", "endpoint"} and value is direct_url:
-                continue
-            if low in _PAGINATION_KEYS:
-                if isinstance(value, str):
-                    _emit(value, link_relation="pagination")
-                elif isinstance(value, dict):
-                    _walk(value, depth=depth + 1, parent_key=low, in_pagination=True)
-            elif low in _DIRECT_LINK_KEYS:
-                if isinstance(value, str):
-                    rel = "self" if low == "self" else ("pagination" if node_pagination else default_rel)
-                    _emit(value, link_relation=rel)
-                elif isinstance(value, dict):
-                    _walk(value, depth=depth + 1, parent_key=low, in_pagination=node_pagination)
-            elif low in _ENVELOPE_LINK_LIST_KEYS or low in _ENVELOPE_RECORD_LIST_KEYS or low in _COLLECTION_CONTAINER_KEYS:
-                if not from_http_body and (
-                    low in _ENVELOPE_RECORD_LIST_KEYS
-                    or (low in _ENVELOPE_LINK_LIST_KEYS and not (low == "links" and isinstance(value, dict)))
-                ):
-                    continue
-                child_pag = node_pagination or (low in _PAGINATION_CONTAINER_KEYS)
-                if low in {"_links", "links"} and isinstance(value, dict):
-                    for rel_name, target_val in value.items():
-                        rel_low = str(rel_name).lower()
-                        rel_tag = "pagination" if rel_low in _PAGINATION_KEYS else ("self" if rel_low == "self" else "json_link")
-                        if isinstance(target_val, str):
-                            _emit(target_val, link_relation=rel_tag)
-                        elif isinstance(target_val, dict):
-                            _walk(target_val, depth=depth + 1, parent_key=rel_low, in_pagination=rel_tag == "pagination")
-                        elif isinstance(target_val, list):
-                            _walk(target_val, depth=depth + 1, parent_key="links", in_pagination=rel_tag == "pagination")
-                elif isinstance(value, (dict, list)):
-                    _walk(value, depth=depth + 1, parent_key=low, in_pagination=child_pag)
-
-    _walk(payload, depth=0, parent_key="", in_pagination=False)
-    return extracted, truncated
+__all__ = [
+    "ACTION_STATUSES",
+    "DISCOVERY_TOOLS",
+    "FRONTIER_SCHEMA",
+    "MAX_JSON_DISCOVERY_DEPTH",
+    "MAX_JSON_DISCOVERY_ITEMS",
+    "MAX_JSON_DISCOVERY_NODES",
+    "SCHEMA",
+    "extract_json_hypermedia",
+    "structured_params_from_node",
+]
