@@ -18,7 +18,8 @@ _ACTIVATION_LOCK = threading.Lock()
 
 HTTP_VALIDATORS = frozenset({
     "validate_sqli", "validate_ssti", "validate_command_injection", "validate_path_traversal",
-    "validate_xss_reflection", "validate_stored_reflection", "validate_open_redirect", "validate_ssrf_oob",
+    "validate_xss_reflection", "validate_stored_reflection", "validate_open_redirect",
+    "validate_business_logic", "validate_ssrf_oob",
     "validate_blind_oob", "validate_csrf", "validate_second_order", "validate_xxe", "validate_auth_bypass",
     "validate_idor", "validate_file_upload", "validate_deserialization", "validate_token_differential",
     "validate_token_roundtrip", "validate_finding", "session_vault_check",

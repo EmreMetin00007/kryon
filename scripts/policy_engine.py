@@ -1192,6 +1192,61 @@ class PolicyEngine:
                             f"malformed program policy file {self.program_policy_file}: "
                             "readonly_operations test_data_only must be a boolean"
                         )
+            if "business_logic_operations" in raw:
+                from business_logic import KINDS as _BIZ_KINDS
+                biz_ops = raw["business_logic_operations"]
+                if not isinstance(biz_ops, list):
+                    raise ValueError(
+                        f"malformed program policy file {self.program_policy_file}: "
+                        "business_logic_operations must be an array"
+                    )
+                for item in biz_ops:
+                    if (
+                        not isinstance(item, dict)
+                        or set(item) - {
+                            "method", "url", "action_url", "control_url",
+                            "operation_id", "kind", "carriers", "test_data_only", "allow_state_mutation",
+                        }
+                        or str(item.get("method") or "").upper() not in {"POST", "PUT", "PATCH"}
+                        or item.get("allow_state_mutation") is not True
+                        or item.get("test_data_only") is not True
+                        or not isinstance(item.get("url"), str) or not item["url"]
+                        or not isinstance(item.get("operation_id"), str) or not item["operation_id"].strip()
+                        or str(item.get("kind") or "") not in _BIZ_KINDS
+                    ):
+                        raise ValueError(
+                            f"malformed program policy file {self.program_policy_file}: "
+                            "business_logic_operations entries require method in POST/PUT/PATCH, "
+                            "allow_state_mutation=true, test_data_only=true, valid kind, url, and operation_id"
+                        )
+                    for url_key in ("url", "action_url", "control_url"):
+                        if url_key in item:
+                            val = item[url_key]
+                            if not isinstance(val, str) or not val:
+                                raise ValueError(
+                                    f"malformed program policy file {self.program_policy_file}: "
+                                    f"business_logic_operations {url_key} must be a non-empty URL"
+                                )
+                            parsed_op = urlparse(val)
+                            if (
+                                parsed_op.scheme not in {"http", "https"} or not parsed_op.hostname
+                                or parsed_op.username is not None or parsed_op.fragment
+                                or re.search(r"[\s]", val)
+                            ):
+                                raise ValueError(
+                                    f"malformed program policy file {self.program_policy_file}: "
+                                    f"business_logic_operations {url_key} must be a valid HTTP(S) URL"
+                                )
+                    if "carriers" in item:
+                        carriers = item["carriers"]
+                        if (
+                            not isinstance(carriers, list) or not carriers
+                            or any(not isinstance(c, str) or c not in {"form", "json"} for c in carriers)
+                        ):
+                            raise ValueError(
+                                f"malformed program policy file {self.program_policy_file}: "
+                                "business_logic_operations carriers must be a non-empty subset of ['form', 'json']"
+                            )
             rules.update(raw)
         scope_rules = self.scope.get("raw", {}).get("rules", {})
         if scope_rules:
@@ -2473,6 +2528,88 @@ class PolicyEngine:
             return True
         return False
 
+    def _business_logic_operation_allows(
+        self,
+        tool_name: str,
+        args: dict[str, Any],
+        urls: list[str],
+        methods: list[str],
+        *,
+        wire_request: bool = False,
+    ) -> bool:
+        """Allow POST/PUT/PATCH only when an exact business_logic_operations policy declaration matches."""
+        if tool_name != "validator_validate_business_logic" or not urls or not methods:
+            return False
+        if any(str(m or "").upper() not in {"POST", "PUT", "PATCH"} for m in methods):
+            return False
+        declarations = self.program_policy.get("business_logic_operations")
+        if not isinstance(declarations, list) or not declarations:
+            return False
+        raw_carrier = str(args.get("carrier") or "").strip().lower()
+        carrier = {"body": "form"}.get(raw_carrier, raw_carrier)
+        if not carrier:
+            headers_obj: dict[str, Any] = {}
+            raw_headers = args.get("headers")
+            if isinstance(raw_headers, dict):
+                headers_obj = raw_headers
+            elif isinstance(args.get("headers_json"), str) and args["headers_json"].strip():
+                try:
+                    parsed_hdrs = json.loads(args["headers_json"])
+                    if isinstance(parsed_hdrs, dict):
+                        headers_obj = parsed_hdrs
+                except ValueError:
+                    headers_obj = {}
+            ctype = next(
+                (str(v).split(";", 1)[0].strip().lower()
+                 for k, v in headers_obj.items() if str(k).lower() == "content-type"),
+                "",
+            )
+            if ctype == "application/json":
+                carrier = "json"
+            elif ctype == "application/x-www-form-urlencoded":
+                carrier = "form"
+        if not wire_request and carrier not in {"form", "json"}:
+            return False
+        if carrier and carrier not in {"form", "json"}:
+            return False
+        op_id = str(args.get("operation_id") or "")
+        req_kind = str(args.get("kind") or "")
+
+        def _url_matches(declared_url: str, actual_url: str) -> bool:
+            if not declared_url:
+                return False
+            d = urlparse(declared_url)._replace(fragment="")
+            a = urlparse(actual_url)._replace(fragment="")
+            if d.geturl() == a.geturl():
+                return True
+            if (d.scheme, d.netloc, d.path) == (a.scheme, a.netloc, a.path):
+                return not d.query and a.query in {"", "role=control", "role=probe"}
+            return False
+
+        for url in urls:
+            matched_url = False
+            for row in declarations:
+                if not isinstance(row, dict):
+                    continue
+                if row.get("allow_state_mutation") is not True or row.get("test_data_only") is not True:
+                    continue
+                if str(row.get("method") or "").upper() not in {str(m).upper() for m in methods}:
+                    continue
+                if op_id and row.get("operation_id") != op_id:
+                    continue
+                if req_kind and row.get("kind") != req_kind:
+                    continue
+                allowed_carriers = row.get("carriers")
+                if isinstance(allowed_carriers, list) and (not carrier or carrier not in allowed_carriers):
+                    continue
+                candidates = [str(row.get("url") or ""), str(row.get("action_url") or ""), str(row.get("control_url") or "")]
+                if any(_url_matches(cand_u, url) for cand_u in candidates):
+                    matched_url = True
+                    break
+            if not matched_url:
+                return False
+        return True
+
     def validate_tool_invocation(self, tool_name: str, args: dict[str, Any] | None = None,
                                  action: str = "execute", extra_metadata: dict[str, Any] | None = None,
                                  *, _wire_request: bool = False, _policy_preflight: bool = False) -> dict[str, Any]:
@@ -2650,6 +2787,9 @@ class PolicyEngine:
               and not self._readonly_operation_allows(
                   tool_name, args, urls, methods, wire_request=_wire_request
               )
+              and not self._business_logic_operation_allows(
+                  tool_name, args, urls, methods, wire_request=_wire_request
+              )
               and not (_wire_request and tool_name == "kali-tools_member_login"
                        and methods == ["POST"] and len(urls) == 1
                        and self.program_policy.get("member_login", {}).get("test_data_only") is True
@@ -2658,7 +2798,10 @@ class PolicyEngine:
         elif (_wire_request and isinstance(write_rule, dict)
               and write_rule.get("enabled") is True
               and any(method in {"PUT", "PATCH", "DELETE"} for method in methods)
-              and not sealed_mutation_ok):
+              and not sealed_mutation_ok
+              and not self._business_logic_operation_allows(
+                  tool_name, args, urls, methods, wire_request=_wire_request
+              )):
             result = reason = "blocked_unsealed_mutation"
             guidance = (
                 "Mutation requires a sealed test object (WS7 write_set): create "

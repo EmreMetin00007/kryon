@@ -28,6 +28,7 @@ def test_validator_imports_and_tool_count():
         "validate_xss_reflection",
         "validate_stored_reflection",
         "validate_open_redirect",
+        "validate_business_logic",
         "validate_ssrf_oob",
         "confirm_oob_callback",
         "validate_blind_oob",

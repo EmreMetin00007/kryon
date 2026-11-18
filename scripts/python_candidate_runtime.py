@@ -15,6 +15,7 @@ PROFILES = {
     "readonly_traversal_application_files": ("file-access", "validator_validate_path_traversal", "file_signature"),
     "readonly_xss_reflection": ("xss-stored", "validator_validate_xss_reflection", "browser_execution"),
     "readonly_open_redirect": ("authn-session", "validator_validate_open_redirect", "redirect_location"),
+    "stateful_business_logic": ("race-business", "validator_validate_business_logic", "business_logic"),
 }
 
 
@@ -87,8 +88,36 @@ _REDIRECT_PATH_RE = re.compile(
     re.I,
 )
 _REDIRECT_SAMPLE_RE = re.compile(r"^(?:/[A-Za-z0-9_./-]*|https?://[^\s]+|//[^\s]+)\Z", re.I)
+_BIZ_PARAM_NAMES = frozenset({
+    "op", "coupon", "redeem", "server_tag", "qty", "quantity",
+    "discount", "step", "resource_id",
+})
+_BIZ_PATH_RE = re.compile(
+    r"/(?:biz[-_/]?|business[-_/]?|coupons?|redeem|checkout|workflows?|state)(?:/|$)",
+    re.I,
+)
 CARD_LIMIT = 8
 CARD_BYTES = 2000
+
+
+def infer_business_logic_kind(url: str, samples: dict[str, str] | None = None) -> str:
+    """Infer P7 business-logic scenario kind deterministically from observed route/fields."""
+    low = (urlsplit(url).path or "").lower()
+    sample_op = str((samples or {}).get("op") or "").strip().lower()
+    keys = {str(k).lower() for k in (samples or {})}
+    if "coupon" in keys or sample_op == "redeem" or any(t in low for t in ("coupon", "redeem", "idempotency", "replay")):
+        return "idempotency_replay"
+    if sample_op in {"prepare", "complete"} or "step" in keys or any(t in low for t in ("workflow", "step", "sequence", "complete")):
+        return "sequence_step_skip"
+    if "server_tag" in keys or sample_op == "server_tag" or any(t in low for t in ("tag", "schema", "mass")):
+        return "schema_symmetry"
+    if sample_op in {"share", "private"} or any(t in low for t in ("share", "state", "transition", "privacy")):
+        return "state_transition"
+    if "qty" in keys or "quantity" in keys or any(t in low for t in ("qty", "price", "cart", "checkout", "arithmetic")):
+        return "arithmetic_invariant"
+    if any(t in low for t in ("auth", "owner")):
+        return "write_authorization"
+    return "idempotency_replay"
 
 
 def normalize_carrier(value: Any, *, method: str = "GET", content_type: str = "") -> str:
@@ -220,6 +249,21 @@ def surface_profile_applicability(url: str, param: str, sample: str, profile: st
             or bool(_XSS_PATH_RE.search(lower_path))
         )
     )
+    is_business_surface = (
+        not is_traversal_surface
+        and not is_sql_lookup_only
+        and not is_template_only
+        and not is_redirect_surface
+        and not is_xss_surface
+        and (
+            lower_param in _BIZ_PARAM_NAMES
+            or bool(_BIZ_PATH_RE.search(lower_path))
+        )
+    )
+    if profile == "stateful_business_logic":
+        if not is_business_surface:
+            return False, False, "profile_not_applicable_to_surface"
+        return True, True, ""
     if profile == "readonly_traversal_application_files":
         if not is_traversal_surface:
             return False, False, "profile_not_applicable_to_surface"
@@ -233,11 +277,11 @@ def surface_profile_applicability(url: str, param: str, sample: str, profile: st
             return False, False, "profile_not_applicable_to_surface"
         return True, True, ""
     if profile == "readonly_sqli_boolean":
-        if is_traversal_surface or is_template_only or is_xss_surface or is_redirect_surface:
+        if is_traversal_surface or is_template_only or is_xss_surface or is_redirect_surface or is_business_surface:
             return True, False, "profile_not_applicable_to_surface"
         return True, True, ""
     if profile == "readonly_ssti_arithmetic":
-        if is_traversal_surface or is_sql_lookup_only or is_xss_surface or is_redirect_surface:
+        if is_traversal_surface or is_sql_lookup_only or is_xss_surface or is_redirect_surface or is_business_surface:
             return True, False, "profile_not_applicable_to_surface"
         return True, True, ""
     return True, True, ""
@@ -363,7 +407,9 @@ def matches_model_call(row: dict[str, Any], tool: str, args: dict[str, Any]) -> 
         required.add("session_bindings")
     if tool == "validator_validate_sqli":
         required.add("boolean_only")
-    if expected.get("method", "GET") != "GET" and tool != "hunter_run_web_loop":
+    if tool == "validator_validate_business_logic":
+        required.update({"method", "carrier", "kind"})
+    elif expected.get("method", "GET") != "GET" and tool != "hunter_run_web_loop":
         required.update({"method", "carrier", "body_template"})
     if not required <= args.keys():
         return False
@@ -519,23 +565,29 @@ def parameter_candidates(spec: Any, records: list[dict[str, Any]],
             output.append(candidate(spec.id, route=url, provenance=provenance, reason=reason, method=method,
                                     carrier="query" if method == "GET" else ""))
             continue
-        if method not in {"GET", "POST"}:
+        if method not in {"GET", "POST", "PUT", "PATCH"}:
             output.append(candidate(spec.id, route=url, provenance=provenance,
                                     reason="unsupported_readonly_method", method=method, carrier=""))
             continue
         ctype = str(record.get("content_type") or "").split(";", 1)[0].strip().lower()
-        if method == "POST":
+        if method in {"POST", "PUT", "PATCH"}:
             probe_carrier = "json" if ctype == "application/json" else "form"
-            post_auth = _call_profile_eligibility(
-                profile_eligibility, spec, url, "", probe_carrier, "readonly_sqli_boolean", "POST"
+            post_ro = (
+                _call_profile_eligibility(
+                    profile_eligibility, spec, url, "", probe_carrier, "readonly_sqli_boolean", "POST"
+                )
+                if method == "POST"
+                else None
             )
-            if not isinstance(post_auth, dict) or (
-                post_auth.get("eligible") is not True
-                and post_auth.get("reason_code") == "unsupported_readonly_method"
-            ):
+            post_biz = _call_profile_eligibility(
+                profile_eligibility, spec, url, "", probe_carrier, "stateful_business_logic", method
+            )
+            ro_ok = isinstance(post_ro, dict) and post_ro.get("reason_code") != "unsupported_readonly_method"
+            biz_ok = isinstance(post_biz, dict) and post_biz.get("reason_code") != "unsupported_readonly_method"
+            if not ro_ok and not biz_ok:
                 output.append(candidate(
                     spec.id, route=url, identity=identity, provenance=provenance,
-                    reason="unsupported_readonly_method", method="POST", carrier="",
+                    reason="unsupported_readonly_method", method=method, carrier="",
                 ))
                 continue
         declared = {
@@ -543,24 +595,36 @@ def parameter_candidates(spec: Any, records: list[dict[str, Any]],
             for item in declarations
         }
         declared_samples = {item["name"]: str(item.get("sample", "")) for item in declarations}
-        if method == "POST" and not declared:
+        if method in {"POST", "PUT", "PATCH"} and not declared:
             output.append(candidate(
                 spec.id, route=url, identity=identity, provenance=provenance,
-                reason="missing_parameter_or_synthetic_identity_pair", method="POST",
+                reason="missing_parameter_or_synthetic_identity_pair", method=method,
                 carrier="json" if ctype == "application/json" else ("form" if params else ""),
             ))
             continue
-        for param in dict.fromkeys([*params, *declared]):
+        emitted_biz_routes: set[tuple[str, str]] = set()
+        param_order = list(dict.fromkeys([*params, *declared]))
+        for param in param_order:
             sample = params.get(param, declared_samples.get(param, ""))
             for profile, (vector, direct, _) in PROFILES.items():
                 if spec.vector not in ("", "access", vector):
                     continue
+                if profile == "stateful_business_logic" and method == "GET":
+                    continue
                 materialize, surface_ok, surface_reason = surface_profile_applicability(url, param, sample, profile)
                 if not materialize:
                     continue
+                if profile == "stateful_business_logic":
+                    preferred_biz_param = "op" if "op" in declared else (next(iter(declared), param))
+                    if param != preferred_biz_param:
+                        continue
+                    biz_route_key = (method, url)
+                    if biz_route_key in emitted_biz_routes:
+                        continue
+                    emitted_biz_routes.add(biz_route_key)
                 carrier = declared.get(param, "query")
                 policy_reason = ""
-                if method == "POST":
+                if method in {"POST", "PUT", "PATCH"}:
                     if profile in {
                         "readonly_traversal_application_files",
                         "readonly_xss_reflection",
@@ -611,7 +675,17 @@ def parameter_candidates(spec: Any, records: list[dict[str, Any]],
                 # Direct validators have no session-ref argument. Authenticated
                 # records use Hunter's existing vault-only profile rather than
                 # projecting credentials or silently testing anonymously.
-                if method == "POST":
+                if profile == "stateful_business_logic":
+                    direct_args = {
+                        "target_url": url,
+                        "kind": infer_business_logic_kind(url, declared_samples),
+                        "method": method,
+                        "carrier": carrier,
+                        "param": param,
+                    }
+                    if isinstance(record.get("operation_id"), str) and record["operation_id"]:
+                        direct_args["operation_id"] = record["operation_id"]
+                elif method == "POST":
                     body_template, headers_json, baseline_val = build_post_body_template(
                         declarations, param, carrier
                     )
@@ -638,17 +712,23 @@ def parameter_candidates(spec: Any, records: list[dict[str, Any]],
                 }
                 if identity in bindings:
                     hunter_args["session_bindings"] = json.dumps({identity: bindings[identity]})
-                use_hunter = bool(bindings and identity != "anon") or direct not in spec.tools
-                tool = "hunter_run_web_loop" if use_hunter else direct
-                args = hunter_args if use_hunter else direct_args
-                recipes: dict[str, dict[str, Any]] = {}
-                if not (bindings and identity != "anon") and direct in spec.tools:
-                    recipes[direct] = copy.deepcopy(direct_args)
-                if "hunter_run_web_loop" in spec.tools:
-                    recipes["hunter_run_web_loop"] = copy.deepcopy(hunter_args)
+                if profile == "stateful_business_logic":
+                    use_hunter = False
+                    tool = direct
+                    args = direct_args
+                    recipes = {direct: copy.deepcopy(direct_args)} if direct in spec.tools else {}
+                else:
+                    use_hunter = bool(bindings and identity != "anon") or direct not in spec.tools
+                    tool = "hunter_run_web_loop" if use_hunter else direct
+                    args = hunter_args if use_hunter else direct_args
+                    recipes = {}
+                    if not (bindings and identity != "anon") and direct in spec.tools:
+                        recipes[direct] = copy.deepcopy(direct_args)
+                    if "hunter_run_web_loop" in spec.tools:
+                        recipes["hunter_run_web_loop"] = copy.deepcopy(hunter_args)
                 carrier_or_sample_reason = (
                     ""
-                    if method == "POST"
+                    if method in {"POST", "PUT", "PATCH"}
                     else (
                         "unsupported_parameter_carrier" if carrier != "query"
                         else "missing_observed_query_sample" if param not in params

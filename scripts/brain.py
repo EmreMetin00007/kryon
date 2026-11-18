@@ -247,9 +247,9 @@ VECTOR_COMMANDS: dict[str, dict] = {
         ],
     },
     "race-business": {
-        "tools": ["kali-tools_curl_request"],
+        "tools": ["validator_validate_business_logic", "kali-tools_curl_request"],
         "commands": [
-            "Document the business-flow preconditions on {target}; do not change state or run concurrent bursts",
+            "Validate only policy-declared synthetic business-logic state transitions (pre_state, business_control, experiment, post_state) on {target}; do not mutate undeclared endpoints or run concurrent bursts",
         ],
     },
     "file-access": {
@@ -292,6 +292,7 @@ BROKER_PHASE_TEMPLATES = {
         "tools": ["hunter_run_web_loop", "hunter_coverage_report", "kali-tools_curl_request",
                   "validator_validate_sqli", "validator_validate_ssti", "validator_validate_path_traversal",
                   "validator_validate_xss_reflection", "validator_validate_open_redirect",
+                  "validator_validate_business_logic",
                   "validator_validate_auth_bypass", "validator_validate_idor"],
         "commands": [
             "Use hunter_run_web_loop on {target} with live=false to plan from observed surface and supplied identities",
@@ -837,6 +838,12 @@ _VALIDATOR_VECTOR_ALIASES = {
                       "token_round_trip_application_flow"),
     "xss-stored": ("xss_reflected", "reflected_xss", "dom_xss"),
     "file-access": ("unrestricted_file_upload", "xxe"),
+    "race-business": (
+        "write_authorization", "schema_symmetry", "idempotency_replay",
+        "sequence_step_skip", "state_transition", "arithmetic_invariant",
+        "offset_to_zero", "order_permutation", "rewrite_after_complete",
+        "price_manipulation", "mass_assignment", "workflow_bypass", "replay",
+    ),
 }
 
 

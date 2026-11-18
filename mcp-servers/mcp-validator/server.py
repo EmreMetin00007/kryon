@@ -101,6 +101,7 @@ ORACLE_CONFIDENCE = {
     "differential_deserialization": 0.85,
     "token_differential": 0.88,
     "token_roundtrip": 0.90,
+    "business_logic": 0.94,
 }
 
 mcp = FastMCP(
@@ -1894,6 +1895,497 @@ def _validate_open_redirect_inner(
                           "limitations": ["external destinations were not followed; only the listed payloads were tested"]},
                    request_evidence=trace.evidence,
                    signed_completion=redirect_completion)
+
+
+def _standalone_business_logic_gate(method, url, headers):
+    """Enforce PolicyEngine business_logic_operations on standalone validator wire calls."""
+    norm_method = str(method or "GET").upper()
+    try:
+        scripts = os.path.abspath(os.path.join(_SERVER_DIR, "..", "..", "scripts"))
+        if scripts not in sys.path:
+            sys.path.insert(0, scripts)
+        from policy_engine import PolicyEngine
+        decision = PolicyEngine().validate_wire_invocation("validator_validate_business_logic", {
+            "target_url": url,
+            "url": url,
+            "method": norm_method,
+            "headers": dict(headers or {}),
+        })
+        return bool(decision.get("allowed")), str(decision.get("reason") or "blocked")
+    except Exception:
+        return False, "business logic probe policy unavailable"
+
+
+def _encode_biz_body(payload: dict, carrier: str, base_headers: dict) -> tuple[str, dict]:
+    hdrs = dict(base_headers or {})
+    if carrier == "form":
+        hdrs.setdefault("Content-Type", "application/x-www-form-urlencoded")
+        return urlencode({k: str(v) for k, v in payload.items()}), hdrs
+    hdrs.setdefault("Content-Type", "application/json")
+    return json.dumps(payload, separators=(",", ":"), ensure_ascii=True), hdrs
+
+
+def _infer_biz_kind(target_url: str, pre_json: dict | None) -> str:
+    if isinstance(pre_json, dict) and isinstance(pre_json.get("kind"), str) and pre_json["kind"]:
+        return pre_json["kind"]
+    low = target_url.lower()
+    if any(tok in low for tok in ("coupon", "redeem", "idempotency", "replay")):
+        return "idempotency_replay"
+    if any(tok in low for tok in ("workflow", "step", "sequence", "checkout", "complete")):
+        return "sequence_step_skip"
+    if any(tok in low for tok in ("tag", "schema", "mass", "profile")):
+        return "schema_symmetry"
+    if any(tok in low for tok in ("share", "state", "transition", "privacy")):
+        return "state_transition"
+    if any(tok in low for tok in ("auth", "owner", "title")):
+        return "write_authorization"
+    if any(tok in low for tok in ("qty", "price", "cart", "arithmetic")):
+        return "arithmetic_invariant"
+    return ""
+
+
+def _biz_scenario_spec(kind: str, control_state: dict, probe_state: dict, target_url: str, rid: str) -> dict | None:
+    ctrl_id = str(control_state.get("id") or rid)
+    probe_id = str(probe_state.get("id") or rid)
+    if kind == "idempotency_replay":
+        c_before = int(control_state.get("uses", 0))
+        p_before = int(probe_state.get("uses", 0))
+        return {
+            "control_actions": [{"op": "redeem", "coupon": "BIZ-ONE", "resource_id": ctrl_id}],
+            "probe_actions": [
+                {"op": "redeem", "coupon": "BIZ-ONE", "resource_id": probe_id},
+                {"op": "redeem", "coupon": "BIZ-ONE", "resource_id": probe_id},
+            ],
+            "contract": {
+                "kind": kind,
+                "expected_rule": "One coupon can produce at most one redemption.",
+                "alternative_explanation": "One discount is legitimate.",
+                "evidence_ref": f"business-logic-rule:{kind}",
+                "workflow_id": f"wf-{probe_id}",
+                "session_id": "validator",
+                "resource_id": probe_id,
+                "control": {"field": "uses", "before": c_before, "after": c_before + 1},
+                "probe": {"field": "uses", "before": p_before, "after": p_before + 2},
+            },
+        }
+    if kind == "sequence_step_skip":
+        return {
+            "control_actions": [
+                {"op": "prepare", "resource_id": ctrl_id},
+                {"op": "complete", "resource_id": ctrl_id},
+            ],
+            "probe_actions": [{"op": "complete", "resource_id": probe_id}],
+            "contract": {
+                "kind": kind,
+                "expected_rule": "Completion requires preparation on this object.",
+                "alternative_explanation": "A previously prepared object may complete.",
+                "evidence_ref": f"business-logic-rule:{kind}",
+                "workflow_id": f"wf-{probe_id}",
+                "session_id": "validator",
+                "resource_id": probe_id,
+                "control": {"field": "status", "before": "draft", "after": "complete"},
+                "probe": {"field": "status", "before": "draft", "after": "complete"},
+            },
+        }
+    if kind == "schema_symmetry":
+        return {
+            "control_actions": [{"op": "title", "title": "normal", "resource_id": ctrl_id}],
+            "probe_actions": [{"op": "server_tag", "server_tag": "tampered", "resource_id": probe_id}],
+            "contract": {
+                "kind": kind,
+                "expected_rule": "The server-owned tag cannot be bound from input.",
+                "alternative_explanation": "A normal editable title may change.",
+                "evidence_ref": f"business-logic-rule:{kind}",
+                "workflow_id": f"wf-{probe_id}",
+                "session_id": "validator",
+                "resource_id": probe_id,
+                "control": {"field": "title", "before": str(control_state.get("title", "initial")), "after": "normal"},
+                "probe": {"field": "server_tag", "before": str(probe_state.get("server_tag", "initial")), "after": "tampered"},
+            },
+        }
+    if kind == "state_transition":
+        return {
+            "control_actions": [{"op": "share", "resource_id": ctrl_id}],
+            "probe_actions": [{"op": "private", "resource_id": probe_id}],
+            "contract": {
+                "kind": kind,
+                "expected_rule": "Making a share private revokes viewer access.",
+                "alternative_explanation": "A shared resource permits viewer access.",
+                "evidence_ref": f"business-logic-rule:{kind}",
+                "workflow_id": f"wf-{probe_id}",
+                "session_id": "validator",
+                "resource_id": probe_id,
+                "control": {
+                    "field": "access_state",
+                    "before": {"status": "private", "viewer_access": False},
+                    "after": {"status": "shared", "viewer_access": True},
+                },
+                "probe": {
+                    "field": "access_state",
+                    "before": {"status": "shared", "viewer_access": True},
+                    "after": {"status": "private", "viewer_access": True},
+                },
+            },
+        }
+    if kind == "write_authorization":
+        return {
+            "control_actions": [{"op": "title", "title": "normal", "resource_id": ctrl_id}],
+            "probe_actions": [{"op": "title", "title": "tampered", "resource_id": probe_id}],
+            "contract": {
+                "kind": kind,
+                "expected_rule": "Only the owner may change the title.",
+                "alternative_explanation": "An owner edit is legitimate.",
+                "evidence_ref": f"business-logic-rule:{kind}",
+                "workflow_id": f"wf-{probe_id}",
+                "session_id": "validator",
+                "resource_id": probe_id,
+                "control": {"field": "title", "before": str(control_state.get("title", "initial")), "after": "normal"},
+                "probe": {"field": "title", "before": str(probe_state.get("title", "initial")), "after": "tampered"},
+            },
+        }
+    if kind in {"arithmetic_invariant", "offset_to_zero"}:
+        c_total = int(control_state.get("total", 100))
+        p_total = int(probe_state.get("total", 100))
+        return {
+            "control_actions": [{"op": "checkout", "qty": 1, "resource_id": ctrl_id}],
+            "probe_actions": [{"op": "checkout", "qty": -5, "resource_id": probe_id}],
+            "contract": {
+                "kind": kind,
+                "expected_rule": "Quantities must remain positive and reduce total monotonically.",
+                "alternative_explanation": "A positive unit purchase decreases remaining balance.",
+                "evidence_ref": f"business-logic-rule:{kind}",
+                "workflow_id": f"wf-{probe_id}",
+                "session_id": "validator",
+                "resource_id": probe_id,
+                "control": {"field": "total", "before": c_total, "after": c_total - 10},
+                "probe": {"field": "total", "before": p_total, "after": p_total + 50},
+            },
+        }
+    return None
+
+
+@mcp.tool()
+def validate_business_logic(
+    target_url: str,
+    kind: str = "idempotency_replay",
+    method: str = "POST",
+    carrier: str = "json",
+    operation_id: str = "",
+    control_url: str = "",
+    headers_json: str = "{}",
+    control_headers_json: str = "{}",
+    probe_headers_json: str = "{}",
+    param: str = "op",
+) -> str:
+    """Stateful business-logic / workflow transition validator with benign normal control.
+
+    Executes pre_state -> benign business_control -> post_state, then
+    probe pre_state -> adversarial experiment -> post_state under PolicyEngine
+    wire gating, emitting Ed25519 signed_completion v1 on clean UNCONFIRMED.
+    """
+    scripts_dir = os.path.abspath(os.path.join(_SERVER_DIR, "..", "..", "scripts"))
+    if scripts_dir not in sys.path:
+        sys.path.insert(0, scripts_dir)
+    from business_logic import KINDS as _BIZ_KINDS, evaluate_business_logic, evaluate_normal_control
+    from cco_validator_core.egress import current_wire_gate, scoped_wire_gate
+
+    parsed_target = urlparse(str(target_url or ""))
+    if parsed_target.scheme not in {"http", "https"} or not parsed_target.hostname or parsed_target.username is not None:
+        return _result("Business Logic", target_url, ERROR, "business_logic",
+                       {"argument_error": "valid HTTP(S) target_url required"}, "-",
+                       guard={"transport_ok": False})
+    norm_method = str(method or "POST").upper()
+    if norm_method not in {"POST", "PUT", "PATCH"}:
+        return _result("Business Logic", target_url, ERROR, "business_logic",
+                       {"argument_error": "method must be POST, PUT, or PATCH"}, "-",
+                       guard={"transport_ok": False})
+    norm_carrier = _normalize_carrier(carrier, norm_method)
+    if norm_carrier not in {"json", "form"}:
+        return _result("Business Logic", target_url, ERROR, "business_logic",
+                       {"argument_error": "carrier must be json or form"}, "-",
+                       guard={"transport_ok": False})
+    eff_param = str(param or "op").strip() or "op"
+    base_hdrs = _headers(headers_json)
+    ctrl_hdrs = {**base_hdrs, **(_headers(control_headers_json) if control_headers_json and control_headers_json != "{}" else {})}
+    probe_hdrs = {**base_hdrs, **(_headers(probe_headers_json) if probe_headers_json and probe_headers_json != "{}" else {})}
+
+    req_evidence: list[dict] = []
+    gate_ctx = nullcontext() if current_wire_gate() is not None else scoped_wire_gate(_standalone_business_logic_gate)
+    with _direct_context_scope(
+        target_url=target_url,
+        param=eff_param,
+        method=norm_method,
+        carrier=norm_carrier,
+        vuln_class="business_logic",
+    ), gate_ctx:
+        probe_before_resp = _request("GET", target_url, headers=base_hdrs, allow_redirects=False)
+        req_evidence.append(response_evidence(probe_before_resp, "probe-before", 0))
+        if not probe_before_resp.get("ok") or probe_before_resp.get("status") != 200:
+            return _result(
+                "Business Logic",
+                target_url,
+                INCONCLUSIVE,
+                "business_logic",
+                {"probe_before_status": probe_before_resp.get("status"), "error": probe_before_resp.get("error")},
+                "-",
+                notes="Pre-state GET observation did not return 200 OK.",
+                guard={"transport_ok": bool(probe_before_resp.get("ok")), "controls": ["pre_state observation"]},
+                request_evidence=req_evidence,
+            )
+        try:
+            probe_before_json = json.loads(probe_before_resp.get("text") or "{}")
+        except ValueError:
+            probe_before_json = {}
+        if not isinstance(probe_before_json, dict):
+            probe_before_json = {}
+
+        eff_kind = str(kind or "").strip().lower()
+        if eff_kind in {"", "auto", "business_logic"} or eff_kind not in _BIZ_KINDS:
+            eff_kind = _infer_biz_kind(target_url, probe_before_json)
+        if eff_kind not in _BIZ_KINDS:
+            return _result(
+                "Business Logic",
+                target_url,
+                INCONCLUSIVE,
+                "business_logic",
+                {"error": "unable to resolve business logic scenario kind"},
+                "-",
+                guard={"transport_ok": True},
+                request_evidence=req_evidence,
+            )
+
+        resolved_ctrl = ""
+        if control_url:
+            resolved_ctrl = urljoin(target_url, control_url)
+        elif isinstance(probe_before_json.get("control_url"), str) and probe_before_json["control_url"]:
+            resolved_ctrl = urljoin(target_url, probe_before_json["control_url"])
+        if resolved_ctrl:
+            ctrl_parsed = urlparse(resolved_ctrl)
+            if (ctrl_parsed.scheme, ctrl_parsed.netloc) != (parsed_target.scheme, parsed_target.netloc):
+                return _result(
+                    "Business Logic",
+                    target_url,
+                    INCONCLUSIVE,
+                    "business_logic",
+                    {"error": "control_url must share origin with target_url"},
+                    "-",
+                    guard={"transport_ok": False},
+                    request_evidence=req_evidence,
+                )
+            ctrl_before_resp = _request("GET", resolved_ctrl, headers=ctrl_hdrs, allow_redirects=False)
+            req_evidence.append(response_evidence(ctrl_before_resp, "control-before", 0))
+            if not ctrl_before_resp.get("ok") or ctrl_before_resp.get("status") != 200:
+                return _result(
+                    "Business Logic",
+                    target_url,
+                    INCONCLUSIVE,
+                    "business_logic",
+                    {"control_before_status": ctrl_before_resp.get("status")},
+                    "-",
+                    notes="Control pre-state observation failed.",
+                    guard={"transport_ok": bool(ctrl_before_resp.get("ok"))},
+                    request_evidence=req_evidence,
+                )
+            try:
+                ctrl_before_json = json.loads(ctrl_before_resp.get("text") or "{}")
+            except ValueError:
+                ctrl_before_json = {}
+            ctrl_target = resolved_ctrl
+        else:
+            sep = "&" if "?" in target_url else "?"
+            ctrl_candidate = f"{target_url}{sep}role=control"
+            ctrl_before_resp = _request("GET", ctrl_candidate, headers=ctrl_hdrs, allow_redirects=False)
+            if ctrl_before_resp.get("ok") and ctrl_before_resp.get("status") == 200:
+                ctrl_target = ctrl_candidate
+                req_evidence.append(response_evidence(ctrl_before_resp, "control-before", 0))
+                try:
+                    ctrl_before_json = json.loads(ctrl_before_resp.get("text") or "{}")
+                except ValueError:
+                    ctrl_before_json = {}
+            else:
+                ctrl_target = target_url
+                ctrl_before_resp = probe_before_resp
+                ctrl_before_json = probe_before_json
+                req_evidence.append(response_evidence(ctrl_before_resp, "control-before", 0))
+
+        rid = parsed_target.path.rstrip("/").rsplit("/", 1)[-1] or "resource"
+        scenario = _biz_scenario_spec(eff_kind, ctrl_before_json, probe_before_json, target_url, rid)
+        if scenario is None:
+            return _result(
+                "Business Logic",
+                target_url,
+                INCONCLUSIVE,
+                "business_logic",
+                {"error": "unsupported_logic_scenario", "kind": eff_kind},
+                "-",
+                guard={"transport_ok": True},
+                request_evidence=req_evidence,
+            )
+
+        ctrl_resps = []
+        for idx, action_payload in enumerate(scenario["control_actions"]):
+            body_str, send_hdrs = _encode_biz_body(action_payload, norm_carrier, ctrl_hdrs)
+            r = _request(norm_method, ctrl_target, data=body_str, headers=send_hdrs, allow_redirects=False)
+            ctrl_resps.append(r)
+            req_evidence.append(response_evidence(r, f"control-action-{idx}", idx))
+            if not r.get("ok"):
+                return _result(
+                    "Business Logic",
+                    target_url,
+                    INCONCLUSIVE,
+                    "business_logic",
+                    {"error": r.get("error") or "control_action_blocked", "blocked": r.get("blocked")},
+                    "-",
+                    notes="Normal business control action blocked or failed transport.",
+                    guard={"transport_ok": False},
+                    request_evidence=req_evidence,
+                )
+
+        ctrl_after_resp = _request("GET", ctrl_target, headers=ctrl_hdrs, allow_redirects=False)
+        req_evidence.append(response_evidence(ctrl_after_resp, "control-after", 0))
+        if not ctrl_after_resp.get("ok") or ctrl_after_resp.get("status") != 200:
+            return _result(
+                "Business Logic",
+                target_url,
+                INCONCLUSIVE,
+                "business_logic",
+                {"control_after_status": ctrl_after_resp.get("status")},
+                "-",
+                guard={"transport_ok": bool(ctrl_after_resp.get("ok"))},
+                request_evidence=req_evidence,
+            )
+
+        if ctrl_target == target_url:
+            probe_before_resp = ctrl_after_resp
+            try:
+                probe_before_json = json.loads(probe_before_resp.get("text") or "{}")
+            except ValueError:
+                probe_before_json = {}
+            scenario = _biz_scenario_spec(eff_kind, ctrl_before_json, probe_before_json, target_url, rid)
+
+        probe_resps = []
+        repro_cmds = []
+        for idx, action_payload in enumerate(scenario["probe_actions"]):
+            body_str, send_hdrs = _encode_biz_body(action_payload, norm_carrier, probe_hdrs)
+            repro_cmds.append(_curl(norm_method, target_url, body_str, send_hdrs))
+            r = _request(norm_method, target_url, data=body_str, headers=send_hdrs, allow_redirects=False)
+            probe_resps.append(r)
+            req_evidence.append(response_evidence(r, f"probe-action-{idx}", idx))
+            if not r.get("ok"):
+                return _result(
+                    "Business Logic",
+                    target_url,
+                    INCONCLUSIVE,
+                    "business_logic",
+                    {"error": r.get("error") or "probe_action_blocked", "blocked": r.get("blocked")},
+                    "-",
+                    notes="Probe action blocked or failed transport.",
+                    guard={"transport_ok": False},
+                    request_evidence=req_evidence,
+                )
+
+        probe_after_resp = _request("GET", target_url, headers=base_hdrs, allow_redirects=False)
+        req_evidence.append(response_evidence(probe_after_resp, "probe-after", 0))
+        if not probe_after_resp.get("ok") or probe_after_resp.get("status") != 200:
+            return _result(
+                "Business Logic",
+                target_url,
+                INCONCLUSIVE,
+                "business_logic",
+                {"probe_after_status": probe_after_resp.get("status")},
+                "-",
+                guard={"transport_ok": bool(probe_after_resp.get("ok"))},
+                request_evidence=req_evidence,
+            )
+
+        steps_map = {
+            "control-before": ctrl_before_resp,
+            "control-after": ctrl_after_resp,
+            "probe-before": probe_before_resp,
+            "probe-after": probe_after_resp,
+        }
+        expect = {
+            "oracle": "business_logic",
+            "contract": scenario["contract"],
+            "control_before": "control-before",
+            "control_after": "control-after",
+            "probe_before": "probe-before",
+            "probe_after": "probe-after",
+        }
+        ctrl_ok, ctrl_detail = evaluate_normal_control(expect, steps_map)
+        if not ctrl_ok:
+            return _result(
+                "Business Logic",
+                target_url,
+                INCONCLUSIVE,
+                "business_logic",
+                {
+                    "kind": eff_kind,
+                    "normal_control_passed": False,
+                    "violation_effect_observed": False,
+                    "business_rule_ref": scenario["contract"]["evidence_ref"],
+                    "reason": "normal_control_failed",
+                    **({"operation_id": operation_id} if operation_id else {}),
+                },
+                repro_cmds or "-",
+                notes="Benign business control did not produce expected state change; cannot conclude.",
+                guard={"transport_ok": True, "controls": ["pre_state", "business_control", "post_state"]},
+                request_evidence=req_evidence,
+            )
+
+        violated, biz_detail = evaluate_business_logic(expect, steps_map)
+        evidence = {
+            "kind": eff_kind,
+            "expected_rule": scenario["contract"]["expected_rule"],
+            "control_statuses": [r.get("status") for r in ctrl_resps],
+            "probe_statuses": [r.get("status") for r in probe_resps],
+            **biz_detail,
+            **({"operation_id": operation_id} if operation_id else {}),
+        }
+        if violated:
+            return _result(
+                "Business Logic",
+                target_url,
+                CONFIRMED,
+                "business_logic",
+                evidence,
+                repro_cmds,
+                notes=f"Stateful business logic violation ({eff_kind}) confirmed with passing benign control.",
+                severity="high",
+                guard={
+                    "prerequisites": ["pre_state observation", "explicit business_logic_operations policy"],
+                    "controls": ["benign business_control", "adversarial experiment", "post_state observation"],
+                    "transport_ok": True,
+                    "decision_rule": "normal_control_passed and violation_effect_observed",
+                },
+                request_evidence=req_evidence,
+            )
+
+        biz_completion = _build_validator_completion(
+            target_url=target_url,
+            param=eff_param,
+            method=norm_method,
+            carrier=norm_carrier,
+            profile="stateful_business_logic",
+            required_checks=["pre_state", "business_control", "experiment", "post_state"],
+        )
+        return _result(
+            "Business Logic",
+            target_url,
+            UNCONFIRMED,
+            "business_logic",
+            evidence,
+            repro_cmds,
+            notes=f"Benign business control passed and adversarial {eff_kind} probe was rejected cleanly.",
+            guard={
+                "prerequisites": ["pre_state observation", "explicit business_logic_operations policy"],
+                "controls": ["benign business_control", "adversarial experiment", "post_state observation"],
+                "transport_ok": True,
+                "decision_rule": "normal_control_passed and not violation_effect_observed",
+            },
+            request_evidence=req_evidence,
+            signed_completion=biz_completion,
+        )
 
 
 def _oob_sent_request_binding(target_url: str, param: str, payload: str, response: dict,

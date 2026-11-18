@@ -703,6 +703,11 @@ class PythonBroker(HostBroker):
                             and (card.get('vector') == 'xss-stored' or card.get('tool') == 'validator_validate_xss_reflection')
                             for card in (context.get('candidate_cards') or [])
                         )
+                        has_business_logic_cards = any(
+                            isinstance(card, dict)
+                            and (card.get('vector') == 'race-business' or card.get('tool') == 'validator_validate_business_logic')
+                            for card in (context.get('candidate_cards') or [])
+                        )
                         reading_tools = {READ_TOOL, SUMMARY_TOOL, SESSION_CHECK_TOOL,
                                            COVERAGE_TOOL, 'hunter_run_web_loop', CRAWL_TOOL,
                                            COMPILED_WORKFLOW_TOOL, 'validator_validate_sqli',
@@ -713,6 +718,8 @@ class PythonBroker(HostBroker):
                             reading_tools.add('validator_validate_path_traversal')
                         if has_xss_cards:
                             reading_tools.add('validator_validate_xss_reflection')
+                        if has_business_logic_cards:
+                            reading_tools.add('validator_validate_business_logic')
                         if spec.phase in {'recon', 'enum'}:
                             reading_tools |= {
                                 'kali-tools_curl_request',
@@ -757,6 +764,11 @@ class PythonBroker(HostBroker):
                             and (card.get('vector') == 'authn-session' or card.get('tool') == 'validator_validate_open_redirect')
                             for card in (context.get('candidate_cards') or [])
                         )
+                        has_business_logic_cards = any(
+                            isinstance(card, dict)
+                            and (card.get('vector') == 'race-business' or card.get('tool') == 'validator_validate_business_logic')
+                            for card in (context.get('candidate_cards') or [])
+                        )
                         trimmed_tools = {'validator_validate_auth_bypass'}
                         if not has_redirect_cards:
                             trimmed_tools.add('validator_validate_open_redirect')
@@ -764,6 +776,8 @@ class PythonBroker(HostBroker):
                             trimmed_tools.add('validator_validate_path_traversal')
                         if not has_xss_cards:
                             trimmed_tools.add('validator_validate_xss_reflection')
+                        if not has_business_logic_cards:
+                            trimmed_tools.add('validator_validate_business_logic')
                         candidate['tools'] = [row for row in candidate['tools'] if row['function']['name'] not in trimmed_tools]
                         latest = projected['recent_results'][-1]
                         if latest.get('result', {}).get('content_ref'):
@@ -793,7 +807,10 @@ class PythonBroker(HostBroker):
                                    'validator_validate_ssti': ssti_fields,
                                    'validator_validate_path_traversal': {'target_url', 'param', 'method', 'carrier'},
                                    'validator_validate_xss_reflection': {'target_url', 'param', 'method', 'carrier'},
-                                   'validator_validate_open_redirect': {'target_url', 'param', 'method', 'carrier'}}
+                                   'validator_validate_open_redirect': {'target_url', 'param', 'method', 'carrier'},
+                                   'validator_validate_business_logic': {
+                                       'target_url', 'kind', 'method', 'carrier', 'param', 'operation_id',
+                                   }}
                         for tool in candidate['tools']:
                             name = tool['function']['name']
                             params = tool['function']['parameters']
@@ -1382,6 +1399,7 @@ class PythonBroker(HostBroker):
                         "ssti": "SSTI",
                         "xss_reflection": "Reflected XSS",
                         "open_redirect": "Open Redirect",
+                        "business_logic": "Business Logic",
                     }
                     if expected_kind in aliases and kind != normalize_finding_type(aliases[expected_kind]):
                         continue
@@ -1390,6 +1408,7 @@ class PythonBroker(HostBroker):
                         "validator_validate_ssti": "readonly_ssti_arithmetic",
                         "validator_validate_xss_reflection": "readonly_xss_reflection",
                         "validator_validate_open_redirect": "readonly_open_redirect",
+                        "validator_validate_business_logic": "stateful_business_logic",
                     }
                     if not context and row["tool"] in direct_profile_tools:
                         context = self.direct_request_context(record, args)
@@ -1405,6 +1424,11 @@ class PythonBroker(HostBroker):
                             or (
                                 profile in {"readonly_sqli_boolean", "readonly_ssti_arithmetic"}
                                 and method_arg == "POST"
+                                and carrier_arg in {"form", "json"}
+                            )
+                            or (
+                                profile == "stateful_business_logic"
+                                and method_arg in {"POST", "PUT", "PATCH"}
                                 and carrier_arg in {"form", "json"}
                             )
                         )
@@ -1489,6 +1513,52 @@ class PythonBroker(HostBroker):
             return True
         return False
 
+    def is_business_logic_authorized(
+        self,
+        url: str,
+        *,
+        method: str = "POST",
+        carrier: str = "",
+        operation_id: str = "",
+    ) -> bool:
+        """Check whether private policy explicitly authorizes this synthetic business-logic operation."""
+        policy_map = self._program_policy_map()
+        if not isinstance(policy_map, dict):
+            return False
+        declarations = policy_map.get("business_logic_operations")
+        if not isinstance(declarations, list) or not declarations:
+            return False
+        parsed = urlsplit(url)
+        if parsed.scheme.lower() not in {"http", "https"} or not parsed.hostname:
+            return False
+        target_url = parsed._replace(fragment="").geturl()
+        if os.environ.get("CCO_SCOPE_FILE"):
+            try:
+                from policy_engine import ScopeResolver
+                if not ScopeResolver(scope_file=os.environ.get("CCO_SCOPE_FILE")).permits_url(target_url):
+                    return False
+            except (ValueError, OSError, TypeError):
+                return False
+        norm_method = str(method or "POST").upper()
+        norm_carrier = {"body": "form"}.get(str(carrier or "").strip().lower(), str(carrier or "").strip().lower())
+        for row in declarations:
+            if not isinstance(row, dict):
+                continue
+            if row.get("allow_state_mutation") is not True or row.get("test_data_only") is not True:
+                continue
+            if str(row.get("method") or "").upper() != norm_method:
+                continue
+            row_url = urlsplit(str(row.get("url") or ""))._replace(fragment="").geturl()
+            if row_url != target_url:
+                continue
+            if operation_id and row.get("operation_id") != operation_id:
+                continue
+            allowed_carriers = row.get("carriers")
+            if norm_carrier and isinstance(allowed_carriers, list) and norm_carrier not in allowed_carriers:
+                continue
+            return True
+        return False
+
     def profile_eligibility(
         self,
         spec,
@@ -1507,8 +1577,19 @@ class PythonBroker(HostBroker):
         norm_method = str(method or "GET").upper()
         spec_origin = urlsplit(spec.target)
         cand_origin = urlsplit(url)
-        if norm_method == "POST":
-            if profile not in {"readonly_sqli_boolean", "readonly_ssti_arithmetic"}:
+        if norm_method in {"POST", "PUT", "PATCH"}:
+            if profile == "stateful_business_logic":
+                if (cand_origin.scheme, cand_origin.netloc) != (spec_origin.scheme, spec_origin.netloc):
+                    return {"eligible": False, "reason_code": "unsupported_readonly_method"}
+                if not self.is_business_logic_authorized(url, method=norm_method):
+                    return {"eligible": False, "reason_code": "unsupported_readonly_method"}
+                norm_carrier = {"body": "form"}.get(str(carrier or "").strip().lower(), str(carrier or "").strip().lower())
+                if norm_carrier not in {"form", "json"}:
+                    return {"eligible": False, "reason_code": "unsupported_parameter_carrier"}
+                if self.is_business_logic_authorized(url, method=norm_method, carrier=norm_carrier):
+                    return {"eligible": True, "reason_code": ""}
+                return {"eligible": False, "reason_code": "unsupported_parameter_carrier"}
+            if norm_method != "POST" or profile not in {"readonly_sqli_boolean", "readonly_ssti_arithmetic"}:
                 return {"eligible": False, "reason_code": "unsupported_readonly_method"}
             if (cand_origin.scheme, cand_origin.netloc) != (spec_origin.scheme, spec_origin.netloc):
                 return {"eligible": False, "reason_code": "unsupported_readonly_method"}
@@ -1521,6 +1602,8 @@ class PythonBroker(HostBroker):
                 return {"eligible": True, "reason_code": ""}
             return {"eligible": False, "reason_code": "unsupported_parameter_carrier"}
         if norm_method != "GET":
+            return {"eligible": False, "reason_code": "unsupported_readonly_method"}
+        if profile == "stateful_business_logic":
             return {"eligible": False, "reason_code": "unsupported_readonly_method"}
         if profile == "readonly_xss_reflection":
             if (cand_origin.scheme, cand_origin.netloc) != (spec_origin.scheme, spec_origin.netloc):
@@ -1725,7 +1808,17 @@ class PythonBroker(HostBroker):
         if not param:
             return {}
         probes = record.get("request_evidence", [])
-        if method == "POST" and carrier in {"form", "json"}:
+        if method in {"POST", "PUT", "PATCH"} and carrier in {"form", "json"}:
+            if record.get("oracle") == "business_logic":
+                if not probes:
+                    return {}
+                for probe in probes:
+                    url = urlsplit(probe.get("request_url", ""))
+                    if (url.scheme, url.netloc) != (target.scheme, target.netloc) or not probe.get("transport_ok"):
+                        return {}
+                if not any(probe.get("method") == method for probe in probes):
+                    return {}
+                return {"param": param, "method": method, "carrier": carrier, "identity": "anon"}
             template = args.get("body_template")
             if not isinstance(template, str) or "{{PAYLOAD}}" not in template or not probes:
                 return {}

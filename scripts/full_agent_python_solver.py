@@ -598,7 +598,7 @@ class PythonSolver:
             rec_params = record.get("params") if isinstance(record.get("params"), list) else []
             rec_carrier = (
                 "json" if rec_ctype == "application/json" or any(isinstance(p, dict) and p.get("in") == "json" for p in rec_params)
-                else ("form" if rec_method == "POST" and (rec_ctype == "application/x-www-form-urlencoded" or any(isinstance(p, dict) and p.get("in") in {"body", "form"} for p in rec_params)) else "")
+                else ("form" if rec_method in {"POST", "PUT", "PATCH"} and (rec_ctype == "application/x-www-form-urlencoded" or any(isinstance(p, dict) and p.get("in") in {"body", "form"} for p in rec_params)) else "")
             )
             rec_http_status = None
             post_authorized = (
@@ -610,13 +610,23 @@ class PythonSolver:
                     operation_id=str(record.get("operation_id") or ""),
                 )
             )
+            biz_authorized = (
+                rec_method in {"POST", "PUT", "PATCH"}
+                and callable(getattr(self.broker, "is_business_logic_authorized", None))
+                and self.broker.is_business_logic_authorized(
+                    rec_url,
+                    method=rec_method,
+                    carrier=rec_carrier,
+                    operation_id=str(record.get("operation_id") or ""),
+                )
+            )
             if rec_reason:
                 rec_status = "blocked"
             elif "{" in rec_url or "}" in rec_url:
                 rec_status, rec_reason = "blocked", "requires_request_context"
-            elif rec_method not in {"GET", "HEAD"} and not post_authorized:
+            elif rec_method not in {"GET", "HEAD"} and not (post_authorized or biz_authorized):
                 rec_status, rec_reason = "blocked", "unsupported_readonly_method"
-            elif post_authorized:
+            elif post_authorized or biz_authorized:
                 rec_status, rec_reason = "completed", ""
             elif (rec_method, rec_url) in crawled_statuses:
                 rec_status, rec_http_status, rec_reason = crawled_statuses[(rec_method, rec_url)]
@@ -887,7 +897,9 @@ class PythonSolver:
                     found_indeterminate = vid
             else:
                 fields: tuple[str, ...] = ("target_url", "param", "method", "carrier")
-                if row_method != "GET":
+                if res_row["tool"] == "validator_validate_business_logic":
+                    fields = ("target_url", "param", "method", "carrier", "kind")
+                elif row_method != "GET":
                     fields = ("target_url", "param", "method", "carrier", "body_template")
                 if any(args.get(k, {"method": "GET", "carrier": "query"}.get(k))
                        != expected.get(k, {"method": "GET", "carrier": "query"}.get(k)) for k in fields):
@@ -973,6 +985,8 @@ class PythonSolver:
                 fields: tuple[str, ...]
                 if execution["tool"] == "hunter_run_web_loop":
                     fields = ("target", "validation_profile", "blind_discovery", "session_bindings")
+                elif execution["tool"] == "validator_validate_business_logic":
+                    fields = ("target_url", "param", "method", "carrier", "kind")
                 elif expected.get("method", "GET") != "GET":
                     fields = ("target_url", "param", "method", "carrier", "body_template")
                 else:
@@ -2828,6 +2842,7 @@ class PythonSolver:
                              "validator_validate_path_traversal",
                              "validator_validate_xss_reflection",
                              "validator_validate_open_redirect",
+                             "validator_validate_business_logic",
                          }
                          for row in self.broker.tools)
         continued = False
@@ -3121,6 +3136,7 @@ class PythonSolver:
                                     "validator_validate_path_traversal",
                                     "validator_validate_xss_reflection",
                                     "validator_validate_open_redirect",
+                                    "validator_validate_business_logic",
                                     "hunter_run_web_loop",
                                 }
                                 and args.get("live", True) is not False):
