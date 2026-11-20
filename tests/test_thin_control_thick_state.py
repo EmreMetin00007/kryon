@@ -784,3 +784,156 @@ def test_monolithic_mode_enables_differential_oracle(tmp_path: Path, mock_target
     finally:
         client.close()
 
+
+def test_differential_oracle_stateful_mutating_clean_replay(tmp_path: Path) -> None:
+    """Non-idempotent PUT transferring ownership must verify via cross-actor GET or stateful fallback, never false-404."""
+    state: dict[str, Any] = {
+        "org_slug": "org-alpha",
+        "tier": "basic",
+        "put_calls": 0,
+    }
+
+    class _StatefulTransferHandler(BaseHTTPRequestHandler):
+        def log_message(self, *_args: Any) -> None:
+            pass
+
+        def _actor_org(self) -> str:
+            auth = self.headers.get("Authorization", "")
+            if auth == "Bearer tok-alpha":
+                return "org-alpha"
+            if auth == "Bearer tok-beta":
+                return "org-beta"
+            return ""
+
+        def _send_json(self, code: int, payload: dict[str, Any]) -> None:
+            raw = json.dumps(payload).encode("utf-8")
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(raw)))
+            self.end_headers()
+            self.wfile.write(raw)
+
+        def do_GET(self) -> None:  # noqa: N802
+            org = self._actor_org()
+            if self.path == "/api/v1/records/1" and org == state["org_slug"]:
+                self._send_json(200, {"id": 1, "org_slug": state["org_slug"], "tier": state["tier"]})
+                return
+            self._send_json(404, {"error": "not_found"})
+
+        def do_PUT(self) -> None:  # noqa: N802
+            state["put_calls"] += 1
+            org = self._actor_org()
+            length = int(self.headers.get("Content-Length") or 0)
+            raw_body = self.rfile.read(length).decode("utf-8") if length > 0 else "{}"
+            try:
+                body = json.loads(raw_body)
+            except ValueError:
+                body = {}
+            if self.path == "/api/v1/records/1" and org == state["org_slug"]:
+                if "org_slug" in body:
+                    state["org_slug"] = str(body["org_slug"])
+                if "tier" in body:
+                    state["tier"] = str(body["tier"])
+                self._send_json(200, {"id": 1, "org_slug": state["org_slug"], "tier": state["tier"]})
+                return
+            self._send_json(404, {"error": "not_found"})
+
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), _StatefulTransferHandler)
+    port = srv.server_address[1]
+    t = threading.Thread(target=srv.serve_forever, daemon=True)
+    t.start()
+    base = f"http://127.0.0.1:{port}"
+    try:
+        store = ReceiptStore(tmp_path / "stateful_oracle")
+        actors = ActorManager([
+            {"alias": "user-alpha", "role": "member", "tenant": "org-alpha"},
+            {"alias": "user-beta", "role": "member", "tenant": "org-beta"},
+        ])
+        actors.register_dynamic_session("user-alpha", bearer_token="tok-alpha")
+        actors.register_dynamic_session("user-beta", bearer_token="tok-beta")
+        client = AgenticHTTPClient(
+            base_url=base,
+            receipt_store=store,
+            actors=actors,
+            allowed_methods=("GET", "PUT"),
+            max_requests=40,
+        )
+        try:
+            oracle = DifferentialOracle(http_client=client, receipt_store=store, mode="differential")
+
+            # Control before mutation: user-beta receives 404.
+            ctrl_before = client.request(method="GET", url="/api/v1/records/1", actor="user-beta")
+            assert ctrl_before["status"] == 404
+
+            # Non-idempotent PUT by user-alpha transfers org_slug to org-beta (revoking user-alpha's access).
+            put_proof = client.request(
+                method="PUT",
+                url="/api/v1/records/1",
+                actor="user-alpha",
+                json_body={"org_slug": "org-beta", "tier": "enterprise"},
+            )
+            assert put_proof["status"] == 200
+            assert state["put_calls"] == 1
+
+            # Follow-up persistence GET by user-beta now returns 200 with mutated fields.
+            get_proof = client.request(method="GET", url="/api/v1/records/1", actor="user-beta")
+            assert get_proof["status"] == 200
+
+            # Case 1: With cross-actor GET in proof_receipts -> replays GET (not PUT), verifies cleanly, no extra PUT!
+            v1 = oracle.verify(
+                canonical_class="mass_assignment",
+                primary_proof=put_proof,
+                proof_receipts=[put_proof, get_proof],
+                control_receipts=[ctrl_before],
+                evidence_value="org-beta",
+            )
+            assert v1.verified is True
+            assert v1.verdict == "VERIFIED"
+            assert v1.stages["stage3_clean_replay"] == "passed"
+            assert state["put_calls"] == 1  # Never re-executed destructive PUT
+
+            # Case 2: Without GET in proof_receipts -> PUT replay returns 404 (old owner lost access),
+            # stateful persistence fallback replays clean GET as previously-denied control actor (user-beta) -> VERIFIED!
+            v2 = oracle.verify(
+                canonical_class="mass_assignment",
+                primary_proof=put_proof,
+                proof_receipts=[put_proof],
+                control_receipts=[ctrl_before],
+                evidence_value="org-beta",
+            )
+            assert v2.verified is True
+            assert v2.verdict == "VERIFIED"
+            assert v2.stages["stage3_clean_replay"] == "passed_stateful_persistence"
+            assert state["put_calls"] == 2
+
+            # Case 3: Truly non-existent resource where neither original actor nor control actor reads 2xx -> REFUTED!
+            fake_ctrl = client.request(method="GET", url="/api/v1/records/999", actor="user-beta")
+            assert fake_ctrl["status"] == 404
+            fake_put = {
+                "receipt_id": "req-fake",
+                "actor": "user-alpha",
+                "method": "PUT",
+                "url": f"{base}/api/v1/records/999",
+                "path": "/api/v1/records/999",
+                "status": 200,
+                "body": '{"id":999,"org_slug":"org-beta"}',
+                "request_headers": {},
+                "request_body": '{"org_slug":"org-beta"}',
+            }
+            v3 = oracle.verify(
+                canonical_class="mass_assignment",
+                primary_proof=fake_put,
+                proof_receipts=[fake_put],
+                control_receipts=[fake_ctrl],
+                evidence_value="org-beta",
+            )
+            assert v3.verified is False
+            assert v3.verdict == "REFUTED"
+            assert v3.stages["stage3_clean_replay"] == "failed_status_404"
+        finally:
+            client.close()
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+

@@ -62,6 +62,58 @@ _INPUT_DIFF_CLASSES = frozenset({
     "csrf",
 })
 _ACCESS_CLASSES = frozenset({"auth_bypass", "bfla", "bola", "tenant_isolation"})
+_MUTATING_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
+
+
+def _receipt_contains_evidence(receipt: dict[str, Any], evidence_value: str) -> bool:
+    ev = str(evidence_value or "").strip().lower()
+    if not ev:
+        return True
+    body = str(receipt.get("body") or "")
+    loc = str(receipt.get("redirect_location") or "")
+    hdrs = json.dumps(receipt.get("response_headers") or {}, ensure_ascii=False)
+    return ev in f"{body}\n{loc}\n{hdrs}".lower()
+
+
+def _select_mutating_get_proof(
+    primary_proof: dict[str, Any],
+    proof_receipts: list[dict[str, Any]],
+    evidence_value: str,
+) -> dict[str, Any] | None:
+    """Select the best 2xx GET persistence proof for a mutating primary receipt.
+
+    Non-idempotent mutations (e.g. ownership or tenant transfers) may revoke the
+    original actor's access after succeeding, so a follow-up 2xx GET from either
+    the original actor or a newly-authorized actor is a safer and more accurate
+    Stage 3 clean-replay target than blindly re-issuing the write.
+    """
+    p_method = str(primary_proof.get("method") or "").upper()
+    if p_method not in _MUTATING_METHODS:
+        return None
+    p_actor = str(primary_proof.get("actor") or "")
+    p_path = urlsplit(str(primary_proof.get("url") or primary_proof.get("path") or "")).path.rstrip("/")
+    ev = str(evidence_value or "").strip()
+
+    candidates = [
+        r
+        for r in proof_receipts
+        if str(r.get("method") or "").upper() == "GET" and 200 <= int(r.get("status") or 0) < 300
+    ]
+    if not candidates:
+        return None
+    if ev:
+        ev_matching = [r for r in candidates if _receipt_contains_evidence(r, ev)]
+        if ev_matching:
+            candidates = ev_matching
+    candidates.sort(
+        key=lambda r: (
+            1 if (ev and _receipt_contains_evidence(r, ev)) else 0,
+            1 if urlsplit(str(r.get("url") or r.get("path") or "")).path.rstrip("/") == p_path else 0,
+            1 if str(r.get("actor") or "") == p_actor else 0,
+        ),
+        reverse=True,
+    )
+    return candidates[0]
 
 
 def mask_dynamic_fields(text: str, *, preserve_values: Sequence[str] = ()) -> str:
@@ -417,12 +469,10 @@ class DifferentialOracle:
                 control_probe_receipt_id=ctrl_probe_rid,
             )
 
-        # Prefer replaying a GET proof receipt when one is present (e.g. mass_assignment persistence check).
-        replay_target = primary_proof
-        if primary_proof.get("method") in {"PUT", "PATCH", "POST"}:
-            get_proofs = [r for r in proof_receipts if r.get("method") == "GET" and r.get("actor") == p_actor]
-            if get_proofs:
-                replay_target = get_proofs[0]
+        # Prefer replaying a 2xx GET persistence proof receipt when one is present
+        # (including cross-actor GETs after non-idempotent ownership/tenant transfers).
+        replay_target = _select_mutating_get_proof(primary_proof, proof_receipts, ev) or primary_proof
+        replayed_via_stateful_fallback = False
 
         try:
             replay_rec = self._run_clean_session_request(
@@ -445,6 +495,52 @@ class DifferentialOracle:
 
         r_status = int(replay_rec.get("status") or 0)
         t_status = int(replay_target.get("status") or 0)
+
+        # Stateful persistence fallback: when re-executing a non-idempotent write as
+        # the original actor returns 403/404/409 (e.g. ownership/tenant already moved),
+        # check whether a previously-denied control actor on the same path now reads
+        # the persisted mutated state (401/403/404 -> 2xx with evidence) in a clean session.
+        if (
+            replay_target is primary_proof
+            and str(primary_proof.get("method") or "").upper() in _MUTATING_METHODS
+            and r_status in {403, 404, 409}
+            and self._has_budget(1)
+        ):
+            p_path = urlsplit(str(primary_proof.get("url") or primary_proof.get("path") or "")).path.rstrip("/")
+            known_actors = {str(a.get("alias") or "") for a in self.http.actors.summaries()}
+            seen_fallback_actors: set[str] = set()
+            for ctrl in eff_controls:
+                c_actor = str(ctrl.get("actor") or "")
+                c_status = int(ctrl.get("status") or 0)
+                c_path = urlsplit(str(ctrl.get("url") or ctrl.get("path") or "")).path.rstrip("/")
+                if (
+                    not c_actor
+                    or c_actor == p_actor
+                    or c_actor not in known_actors
+                    or c_actor in seen_fallback_actors
+                    or c_status not in {401, 403, 404}
+                    or c_path != p_path
+                ):
+                    continue
+                seen_fallback_actors.add(c_actor)
+                if not self._has_budget(1):
+                    break
+                try:
+                    fb_rec = self._run_clean_session_request(
+                        actor=c_actor,
+                        method="GET",
+                        url=str(primary_proof.get("url") or "/"),
+                    )
+                except BudgetExhaustedError:
+                    break
+                fb_status = int(fb_rec.get("status") or 0)
+                if 200 <= fb_status < 300 and _receipt_contains_evidence(fb_rec, ev):
+                    replay_rec = fb_rec
+                    r_status = fb_status
+                    t_status = 200
+                    replayed_via_stateful_fallback = True
+                    break
+
         if not (200 <= r_status < 400) or (r_status // 100) != (t_status // 100):
             stages["stage3_clean_replay"] = f"failed_status_{r_status}"
             return OracleVerdict(
@@ -472,11 +568,7 @@ class DifferentialOracle:
                     control_probe_receipt_id=ctrl_probe_rid,
                 )
         else:
-            r_body = str(replay_rec.get("body") or "")
-            r_loc = str(replay_rec.get("redirect_location") or "")
-            r_hdrs = json.dumps(replay_rec.get("response_headers") or {}, ensure_ascii=False)
-            haystack = f"{r_body}\n{r_loc}\n{r_hdrs}".lower()
-            if ev and ev.lower() not in haystack:
+            if ev and not _receipt_contains_evidence(replay_rec, ev):
                 stages["stage3_clean_replay"] = "failed_missing_evidence"
                 return OracleVerdict(
                     verified=False,
@@ -488,7 +580,9 @@ class DifferentialOracle:
                     control_probe_receipt_id=ctrl_probe_rid,
                 )
 
-        stages["stage3_clean_replay"] = "passed"
+        stages["stage3_clean_replay"] = (
+            "passed_stateful_persistence" if replayed_via_stateful_fallback else "passed"
+        )
         return OracleVerdict(
             verified=True,
             verdict="VERIFIED",

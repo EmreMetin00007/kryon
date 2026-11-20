@@ -785,7 +785,10 @@ class AgenticHTTPClient:
                 body_preview=body_preview,
             )
 
-        if norm_method in {"GET", "HEAD"} and 200 <= receipt["status"] < 500 and receipt["status"] != 429:
+        if norm_method in _MUTATING_METHODS and 200 <= receipt["status"] < 400:
+            with self._lock:
+                self._cache.clear()
+        elif norm_method in {"GET", "HEAD"} and 200 <= receipt["status"] < 500 and receipt["status"] != 429:
             with self._lock:
                 self._cache[cache_key] = receipt
 
