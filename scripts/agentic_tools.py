@@ -20,6 +20,7 @@ from agentic_http import (
     ScopeViolationError,
     is_static_asset_url,
 )
+from agentic_oracle import check_bola_false_positive
 from agentic_receipts import DEFAULT_PREVIEW_CHARS, ReceiptStore
 from agentic_surface import SurfaceFrontierTracker
 
@@ -1191,6 +1192,69 @@ def select_primary_proof(
     return primary, ordered_actors
 
 
+def _find_exact_route_anon_2xx(
+    norm_path: str,
+    method: str,
+    proof_recs: list[dict[str, Any]],
+    ctrl_recs: list[dict[str, Any]],
+    *,
+    actor_meta_map: dict[str, dict[str, str]],
+    receipt_store: ReceiptStore | None = None,
+    evidence_value: str = "",
+) -> tuple[dict[str, Any] | None, bool]:
+    """Find a genuine `anon` 2xx receipt on the exact `(norm_path, method)` if `anon` was not denied (401/403).
+
+    Returns `(best_anon_2xx_receipt, anon_was_denied)`.
+    """
+    target_path = _norm_path(norm_path)
+    target_method = str(method or "GET").strip().upper()
+    candidates: list[dict[str, Any]] = []
+    seen_ids: set[str] = set()
+
+    def _consider(rec: dict[str, Any]) -> None:
+        rid = str(rec.get("receipt_id") or "")
+        if rid and rid in seen_ids:
+            return
+        if _norm_path(str(rec.get("url") or rec.get("path") or "")) != target_path:
+            return
+        rec_method = str(rec.get("method") or "GET").strip().upper()
+        if target_method and rec_method != target_method:
+            return
+        if rid:
+            seen_ids.add(rid)
+        candidates.append(rec)
+
+    for rec in [*proof_recs, *ctrl_recs]:
+        _consider(rec)
+    if receipt_store is not None:
+        for rid in receipt_store.list_ids():
+            if rid in seen_ids:
+                continue
+            try:
+                rec = receipt_store.get(rid)
+            except (KeyError, ValueError):
+                continue
+            _consider(rec)
+
+    anon_denied = any(
+        str(r.get("actor") or "").strip() == "anon" and int(r.get("status") or 0) in {401, 403}
+        for r in candidates
+    )
+    if anon_denied:
+        return None, True
+
+    anon_2xx = [r for r in candidates if _is_genuine_anon_2xx(r, actor_meta_map)]
+    if not anon_2xx:
+        return None, False
+
+    ev = str(evidence_value or "").strip()
+    if ev:
+        for r in anon_2xx:
+            if _receipt_contains_value(r, ev):
+                return r, False
+    return anon_2xx[0], False
+
+
 def _resolve_route_auth_bypass_vs_bfla(
     route_template: str,
     proof_recs: list[dict[str, Any]],
@@ -1198,12 +1262,17 @@ def _resolve_route_auth_bypass_vs_bfla(
     *,
     actor_meta_map: dict[str, dict[str, str]],
     receipt_store: ReceiptStore | None = None,
+    exact_path: str = "",
+    method: str = "",
 ) -> str:
     """Deterministically resolve auth_bypass vs bfla on a route from observed receipts.
 
     If `anon` gets 401/403 (or has no genuine 2xx proof) and a non-admin authenticated actor
-    gets 200 -> `bfla`. If `anon` genuinely gets 200 on protected data -> `auth_bypass`.
+    gets 200 -> `bfla`. If `anon` genuinely gets 200 on protected data (and was not denied 401/403)
+    -> `auth_bypass`.
     """
+    norm_exact = _norm_path(exact_path) if exact_path else ""
+    norm_method = str(method or "").strip().upper()
     all_recs = [*proof_recs, *ctrl_recs]
     if receipt_store is not None:
         seen_ids = {r.get("receipt_id") for r in all_recs}
@@ -1214,14 +1283,24 @@ def _resolve_route_auth_bypass_vs_bfla(
                 rec = receipt_store.get(rid)
             except (KeyError, ValueError):
                 continue
-            if normalize_route_template(str(rec.get("url") or "")) == route_template:
-                all_recs.append(rec)
+            rec_url = str(rec.get("url") or rec.get("path") or "")
+            if norm_exact:
+                if _norm_path(rec_url) != norm_exact:
+                    continue
+                if norm_method and str(rec.get("method") or "").strip().upper() != norm_method:
+                    continue
+            elif normalize_route_template(rec_url) != route_template:
+                continue
+            all_recs.append(rec)
 
     anon_denied = any(
         str(r.get("actor") or "") == "anon" and int(r.get("status") or 0) in {401, 403}
         for r in all_recs
     )
-    anon_genuine_2xx = any(_is_genuine_anon_2xx(r, actor_meta_map) for r in proof_recs)
+    anon_genuine_2xx = any(
+        _is_genuine_anon_2xx(r, actor_meta_map)
+        for r in (all_recs if norm_exact else proof_recs)
+    )
     non_admin_2xx = any(
         str(r.get("actor") or "") not in {"", "anon"}
         and not _is_admin_role((actor_meta_map.get(str(r.get("actor") or "")) or {}).get("role", ""))
@@ -1467,6 +1546,8 @@ def canonicalize_and_deduplicate_findings(
                     ctrl_recs,
                     actor_meta_map=actor_meta_map,
                     receipt_store=receipt_store,
+                    exact_path=str(entry.get("url") or entry.get("path") or ""),
+                    method=str(entry.get("method") or "GET"),
                 )
                 if resolved_cls == "bfla":
                     non_anon_proofs = [r for r in proof_recs if str(r.get("actor") or "") != "anon"]
@@ -1475,6 +1556,40 @@ def canonicalize_and_deduplicate_findings(
                         proof_recs = non_anon_proofs
                     else:
                         continue
+            elif entry["class_type"] == "bfla":
+                # Bidirectional bfla -> auth_bypass promotion when anon received a genuine 2xx on this exact route
+                # and was NOT denied with 401/403.
+                entry_url = str((proof_recs[0].get("url") if proof_recs else "") or entry.get("url") or entry.get("path") or "")
+                entry_method = str((proof_recs[0].get("method") if proof_recs else "") or entry.get("method") or "GET")
+                ev_hint = str(entry.get("evidence_value") or "").strip()
+                anon_rec, anon_denied = _find_exact_route_anon_2xx(
+                    entry_url,
+                    entry_method,
+                    proof_recs,
+                    ctrl_recs,
+                    actor_meta_map=actor_meta_map,
+                    receipt_store=receipt_store,
+                    evidence_value=ev_hint,
+                )
+                if anon_rec is not None and not anon_denied:
+                    entry["class_type"] = "auth_bypass"
+                    anon_rid = str(anon_rec.get("receipt_id") or "")
+                    seen_p_ids = {str(r.get("receipt_id") or "") for r in proof_recs}
+                    ctrl_id_set = set(entry.get("control_receipt_ids") or [])
+                    if anon_rid and anon_rid not in seen_p_ids:
+                        proof_recs.append(anon_rec)
+                    if anon_rid and anon_rid not in (entry.get("proof_receipt_ids") or []) and anon_rid not in ctrl_id_set:
+                        entry.setdefault("proof_receipt_ids", []).append(anon_rid)
+                    if ev_hint and not _receipt_contains_value(anon_rec, ev_hint):
+                        promoted_anon_ev, _ = _select_stronger_evidence_from_receipts(
+                            "auth_bypass",
+                            "",
+                            [anon_rec],
+                            ctrl_recs,
+                        )
+                        if promoted_anon_ev:
+                            entry["evidence_value"] = promoted_anon_ev
+                            entry["marker"] = promoted_anon_ev
 
             # For BOLA, if receipt_store also has a same-path 2xx receipt from a higher-priority peer actor containing evidence_value, include it.
             if entry["class_type"] == "bola" and proof_recs:
@@ -2771,6 +2886,7 @@ class ToolDispatcher:
         valid_receipts_only = [r for r, _ in valid_proof_records]
 
         # For bola / tenant_isolation: ensure proof receipt shows another owner's data rather than the caller's own record.
+        inferred_bola_owner = ""
         if canonical_class in {"bola", "tenant_isolation"}:
             explicit_owner, explicit_tenant = _extract_record_owner_and_tenant(primary, actor_meta)
             inferred_owner = _infer_owner_actor(
@@ -2783,6 +2899,7 @@ class ToolDispatcher:
                 target_path=effective_norm_path,
             )
             eff_owner = explicit_owner or inferred_owner
+            inferred_bola_owner = eff_owner
             if eff_owner and all(str(r.get("actor") or "") == eff_owner for r in valid_receipts_only):
                 return json.dumps({
                     "rejected": True,
@@ -2805,16 +2922,47 @@ class ToolDispatcher:
                             ),
                         })
 
-        # Resolve auth_bypass vs bfla deterministically if receipt history shows anon was denied (401/403).
-        if canonical_class in {"auth_bypass", "bfla"}:
+        # Resolve auth_bypass <-> bfla bidirectionally and deterministically from observed receipts.
+        if canonical_class == "bfla":
+            anon_rec, anon_denied = _find_exact_route_anon_2xx(
+                effective_norm_path,
+                method,
+                valid_receipts_only,
+                control_receipts,
+                actor_meta_map=actor_meta,
+                receipt_store=self.receipts,
+                evidence_value=evidence_value,
+            )
+            if anon_rec is not None and not anon_denied:
+                canonical_class = "auth_bypass"
+                anon_rid = str(anon_rec.get("receipt_id") or "")
+                if anon_rid and anon_rid not in seen_rids:
+                    anon_ex = build_receipt_excerpt(anon_rec, evidence_value, max_chars=MAX_PROOF_EXCERPT_CHARS)
+                    valid_proof_records.append((anon_rec, anon_ex))
+                    valid_receipts_only.append(anon_rec)
+                    seen_rids.add(anon_rid)
+                if anon_rid and anon_rid not in proof_ids and anon_rid not in control_ids:
+                    proof_ids.append(anon_rid)
+                if evidence_value and not _receipt_contains_value(anon_rec, evidence_value):
+                    promoted_anon_ev, _ = _select_stronger_evidence_from_receipts(
+                        "auth_bypass",
+                        "",
+                        [anon_rec],
+                        control_receipts,
+                    )
+                    if promoted_anon_ev:
+                        evidence_value = promoted_anon_ev
+        elif canonical_class == "auth_bypass":
             resolved_cls = _resolve_route_auth_bypass_vs_bfla(
                 route_template,
                 valid_receipts_only,
                 control_receipts,
                 actor_meta_map=actor_meta,
                 receipt_store=self.receipts,
+                exact_path=effective_norm_path,
+                method=method,
             )
-            if canonical_class == "auth_bypass" and resolved_cls == "bfla":
+            if resolved_cls == "bfla":
                 return json.dumps({
                     "rejected": True,
                     "reason": (
@@ -2864,6 +3012,8 @@ class ToolDispatcher:
                         all_ctrl_recs,
                         actor_meta_map=actor_meta,
                         receipt_store=self.receipts,
+                        exact_path=effective_norm_path,
+                        method=method,
                     )
                 existing["class_type"] = canonical_class
                 existing["route_template"] = route_template
@@ -2974,6 +3124,19 @@ class ToolDispatcher:
         )
         best_actor = str(best_primary.get("actor") or actor_alias or "anon").strip() or "anon"
 
+        if canonical_class == "bola" and self.oracle is None:
+            bola_fp = check_bola_false_positive(
+                primary_proof=best_primary,
+                proof_receipts=valid_receipts_only,
+                control_receipts=control_receipts,
+                actor_meta_map=actor_meta,
+                receipt_store=self.receipts,
+                surface_tracker=self.surface_tracker,
+                inferred_owner=inferred_bola_owner,
+            )
+            if bola_fp is not None:
+                return json.dumps({"rejected": True, "reason": bola_fp[1]})
+
         self._step_claim_submitted = True
         oracle_verdict_str = "verified"
         clean_replay_rid = ""
@@ -3005,6 +3168,8 @@ class ToolDispatcher:
                 control_receipts=control_receipts,
                 evidence_value=evidence_value,
                 actor_meta_map=actor_meta,
+                surface_tracker=self.surface_tracker,
+                inferred_owner=inferred_bola_owner,
             )
             if self.bsag is not None and hyp_id:
                 self.bsag.apply_oracle_verdict(

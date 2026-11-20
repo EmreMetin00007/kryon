@@ -166,6 +166,7 @@ class MeteredProviderTransport:
         api_key,
         api_key_header="Authorization",
         session_gate=None,
+        provider_options=None,
     ):
         if api_key_header not in {"Authorization", "X-API-Key"}:
             raise ValueError("unsupported provider API key header")
@@ -176,6 +177,7 @@ class MeteredProviderTransport:
         self.api_key = api_key
         self.api_key_header = api_key_header
         self.session_gate = session_gate or SessionGate()
+        self.provider_options = dict(provider_options) if isinstance(provider_options, dict) and provider_options else None
         self.provider_lock = threading.Lock()
         self.transport_lock = threading.Lock()
         self.upstream = None
@@ -235,6 +237,8 @@ class MeteredProviderTransport:
                             messages_bytes=len(provider_json(body.get("messages"))),
                             tools_bytes=len(provider_json(body.get("tools"))),
                         )
+                if self.provider_options and isinstance(body, dict) and "providerOptions" not in body:
+                    body = {**body, "providerOptions": self.provider_options}
                 request, reserve = completion_request(
                     body,
                     models=self.models,

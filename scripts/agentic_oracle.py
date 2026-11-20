@@ -12,8 +12,30 @@ import requests
 
 from agentic_http import AgenticHTTPClient, BudgetExhaustedError, _decode_raw_response
 from agentic_receipts import ReceiptStore
+from agentic_surface import is_id_segment, normalize_path, route_template_of
 
 VALID_VERIFICATION_GATES = frozenset({"differential", "llm_self_judge"})
+
+_BOLA_OWNER_KEYS = (
+    "owner",
+    "owner_id",
+    "owner_alias",
+    "requested_by",
+    "created_by",
+    "author",
+    "user",
+    "username",
+    "actor",
+    "assigned_to",
+)
+_BOLA_TENANT_KEYS = (
+    "tenant",
+    "tenant_slug",
+    "tenant_id",
+    "org",
+    "organization",
+    "company",
+)
 
 _EPHEMERAL_JSON_KEYS = frozenset({
     "timestamp",
@@ -63,6 +85,206 @@ _INPUT_DIFF_CLASSES = frozenset({
 })
 _ACCESS_CLASSES = frozenset({"auth_bypass", "bfla", "bola", "tenant_isolation"})
 _MUTATING_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
+
+
+def _extract_owner_and_tenant_from_receipt(
+    receipt: dict[str, Any],
+    actor_meta_map: dict[str, dict[str, str]],
+) -> tuple[str, str]:
+    """Extract explicit owner alias and tenant string from a JSON response receipt."""
+    body = str(receipt.get("body") or "").strip()
+    if not body.startswith("{"):
+        return "", ""
+    try:
+        parsed = json.loads(body)
+    except ValueError:
+        return "", ""
+    if not isinstance(parsed, dict):
+        return "", ""
+
+    owner_actor = ""
+    for key in _BOLA_OWNER_KEYS:
+        val = parsed.get(key)
+        if isinstance(val, str):
+            clean = val.strip()
+            if clean and clean != "anon" and (clean in actor_meta_map or not actor_meta_map):
+                owner_actor = clean
+                break
+
+    record_tenant = ""
+    for key in _BOLA_TENANT_KEYS:
+        val = parsed.get(key)
+        if isinstance(val, str) and val.strip():
+            record_tenant = val.strip().lower()
+            break
+    if not record_tenant and owner_actor and owner_actor in actor_meta_map:
+        record_tenant = str(actor_meta_map[owner_actor].get("tenant") or "").strip().lower()
+    return owner_actor, record_tenant
+
+
+def _receipt_store_lists_object_for_actor(
+    receipt_store: ReceiptStore,
+    concrete_path: str,
+    actor: str,
+) -> bool:
+    """Return True if `receipt_store` shows `actor` received this concrete object ID in a 2xx collection response."""
+    norm_p = normalize_path(concrete_path)
+    parts = [seg for seg in norm_p.split("/") if seg]
+    if len(parts) < 2 or not is_id_segment(parts[-1]):
+        return False
+    concrete_id = parts[-1]
+    concrete_id_low = concrete_id.lower()
+    resource_family = parts[-2].lower()
+    parent_path = "/" + "/".join(parts[:-1])
+    singular = resource_family[:-1] if len(resource_family) > 2 and resource_family.endswith("s") else resource_family
+    short_singular = singular.replace("-", "_").split("_")[-1]
+    id_keys = {"id", "uuid", f"{singular}_id", f"{short_singular}_id"}
+    html_link_re = re.compile(
+        rf"""(?:{re.escape(parent_path)}|/{re.escape(resource_family)})/{re.escape(concrete_id)}(?:["'/?#\s>]|$)""",
+        re.IGNORECASE,
+    )
+
+    for rid in receipt_store.list_ids():
+        try:
+            rec = receipt_store.get(rid)
+        except (KeyError, ValueError):
+            continue
+        if str(rec.get("actor") or "").strip() != actor:
+            continue
+        if str(rec.get("method") or "").upper() != "GET":
+            continue
+        if not (200 <= int(rec.get("status") or 0) < 300):
+            continue
+        rec_path = normalize_path(str(rec.get("url") or rec.get("path") or ""))
+        if "{id}" in route_template_of(rec_path):
+            continue
+        if not (
+            rec_path == parent_path
+            or rec_path == f"/{resource_family}"
+            or rec_path.endswith(f"/{resource_family}")
+        ):
+            continue
+        body = str(rec.get("body") or "")
+        if not body:
+            continue
+        stripped = body.lstrip()
+        if stripped.startswith(("{", "[")):
+            try:
+                parsed = json.loads(body)
+            except ValueError:
+                parsed = None
+            items: list[dict[str, Any]] = []
+            if isinstance(parsed, list):
+                items = [x for x in parsed[:100] if isinstance(x, dict)]
+            elif isinstance(parsed, dict):
+                for v in parsed.values():
+                    if isinstance(v, list):
+                        items.extend(x for x in v[:100] if isinstance(x, dict))
+            for item in items:
+                for k, v in item.items():
+                    if str(k).lower() in id_keys and isinstance(v, (str, int)) and not isinstance(v, bool):
+                        if str(v).strip().lower() == concrete_id_low:
+                            return True
+        ctype = str(rec.get("content_type") or "").lower()
+        if ("html" in ctype or "href=" in body.lower()) and html_link_re.search(body):
+            return True
+    return False
+
+
+def check_bola_false_positive(
+    *,
+    primary_proof: dict[str, Any],
+    proof_receipts: Sequence[dict[str, Any]],
+    control_receipts: Sequence[dict[str, Any]],
+    actor_meta_map: dict[str, dict[str, str]] | None,
+    receipt_store: ReceiptStore | None = None,
+    surface_tracker: Any | None = None,
+    inferred_owner: str = "",
+) -> tuple[str, str] | None:
+    """Detect common BOLA false positives; return `(stage_code, reason)` if rejected, else None."""
+    p_actor = str(primary_proof.get("actor") or "").strip()
+    meta_map = actor_meta_map or {}
+    p_tenant = str((meta_map.get(p_actor) or {}).get("tenant") or "").strip().lower()
+    p_method = str(primary_proof.get("method") or "GET").strip().upper()
+    p_path = normalize_path(str(primary_proof.get("url") or primary_proof.get("path") or ""))
+    p_tmpl = route_template_of(p_path)
+
+    # Guard 2: Read-only GET/HEAD BOLA cannot claim a shared-tenant resource that appeared in the
+    # claiming actor's own 2xx collection listing.
+    if p_method in {"GET", "HEAD"} and p_actor and p_actor != "anon" and "{id}" in p_tmpl:
+        listed_in_tracker = (
+            surface_tracker is not None
+            and hasattr(surface_tracker, "was_object_listed_for_actor")
+            and bool(surface_tracker.was_object_listed_for_actor(p_path, p_actor))
+        )
+        listed_in_store = (
+            receipt_store is not None
+            and _receipt_store_lists_object_for_actor(receipt_store, p_path, p_actor)
+        )
+        if listed_in_tracker or listed_in_store:
+            return (
+                "failed_bola_shared_collection_resource",
+                (
+                    f"Read-only BOLA rejected: actor {p_actor!r} legitimately received concrete object "
+                    f"{p_path!r} in its own 2xx collection listing (shared-tenant resource, not BOLA)."
+                ),
+            )
+
+    # Guard 1: Same-tenant BOLA cannot rely solely on cross-tenant or anon denied controls.
+    explicit_owner, record_tenant = _extract_owner_and_tenant_from_receipt(primary_proof, meta_map)
+    eff_owner = explicit_owner or str(inferred_owner or "").strip()
+    if not eff_owner and surface_tracker is not None:
+        obj_entry = (getattr(surface_tracker, "discovered_objects", None) or {}).get(p_path)
+        if isinstance(obj_entry, dict):
+            eff_owner = str(obj_entry.get("owner_actor") or "").strip()
+    if not eff_owner:
+        proof_actors = {str(r.get("actor") or "").strip() for r in proof_receipts}
+        for ctrl in control_receipts:
+            c_actor = str(ctrl.get("actor") or "").strip()
+            if c_actor and c_actor != "anon" and c_actor not in proof_actors and 200 <= int(ctrl.get("status") or 0) < 300:
+                eff_owner = c_actor
+                break
+    owner_tenant = record_tenant or str((meta_map.get(eff_owner) or {}).get("tenant") or "").strip().lower()
+
+    if p_tenant and owner_tenant and p_tenant == owner_tenant:
+        denied_controls = [c for c in control_receipts if int(c.get("status") or 0) in {401, 403, 404}]
+        if denied_controls:
+            has_same_tenant_denied = False
+            has_cross_tenant_denied = False
+            for ctrl in denied_controls:
+                c_actor = str(ctrl.get("actor") or "").strip()
+                c_tenant = str((meta_map.get(c_actor) or {}).get("tenant") or "").strip().lower()
+                if c_actor and c_actor != "anon":
+                    if c_tenant == p_tenant:
+                        has_same_tenant_denied = True
+                    elif c_tenant and c_tenant != p_tenant:
+                        has_cross_tenant_denied = True
+            distinct_tenants = {
+                str(m.get("tenant") or "").strip().lower()
+                for m in meta_map.values()
+                if str(m.get("tenant") or "").strip()
+            }
+            if not has_same_tenant_denied:
+                if has_cross_tenant_denied:
+                    return (
+                        "failed_bola_cross_tenant_only_control",
+                        (
+                            "Same-tenant BOLA rejected: all denied control receipts belong only to cross-tenant "
+                            "actors or 'anon'. Cross-tenant denial proves tenant isolation, not same-tenant peer "
+                            "restriction; provide a same-tenant peer denial control (403/404) or verify "
+                            "cross-tenant access as 'tenant_isolation'."
+                        ),
+                    )
+                if len(distinct_tenants) >= 2 or not explicit_owner:
+                    return (
+                        "failed_bola_anon_only_control",
+                        (
+                            "Same-tenant BOLA rejected: all denied control receipts belong only to 'anon' with "
+                            "no same-tenant peer denial control. Anonymous denial proves authentication, not "
+                            "same-tenant peer restriction; provide a same-tenant peer denial control (403/404)."
+                        ),
+                    )
+    return None
 
 
 def _receipt_contains_evidence(receipt: dict[str, Any], evidence_value: str) -> bool:
@@ -300,6 +522,8 @@ class DifferentialOracle:
         control_receipts: list[dict[str, Any]],
         evidence_value: str,
         actor_meta_map: dict[str, dict[str, str]] | None = None,
+        surface_tracker: Any | None = None,
+        inferred_owner: str = "",
     ) -> OracleVerdict:
         """Run verification gate before promoting a CLAIMED hypothesis to VERIFIED."""
         if self.mode == "llm_self_judge":
@@ -454,6 +678,27 @@ class DifferentialOracle:
                         reason="BFLA proof cannot rely on an admin actor.",
                         mode=self.mode,
                         stages=stages,
+                    )
+            elif canonical_class == "bola":
+                bola_fp = check_bola_false_positive(
+                    primary_proof=primary_proof,
+                    proof_receipts=proof_receipts,
+                    control_receipts=eff_controls,
+                    actor_meta_map=meta_map,
+                    receipt_store=self.receipts,
+                    surface_tracker=surface_tracker,
+                    inferred_owner=inferred_owner,
+                )
+                if bola_fp is not None:
+                    stage_code, reason = bola_fp
+                    stages["stage2_diff"] = stage_code
+                    return OracleVerdict(
+                        verified=False,
+                        verdict="REFUTED",
+                        reason=reason,
+                        mode=self.mode,
+                        stages=stages,
+                        control_probe_receipt_id=ctrl_probe_rid,
                     )
         stages["stage2_diff"] = "passed"
 

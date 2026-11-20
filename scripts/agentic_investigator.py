@@ -882,6 +882,27 @@ class AgenticInvestigator:
         self._epoch_turn_start: int = 0
         self._epoch_summary_text: str = ""
 
+    def _wrapup_reasons(self, turn: int) -> list[str]:
+        http_rem = self.http.budget.limit - self.http.budget.used
+        tok_rem = self.budget.available("tokens")
+        tok_lim = self.budget.limits["tokens"]
+        wrapup_reasons: list[str] = []
+        if tok_lim > 0:
+            tok_threshold = max(30_000, int(tok_lim * 0.15)) if tok_lim >= 60_000 else int(tok_lim * 0.15)
+            if tok_rem <= tok_threshold:
+                wrapup_reasons.append(f"tokens={tok_rem}/{tok_lim}")
+        if self.max_turns > 5 and (self.max_turns - turn) <= 4:
+            wrapup_reasons.append(f"turns_left={max(0, self.max_turns - turn)}")
+        if self.http.budget.limit > 15 and http_rem <= 10:
+            wrapup_reasons.append(f"http_left={http_rem}/{self.http.budget.limit}")
+        return wrapup_reasons
+
+    def _sync_coverage_gate(self, turn: int) -> bool:
+        """Align `coverage_gate_enabled` with `[BUDGET-WRAPUP]` so `finish` is never rejected during wrapup."""
+        enabled = self.max_turns > 5 and not self._wrapup_reasons(turn)
+        self.dispatcher.coverage_gate_enabled = enabled
+        return enabled
+
     def _state_banner(self, turn: int) -> str:
         http_rem = self.http.budget.limit - self.http.budget.used
         tok_rem = self.budget.available("tokens")
@@ -919,13 +940,9 @@ class AgenticInvestigator:
                     f"are properly rejected, confirm state persistence with a follow-up GET, and call "
                     f"`record_finding` immediately if a restriction is not enforced."
                 )
-        wrapup_reasons: list[str] = []
-        if tok_lim > 0 and tok_rem <= max(30_000, int(tok_lim * 0.15)):
-            wrapup_reasons.append(f"tokens={tok_rem}/{tok_lim}")
-        if self.max_turns > 5 and (self.max_turns - turn) <= 4:
-            wrapup_reasons.append(f"turns_left={max(0, self.max_turns - turn)}")
-        if self.http.budget.limit > 15 and http_rem <= 10:
-            wrapup_reasons.append(f"http_left={http_rem}/{self.http.budget.limit}")
+        wrapup_reasons = self._wrapup_reasons(turn)
+        if wrapup_reasons:
+            self.dispatcher.coverage_gate_enabled = False
         wrapup_line = (
             f"\n[BUDGET-WRAPUP] Low remaining budget ({', '.join(wrapup_reasons)}): "
             "stop broad new discovery, immediately call `record_finding` for every verified vulnerability "
@@ -1757,9 +1774,9 @@ class AgenticInvestigator:
                     status = "budget_exhausted"
                     break
 
-                # Warn the agent when approaching turn or HTTP budget limits so it records findings & finishes.
+                # Warn the agent when approaching turn, token, or HTTP budget limits so it records findings & finishes.
                 # Wrapup directives are emitted at creation time via `_state_banner(...)` so earlier messages remain immutable.
-                self.dispatcher.coverage_gate_enabled = self.max_turns > 5 and (self.max_turns - turn) > 3
+                self._sync_coverage_gate(turn)
 
                 resp = self._complete_with_retry(messages)
                 choice = (resp.get("choices") or [{}])[0]
@@ -1777,6 +1794,7 @@ class AgenticInvestigator:
                 messages.append(assistant_entry)
 
                 if tool_calls:
+                    self._sync_coverage_gate(turn)
                     empty_nudges = 0
                     recent_local_reads = [entry for entry in recent_local_reads if turn - entry[0] <= 8]
                     for idx, tc in enumerate(tool_calls):

@@ -189,6 +189,7 @@ def run_agentic_target(
         api_key=api_key,
         api_key_header=provider.get("api_key_header", "Authorization"),
         session_gate=session_gate,
+        provider_options=provider.get("provider_options"),
     )
     receipt_store = ReceiptStore(output)
     actors = ActorManager(

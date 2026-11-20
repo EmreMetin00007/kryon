@@ -34,9 +34,16 @@ def load_config(path) -> dict:
         if not isinstance(name, str) or not re.fullmatch(r"[A-Za-z0-9_-]+", name):
             raise ValueError("invalid provider name")
         if not isinstance(provider, dict) or set(provider) - {
-            "base_url", "models", "api_key_env", "api_key_header"
+            "base_url", "models", "api_key_env", "api_key_header", "provider_options"
         }:
             raise ValueError("provider fields must contain configuration, never credentials")
+        if "provider_options" in provider:
+            opts = provider["provider_options"]
+            if not isinstance(opts, dict):
+                raise ValueError("provider_options must be an object")
+            opts_text = json.dumps(opts, ensure_ascii=False).lower()
+            if any(bad in opts_text for bad in ('"api_key"', '"apikey"', '"authorization"', '"secret"', '"password"', '"token"')):
+                raise ValueError("provider_options must not contain credentials")
         endpoint = provider.get("base_url", "")
         if not isinstance(endpoint, str) or any(c.isspace() for c in endpoint):
             raise ValueError("invalid provider base_url")
@@ -90,15 +97,21 @@ def provider_settings(path, models):
         raise ValueError("a run requires one provider")
     name = selected[0][0]
     source = data["providers"][name]
-    return {"name": name, "url": source["base_url"].rstrip("/"),
-            "models": {model for _, model in selected}, "api_key_env": source["api_key_env"],
-            "api_key_header": source.get("api_key_header", "Authorization")}
+    result = {"name": name, "url": source["base_url"].rstrip("/"),
+              "models": {model for _, model in selected}, "api_key_env": source["api_key_env"],
+              "api_key_header": source.get("api_key_header", "Authorization")}
+    if "provider_options" in source:
+        result["provider_options"] = source["provider_options"]
+    return result
 
 
 def snapshot(path, models):
     """Freeze selected routing metadata without reading any credential value."""
     settings = provider_settings(path, models)
+    provider_snap = {"base_url": settings["url"], "models": sorted(settings["models"]),
+                     "api_key_env": settings["api_key_env"],
+                     "api_key_header": settings["api_key_header"]}
+    if "provider_options" in settings:
+        provider_snap["provider_options"] = settings["provider_options"]
     return {"schema": SCHEMA, "model": models["worker"], "providers": {
-        settings["name"]: {"base_url": settings["url"], "models": sorted(settings["models"]),
-                           "api_key_env": settings["api_key_env"],
-                           "api_key_header": settings["api_key_header"]}}}
+        settings["name"]: provider_snap}}

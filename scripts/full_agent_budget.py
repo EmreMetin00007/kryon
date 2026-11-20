@@ -237,7 +237,8 @@ def completion_request(body, *, models, remaining, output_limit=8192, diagnostic
     """Reserve a calibrated text prompt bound and a bounded completion."""
     allowed = {"model", "messages", "tools", "tool_choice", "parallel_tool_calls", "temperature",
                "top_p", "stop", "max_tokens", "max_completion_tokens", "stream", "stream_options",
-               "presence_penalty", "frequency_penalty", "seed", "user", "reasoning_effort"}
+               "presence_penalty", "frequency_penalty", "seed", "user", "reasoning_effort",
+               "providerOptions"}
     if not isinstance(body, dict) or set(body) - allowed or body.get("model") not in models:
         raise ValueError("unsupported provider request or model")
     messages = body.get("messages")

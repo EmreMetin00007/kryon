@@ -64,6 +64,62 @@ _OWNER_FIELD_KEYS = (
     "assigned_to",
 )
 _PRIMARY_ID_KEYS = ("id", "uuid")
+_MAX_OBJECTS_PER_TEMPLATE = 6
+_MAX_PARAM_VALUES_TRACKED = 6
+_PLAIN_ALNUM_VAL_RE = re.compile(r"^[A-Za-z0-9_-]*$")
+_NON_PROBE_PARAM_NAMES = frozenset({
+    "page",
+    "limit",
+    "offset",
+    "per_page",
+    "page_size",
+    "size",
+    "cursor",
+    "csrf",
+    "csrf_token",
+    "_csrf",
+    "xsrf",
+    "xsrf_token",
+    "lang",
+    "locale",
+    "v",
+    "_",
+    "t",
+    "ts",
+    "timestamp",
+})
+_PROBE_PRIORITY_PARAM_NAMES = frozenset({
+    "q",
+    "query",
+    "search",
+    "term",
+    "keyword",
+    "filter",
+    "sort",
+    "order",
+    "order_by",
+    "sort_by",
+    "dir",
+    "direction",
+    "next",
+    "redirect",
+    "return",
+    "return_to",
+    "redirect_uri",
+    "url",
+    "target",
+    "continue",
+    "callback",
+    "goto",
+    "dest",
+    "destination",
+    "path",
+    "template",
+    "view",
+    "name",
+    "message",
+    "comment",
+})
 _API_PREFIX_RE = re.compile(r"^/(api(?:/v\d+)?|v\d+)(?=/|$)", re.IGNORECASE)
 _NON_RESOURCE_UI_SEGMENTS = frozenset({
     "login",
@@ -272,6 +328,8 @@ class SurfaceFrontierTracker:
         self.visited_method_paths: set[tuple[str, str]] = set()
         self.visited_method_templates: set[tuple[str, str]] = set()
         self.tested_params_by_template: dict[str, set[str]] = {}
+        self.param_probes_by_template: dict[str, dict[str, dict[str, Any]]] = {}
+        self.html_or_form_templates: set[str] = set()
         self.actors_by_template: dict[str, set[str]] = {}
         self.actors_by_path: dict[str, set[str]] = {}
         self.route_2xx_actors: dict[str, set[str]] = {}
@@ -281,8 +339,11 @@ class SurfaceFrontierTracker:
         self.discovered_routes: dict[tuple[str, str], str] = {}
         # key: route_template -> set of discovered query/form param names
         self.discovered_params: dict[str, set[str]] = {}
-        # key: concrete_path -> {"path": str, "template": str, "owner_actor": str, "seen_by": set[str], "tested_by": set[str]}
+        # key: concrete_path -> {"path": str, "template": str, "owner_actor": str, "seen_by": set[str], "listed_by": set[str], "tested_by": set[str], "verified_2xx": bool}
         self.discovered_objects: dict[str, dict[str, Any]] = {}
+        # key: concrete_path -> actors whose 2xx collection/list response included this object (unbounded by frontier cap)
+        self.collection_listed_objects: dict[str, set[str]] = {}
+        self._pruned_404_objects: set[str] = set()
         # key: (method, route_template) -> concrete or sample path
         self.discovered_write_ops: dict[tuple[str, str], str] = {}
         self.declared_write_ops: set[tuple[str, str]] = set()
@@ -290,6 +351,127 @@ class SurfaceFrontierTracker:
         # Observed API prefixes and non-API UI resource families for UI <-> API parity
         self.api_prefix_routes: dict[str, set[str]] = {}
         self.ui_resource_families: dict[str, dict[str, Any]] = {}
+
+    def _record_param_probes(self, tmpl: str, pairs: Sequence[tuple[str, str]]) -> None:
+        """Record observed parameter names, distinct values (bounded), and special-char probe depth."""
+        for k, v in pairs:
+            pname = str(k or "").strip()
+            if not pname:
+                continue
+            self.tested_params_by_template.setdefault(tmpl, set()).add(pname)
+            val = str(v or "")[:64]
+            p_map = self.param_probes_by_template.setdefault(tmpl, {})
+            rec = p_map.setdefault(pname, {"values": set(), "has_special": False})
+            if len(rec["values"]) < _MAX_PARAM_VALUES_TRACKED:
+                rec["values"].add(val)
+            if val and not _PLAIN_ALNUM_VAL_RE.fullmatch(val):
+                rec["has_special"] = True
+
+    def _is_param_probed_enough(self, tmpl: str, pname: str) -> bool:
+        """Return True once a parameter has sufficient differential or special-character probe depth."""
+        p_low = str(pname or "").strip().lower()
+        if not p_low or p_low in _NON_PROBE_PARAM_NAMES:
+            return True
+        rec = (self.param_probes_by_template.get(tmpl) or {}).get(pname)
+        if rec is None:
+            return pname in (self.tested_params_by_template.get(tmpl) or set())
+        if rec.get("has_special"):
+            return True
+        if len(rec.get("values") or set()) >= 2:
+            return True
+        needs_depth = (tmpl in self.html_or_form_templates) or (p_low in _PROBE_PRIORITY_PARAM_NAMES)
+        return not needs_depth
+
+    def was_object_listed_for_actor(self, url_or_path: str, actor: str) -> bool:
+        """Return True if `actor` legitimately received this concrete object ID in its own 2xx collection listing."""
+        clean_actor = str(actor or "").strip()
+        if not clean_actor:
+            return False
+        norm_p = normalize_path(url_or_path)
+        if clean_actor in (self.collection_listed_objects.get(norm_p) or set()):
+            return True
+        entry = self.discovered_objects.get(norm_p)
+        if entry and clean_actor in (entry.get("listed_by") or set()):
+            return True
+
+        # Check UI <-> API concrete sibling equivalence for the same (resource_family, concrete_id).
+        api_prefix = _extract_api_prefix(norm_p)
+        if api_prefix:
+            remainder = norm_p[len(api_prefix):].lstrip("/")
+            parts = [seg for seg in remainder.split("/") if seg]
+            if len(parts) == 2 and is_id_segment(parts[1]):
+                ui_sibling = f"/{parts[0].lower()}/{parts[1]}"
+                if clean_actor in (self.collection_listed_objects.get(ui_sibling) or set()):
+                    return True
+                ui_entry = self.discovered_objects.get(ui_sibling)
+                if ui_entry and clean_actor in (ui_entry.get("listed_by") or set()):
+                    return True
+        else:
+            info = _extract_ui_resource_info(norm_p)
+            if info is not None and info[2]:
+                res_name, _, cid = info
+                for prefix in self._ranked_api_prefixes():
+                    api_sibling = f"{prefix}/{res_name}/{cid}"
+                    if clean_actor in (self.collection_listed_objects.get(api_sibling) or set()):
+                        return True
+                    api_entry = self.discovered_objects.get(api_sibling)
+                    if api_entry and clean_actor in (api_entry.get("listed_by") or set()):
+                        return True
+        return False
+
+    def _known_api_prefixes_for_family(self, resource: str) -> list[str]:
+        """Return observed API prefixes that already expose `/<prefix>/<resource>` or `/<prefix>/<resource>/...`."""
+        res_low = str(resource or "").strip().lower()
+        if not res_low:
+            return []
+        matched: list[str] = []
+        for prefix in self._ranked_api_prefixes():
+            base = f"{prefix}/{res_low}"
+            base_slash = f"{base}/"
+            in_prefix = any(
+                p.lower() == base or p.lower().startswith(base_slash)
+                for p in (self.api_prefix_routes.get(prefix) or ())
+            )
+            in_disc = any(
+                normalize_path(p).lower() == base or normalize_path(p).lower().startswith(base_slash)
+                for _, p in self.discovered_routes
+            )
+            if in_prefix or in_disc:
+                matched.append(prefix)
+        return matched
+
+    def _sync_ui_api_concrete_siblings(self, resource: str | None = None) -> None:
+        """Register concrete `/api/.../<family>/<id>` siblings for known API families discovered via UI objects."""
+        targets = (
+            [(resource, self.ui_resource_families[resource])]
+            if resource and resource in self.ui_resource_families
+            else list(self.ui_resource_families.items())
+        )
+        for res_name, info in targets:
+            prefixes = self._known_api_prefixes_for_family(res_name)
+            if not prefixes:
+                continue
+            primary_prefix = prefixes[0]
+            for cid in (info.get("concrete_ids") or [])[:_MAX_OBJECTS_PER_TEMPLATE]:
+                api_path = f"{primary_prefix}/{res_name}/{cid}"
+                if api_path in self._pruned_404_objects:
+                    continue
+                ui_path = f"/{res_name}/{cid}"
+                ui_entry = self.discovered_objects.get(ui_path) or {}
+                owner_hint = str(ui_entry.get("owner_actor") or "")
+                seen_actor = owner_hint or next(iter(sorted(ui_entry.get("seen_by") or ())), "")
+                already_tested = set(self.actors_by_path.get(api_path) or ())
+                if api_path not in self.discovered_objects:
+                    self._register_object_path(
+                        api_path,
+                        actor=seen_actor,
+                        owner_hint=owner_hint,
+                        visited=bool(already_tested),
+                    )
+                    if api_path in self.discovered_objects and already_tested:
+                        self.discovered_objects[api_path]["tested_by"].update(already_tested)
+                elif owner_hint and not self.discovered_objects[api_path].get("owner_actor"):
+                    self.discovered_objects[api_path]["owner_actor"] = owner_hint
 
     def _observe_parity_path(
         self,
@@ -303,6 +485,11 @@ class SurfaceFrontierTracker:
         if api_prefix:
             if discovered or status != 404:
                 self.api_prefix_routes.setdefault(api_prefix, set()).add(norm_p)
+                remainder = norm_p[len(api_prefix):].lstrip("/")
+                if remainder:
+                    res_seg = remainder.split("/", 1)[0].lower()
+                    if res_seg in self.ui_resource_families:
+                        self._sync_ui_api_concrete_siblings(res_seg)
             return
 
         low_ct = ctype.lower()
@@ -326,6 +513,8 @@ class SurfaceFrontierTracker:
                 entry["collection_2xx"] = True
             elif status in (401, 403):
                 entry["collection_403"] = True
+        if concrete_id:
+            self._sync_ui_api_concrete_siblings(resource)
 
     def _resolve_same_origin(self, raw_url: str, current_url: str = "") -> tuple[str, str] | None:
         raw = str(raw_url or "").strip()
@@ -349,6 +538,8 @@ class SurfaceFrontierTracker:
         params: Sequence[str] = (),
         actor: str = "",
         current_url: str = "",
+        is_form: bool = False,
+        listed_from_collection: bool = False,
     ) -> None:
         norm_method = str(method or "GET").strip().upper()
         resolved = self._resolve_same_origin(raw_url, current_url=current_url)
@@ -367,6 +558,8 @@ class SurfaceFrontierTracker:
                 q_names.append(pname)
         if q_names:
             self.discovered_params.setdefault(tmpl, set()).update(q_names)
+        if is_form:
+            self.html_or_form_templates.add(tmpl)
 
         if norm_method in self.allowed_methods:
             display = f"{norm_p}?{ '&'.join(f'{k}=' for k in q_names[:4]) }" if q_names else norm_p
@@ -384,7 +577,12 @@ class SurfaceFrontierTracker:
 
         # Check if norm_p is a concrete object URL (has `{id}` in template, not a literal `{...}` template itself).
         if "{id}" in tmpl and "{" not in norm_p and not norm_p.lower().endswith((".js", ".mjs", ".html")):
-            self._register_object_path(norm_p, actor=actor, visited=False)
+            self._register_object_path(
+                norm_p,
+                actor=actor,
+                visited=False,
+                listed=listed_from_collection,
+            )
 
         self._observe_parity_path(norm_p, discovered=True)
 
@@ -396,15 +594,26 @@ class SurfaceFrontierTracker:
         owner_hint: str = "",
         visited: bool = False,
         verified_2xx: bool = False,
+        listed: bool = False,
     ) -> None:
         norm_p = normalize_path(concrete_path)
         tmpl = route_template_of(norm_p)
         if "{id}" not in tmpl or "{" in norm_p or norm_p.lower().endswith((".js", ".mjs")):
             return
-        entry = self.discovered_objects.get(norm_p)
         clean_actor = str(actor or "").strip()
         clean_owner = str(owner_hint or "").strip()
+        if listed and clean_actor:
+            self.collection_listed_objects.setdefault(norm_p, set()).add(clean_actor)
+        if verified_2xx:
+            self._pruned_404_objects.discard(norm_p)
+        elif norm_p in self._pruned_404_objects:
+            return
+
+        entry = self.discovered_objects.get(norm_p)
         if entry is None:
+            tmpl_count = sum(1 for v in self.discovered_objects.values() if v.get("template") == tmpl)
+            if tmpl_count >= _MAX_OBJECTS_PER_TEMPLATE and not visited:
+                return
             owner = clean_owner if clean_owner in self.actors and clean_owner != "anon" else (
                 clean_actor if clean_actor in self.actors and clean_actor != "anon" else ""
             )
@@ -413,6 +622,7 @@ class SurfaceFrontierTracker:
                 "template": tmpl,
                 "owner_actor": owner,
                 "seen_by": {clean_actor} if clean_actor else set(),
+                "listed_by": {clean_actor} if (listed and clean_actor) else set(),
                 "tested_by": {clean_actor} if (visited and clean_actor) else set(),
                 "verified_2xx": bool(verified_2xx),
             }
@@ -426,6 +636,8 @@ class SurfaceFrontierTracker:
                 entry["owner_actor"] = clean_actor
             if clean_actor:
                 entry["seen_by"].add(clean_actor)
+                if listed:
+                    entry.setdefault("listed_by", set()).add(clean_actor)
                 if visited:
                     entry["tested_by"].add(clean_actor)
 
@@ -462,13 +674,13 @@ class SurfaceFrontierTracker:
 
         items: list[dict[str, Any]] = []
         if isinstance(parsed_json, list):
-            items = [x for x in parsed_json[:20] if isinstance(x, dict)]
+            items = [x for x in parsed_json[:50] if isinstance(x, dict)]
         elif isinstance(parsed_json, dict):
             for v in parsed_json.values():
                 if isinstance(v, list):
-                    items.extend(x for x in v[:20] if isinstance(x, dict))
+                    items.extend(x for x in v[:50] if isinstance(x, dict))
 
-        for obj in items[:15]:
+        for obj in items[:50]:
             owner_val = ""
             for okey in _OWNER_FIELD_KEYS:
                 raw_owner = obj.get(okey)
@@ -481,8 +693,14 @@ class SurfaceFrontierTracker:
                     sval = str(v).strip()
                     if sval and len(sval) <= 64 and is_id_segment(sval):
                         obj_path = f"{norm_col}/{sval}"
-                        self._register_object_path(obj_path, actor=actor, owner_hint=owner_val, visited=False)
-                        if "GET" in self.allowed_methods:
+                        self._register_object_path(
+                            obj_path,
+                            actor=actor,
+                            owner_hint=owner_val,
+                            visited=False,
+                            listed=True,
+                        )
+                        if "GET" in self.allowed_methods and obj_path in self.discovered_objects:
                             self.discovered_routes.setdefault(("GET", obj_path), obj_path)
                         break
 
@@ -509,15 +727,28 @@ class SurfaceFrontierTracker:
 
         parsed_url = urlsplit(url)
         query_str = str(receipt.get("query") or parsed_url.query or "")
-        q_keys = {k.strip() for k, _ in parse_qsl(query_str, keep_blank_values=True) if k.strip()}
-        if q_keys:
-            self.tested_params_by_template.setdefault(tmpl, set()).update(q_keys)
+        q_pairs = [(k.strip(), v) for k, v in parse_qsl(query_str, keep_blank_values=True) if k.strip()]
+        if q_pairs:
+            self._record_param_probes(tmpl, q_pairs)
+
+        is_html_resp = (
+            "html" in ctype
+            or "<html" in body[:512].lower()
+            or "<form" in body.lower()
+        )
+        is_redirect_resp = 300 <= status < 400 and bool(str(receipt.get("redirect_location") or "").strip())
+        if 200 <= status < 400 and (is_html_resp or is_redirect_resp):
+            self.html_or_form_templates.add(tmpl)
+            if q_pairs:
+                non_meta_keys = {k for k, _ in q_pairs if k.lower() not in _NON_PROBE_PARAM_NAMES}
+                if non_meta_keys:
+                    self.discovered_params.setdefault(tmpl, set()).update(non_meta_keys)
 
         if method in {"POST", "PUT", "PATCH", "DELETE"}:
             req_body = str(receipt.get("request_body") or "")
-            for k, _ in parse_qsl(req_body, keep_blank_values=True):
-                if k.strip():
-                    self.tested_params_by_template.setdefault(tmpl, set()).add(k.strip())
+            body_pairs = [(k.strip(), v) for k, v in parse_qsl(req_body, keep_blank_values=True) if k.strip()]
+            if body_pairs:
+                self._record_param_probes(tmpl, body_pairs)
             if not _is_auth_utility_path(norm_p):
                 self.tested_write_ops.add((method, tmpl))
 
@@ -554,6 +785,7 @@ class SurfaceFrontierTracker:
             ):
                 del self.discovered_objects[norm_p]
                 self.discovered_routes.pop(("GET", norm_p), None)
+                self._pruned_404_objects.add(norm_p)
             else:
                 obj_entry["tested_by"].add(actor)
 
@@ -564,6 +796,9 @@ class SurfaceFrontierTracker:
 
         if not body or status >= 500:
             return
+
+        is_collection_2xx = (200 <= status < 300) and ("{id}" not in tmpl) and norm_p != "/"
+        col_prefix = f"{norm_p}/"
 
         # Passive extraction from JSON / OpenAPI / HTML / JS / robots / sitemap
         stripped = body.lstrip()
@@ -577,26 +812,43 @@ class SurfaceFrontierTracker:
                     self._ingest_openapi_spec(parsed)
                 hypermedia, _ = extract_json_hypermedia(parsed, url, origin_url=self.base_url)
                 for item in hypermedia:
+                    raw_hm_url = str(item.get("url") or "")
+                    hm_resolved = self._resolve_same_origin(raw_hm_url, current_url=url)
+                    hm_listed = bool(
+                        is_collection_2xx
+                        and hm_resolved is not None
+                        and hm_resolved[0].startswith(col_prefix)
+                    )
                     self._register_discovered_url(
-                        str(item.get("url") or ""),
+                        raw_hm_url,
                         method=str(item.get("method") or "GET"),
                         params=item.get("params") or (),
                         actor=actor,
                         current_url=url,
+                        listed_from_collection=hm_listed,
                     )
                 if 200 <= status < 300:
                     self._extract_collection_item_paths(norm_p, parsed, actor)
                 for spec_u in find_spec_urls(body, url):
                     self._register_discovered_url(spec_u, method="GET", actor=actor, current_url=url)
 
-        if "html" in ctype or "<html" in body[:512].lower() or "<form" in body.lower() or "href=" in body.lower():
+        if is_html_resp or "href=" in body.lower():
             for rec in extract_html(body, url):
+                raw_h_url = str(rec.get("url") or "")
+                h_resolved = self._resolve_same_origin(raw_h_url, current_url=url)
+                h_listed = bool(
+                    is_collection_2xx
+                    and h_resolved is not None
+                    and h_resolved[0].startswith(col_prefix)
+                )
                 self._register_discovered_url(
-                    str(rec.get("url") or ""),
+                    raw_h_url,
                     method=str(rec.get("method") or "GET"),
                     params=rec.get("params") or (),
                     actor=actor,
                     current_url=url,
+                    is_form=(rec.get("sources") == ["form"]),
+                    listed_from_collection=h_listed,
                 )
             for script in extract_inline_scripts(body):
                 for jc in extract_js_calls(script, url, limit=40):
@@ -687,9 +939,18 @@ class SurfaceFrontierTracker:
         if not isinstance(surface, dict):
             return
         curr_url = str(surface.get("url") or self.base_url)
+        for item in (surface.get("forms") or []):
+            if isinstance(item, dict):
+                self._register_discovered_url(
+                    str(item.get("url") or ""),
+                    method=str(item.get("method") or "GET"),
+                    params=item.get("params") or (),
+                    actor=actor,
+                    current_url=curr_url,
+                    is_form=True,
+                )
         for item in [
             *(surface.get("links") or []),
-            *(surface.get("forms") or []),
             *(surface.get("js_calls") or []),
             *(surface.get("spa_routes") or []),
         ]:
@@ -745,6 +1006,34 @@ class SurfaceFrontierTracker:
                     out.append(f"{method} {norm_p}?{param_hint}")
         return out
 
+    def unprobed_params(self) -> list[str]:
+        """Return discovered query params on visited routes that only received a single plain alphanumeric value."""
+        out: list[str] = []
+        visited_tmpls = {tmpl for _, tmpl in self.visited_method_templates}
+        sample_path_by_tmpl: dict[str, str] = {}
+        for _, path in sorted(self.visited_method_paths):
+            t = route_template_of(path)
+            if t not in sample_path_by_tmpl:
+                sample_path_by_tmpl[t] = path
+
+        for tmpl, disc_p in sorted(self.discovered_params.items()):
+            if tmpl not in visited_tmpls or _is_auth_utility_path(tmpl):
+                continue
+            tested_p = self.tested_params_by_template.get(tmpl) or set()
+            shallow = [
+                pname
+                for pname in sorted(disc_p)
+                if pname in tested_p and not self._is_param_probed_enough(tmpl, pname)
+            ]
+            if not shallow:
+                continue
+            sample_path = sample_path_by_tmpl.get(tmpl, tmpl)
+            for pname in shallow[:2]:
+                out.append(f"GET {sample_path}?{pname}= (1 benign value seen; probe special-char/differential value)")
+                if len(out) >= 8:
+                    return out
+        return out
+
     def _recommended_cross_actors(self, owner_actor: str) -> list[str]:
         """Return ordered peer/cross-tenant/anon actors to cross-test an object owned by `owner_actor`."""
         owner_meta = self.actors.get(owner_actor) or {}
@@ -777,6 +1066,103 @@ class SurfaceFrontierTracker:
         if not candidates and "anon" in self.actors and owner_actor != "anon":
             candidates.append("anon")
         return candidates
+
+    def _missing_actors_for_object(self, info: dict[str, Any]) -> list[str]:
+        """Return missing same-tenant peer and cross-tenant actors for a concrete object."""
+        owner = str(info.get("owner_actor") or "")
+        listed_by = set(info.get("listed_by") or ())
+        tested_by = set(info.get("tested_by") or ())
+        seen_by = set(info.get("seen_by") or ())
+
+        ref_actor = owner
+        if not ref_actor:
+            for pool in (listed_by, seen_by, tested_by):
+                non_anon = [
+                    a for a in sorted(pool)
+                    if a in self.actors and a != "anon" and "admin" not in (self.actors[a].get("role") or "")
+                ]
+                if non_anon:
+                    ref_actor = non_anon[0]
+                    break
+
+        if not ref_actor:
+            # Unknown owner: require coverage from up to 2 non-admin actors across distinct tenants when available.
+            non_admin = [
+                (alias, meta.get("tenant", ""))
+                for alias, meta in sorted(self.actors.items())
+                if alias != "anon" and "admin" not in meta.get("role", "")
+            ]
+            if not non_admin:
+                return ["anon"] if ("anon" in self.actors and "anon" not in tested_by) else []
+            by_tenant: dict[str, list[str]] = {}
+            for alias, tenant in non_admin:
+                by_tenant.setdefault(tenant, []).append(alias)
+            missing_unknown: list[str] = []
+            for tenant_key in sorted(by_tenant):
+                t_actors = by_tenant[tenant_key]
+                if not any(a in tested_by for a in t_actors):
+                    missing_unknown.append(t_actors[0])
+                if len(missing_unknown) >= 2:
+                    break
+            if not missing_unknown and len(non_admin) >= 2 and len(tested_by) < 2:
+                for alias, _ in non_admin:
+                    if alias not in tested_by:
+                        missing_unknown.append(alias)
+                        break
+            return missing_unknown
+
+        ref_meta = self.actors.get(ref_actor) or {}
+        ref_tenant = ref_meta.get("tenant", "")
+        ref_role = ref_meta.get("role", "")
+
+        same_tenant_peers: list[str] = []
+        cross_tenant_actors: list[str] = []
+        other_actors: list[str] = []
+
+        for alias, meta in sorted(self.actors.items()):
+            if alias == ref_actor or alias == "anon":
+                continue
+            role = meta.get("role", "")
+            tenant = meta.get("tenant", "")
+            if "admin" in role:
+                continue
+            if ref_tenant and tenant == ref_tenant:
+                same_tenant_peers.append(alias)
+            elif ref_tenant and tenant and tenant != ref_tenant:
+                cross_tenant_actors.append(alias)
+            else:
+                other_actors.append(alias)
+
+        same_tenant_peers.sort(
+            key=lambda a: (
+                0 if a not in listed_by else 1,
+                0 if (ref_role and (self.actors.get(a) or {}).get("role", "") == ref_role) else 1,
+                a,
+            )
+        )
+        cross_tenant_actors.sort(key=lambda a: (0 if a not in listed_by else 1, a))
+
+        missing: list[str] = []
+        if same_tenant_peers:
+            unlisted_peers = [p for p in same_tenant_peers if p not in listed_by]
+            peer_pool = unlisted_peers if unlisted_peers else ([] if tested_by else same_tenant_peers)
+            if peer_pool and not any(p in tested_by for p in peer_pool):
+                missing.append(peer_pool[0])
+
+        if cross_tenant_actors:
+            unlisted_xt = [c for c in cross_tenant_actors if c not in listed_by]
+            xt_pool = unlisted_xt if unlisted_xt else cross_tenant_actors
+            if xt_pool and not any(c in tested_by for c in xt_pool):
+                missing.append(xt_pool[0])
+
+        if not same_tenant_peers and not cross_tenant_actors:
+            if other_actors:
+                if not any(o in tested_by for o in other_actors):
+                    missing.append(other_actors[0])
+            elif "anon" in self.actors and ref_actor != "anon" and "anon" not in tested_by:
+                missing.append("anon")
+
+        return missing
 
     def untested_cross_actor_objects(self) -> list[str]:
         """Return concrete object endpoints and role/auth API routes not yet cross-tested."""
@@ -812,35 +1198,26 @@ class SurfaceFrontierTracker:
                     src_actor = next(a for a in sorted(ok_actors) if a != "anon")
                     out.append(f"GET {norm_p} (API 200 as {src_actor}; replay_as anon for auth_bypass)")
 
-        # 3. Concrete object endpoints ({id}) for BOLA (same-tenant peer) & Tenant Isolation (cross-tenant actor)
-        templates_cross_tested: set[str] = set()
-        for norm_p, info in self.discovered_objects.items():
-            tmpl = info["template"]
-            tested_non_anon = {a for a in info["tested_by"] if a != "anon"}
-            owner = info.get("owner_actor") or ""
-            if owner and any(a != owner for a in tested_non_anon):
-                rec_peers = self._recommended_cross_actors(owner)
-                if all(p in (self.actors_by_template.get(tmpl) or set()) for p in rec_peers):
-                    templates_cross_tested.add(tmpl)
-
-        seen_tmpl_owner: set[tuple[str, str]] = set()
-        for norm_p, info in sorted(self.discovered_objects.items()):
-            tmpl = info["template"]
-            if tmpl in templates_cross_tested:
+        # 3. Per-concrete-object ({id}) frontier across same-tenant peer & cross-tenant dimensions (bounded per template)
+        ordered_objects = sorted(
+            self.discovered_objects.items(),
+            key=lambda kv: (
+                len(kv[1].get("tested_by") or ()),
+                0 if kv[0].startswith("/api/") else 1,
+                kv[0],
+            ),
+        )
+        for norm_p, info in ordered_objects:
+            missing = self._missing_actors_for_object(info)
+            if not missing:
                 continue
-            owner = info.get("owner_actor") or next(iter(info["seen_by"]), "")
-            tested_by = info["tested_by"]
-            rec_actors = [a for a in self._recommended_cross_actors(owner) if a not in tested_by]
+            tested_by = info.get("tested_by") or set()
+            owner = str(info.get("owner_actor") or "") or next(iter(sorted(info.get("seen_by") or ())), "")
+            peers_str = ",".join(missing[:2])
             if not tested_by:
-                target_actor = owner or next((a for a in self.actors if a != "anon"), "anon")
-                if (tmpl, target_actor) not in seen_tmpl_owner:
-                    seen_tmpl_owner.add((tmpl, target_actor))
-                    out.append(f"GET {norm_p} (unfetched object; test as {target_actor} then replay_as peer)")
-            elif rec_actors:
-                if (tmpl, owner) not in seen_tmpl_owner:
-                    seen_tmpl_owner.add((tmpl, owner))
-                    peers_str = ",".join(rec_actors[:2])
-                    out.append(f"GET {norm_p} (owner={owner or 'unknown'}; replay_as {peers_str})")
+                out.append(f"GET {norm_p} (untested object, owner={owner or 'unknown'}; test as {peers_str})")
+            else:
+                out.append(f"GET {norm_p} (owner={owner or 'unknown'}; replay_as {peers_str})")
         return out
 
     def untested_write_ops(self) -> list[str]:
@@ -934,17 +1311,19 @@ class SurfaceFrontierTracker:
         """Return remaining high-value frontier items grouped by category."""
         return {
             "unvisited_routes": self.unvisited_routes()[:12],
-            "untested_cross_actor_objects": self.untested_cross_actor_objects()[:8],
+            "unprobed_params": self.unprobed_params()[:6],
+            "untested_cross_actor_objects": self.untested_cross_actor_objects()[:10],
             "untested_write_ops": self.untested_write_ops()[:8],
             "api_parity_untested": self.untested_api_parity()[:6],
             "untested_actors": self.untested_actors()[:6],
         }
 
     def has_high_value_frontier(self) -> bool:
-        """Return True if any high-value route, cross-actor object, write op, or API parity item remains untested."""
+        """Return True if any high-value route, param depth, cross-actor object, write op, or API parity item remains."""
         frontier = self.high_value_frontier()
         return bool(
             frontier["unvisited_routes"]
+            or frontier["unprobed_params"]
             or frontier["untested_cross_actor_objects"]
             or frontier["untested_write_ops"]
             or frontier["api_parity_untested"]
@@ -956,12 +1335,14 @@ class SurfaceFrontierTracker:
             return ""
         frontier = self.high_value_frontier()
         all_routes = self.unvisited_routes()
+        all_params = self.unprobed_params()
         all_objs = self.untested_cross_actor_objects()
         all_writes = self.untested_write_ops()
 
         if not any(
             (
                 frontier["unvisited_routes"],
+                frontier["unprobed_params"],
                 frontier["untested_cross_actor_objects"],
                 frontier["untested_write_ops"],
                 frontier["api_parity_untested"],
@@ -970,11 +1351,14 @@ class SurfaceFrontierTracker:
         ):
             return "\n[SURFACE FRONTIER] All discovered routes, objects, and allowed write ops covered."[:max_chars]
 
-        def _build(r_cap: int, o_cap: int, p_cap: int, w_cap: int, a_cap: int) -> str:
+        def _build(r_cap: int, q_cap: int, o_cap: int, p_cap: int, w_cap: int, a_cap: int) -> str:
             parts: list[str] = []
             if frontier["unvisited_routes"]:
                 routes = ", ".join(frontier["unvisited_routes"][:r_cap])
                 parts.append(f"unvisited_routes({len(all_routes)}): [{routes}]")
+            if frontier["unprobed_params"]:
+                qparams = ", ".join(frontier["unprobed_params"][:q_cap])
+                parts.append(f"unprobed_params({len(all_params)}): [{qparams}]")
             if frontier["untested_cross_actor_objects"]:
                 objs = ", ".join(frontier["untested_cross_actor_objects"][:o_cap])
                 parts.append(f"untested_objects({len(all_objs)}): [{objs}]")
@@ -989,11 +1373,11 @@ class SurfaceFrontierTracker:
                 parts.append(f"untested_actors: [{acts}]")
             return "\n[SURFACE FRONTIER] " + " | ".join(parts)
 
-        for caps in ((6, 4, 3, 6, 5), (3, 2, 3, 3, 3), (2, 1, 3, 1, 2), (1, 1, 2, 1, 1)):
+        for caps in ((6, 3, 4, 3, 6, 5), (3, 2, 2, 3, 3, 3), (2, 1, 1, 3, 1, 2), (1, 1, 1, 2, 1, 1)):
             candidate = _build(*caps)
             if len(candidate) <= max_chars:
                 return candidate
-        return _build(1, 1, 2, 1, 1)[:max_chars]
+        return _build(1, 1, 1, 2, 1, 1)[:max_chars]
 
     def to_dict(self) -> dict[str, Any]:
         """Serialize tracker state for checkpoint persistence."""
@@ -1005,6 +1389,17 @@ class SurfaceFrontierTracker:
             "visited_method_paths": [list(x) for x in sorted(self.visited_method_paths)],
             "visited_method_templates": [list(x) for x in sorted(self.visited_method_templates)],
             "tested_params_by_template": {k: sorted(v) for k, v in self.tested_params_by_template.items()},
+            "param_probes_by_template": {
+                tmpl: {
+                    pname: {
+                        "values": sorted(rec.get("values") or ()),
+                        "has_special": bool(rec.get("has_special")),
+                    }
+                    for pname, rec in sorted(pmap.items())
+                }
+                for tmpl, pmap in sorted(self.param_probes_by_template.items())
+            },
+            "html_or_form_templates": sorted(self.html_or_form_templates),
             "actors_by_template": {k: sorted(v) for k, v in self.actors_by_template.items()},
             "actors_by_path": {k: sorted(v) for k, v in self.actors_by_path.items()},
             "discovered_routes": [[k[0], k[1], v] for k, v in sorted(self.discovered_routes.items())],
@@ -1015,10 +1410,16 @@ class SurfaceFrontierTracker:
                     "template": v["template"],
                     "owner_actor": v.get("owner_actor", ""),
                     "seen_by": sorted(v["seen_by"]),
+                    "listed_by": sorted(v.get("listed_by") or ()),
                     "tested_by": sorted(v["tested_by"]),
+                    "verified_2xx": bool(v.get("verified_2xx")),
                 }
                 for k, v in self.discovered_objects.items()
             },
+            "collection_listed_objects": {
+                k: sorted(v) for k, v in sorted(self.collection_listed_objects.items())
+            },
+            "pruned_404_objects": sorted(self._pruned_404_objects),
             "discovered_write_ops": [[k[0], k[1], v] for k, v in sorted(self.discovered_write_ops.items())],
             "declared_write_ops": [list(x) for x in sorted(self.declared_write_ops)],
             "tested_write_ops": [list(x) for x in sorted(self.tested_write_ops)],
@@ -1043,6 +1444,19 @@ class SurfaceFrontierTracker:
         self.tested_params_by_template = {
             str(k): set(v) for k, v in (data.get("tested_params_by_template") or {}).items() if isinstance(v, list)
         }
+        self.param_probes_by_template = {}
+        for tmpl, pmap in (data.get("param_probes_by_template") or {}).items():
+            if isinstance(pmap, dict):
+                restored_pmap: dict[str, dict[str, Any]] = {}
+                for pname, rec in pmap.items():
+                    if isinstance(rec, dict):
+                        restored_pmap[str(pname)] = {
+                            "values": {str(val) for val in (rec.get("values") or [])},
+                            "has_special": bool(rec.get("has_special")),
+                        }
+                if restored_pmap:
+                    self.param_probes_by_template[str(tmpl)] = restored_pmap
+        self.html_or_form_templates = {str(x) for x in (data.get("html_or_form_templates") or [])}
         self.actors_by_template = {
             str(k): set(v) for k, v in (data.get("actors_by_template") or {}).items() if isinstance(v, list)
         }
@@ -1065,8 +1479,16 @@ class SurfaceFrontierTracker:
                     "template": str(v.get("template") or route_template_of(str(k))),
                     "owner_actor": str(v.get("owner_actor") or ""),
                     "seen_by": set(v.get("seen_by") or []),
+                    "listed_by": set(v.get("listed_by") or []),
                     "tested_by": set(v.get("tested_by") or []),
+                    "verified_2xx": bool(v.get("verified_2xx")),
                 }
+        self.collection_listed_objects = {
+            str(k): {str(a) for a in v}
+            for k, v in (data.get("collection_listed_objects") or {}).items()
+            if isinstance(v, list)
+        }
+        self._pruned_404_objects = {str(x) for x in (data.get("pruned_404_objects") or [])}
         self.discovered_write_ops = {
             (str(x[0]), str(x[1])): str(x[2])
             for x in (data.get("discovered_write_ops") or [])
@@ -1109,6 +1531,7 @@ class SurfaceFrontierTracker:
                 info = _extract_ui_resource_info(norm_p)
                 if info is not None and info[2]:
                     self._observe_parity_path(norm_p, discovered=True)
+        self._sync_ui_api_concrete_siblings()
 
     @classmethod
     def from_dict(
