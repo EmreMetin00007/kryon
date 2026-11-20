@@ -17,7 +17,7 @@ from .evidence import (
     safe_curl,
 )
 from .deser import decode_sample, detect_format, java_class_name, looks_serialized
-from .observer import analyze_differential_observations, field_diff
+from .observer import analyze_differential_observations, field_diff, summarize_differential_evidence
 
 __all__ = [
     "SCHEMA_VERSION",
@@ -25,6 +25,7 @@ __all__ = [
     "VALIDATOR_VERSION",
     "analyze_differential_observations",
     "field_diff",
+    "summarize_differential_evidence",
     "decode_sample",
     "detect_format",
     "java_class_name",

@@ -1339,12 +1339,12 @@ def test_native_enum_real_handoff_and_access_consumption(integration_run, record
             assert receipt["files"] == {str(work / name): preflight.sha256(work / name)
                                          for name in ("object-pool.json", "handoff-access.json")}
             for ident, name in (("it-handoff-read", "handoff-access.json"), ("it-pool-read", "object-pool.json")):
-                requests = [row["request"] for row in run["provider"].requests if any(
-                    m.get("tool_call_id") == ident for m in row["request"]["messages"])]
+                requests = [row["request"] for row in run["provider"].requests
+                            if ident in completed_tool_ids(row["request"])]
                 assert requests and all(read_result_json(body, ident) == read_json(work / name) for body in requests)
             assert any("pool_sha256" in returned_text(row["request"], "it-handoff-read")
-                       for row in run["provider"].requests if any(m.get("tool_call_id") == "it-handoff-read"
-                                                                 for m in row["request"]["messages"]))
+                       for row in run["provider"].requests
+                       if "it-handoff-read" in completed_tool_ids(row["request"]))
         else:
             assert not (private / "handoff-receipts.json").exists()
             assert not (work / "summaries/access-3.json").exists()

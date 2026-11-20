@@ -323,3 +323,24 @@ def analyze_differential_observations(
             "Bodies, header values and cookie values are never emitted.",
         ],
     }
+
+
+def summarize_differential_evidence(
+    baseline_body: Any,
+    probe_body: Any,
+    *,
+    signals: list[str] | None = None,
+    baseline_status: int | None = None,
+    probe_status: int | None = None,
+) -> dict[str, Any]:
+    """Build a bounded, value-free differential summary for operator-review artifacts."""
+    diff = field_diff(baseline_body, probe_body)
+    return {
+        "schema": SCHEMA,
+        "signals": list(signals or []),
+        "baseline_status": baseline_status,
+        "probe_status": probe_status,
+        "baseline_schema": _body_schema(baseline_body),
+        "probe_schema": _body_schema(probe_body),
+        "field_diff": diff,
+    }

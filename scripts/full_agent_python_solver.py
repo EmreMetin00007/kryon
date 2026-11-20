@@ -92,7 +92,7 @@ def _safe_schema_diagnostic(tool_name: str, args: Any, exc: Exception) -> dict[s
 
 class PythonSolver:
     def __init__(self, broker, *, model, recent_results=4, observed_db=None, observation_context=None,
-                 resume=False, compiled_workflows=()):
+                 resume=False, compiled_workflows=(), external_config: dict[str, Any] | None = None):
         if type(recent_results) is not int or not 0 <= recent_results <= 4:
             raise ValueError("recent results must be 0..4")
         if model not in broker.models:
@@ -109,27 +109,31 @@ class PythonSolver:
         self.base_specs = [spec.to_dict() for spec in broker.tasks.specs]
         self.observed_db, self.observation_context = observed_db, observation_context
         self.resume = resume
-        self.task_states = {}
-        self.run_id = uuid.uuid4().hex
+        self.external_config = copy.deepcopy(external_config) if isinstance(external_config, dict) and external_config else None
+        self.external_ledger_entries: list[dict[str, Any]] = []
+        self.external_sprint_e_done: set[str] = set()
+        self._external_hints_fetched: dict[str, set[str]] = {}
+        self.task_states: dict[str, Any] = {}
+        self.run_id = str((self.external_config or {}).get("run_id") or "").strip() or uuid.uuid4().hex
         self.checkpoint = WorkflowCheckpoint(broker.workdir)
         self._checkpoint_active = False
         self.expires_at = time.time() + broker.budget.remaining_seconds()
         self.total_seconds = broker.budget.seconds_limit
-        self.summaries = {}
-        self.repairs = {}
-        self.protocol_repairs = {}
-        self.protocol_feedback = {}
-        self.loop_events = []
-        self._observations = {}
-        self.access_dispatches = set()
-        self.batches_by_task = {}
-        self.candidates_by_task = {}
-        self.leaf_outcomes_by_task = {}
-        self.pair_progress_by_task = {}
-        self.discovery_states = {}
-        self.coverage_gaps = {}
-        self._discovery_stagnation = {}
-        self._last_surface_truncated = {}
+        self.summaries: dict[str, Any] = {}
+        self.repairs: dict[str, Any] = {}
+        self.protocol_repairs: dict[str, Any] = {}
+        self.protocol_feedback: dict[str, Any] = {}
+        self.loop_events: list[dict[str, Any]] = []
+        self._observations: dict[str, Any] = {}
+        self.access_dispatches: set[Any] = set()
+        self.batches_by_task: dict[str, Any] = {}
+        self.candidates_by_task: dict[str, Any] = {}
+        self.leaf_outcomes_by_task: dict[str, Any] = {}
+        self.pair_progress_by_task: dict[str, Any] = {}
+        self.discovery_states: dict[str, Any] = {}
+        self.coverage_gaps: dict[str, Any] = {}
+        self._discovery_stagnation: dict[str, Any] = {}
+        self._last_surface_truncated: dict[str, Any] = {}
         for spec in broker.tasks.specs:
             if spec.phase == "enum" and "kali-tools_ledger_prepare_handoff" in spec.tools:
                 broker.runtime_policy.reserve_handoff(spec, len(broker.session_checks(spec)))
@@ -138,7 +142,7 @@ class PythonSolver:
                 if any(tool == "hunter_run_web_loop" or tool.startswith("validator_validate_") for tool in spec.tools):
                     identities = set().union(*(set(batch) for batch in batches))
                     broker.runtime_policy.validation_reserves[spec.id] = min(
-                        spec.max_calls, PHASE_CALL_LIMITS[spec.phase], max(1, (len(identities) + 1) // 2))
+                        spec.max_calls, broker.runtime_policy.phase_call_limits[spec.phase], max(1, (len(identities) + 1) // 2))
             if spec.phase == 'report' and 'kali-tools_ledger_checkpoint' in spec.tools:
                 broker.runtime_policy.checkpoint_reserves[spec.id] = 1
         dump(broker.private / "runtime-policy.json", broker.runtime_policy.snapshot())
@@ -175,6 +179,9 @@ class PythonSolver:
                  'pair_progress_by_task': self.pair_progress_by_task,
                  'discovery_states': {key: item.to_dict() for key, item in self.discovery_states.items()},
                  'coverage_gaps': self.coverage_gaps, 'branch_handoffs': broker.branch_handoffs,
+                 'external_ledger_entries': self.external_ledger_entries,
+                 'external_sprint_e_done': sorted(self.external_sprint_e_done),
+                 'external_hints_fetched': {k: sorted(v) for k, v in self._external_hints_fetched.items()},
                   'read_progress': broker.read_progress,
                   # HOST-PRIVATE signed/hash-bound state; never a model archive.
                   'private_discovery_sources': broker.private_discovery_sources,
@@ -242,6 +249,9 @@ class PythonSolver:
             key: DiscoveryState.from_dict(item)
             for key, item in state.get('discovery_states', {}).items()
         }
+        self.external_ledger_entries = list(state.get('external_ledger_entries', []))
+        self.external_sprint_e_done = set(state.get('external_sprint_e_done', []))
+        self._external_hints_fetched = {k: set(v) for k, v in state.get('external_hints_fetched', {}).items()}
         for state_obj in self.discovery_states.values():
             for src in state_obj.sources:
                 ref = self.broker.references.get(src['source_artifact'])
@@ -771,6 +781,7 @@ class PythonSolver:
             records,
             bindings,
             profile_eligibility=getattr(self.broker, "profile_eligibility", None),
+            high_recall=bool(self.external_config),
         )
         provenance = [{key: record[key] for key in ("source_spec_id", "source_artifact", "source_sha256")}
                       for record in records]
@@ -2416,6 +2427,15 @@ class PythonSolver:
                     # Accepted signed outcomes mean minimal-validation completed;
                     # untested residual slices represent partial access, not a block.
                     summary["status"] = "partial"
+            if self.external_config:
+                summary["probable_findings"] = self.broker.probable_findings(spec)
+                if self.external_ledger_entries:
+                    from external_sprint_e import summarize_sprint_e_ledger
+                    ledger_summary = summarize_sprint_e_ledger(self.external_ledger_entries)
+                    summary["verdict_ledger"] = ledger_summary
+                    summary["adjudication_coverage"] = ledger_summary["adjudication_coverage"]
+                    summary["oracle_gap"] = ledger_summary["oracle_gap"]
+                    summary["probable_review"] = ledger_summary["probable_review"]
         if spec.phase == "report":
             sources = set(upstream_ids(spec, self.broker.tasks.specs))
             summary["validation_funnels"] = {}
@@ -2459,6 +2479,19 @@ class PythonSolver:
             if reports:
                 row = reports[-1]
                 summary["coverage_report"] = {"content_ref": row["content_ref"], "result": row["result"]}
+            if self.external_config:
+                report_probable = []
+                for source in self.broker.tasks.specs:
+                    if source.id in sources and source.phase == "access":
+                        report_probable.extend(self.broker.probable_findings(source))
+                summary["probable_findings"] = report_probable
+                if self.external_ledger_entries:
+                    from external_sprint_e import summarize_sprint_e_ledger
+                    ledger_summary = summarize_sprint_e_ledger(self.external_ledger_entries)
+                    summary["verdict_ledger"] = ledger_summary
+                    summary["adjudication_coverage"] = ledger_summary["adjudication_coverage"]
+                    summary["oracle_gap"] = ledger_summary["oracle_gap"]
+                    summary["probable_review"] = ledger_summary["probable_review"]
         if (spec.phase == "report" and any(step.id == REPORT_CARRYOVER_STEP for step in spec.steps)
                 and isinstance(summary.get("steps"), list)):
             # Completion of the review is distinct from unfinished probes.
@@ -2706,8 +2739,21 @@ class PythonSolver:
             for action in pending
         ):
             return True
+        if self.external_config:
+            total_dispatched = sum(int(state.continuation.get("dispatched_count", 0)) for state in states.values())
+            if total_dispatched < 14 and any(
+                action.get("params") or action.get("link_relation") in {"html", "form", "link"}
+                for action in pending
+            ):
+                return True
         if submitted.get("status") == "done" and surface_errors(self.compile_summary(spec, submitted)):
             return True
+        if self.external_config and self.external_config.get("discovery_hints"):
+            done_hints = self._external_hints_fetched.get(spec.id, set())
+            for raw_hint in self.external_config.get("discovery_hints") or []:
+                hint_url = urljoin(spec.target, str(raw_hint).lstrip("/"))
+                if hint_url.rstrip("/") != spec.target.rstrip("/") and hint_url not in done_hints:
+                    return True
         return False
 
     def _crawl_tool_allowance_needed(self, spec, identity=None):
@@ -2732,7 +2778,7 @@ class PythonSolver:
         if spec.phase != "enum" or spec.references or spec.compiled_workflows:
             return False
         states = self.hydrate_discovery_state(spec)
-        max_total = 10
+        max_total = 18 if self.external_config else 10
         total_dispatched = sum(int(state.continuation.get("dispatched_count", 0)) for state in states.values())
         if total_dispatched >= max_total:
             return False
@@ -2766,10 +2812,16 @@ class PythonSolver:
                 and dispatched_this_call < max_actions
                 and total_dispatched < max_total
             ):
-                needed = self._crawl_tool_allowance_needed(spec)
+                checks = self.broker.session_checks(spec) if self.external_config else []
+                members = [row["identity"] for row in checks if self.broker.tasks.bindings[row["identity"]].get("role") == "member"]
+                primary_id = (members or [row["identity"] for row in checks])[0] if checks else None
+                needed = self._crawl_tool_allowance_needed(spec, primary_id)
                 ready, gap_reason = _budget_ready(needed)
                 if ready:
-                    crawl_args: dict[str, Any] = {"target": spec.target, "max_pages": 12}
+                    crawl_args: dict[str, Any] = {"target": spec.target, "max_pages": 24 if self.external_config else 12}
+                    if primary_id and self.external_config:
+                        crawl_args["session_target"] = spec.target
+                        crawl_args["identity"] = primary_id
                     before_results = len(self.broker.results)
                     try:
                         self.broker.invoke(CRAWL_TOOL, crawl_args)
@@ -2799,6 +2851,86 @@ class PythonSolver:
                         self.save_checkpoint()
                 elif not pending_now and gap_reason:
                     self.add_gap(spec, gap_reason, "admission_budget")
+
+            if self.external_config and CRAWL_TOOL in available:
+                crawled_identities = {
+                    (row.get("arguments") or {}).get("identity") or "anon"
+                    for row in self.broker.results
+                    if row["spec_id"] == spec.id and row["tool"] == CRAWL_TOOL
+                }
+                checks = self.broker.session_checks(spec)
+                role_reps: list[str] = []
+                for wanted_role in ("member", "admin"):
+                    rep = next(
+                        (
+                            item["identity"] for item in checks
+                            if self.broker.tasks.bindings.get(item["identity"], {}).get("role") == wanted_role
+                        ),
+                        None,
+                    )
+                    if rep and rep not in crawled_identities:
+                        role_reps.append(rep)
+                for rep_id in role_reps:
+                    if dispatched_this_call >= max_actions or total_dispatched >= max_total:
+                        break
+                    needed = self._crawl_tool_allowance_needed(spec, rep_id)
+                    ready, _ = _budget_ready(needed)
+                    if not ready:
+                        break
+                    try:
+                        self.broker.invoke(CRAWL_TOOL, {
+                            "target": spec.target,
+                            "max_pages": 16,
+                            "session_target": spec.target,
+                            "identity": rep_id,
+                        })
+                    except BudgetError:
+                        raise
+                    except ValueError:
+                        if policy.consecutive_failures.get(spec.id, 0) >= 2:
+                            raise BudgetError("consecutive_tool_failure_limit")
+                    else:
+                        continued = True
+                        dispatched_this_call += 1
+                        total_dispatched += 1
+                        states = self.hydrate_discovery_state(spec)
+                        self.save_checkpoint()
+
+            if self.external_config and "kali-tools_curl_request" in available:
+                hints = [
+                    urljoin(spec.target, str(h).lstrip("/"))
+                    for h in (self.external_config.get("discovery_hints") or [])
+                    if isinstance(h, str) and h.strip()
+                ]
+                done_hints = self._external_hints_fetched.setdefault(spec.id, set())
+                curl_schema = available["kali-tools_curl_request"]
+                props = curl_schema.get("properties") if isinstance(curl_schema, dict) else {}
+                for hint_url in hints:
+                    if hint_url in done_hints or dispatched_this_call >= max_actions or total_dispatched >= max_total:
+                        break
+                    if hint_url.rstrip("/") == spec.target.rstrip("/") and enum_crawled:
+                        done_hints.add(hint_url)
+                        continue
+                    ready, _ = _budget_ready(1)
+                    if not ready:
+                        break
+                    done_hints.add(hint_url)
+                    hint_args: dict[str, Any] = {"url": hint_url}
+                    if isinstance(props, dict) and "follow_redirects" in props:
+                        hint_args["follow_redirects"] = False
+                    try:
+                        self.broker.invoke("kali-tools_curl_request", hint_args)
+                    except BudgetError:
+                        raise
+                    except ValueError:
+                        if policy.consecutive_failures.get(spec.id, 0) >= 2:
+                            raise BudgetError("consecutive_tool_failure_limit")
+                    else:
+                        continued = True
+                        dispatched_this_call += 1
+                        total_dispatched += 1
+                        states = self.hydrate_discovery_state(spec)
+                        self.save_checkpoint()
 
             pending_now = [action for state in states.values() for action in state.pending_actions()]
             has_any_actions = any(state.actions for state in states.values())
@@ -2958,10 +3090,29 @@ class PythonSolver:
             dump(self.broker.private / "runtime-policy.json", policy.snapshot())
         return continued
 
+    def dispatch_external_sprint_e(self, spec):
+        """Run bounded host-owned Sprint E checks when configured by external_target_runner."""
+        if (not self.external_config or spec.phase != "access" or spec.references
+                or spec.compiled_workflows or spec.id in self.external_sprint_e_done):
+            return False
+        from external_sprint_e import run_sprint_e_checks
+        policy = self.broker.runtime_policy
+        policy.host_finalizing.add(spec.id)
+        try:
+            entries = run_sprint_e_checks(self, spec)
+            self.external_ledger_entries.extend(entries)
+            self.external_sprint_e_done.add(spec.id)
+            self.save_checkpoint()
+            return bool(entries)
+        finally:
+            policy.host_finalizing.discard(spec.id)
+            dump(self.broker.private / "runtime-policy.json", policy.snapshot())
+
     def dispatch_access_validation(self, spec):
         """An early summary cannot bypass the admitted, budgeted validation step."""
         if spec.phase != "access" or spec.references or spec.compiled_workflows or spec.id in self.access_dispatches:
             return False
+        sprint_e_continued = self.dispatch_external_sprint_e(spec)
         policy = self.broker.runtime_policy
         candidates = self.plan_candidates(spec)
         pending = [row for row in candidates if row["eligible"] and not row["evidence_accepted"]
@@ -3136,7 +3287,7 @@ class PythonSolver:
             policy.host_finalizing.discard(spec.id)
             policy.validation_reserves.pop(spec.id, None)
             dump(self.broker.private / "runtime-policy.json", policy.snapshot())
-        return continued
+        return continued or sprint_e_continued
 
     def pending_parameter_batches(self, spec):
         """Host-selected parameter candidates; no previous model profile required."""
@@ -3557,6 +3708,16 @@ class PythonSolver:
                            leaf_validation_funnels={ident: leaf_funnel(self.leaf_outcomes_by_task.get(ident, [])) for ident in self.candidates_by_task},
                            pair_progress={ident: copy.deepcopy(self.pair_progress_by_task[ident]) for ident in self.candidates_by_task if ident in self.pair_progress_by_task},
                           budget=self.broker.budget.snapshot())
+            if self.external_ledger_entries:
+                from external_sprint_e import summarize_sprint_e_ledger
+                ledger_summary = summarize_sprint_e_ledger(self.external_ledger_entries)
+                result.update(
+                    verdict_ledger=ledger_summary,
+                    adjudication_coverage=ledger_summary["adjudication_coverage"],
+                    oracle_gap=ledger_summary["oracle_gap"],
+                    probable_review=ledger_summary["probable_review"],
+                    external_ledger_entries=copy.deepcopy(self.external_ledger_entries),
+                )
             dump(self.broker.private.parent / "run-result.json", result)
             dump(self.broker.private.parent / "budget.json", self.broker.budget.snapshot())
             with (self.broker.private.parent / "provider-usage.jsonl").open("w") as handle:

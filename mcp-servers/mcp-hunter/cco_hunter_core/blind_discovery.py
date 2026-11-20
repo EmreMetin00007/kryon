@@ -11,6 +11,7 @@ import json
 import re
 from collections import deque
 from html.parser import HTMLParser
+from typing import Any, Sequence
 from urllib.parse import parse_qsl, unquote, urldefrag, urljoin, urlsplit, urlunsplit
 
 from cco_surface_core.normalize import discovery_link_skip_reason
@@ -298,20 +299,24 @@ def _document(text, is_profile):
     return _json_document(data, is_profile)
 
 
-def _marker(url, ids):
-    """Use only an observed opaque resource ID that is bound to its URL."""
+def _marker(url, ids, *, allow_short_ids: bool = False):
+    """Use only an observed resource ID that is bound to its URL."""
     try:
         parsed = urlsplit(url)
         tokens = {unquote(part) for part in parsed.path.split("/") if part}
         tokens.update(value for _, value in parse_qsl(parsed.query, keep_blank_values=True, max_num_fields=64))
-        choices = sorted(item for item in ids if len(item) >= 8 and item in tokens)
+        choices = sorted(
+            item for item in ids
+            if (len(item) >= 8 or (allow_short_ids and (item.isdigit() or len(item) >= 1)))
+            and item in tokens
+        )
         return choices[0] if len(choices) == 1 else ""
     except ValueError:
         return ""
 
 
-def _owned_record(url, records):
-    matches = [(marker, owners) for owners, ids in records if (marker := _marker(url, ids))]
+def _owned_record(url, records, *, allow_short_ids: bool = False):
+    matches = [(marker, owners) for owners, ids in records if (marker := _marker(url, ids, allow_short_ids=allow_short_ids))]
     if not matches or len({marker for marker, _ in matches}) != 1 or any(not owners for _, owners in matches):
         return "", set()
     return matches[0][0], set.intersection(*(owners for _, owners in matches))
@@ -364,7 +369,8 @@ def _observed_exposure(text):
 
 def discover_owned_resources(target, identities, fetch, permits, *, stop_reason=None,
                               max_requests=24, per_identity=8, max_depth=3, pace=None,
-                              allow_private_owned=False, observations=None):
+                              allow_private_owned=False, observations=None,
+                              seed_urls=()):
     """Return (safe summary, transient identities, transient candidates).
 
     The caller supplies a gate-backed GET transport and scope predicate. The
@@ -448,6 +454,10 @@ def discover_owned_resources(target, identities, fetch, permits, *, stop_reason=
         subjects, resources, subject_conflict = set(), [], False
         exposures = {}
         queue, seen = deque([(start, 0, False)]), set()
+        for extra in seed_urls or ():
+            safe_extra = _safe_link(start, str(extra or ""), origin, permits)
+            if safe_extra and safe_extra != start and all(item[0] != safe_extra for item in queue):
+                queue.append((safe_extra, 0, False))
         requests = 0
         while queue and requests < per_limit and summary["requests"] < total_limit:
             current, depth, is_profile = queue.popleft()
@@ -640,7 +650,27 @@ def _derive_marker(detail_text, other_texts, raw_id):
     try:
         data = _load_json(detail_text)
     except Exception:
-        return ""
+        cleaned = re.sub(r"<(?:script|style)\b[^>]*>.*?</(?:script|style)>", " ", detail_text or "", flags=re.I | re.S)
+        cleaned = re.sub(r"<[^>]+>", "\n", cleaned)
+        tokens = []
+        for raw_line in cleaned.splitlines():
+            line = " ".join(raw_line.split()).strip()
+            if 5 <= len(line) <= 120:
+                tokens.append(line)
+            for word in line.split():
+                w = word.strip(".,;:()[]{}\"'")
+                if len(w) >= 5:
+                    tokens.append(w)
+        if raw_id and len(str(raw_id)) >= 5:
+            tokens.append(str(raw_id))
+        unique_html = [
+            val for val in dict.fromkeys(tokens)
+            if all(val not in text for text in other_texts)
+        ]
+        if not unique_html:
+            return ""
+        unique_html.sort(key=lambda v: (0 if "@" in v else 1 if v == raw_id else 2, -len(v), v))
+        return unique_html[0]
     scalars = set()
     _json_scalars(data, scalars, [1000])
     unique = [value for value in scalars
@@ -653,7 +683,8 @@ def _derive_marker(detail_text, other_texts, raw_id):
 
 def discover_differential_resources(target, identities, fetch, permits, *,
                                     stop_reason=None, max_requests=40,
-                                    per_identity=12, max_depth=3, pace=None):
+                                    per_identity=12, max_depth=3, pace=None,
+                                    seed_urls=()):
     """Küme farkı sahiplik çıkarımı (WS4): açık owner metaverisi olmadan,
     oturumlar arası görünürlük farkından BOLA adayları üretir.
 
@@ -715,6 +746,10 @@ def discover_differential_resources(target, identities, fetch, permits, *,
         paginated = False
         auth_denied = False
         queue, seen = deque([(start, 0)]), set()
+        for extra in seed_urls or ():
+            safe_extra = _safe_link(start, str(extra or ""), origin, permits)
+            if safe_extra and safe_extra != start and all(item[0] != safe_extra for item in queue):
+                queue.append((safe_extra, 0))
         made = 0
         while queue and made < allowance and summary["requests"] < total_limit:
             current, depth = queue.popleft()
@@ -744,7 +779,10 @@ def discover_differential_resources(target, identities, fetch, permits, *,
             if status in {301, 302, 303, 307, 308} and depth < depth_limit:
                 next_url = ""
                 try:
-                    next_url = _safe_link(current, response.get("location") or "", origin, permits)
+                    raw_loc = response.get("location") or ""
+                    if not raw_loc and isinstance(response.get("headers"), dict):
+                        raw_loc = next((str(v) for k, v in response["headers"].items() if str(k).lower() == "location"), "")
+                    next_url = _safe_link(current, raw_loc, origin, permits)
                 except Exception:
                     next_url = ""
                 if next_url and next_url not in seen:
@@ -804,6 +842,19 @@ def discover_differential_resources(target, identities, fetch, permits, *,
                 if last and (any(c.isdigit() for c in last) or len(last) >= 8) \
                         and last not in visible:
                     visible[last] = {"raw": last, "url": current}
+                if data is None:
+                    for value, _is_me in links:
+                        try:
+                            cand_link = _safe_link(current, value, origin, permits)
+                        except Exception:
+                            cand_link = ""
+                        if not cand_link:
+                            continue
+                        seg = urlsplit(cand_link).path.rstrip("/").rsplit("/", 1)[-1]
+                        if (seg and seg not in visible and not _DIFF_SKIP_PATH.search(urlsplit(cand_link).path)
+                                and (seg.isdigit() or _UUID_SEG_RE.fullmatch(seg)
+                                     or (len(seg) >= 8 and any(c.isdigit() for c in seg)))):
+                            visible[seg] = {"raw": seg, "url": cand_link}
             if depth < depth_limit:
                 for value, _is_me in sorted(links, key=lambda item: not item[1]):
                     try:
@@ -918,3 +969,492 @@ def discover_differential_resources(target, identities, fetch, permits, *,
         summary["reasons"].append("identity discovery request budget limited coverage")
     summary["status"] = "ready" if candidates else "incomplete"
     return summary, enriched, candidates
+
+
+_TYPED_OWNER_PREFIXES = (
+    "owner",
+    "custodian",
+    "createdby",
+    "requestedby",
+    "assignedto",
+    "author",
+    "creator",
+    "requester",
+    "maintainer",
+    "operator",
+    "technician",
+)
+_TYPED_OWNER_EXACT = frozenset({
+    "owner", "ownerid", "owneruuid", "ownerusername", "owneralias", "owneremail", "ownedby",
+    "custodian", "custodianid", "custodianalias", "custodianemail", "custodianusername",
+    "createdby", "createdbyid", "createdbyalias", "createdbyemail",
+    "requestedby", "requestedbyid", "requestedbyalias", "requestedbyemail",
+    "assignedto", "assignedtoid", "assignedtoalias",
+    "authorid", "authoralias", "memberid", "userid", "useralias",
+})
+_TYPED_TENANT_EXACT = frozenset({
+    "tenant", "tenantid", "tenantslug", "tenantname", "tenantcode",
+    "org", "orgid", "orgslug", "organization", "organizationid",
+    "company", "companyid", "workspace", "workspaceid", "plant", "plantid", "accountid",
+})
+_TYPED_ID_EXACT = frozenset({"id", "uuid", "resourceid", "objectid", "documentid", "recordid", "itemid"})
+_TEMPLATE_SLOT_RE = re.compile(r"\{([A-Za-z_][A-Za-z0-9_]*)\}")
+_UUID_SEG_RE = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
+
+
+def canonical_resource_type(url_or_path: str) -> str:
+    """Derive a stable resource_type namespace from a collection, detail, or template URL."""
+    raw = str(url_or_path or "").strip()
+    if not raw:
+        return "/"
+    path = urlsplit(raw).path if "://" in raw else raw
+    parts = [p for p in path.split("/") if p]
+    while parts:
+        tail = parts[-1]
+        if (_TEMPLATE_SLOT_RE.fullmatch(tail)
+                or tail.isdigit()
+                or _UUID_SEG_RE.fullmatch(tail)
+                or (len(tail) >= 16 and re.fullmatch(r"[A-Za-z0-9_-]+", tail) and any(c.isdigit() for c in tail))):
+            parts.pop()
+            continue
+        break
+    return "/" + "/".join(parts) if parts else "/"
+
+
+def _is_owner_field_key(normalized_key: str) -> bool:
+    if normalized_key in _TYPED_OWNER_EXACT:
+        return True
+    return any(normalized_key.startswith(prefix) for prefix in _TYPED_OWNER_PREFIXES) and (
+        normalized_key.endswith(("id", "uuid", "alias", "email", "username", "name"))
+    )
+
+
+def _is_tenant_field_key(normalized_key: str) -> bool:
+    if normalized_key in _TYPED_TENANT_EXACT:
+        return True
+    return normalized_key.startswith(("tenant", "org", "organization", "workspace", "plant")) and (
+        normalized_key.endswith(("id", "slug", "name", "code"))
+    )
+
+
+def normalize_owner_values(node: Any) -> set[str]:
+    """Extract normalized owner/custodian/creator identifiers from a JSON record."""
+    if not isinstance(node, dict):
+        return set()
+    owners: set[str] = set()
+    for key, raw in node.items():
+        norm = _key(key)
+        if _is_owner_field_key(norm):
+            val = _scalar(raw)
+            if val:
+                owners.add(val)
+            elif isinstance(raw, dict):
+                for subk, subv in raw.items():
+                    if _key(subk) in {"id", "uuid", "alias", "email", "workemail", "username", "sub"}:
+                        sval = _scalar(subv)
+                        if sval:
+                            owners.add(sval)
+    return owners
+
+
+def normalize_tenant_values(node: Any) -> set[str]:
+    """Extract normalized tenant/organization identifiers from a JSON record."""
+    if not isinstance(node, dict):
+        return set()
+    tenants: set[str] = set()
+    for key, raw in node.items():
+        norm = _key(key)
+        if _is_tenant_field_key(norm):
+            val = _scalar(raw)
+            if val:
+                tenants.add(val)
+            elif isinstance(raw, dict):
+                for subk, subv in raw.items():
+                    if _key(subk) in {"id", "slug", "name", "code"}:
+                        sval = _scalar(subv)
+                        if sval:
+                            tenants.add(sval)
+    return tenants
+
+
+def normalize_resource_id(node: Any, *, preferred_param: str = "") -> str:
+    """Extract a record's primary typed ID (including short ints like '1', '2')."""
+    if not isinstance(node, dict):
+        return ""
+    pref = _key(preferred_param)
+    candidates: list[tuple[int, str]] = []
+    for key, raw in node.items():
+        norm = _key(key)
+        if _is_owner_field_key(norm) or _is_tenant_field_key(norm):
+            continue
+        val = _scalar(raw)
+        if not val:
+            continue
+        if pref and norm == pref:
+            candidates.append((0, val))
+        elif norm == "id":
+            candidates.append((1, val))
+        elif norm in _TYPED_ID_EXACT:
+            candidates.append((2, val))
+        elif norm.endswith(("id", "uuid")) and norm not in {"parentid", "companyid"}:
+            candidates.append((3, val))
+    if not candidates:
+        return ""
+    candidates.sort(key=lambda item: (item[0], item[1]))
+    return candidates[0][1]
+
+
+def hydrate_template_url(template_url: str, id_value: str, *, param_name: str = "") -> str:
+    """Hydrate a single-slot OpenAPI path template (/{..._id}) with a typed ID."""
+    slots = _TEMPLATE_SLOT_RE.findall(template_url)
+    if len(slots) != 1:
+        return ""
+    slot = slots[0]
+    if param_name and slot != param_name:
+        return ""
+    val = str(id_value or "").strip()
+    if not val or any(ch in val for ch in "/?#\r\n\x00"):
+        return ""
+    from urllib.parse import quote
+    return template_url.replace("{" + slot + "}", quote(val, safe=""))
+
+
+def extract_typed_records(
+    payload: Any,
+    source_url: str,
+    *,
+    preferred_param: str = "",
+) -> list[dict[str, Any]]:
+    """Extract typed resource records from a JSON list/envelope/object using generic normalization."""
+    if not isinstance(payload, (dict, list)):
+        return []
+    base_type = canonical_resource_type(source_url)
+    rows: list[dict[str, Any]] = []
+    seen_nodes: set[int] = set()
+    queue: deque[tuple[Any, str]] = deque([(payload, base_type)])
+    visited = 0
+    while queue and visited < _MAX_JSON_NODES:
+        node, rtype = queue.popleft()
+        visited += 1
+        if isinstance(node, list):
+            for elem in node[:_MAX_JSON_NODES]:
+                if isinstance(elem, (dict, list)):
+                    queue.append((elem, rtype))
+            continue
+        if not isinstance(node, dict):
+            continue
+        oid = id(node)
+        if oid in seen_nodes:
+            continue
+        seen_nodes.add(oid)
+        link_raw = next(
+            (node[k] for k in ("href", "url", "self", "uri") if isinstance(node.get(k), str) and node.get(k)),
+            "",
+        )
+        node_type = canonical_resource_type(link_raw) if link_raw else rtype
+        rec_id = normalize_resource_id(node, preferred_param=preferred_param)
+        if rec_id:
+            rows.append({
+                "resource_type": node_type,
+                "key": rec_id,
+                "typed_key": f"{node_type}::{rec_id}",
+                "link": link_raw,
+                "tenants": sorted(normalize_tenant_values(node)),
+                "owners": sorted(normalize_owner_values(node)),
+                "fields": sorted(str(k) for k in node.keys()),
+                "record": node,
+            })
+        for k, v in node.items():
+            if isinstance(v, (dict, list)):
+                child_type = rtype
+                if isinstance(v, list) and _key(k) not in {"items", "results", "data", "entries", "records"}:
+                    child_type = rtype
+                queue.append((v, child_type))
+    return rows
+
+
+def discover_typed_resources(
+    target: str,
+    identities: dict[str, dict[str, Any]],
+    fetch,
+    permits,
+    *,
+    collection_urls: Sequence[str] = (),
+    template_routes: Sequence[dict[str, Any]] = (),
+    max_requests: int = 80,
+    max_detail_per_actor: int = 4,
+    stop_reason=None,
+) -> dict[str, Any]:
+    """Actor-scoped typed resource discovery & OpenAPI {id} template hydration.
+
+    Keeps distinct (resource_type, key) namespaces so colliding short integer IDs
+    across different resource families never join.
+    """
+    start = str(target or "").strip()
+    if "://" not in start:
+        start = "http://" + start
+    origin = _origin(start)
+    if not origin or not callable(fetch) or not callable(permits):
+        return {"status": "blocked", "reasons": ["invalid discovery target or transport"],
+                "requests": 0, "resources": {}, "hydrated_templates": {}, "collection_observations": {}}
+
+    safe_collections: list[str] = []
+    for raw in collection_urls:
+        safe = _safe_link(start, str(raw or ""), origin, permits)
+        if safe and "{" not in safe and "}" not in safe and safe not in safe_collections:
+            safe_collections.append(safe)
+
+    requests_used = 0
+    # Keyed strictly by (resource_type, key) so colliding IDs never merge.
+    typed_registry: dict[tuple[str, str], dict[str, Any]] = {}
+    collection_observations: dict[tuple[str, str], dict[str, Any]] = {}
+
+    def _call(url: str, headers: dict[str, Any]) -> dict[str, Any]:
+        nonlocal requests_used
+        if requests_used >= max_requests:
+            return {"ok": False, "status": None, "error": "budget_exhausted"}
+        if callable(stop_reason) and stop_reason():
+            return {"ok": False, "status": None, "error": str(stop_reason())}
+        requests_used += 1
+        try:
+            resp = fetch(url, dict(headers))
+            return resp if isinstance(resp, dict) else {"ok": False, "status": None}
+        except Exception as exc:
+            return {"ok": False, "status": None, "error": str(exc)}
+
+    for actor_name, identity in identities.items():
+        headers = identity.get("headers") if isinstance(identity, dict) else None
+        if not isinstance(headers, dict):
+            continue
+        for col_url in safe_collections:
+            if requests_used >= max_requests:
+                break
+            resp = _call(col_url, headers)
+            status = resp.get("status")
+            text = str(resp.get("text") or "")
+            parsed = None
+            if resp.get("ok") and status == 200:
+                try:
+                    parsed = _load_json(text)
+                except Exception:
+                    try:
+                        parsed = json.loads(text)
+                    except ValueError:
+                        parsed = None
+            col_type = canonical_resource_type(col_url)
+            extracted = extract_typed_records(parsed, col_url) if parsed is not None else []
+            if parsed is None and resp.get("ok") and status == 200 and text:
+                parser = _Links()
+                try:
+                    parser.feed(text)
+                except (TypeError, ValueError):
+                    parser_links = []
+                else:
+                    parser_links = parser.links
+                seen_html_items: set[tuple[str, str]] = set()
+                for href, _ in parser_links:
+                    safe_det = _safe_link(col_url, href, origin, permits)
+                    if not safe_det:
+                        continue
+                    det_parts = [p for p in urlsplit(safe_det).path.split("/") if p]
+                    if len(det_parts) < 2:
+                        continue
+                    tail = det_parts[-1]
+                    if (tail.isdigit() or _UUID_SEG_RE.fullmatch(tail)
+                            or (len(tail) >= 8 and re.fullmatch(r"[A-Za-z0-9_-]+", tail) and any(c.isdigit() for c in tail))):
+                        item_type = canonical_resource_type(safe_det)
+                        ns_key = (item_type, tail)
+                        if ns_key in seen_html_items:
+                            continue
+                        seen_html_items.add(ns_key)
+                        extracted.append({
+                            "resource_type": item_type,
+                            "key": tail,
+                            "typed_key": f"{item_type}::{tail}",
+                            "link": safe_det,
+                            "tenants": [],
+                            "owners": [],
+                            "fields": [],
+                            "record": {},
+                        })
+            collection_observations[(actor_name, col_url)] = {
+                "actor": actor_name,
+                "url": col_url,
+                "resource_type": col_type,
+                "status": status,
+                "ok": bool(resp.get("ok")),
+                "record_count": len(extracted),
+                "keys": [row["key"] for row in extracted],
+                "list_fields": sorted({f for row in extracted for f in row["fields"]}),
+                "tenants": sorted({t for row in extracted for t in row["tenants"]}),
+                "parsed": parsed,
+            }
+            for row in extracted:
+                ns_key = (row["resource_type"], row["key"])
+                entry = typed_registry.setdefault(ns_key, {
+                    "resource_type": row["resource_type"],
+                    "key": row["key"],
+                    "typed_key": row["typed_key"],
+                    "observed_by": [],
+                    "tenants": set(),
+                    "owners": set(),
+                    "list_fields": set(),
+                    "detail_urls": set(),
+                    "collection_urls": set(),
+                })
+                if actor_name not in entry["observed_by"]:
+                    entry["observed_by"].append(actor_name)
+                entry["tenants"].update(row["tenants"])
+                entry["owners"].update(row["owners"])
+                entry["list_fields"].update(row["fields"])
+                entry["collection_urls"].add(col_url)
+                if row["link"]:
+                    safe_det = _safe_link(col_url, row["link"], origin, permits)
+                    if safe_det:
+                        entry["detail_urls"].add(safe_det)
+
+    hydrated_templates: dict[str, list[dict[str, Any]]] = {}
+    for tpl in template_routes:
+        tpl_url = str(tpl.get("url") or "").strip()
+        tpl_method = str(tpl.get("method") or "GET").upper()
+        slots = _TEMPLATE_SLOT_RE.findall(tpl_url)
+        if len(slots) != 1:
+            continue
+        tpl_type = canonical_resource_type(tpl_url)
+        matches = [entry for (rtype, _), entry in sorted(typed_registry.items()) if rtype == tpl_type]
+        if not matches and any(tok in slots[0].lower() for tok in ("id", "plan", "item", "record")):
+            # Bounded integer-seed hydration ONLY for collection-less detail templates (e.g. GET /plans returns 404).
+            for seed_key in ("1", "2"):
+                concrete_seed = hydrate_template_url(tpl_url, seed_key, param_name=slots[0])
+                if not concrete_seed or not permits(concrete_seed):
+                    continue
+                for actor_name, identity in identities.items():
+                    if requests_used >= max_requests:
+                        break
+                    headers = identity.get("headers") if isinstance(identity, dict) else None
+                    if not isinstance(headers, dict):
+                        continue
+                    resp = _call(concrete_seed, headers)
+                    if resp.get("ok") and resp.get("status") == 200:
+                        try:
+                            seed_parsed = json.loads(str(resp.get("text") or ""))
+                        except ValueError:
+                            seed_parsed = None
+                        if isinstance(seed_parsed, dict):
+                            ns_key = (tpl_type, seed_key)
+                            entry = typed_registry.setdefault(ns_key, {
+                                "resource_type": tpl_type,
+                                "key": seed_key,
+                                "typed_key": f"{tpl_type}::{seed_key}",
+                                "observed_by": [],
+                                "tenants": set(),
+                                "owners": set(),
+                                "list_fields": set(str(k) for k in seed_parsed.keys()),
+                                "detail_urls": set(),
+                                "collection_urls": set(),
+                            })
+                            if actor_name not in entry["observed_by"]:
+                                entry["observed_by"].append(actor_name)
+                            entry["tenants"].update(normalize_tenant_values(seed_parsed))
+                            entry["owners"].update(normalize_owner_values(seed_parsed))
+                            entry["detail_urls"].add(concrete_seed)
+            matches = [entry for (rtype, _), entry in sorted(typed_registry.items()) if rtype == tpl_type]
+        hydrated_list: list[dict[str, Any]] = []
+        for entry in matches:
+            concrete = hydrate_template_url(tpl_url, entry["key"], param_name=slots[0])
+            if not concrete or not permits(concrete):
+                continue
+            entry["detail_urls"].add(concrete)
+            hydrated_list.append({
+                "template": tpl_url,
+                "method": tpl_method,
+                "url": concrete,
+                "param_name": slots[0],
+                "resource_type": tpl_type,
+                "key": entry["key"],
+                "observed_by": list(entry["observed_by"]),
+                "tenants": sorted(entry["tenants"]),
+                "owners": sorted(entry["owners"]),
+                "list_fields": sorted(entry["list_fields"]),
+            })
+        if hydrated_list:
+            hydrated_templates[f"{tpl_method} {tpl_url}"] = hydrated_list
+
+    # Fetch bounded owner detail GETs round-robin across resource types so no family starves.
+    detail_observations: dict[tuple[str, str], dict[str, Any]] = {}
+    for actor_name, identity in identities.items():
+        headers = identity.get("headers") if isinstance(identity, dict) else None
+        if not isinstance(headers, dict):
+            continue
+        by_type: dict[str, list[tuple[tuple[str, str], dict[str, Any]]]] = {}
+        for (rtype, key), entry in sorted(typed_registry.items()):
+            if actor_name in entry["observed_by"] and entry["detail_urls"]:
+                by_type.setdefault(rtype, []).append(((rtype, key), entry))
+        ordered_entries: list[tuple[tuple[str, str], dict[str, Any]]] = []
+        round_idx = 0
+        while len(ordered_entries) < max_detail_per_actor:
+            added = False
+            for rtype in sorted(by_type):
+                bucket = by_type[rtype]
+                if round_idx < len(bucket):
+                    ordered_entries.append(bucket[round_idx])
+                    added = True
+                    if len(ordered_entries) >= max_detail_per_actor:
+                        break
+            if not added:
+                break
+            round_idx += 1
+
+        fetched_for_actor = 0
+        for (rtype, key), entry in ordered_entries:
+            if fetched_for_actor >= max_detail_per_actor or requests_used >= max_requests:
+                break
+            detail_url = next(iter(sorted(entry["detail_urls"])), "")
+            if not detail_url:
+                continue
+            resp = _call(detail_url, headers)
+            fetched_for_actor += 1
+            text = str(resp.get("text") or "")
+            parsed = None
+            if resp.get("ok") and resp.get("status") == 200:
+                try:
+                    parsed = json.loads(text)
+                except ValueError:
+                    parsed = None
+            if isinstance(parsed, dict):
+                entry["tenants"].update(normalize_tenant_values(parsed))
+                entry["owners"].update(normalize_owner_values(parsed))
+            detail_observations[(actor_name, detail_url)] = {
+                "actor": actor_name,
+                "url": detail_url,
+                "resource_type": rtype,
+                "key": key,
+                "status": resp.get("status"),
+                "ok": bool(resp.get("ok")),
+                "parsed": parsed,
+                "text": text,
+                "fields": sorted(str(k) for k in parsed.keys()) if isinstance(parsed, dict) else [],
+            }
+
+    serialized_registry = {
+        f"{rtype}::{key}": {
+            "resource_type": rtype,
+            "key": key,
+            "observed_by": list(entry["observed_by"]),
+            "tenants": sorted(entry["tenants"]),
+            "owners": sorted(entry["owners"]),
+            "list_fields": sorted(entry["list_fields"]),
+            "detail_urls": sorted(entry["detail_urls"]),
+            "collection_urls": sorted(entry["collection_urls"]),
+        }
+        for (rtype, key), entry in sorted(typed_registry.items())
+    }
+    return {
+        "status": "ready" if typed_registry else "incomplete",
+        "requests": requests_used,
+        "resources": serialized_registry,
+        "hydrated_templates": hydrated_templates,
+        "collection_observations": collection_observations,
+        "detail_observations": detail_observations,
+        "reasons": [] if typed_registry else ["no typed resources observed"],
+    }

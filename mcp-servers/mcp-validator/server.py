@@ -58,6 +58,7 @@ from cco_validator_core import (  # noqa: E402
     redact_value,
     response_evidence,
     safe_curl,
+    summarize_differential_evidence,
 )
 from cco_validator_core.waf_retry import (  # noqa: E402
     MAX_WAF_RETRIES,
@@ -82,6 +83,7 @@ DEFAULT_TIMEOUT = int(os.environ.get("CCO_VALIDATOR_TIMEOUT", "20"))
 
 # Verdict sabitleri
 CONFIRMED = "CONFIRMED"
+PROBABLE = "PROBABLE"
 UNCONFIRMED = "UNCONFIRMED"
 INCONCLUSIVE = "INCONCLUSIVE"
 ERROR = "ERROR"
@@ -102,6 +104,10 @@ ORACLE_CONFIDENCE = {
     "token_differential": 0.88,
     "token_roundtrip": 0.90,
     "business_logic": 0.94,
+    "field_binding": 0.93,
+    "cross_tenant_isolation": 0.95,
+    "behavioral_differential": 0.68,
+    "role_differential": 0.66,
 }
 
 mcp = FastMCP(
@@ -435,7 +441,12 @@ def _result(vuln_type: str, target: str, verdict: str, oracle: str,
              severity: str = "high", guard: dict | None = None,
              request_evidence: list | None = None,
              signed_completion: dict | None = None) -> str:
-    confidence = ORACLE_CONFIDENCE.get(oracle, 0.0) if verdict == CONFIRMED else 0.0
+    if verdict == CONFIRMED:
+        confidence = ORACLE_CONFIDENCE.get(oracle, 0.0)
+    elif verdict == PROBABLE:
+        confidence = min(0.74, ORACLE_CONFIDENCE.get(oracle, 0.65))
+    else:
+        confidence = 0.0
     if isinstance(reproduction, str):
         reproduction = [reproduction]
     guard = guard or {}
@@ -448,7 +459,7 @@ def _result(vuln_type: str, target: str, verdict: str, oracle: str,
         "target": target,
         "verdict": verdict,
         "confidence": confidence,
-        "severity": severity if verdict == CONFIRMED else "info",
+        "severity": severity if verdict in {CONFIRMED, PROBABLE} else "info",
         "oracle": oracle,
         "evidence": evidence,
         "reproduction": reproduction,
@@ -467,6 +478,9 @@ def _result(vuln_type: str, target: str, verdict: str, oracle: str,
         "notes": notes,
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
+    if verdict == PROBABLE:
+        res["operator_review"] = True
+        res["review_tier"] = "operator-review"
     if signed_completion is not None and verdict == UNCONFIRMED:
         res["signed_completion"] = signed_completion
     _persist(res)
@@ -808,6 +822,12 @@ def _validate_sqli_inner(
         (f"{base_val}\" AND \"1\"=\"1", f"{base_val}\" AND \"1\"=\"2"),
         (f"{base_val}) AND (1=1", f"{base_val}) AND (1=2"),
     ]
+    err_sig = re.compile(
+        r"(SQL syntax|mysql_fetch|ORA-\d{5}|PostgreSQL.*ERROR|"
+        r"SQLite/JDBCDriver|Unclosed quotation mark|quoted string not properly|"
+        r"Microsoft OLE DB Provider|valid MySQL result|psql:|"
+        r"OperationalError|integer overflow|cardinality violation|subquery)", re.I)
+
     if boolean_only:
         # Explicitly bounded SELECT profile: numeric and quoted string
         # predicates only. A clean result covers these two dialect shapes.
@@ -885,6 +905,141 @@ def _validate_sqli_inner(
                                   response_evidence(fr2, "false-2", 0),
                                   response_evidence(tr2, "true-2", 0)])
 
+    err_sig = re.compile(
+        r"(SQL syntax|mysql_fetch|ORA-\d{5}|PostgreSQL.*ERROR|"
+        r"SQLite/JDBCDriver|Unclosed quotation mark|quoted string not properly|"
+        r"Microsoft OLE DB Provider|valid MySQL result|psql:|"
+        r"OperationalError|integer overflow|cardinality violation|subquery)", re.I)
+
+    sort_param_names = {"sort", "order", "order_by", "orderby", "sort_by", "sortby", "dir"}
+    if not boolean_only or param.lower() in sort_param_names:
+        # 1b) ORDER BY conditional error differential & reversible ASC/DESC differential.
+        def _order_err_matches(t_resp: dict, f_resp: dict) -> bool:
+            t_ok = bool(t_resp.get("ok")) and t_resp.get("status") in {200, 206} and t_resp.get("status") == base.get("status")
+            f_status = f_resp.get("status")
+            f_err = bool(f_resp.get("ok")) and (
+                (isinstance(f_status, int) and f_status >= 500)
+                or (
+                    bool(err_sig.search(f_resp.get("text", "")))
+                    and not err_sig.search(t_resp.get("text", ""))
+                    and not err_sig.search(base.get("text", ""))
+                )
+            )
+            return t_ok and f_err
+
+        order_error_pairs = [
+            (
+                f"{base_val},(SELECT CASE WHEN (1=1) THEN 1 ELSE 1/0 END)",
+                f"{base_val},(SELECT CASE WHEN (1=2) THEN 1 ELSE 1/0 END)",
+            ),
+            (
+                f"{base_val},(CASE WHEN (1=1) THEN 1 ELSE ABS(-9223372036854775808) END)",
+                f"{base_val},(CASE WHEN (1=2) THEN 1 ELSE ABS(-9223372036854775808) END)",
+            ),
+            (
+                f"(CASE WHEN (1=1) THEN {base_val} ELSE {base_val} END)",
+                f"(CASE WHEN (1=2) THEN {base_val} ELSE (SELECT 1 UNION SELECT 2) END)",
+            ),
+        ]
+        for t_pl, f_pl in order_error_pairs:
+            tr = send(t_pl)
+            fr = send(f_pl)
+            if not _order_err_matches(tr, fr):
+                continue
+            fr2 = send(f_pl)
+            tr2 = send(t_pl)
+            if _order_err_matches(tr2, fr2):
+                evidence = {
+                    "true_payload": t_pl,
+                    "false_payload": f_pl,
+                    "true_status": tr.get("status"),
+                    "false_status": fr.get("status"),
+                    "baseline_stability": round(baseline_stability, 4),
+                    "order_by_oracle": "conditional_error_differential",
+                }
+                return _result(
+                    "SQL Injection (ORDER BY)", target_url, CONFIRMED,
+                    "differential_order_by",
+                    evidence,
+                    [_reproduction(method, target_url, param=param, payload=t_pl,
+                                   body_template=body_template, headers=H, carrier=carrier),
+                     _reproduction(method, target_url, param=param, payload=f_pl,
+                                   body_template=body_template, headers=H, carrier=carrier)],
+                    notes="ORDER BY koşullu hata farkı ters istek sırasındaki ikinci turda tekrarlandı.",
+                    guard={
+                        "prerequisites": ["reachable baseline", "stable baseline"],
+                        "controls": ["repeated stable baseline", "two consistent ORDER BY error rounds",
+                                     "reversed request order"],
+                        "transport_ok": True,
+                        "decision_rule": "TRUE condition matches baseline 2xx and FALSE condition triggers repeatable error",
+                    },
+                    request_evidence=[response_evidence(base, "baseline", 0),
+                                      response_evidence(tr, "order-true-1", 0),
+                                      response_evidence(fr, "order-false-1", 0),
+                                      response_evidence(fr2, "order-false-2", 0),
+                                      response_evidence(tr2, "order-true-2", 0)],
+                )
+
+        base_clean = str(base_val or "").strip()
+        if (base.get("status") == 200 and base_clean
+                and base_clean.lower() not in {"asc", "desc"}
+                and not re.search(r"\s+(?:asc|desc)\Z", base_clean, re.I)):
+            asc_pl = f"{base_clean} ASC"
+            desc_pl = f"{base_clean} DESC"
+            asc1 = send(asc_pl)
+            desc1 = send(desc_pl)
+            len_diff = abs(int(asc1.get("len", 0)) - int(desc1.get("len", 0)))
+            len_bound = max(64, int(max(int(asc1.get("len", 0)), 1) * 0.20))
+            round1_ok = (
+                asc1.get("ok") and desc1.get("ok")
+                and asc1.get("status") == 200 and desc1.get("status") == 200
+                and asc1.get("text", "") == base.get("text", "")
+                and asc1.get("text", "") != desc1.get("text", "")
+                and asc_pl not in asc1.get("text", "")
+                and desc_pl not in desc1.get("text", "")
+                and len_diff <= len_bound
+            )
+            if round1_ok:
+                desc2 = send(desc_pl)
+                asc2 = send(asc_pl)
+                round2_ok = (
+                    asc2.get("ok") and desc2.get("ok")
+                    and asc2.get("status") == 200 and desc2.get("status") == 200
+                    and asc2.get("text", "") == asc1.get("text", "")
+                    and desc2.get("text", "") == desc1.get("text", "")
+                )
+                if round2_ok:
+                    evidence = {
+                        "asc_payload": asc_pl,
+                        "desc_payload": desc_pl,
+                        "baseline_stability": round(baseline_stability, 4),
+                        "asc_len": asc1.get("len"),
+                        "desc_len": desc1.get("len"),
+                        "order_by_oracle": "reversible_direction_differential",
+                    }
+                    return _result(
+                        "SQL Injection (ORDER BY)", target_url, CONFIRMED,
+                        "differential_order_by",
+                        evidence,
+                        [_reproduction(method, target_url, param=param, payload=asc_pl,
+                                       body_template=body_template, headers=H, carrier=carrier),
+                         _reproduction(method, target_url, param=param, payload=desc_pl,
+                                       body_template=body_template, headers=H, carrier=carrier)],
+                        notes="ORDER BY ASC/DESC sıralama farkı ters sırada tekrarlandı.",
+                        guard={
+                            "prerequisites": ["reachable baseline", "stable baseline"],
+                            "controls": ["baseline == ASC", "ASC != DESC", "reversed order repeatability",
+                                         "stable response length"],
+                            "transport_ok": True,
+                            "decision_rule": "baseline == ASC != DESC across two reversed rounds",
+                        },
+                        request_evidence=[response_evidence(base, "baseline", 0),
+                                          response_evidence(asc1, "order-asc-1", 0),
+                                          response_evidence(desc1, "order-desc-1", 0),
+                                          response_evidence(desc2, "order-desc-2", 0),
+                                          response_evidence(asc2, "order-asc-2", 0)],
+                    )
+
     if boolean_only:
         verdict = UNCONFIRMED if trace.complete and not differential_candidates else INCONCLUSIVE
         completion_env = (
@@ -912,10 +1067,6 @@ def _validate_sqli_inner(
             signed_completion=completion_env)
 
     # 2) Error-based imzalar
-    err_sig = re.compile(
-        r"(SQL syntax|mysql_fetch|ORA-\d{5}|PostgreSQL.*ERROR|"
-        r"SQLite/JDBCDriver|Unclosed quotation mark|quoted string not properly|"
-        r"Microsoft OLE DB Provider|valid MySQL result|psql:)", re.I)
     er = send(base_val + "'")
     error_signal = None
     if er.get("ok") and err_sig.search(er.get("text", "")) and not err_sig.search(base.get("text", "")):
@@ -2385,6 +2536,1308 @@ def validate_business_logic(
             },
             request_evidence=req_evidence,
             signed_completion=biz_completion,
+        )
+
+
+def _extract_next_csrf(resp: dict) -> str:
+    hdrs = resp.get("headers") if isinstance(resp, dict) else None
+    if isinstance(hdrs, dict):
+        for k, v in hdrs.items():
+            if str(k).lower() == "x-csrf-token-next" and isinstance(v, str) and v.strip():
+                return v.strip()
+    try:
+        body = json.loads(str((resp or {}).get("text") or ""))
+    except ValueError:
+        body = None
+    if isinstance(body, dict):
+        tok = body.get("csrf_token")
+        if isinstance(tok, str) and tok.strip():
+            return tok.strip()
+    return ""
+
+
+def _update_csrf_headers(headers: dict, resp: dict) -> dict:
+    updated = dict(headers or {})
+    nxt = _extract_next_csrf(resp)
+    if nxt:
+        key = next((k for k in updated if str(k).lower() == "x-csrf-token"), "X-CSRF-Token")
+        updated[key] = nxt
+    return updated
+
+
+def _is_challenge_or_degradation(resp: dict) -> tuple[bool, str]:
+    if not isinstance(resp, dict) or not resp.get("ok"):
+        return True, "transport_failure"
+    status = resp.get("status")
+    if status is None:
+        return True, "missing_status"
+    hdrs = {str(k).lower(): str(v) for k, v in (resp.get("headers") or {}).items()} if isinstance(resp.get("headers"), dict) else {}
+    if "x-lab-injected" in hdrs:
+        return True, "injected_fault"
+    if status == 429:
+        return True, "rate_limited_429"
+    if status >= 500:
+        return True, f"server_error_{status}"
+    if status == 403:
+        text_low = str(resp.get("text") or "")[:512].lower()
+        if (
+            any(k in hdrs for k in ("x-telemetry-challenge", "x-challenge", "cf-mitigated", "x-waf-challenge"))
+            or any(tok in text_low for tok in ("telemetry", "challenge", "captcha", "bot verification"))
+        ) and not any(tok in text_low for tok in ("forbidden", "role", "permission", "unauthorized", "admin only")):
+            return True, "telemetry_challenge_403"
+    return False, ""
+
+
+def _json_body(resp: dict):
+    try:
+        return json.loads(str((resp or {}).get("text") or ""))
+    except ValueError:
+        return None
+
+
+def _normalized_field_key(name: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", str(name or "").lower())
+
+
+def _extract_tenants_generic(node) -> set[str]:
+    tenants: set[str] = set()
+    tenant_keys = {
+        "tenant", "tenantid", "tenantslug", "tenantname", "tenantcode",
+        "org", "orgid", "orgslug", "organization", "organizationid",
+        "company", "companyid", "workspace", "workspaceid", "plant", "plantid",
+    }
+    stack = [node]
+    visited = 0
+    while stack and visited < 512:
+        cur = stack.pop()
+        visited += 1
+        if isinstance(cur, list):
+            stack.extend(cur[:128])
+        elif isinstance(cur, dict):
+            for k, v in cur.items():
+                nk = _normalized_field_key(k)
+                if nk in tenant_keys:
+                    if isinstance(v, str) and v.strip():
+                        tenants.add(v.strip())
+                    elif isinstance(v, dict):
+                        for sk in ("id", "slug", "name", "code"):
+                            sv = v.get(sk)
+                            if isinstance(sv, str) and sv.strip():
+                                tenants.add(sv.strip())
+                if isinstance(v, (dict, list)):
+                    stack.append(v)
+    return tenants
+
+
+def _extract_owners_generic(node) -> set[str]:
+    owners: set[str] = set()
+    prefixes = ("owner", "custodian", "createdby", "requestedby", "assignedto", "author", "creator", "requester", "maintainer", "technician")
+    stack = [node]
+    visited = 0
+    while stack and visited < 256:
+        cur = stack.pop()
+        visited += 1
+        if isinstance(cur, list):
+            stack.extend(cur[:64])
+        elif isinstance(cur, dict):
+            for k, v in cur.items():
+                nk = _normalized_field_key(k)
+                if nk in {"owner", "custodian"} or (
+                    any(nk.startswith(p) for p in prefixes)
+                    and nk.endswith(("id", "uuid", "alias", "email", "username", "name"))
+                ):
+                    if isinstance(v, (str, int)) and not isinstance(v, bool) and str(v).strip():
+                        owners.add(str(v).strip())
+                    elif isinstance(v, dict):
+                        for sk in ("id", "uuid", "alias", "email", "username"):
+                            sv = v.get(sk)
+                            if isinstance(sv, (str, int)) and not isinstance(sv, bool) and str(sv).strip():
+                                owners.add(str(sv).strip())
+                if isinstance(v, (dict, list)):
+                    stack.append(v)
+    return owners
+
+
+_SENSITIVE_DETAIL_FIELD_RE = re.compile(
+    r"(?:private|secret|internal|confidential|restricted|note|notes|comment|remarks|pii|ssn|salary|tax|audit|token_hint|diagnostic|calibration|inspection|billing|contact|phone)",
+    re.I,
+)
+
+
+def _private_detail_differential(parsed_body, list_fields: set[str]) -> tuple[list[str], list[str]]:
+    if not isinstance(parsed_body, dict):
+        return [], []
+    all_keys = [str(k) for k in parsed_body.keys()]
+    non_list = sorted(k for k in all_keys if list_fields and k not in list_fields)
+    sensitive = sorted(k for k in all_keys if _SENSITIVE_DETAIL_FIELD_RE.search(k))
+    return non_list, sensitive
+
+
+def _standalone_field_binding_gate(method, url, headers):
+    norm_method = str(method or "GET").upper()
+    try:
+        scripts = os.path.abspath(os.path.join(_SERVER_DIR, "..", "..", "scripts"))
+        if scripts not in sys.path:
+            sys.path.insert(0, scripts)
+        from policy_engine import PolicyEngine
+        decision = PolicyEngine().validate_wire_invocation("validator_validate_field_binding", {
+            "target_url": url,
+            "url": url,
+            "method": norm_method,
+            "headers": dict(headers or {}),
+        })
+        return bool(decision.get("allowed")), str(decision.get("reason") or "blocked")
+    except Exception:
+        return False, "field binding policy unavailable"
+
+
+def _standalone_access_control_gate(method, url, headers):
+    norm_method = str(method or "GET").upper()
+    try:
+        scripts = os.path.abspath(os.path.join(_SERVER_DIR, "..", "..", "scripts"))
+        if scripts not in sys.path:
+            sys.path.insert(0, scripts)
+        from policy_engine import PolicyEngine
+        decision = PolicyEngine().validate_wire_invocation("validator_validate_access_control", {
+            "target_url": url,
+            "url": url,
+            "method": norm_method,
+            "headers": dict(headers or {}),
+        })
+        return bool(decision.get("allowed")), str(decision.get("reason") or "blocked")
+    except Exception:
+        return False, "access control policy unavailable"
+
+
+def _field_value_matches(actual, expected) -> bool:
+    if isinstance(expected, bool):
+        return actual is expected
+    if isinstance(expected, (int, float)) and not isinstance(actual, bool) and isinstance(actual, (int, float)):
+        return actual == expected
+    return str(actual) == str(expected)
+
+
+def _find_persisted_field(read_body, field_name: str, expected_value, created_id=None) -> tuple[bool, object]:
+    """Check independent GET response JSON for persistence of field_name == expected_value."""
+    if isinstance(read_body, dict):
+        # If this dict wraps a collection list (e.g. items/results/resource list), inspect the list item first.
+        list_subs = [v for v in read_body.values() if isinstance(v, list) and (not v or isinstance(v[0], dict))]
+        if created_id is not None and list_subs:
+            for sub in list_subs:
+                if sub:
+                    return _find_persisted_field(sub, field_name, expected_value, created_id=created_id)
+        for container_key in ("items", "results", "data", "entries", "records"):
+            sub = read_body.get(container_key)
+            if isinstance(sub, list) and sub:
+                return _find_persisted_field(sub, field_name, expected_value, created_id=created_id)
+            if isinstance(sub, dict) and field_name in sub:
+                if _field_value_matches(sub[field_name], expected_value):
+                    return True, sub[field_name]
+                return False, sub[field_name]
+        for sub in list_subs:
+            if sub:
+                return _find_persisted_field(sub, field_name, expected_value, created_id=created_id)
+        if field_name in read_body:
+            if _field_value_matches(read_body[field_name], expected_value):
+                return True, read_body[field_name]
+            return False, read_body[field_name]
+    elif isinstance(read_body, list):
+        candidates = read_body
+        if created_id is not None:
+            matched = [
+                item for item in read_body
+                if isinstance(item, dict) and (
+                    str(item.get("id", "")) == str(created_id)
+                    or any(k.endswith("_id") and str(v) == str(created_id) for k, v in item.items())
+                )
+            ]
+            if matched:
+                candidates = matched
+        else:
+            candidates = read_body[-1:]
+        for item in candidates:
+            if isinstance(item, dict) and field_name in item:
+                if _field_value_matches(item[field_name], expected_value):
+                    return True, item[field_name]
+                return False, item[field_name]
+    return False, None
+
+
+def _resolve_vault_headers(target_url: str, headers_json: str, identity: str = "") -> dict:
+    hdrs = _headers(headers_json)
+    if any(str(k).lower() in _CREDENTIAL_HEADERS and str(v).strip() for k, v in hdrs.items()):
+        return hdrs
+    if not identity:
+        return hdrs
+    try:
+        mem_dir = os.path.abspath(os.path.join(_SERVER_DIR, "..", "mcp-memory-server"))
+        if mem_dir not in sys.path:
+            sys.path.insert(0, mem_dir)
+        from cco_surface_core import session_store
+        parsed = urlparse(str(target_url or ""))
+        origin_slash = f"{parsed.scheme}://{parsed.netloc}/"
+        origin_bare = f"{parsed.scheme}://{parsed.netloc}"
+        entry = session_store.get_session(origin_slash, identity) or session_store.get_session(origin_bare, identity)
+        if isinstance(entry, dict) and isinstance(entry.get("headers"), dict):
+            resolved = {str(k): str(v) for k, v in entry["headers"].items()}
+            resolved.setdefault("User-Agent", UA)
+            for k, v in hdrs.items():
+                resolved.setdefault(k, v)
+            return resolved
+    except Exception:
+        pass
+    return hdrs
+
+
+@mcp.tool()
+def validate_field_binding(
+    target_url: str,
+    method: str = "PUT",
+    carrier: str = "json",
+    read_url: str = "",
+    headers_json: str = "{}",
+    identity: str = "",
+    allowed_payload_json: str = "{}",
+    candidate_fields_json: str = "[]",
+    write_isolation_json: str = "",
+    expected_run_id: str = "",
+    session_check_url: str = "",
+    mode: str = "blind",
+    expected_rule_json: str = "{}",
+    operation_id: str = "",
+    param: str = "",
+) -> str:
+    """Validate field-binding / mass-assignment via control + candidate probe + independent read-after-write GET.
+
+    Requires a valid, fresh, run-scoped write_isolation attestation before any traffic.
+    Never trusts echoed write responses alone: always verifies persistence via GET readback.
+    """
+    scripts_dir = os.path.abspath(os.path.join(_SERVER_DIR, "..", "..", "scripts"))
+    if scripts_dir not in sys.path:
+        sys.path.insert(0, scripts_dir)
+    from cco_validator_core.egress import current_wire_gate, scoped_wire_gate
+    from cco_validator_core.evidence import current_validation_context
+    from write_isolation import verify_attestation
+
+    parsed_target = urlparse(str(target_url or ""))
+    if parsed_target.scheme not in {"http", "https"} or not parsed_target.hostname or parsed_target.username is not None:
+        return _result("Field Binding", target_url, ERROR, "field_binding",
+                       {"argument_error": "valid HTTP(S) target_url required", "writes_emitted": 0}, "-",
+                       guard={"transport_ok": False})
+    norm_method = str(method or "PUT").upper()
+    if norm_method not in {"POST", "PUT", "PATCH"}:
+        return _result("Field Binding", target_url, ERROR, "field_binding",
+                       {"argument_error": "method must be POST, PUT, or PATCH", "writes_emitted": 0}, "-",
+                       guard={"transport_ok": False})
+    norm_carrier = _normalize_carrier(carrier, norm_method)
+    if norm_carrier not in {"json", "form"}:
+        return _result("Field Binding", target_url, ERROR, "field_binding",
+                       {"argument_error": "carrier must be json or form", "writes_emitted": 0}, "-",
+                       guard={"transport_ok": False})
+
+    ctx = current_validation_context()
+    eff_run_id = str(expected_run_id or ctx.get("run_id") or os.environ.get("CCO_RUN_ID") or "").strip()
+    raw_attestation = write_isolation_json or os.environ.get("CCO_WRITE_ISOLATION_FILE") or ""
+    att_ok, att_reason = verify_attestation(
+        raw_attestation,
+        expected_origin=target_url,
+        expected_run_id=eff_run_id,
+    )
+    if not att_ok:
+        return _result(
+            "Field Binding",
+            target_url,
+            INCONCLUSIVE,
+            "field_binding",
+            {
+                "blocked": True,
+                "blocked_reason": "write_isolation_unattested",
+                "detail": att_reason,
+                "writes_emitted": 0,
+            },
+            "-",
+            notes=f"Blocked before write traffic: {att_reason}",
+            guard={
+                "transport_ok": False,
+                "prerequisites": ["run-scoped fresh write_isolation attestation"],
+                "decision_rule": "fail_closed_write_isolation",
+                "limitations": [att_reason],
+            },
+            request_evidence=[],
+        )
+
+    eff_mode = str(mode or "blind").strip().lower()
+    try:
+        expected_rule = json.loads(expected_rule_json) if expected_rule_json else {}
+    except ValueError:
+        expected_rule = {}
+    if eff_mode == "policy" and (not isinstance(expected_rule, dict) or not expected_rule.get("expect")):
+        return _result(
+            "Field Binding",
+            target_url,
+            INCONCLUSIVE,
+            "field_binding",
+            {"oracle_gap": True, "reason": "oracle_gap:missing_policy_rule", "writes_emitted": 0},
+            "-",
+            notes="Policy mode missing field-binding rule; zero write requests emitted.",
+            guard={"transport_ok": False, "limitations": ["oracle_gap:missing_policy_rule"]},
+            request_evidence=[],
+        )
+
+    try:
+        allowed_payload = json.loads(allowed_payload_json) if allowed_payload_json else {}
+    except ValueError:
+        allowed_payload = {}
+    if not isinstance(allowed_payload, dict):
+        allowed_payload = {}
+
+    try:
+        raw_candidates = json.loads(candidate_fields_json) if candidate_fields_json else []
+    except ValueError:
+        raw_candidates = []
+    candidates: list[dict] = []
+    if isinstance(raw_candidates, list):
+        for entry in raw_candidates:
+            if isinstance(entry, str) and entry.strip():
+                candidates.append({"name": entry.strip(), "value": "probe_restricted_val"})
+            elif isinstance(entry, dict) and isinstance(entry.get("name"), str) and entry["name"].strip():
+                candidates.append({"name": entry["name"].strip(), "value": entry.get("value", "probe_restricted_val")})
+    if not candidates:
+        return _result(
+            "Field Binding",
+            target_url,
+            INCONCLUSIVE,
+            "field_binding",
+            {"oracle_gap": True, "reason": "no_candidate_restricted_fields", "writes_emitted": 0},
+            "-",
+            notes="No candidate restricted fields supplied for field-binding probe.",
+            guard={"transport_ok": False},
+            request_evidence=[],
+        )
+
+    eff_read_url = urljoin(target_url, read_url) if read_url else target_url
+    read_parsed = urlparse(eff_read_url)
+    if (read_parsed.scheme, read_parsed.netloc) != (parsed_target.scheme, parsed_target.netloc):
+        return _result("Field Binding", target_url, ERROR, "field_binding",
+                       {"argument_error": "read_url must share origin with target_url", "writes_emitted": 0}, "-",
+                       guard={"transport_ok": False})
+
+    working_headers = _resolve_vault_headers(target_url, headers_json, identity)
+    req_evidence: list[dict] = []
+    use_policy_gate = current_wire_gate() is None and (
+        os.environ.get("CCO_SCOPE_FILE") or os.environ.get("CCO_PROGRAM_POLICY_FILE")
+    )
+    gate_ctx = scoped_wire_gate(_standalone_field_binding_gate) if use_policy_gate else nullcontext()
+    eff_param = str(param or candidates[0]["name"]).strip() or candidates[0]["name"]
+
+    with _direct_context_scope(
+        target_url=target_url,
+        param=eff_param,
+        method=norm_method,
+        carrier=norm_carrier,
+        vuln_class="field_binding",
+    ), gate_ctx:
+        if session_check_url:
+            sc_parsed = urlparse(urljoin(target_url, session_check_url))
+            if (sc_parsed.scheme, sc_parsed.netloc) == (parsed_target.scheme, parsed_target.netloc):
+                sc_resp = _request("GET", sc_parsed.geturl(), headers=working_headers, allow_redirects=False, observe_session=False)
+                if sc_resp.get("ok"):
+                    working_headers = _update_csrf_headers(working_headers, sc_resp)
+
+        pre_resp = _request("GET", eff_read_url, headers=working_headers, allow_redirects=False, observe_session=False)
+        req_evidence.append(response_evidence(pre_resp, "pre-state", 0))
+        working_headers = _update_csrf_headers(working_headers, pre_resp)
+        challenged, ch_reason = _is_challenge_or_degradation(pre_resp)
+        if challenged or pre_resp.get("status") not in {200, 206}:
+            return _result(
+                "Field Binding",
+                target_url,
+                INCONCLUSIVE,
+                "field_binding",
+                {"pre_state_status": pre_resp.get("status"), "reason": ch_reason or "pre_state_unavailable", "writes_emitted": 0},
+                "-",
+                notes="Pre-state GET readback failed before any write.",
+                guard={"transport_ok": bool(pre_resp.get("ok"))},
+                request_evidence=req_evidence,
+            )
+        pre_json = _json_body(pre_resp)
+
+        # Control probe (allowed fields only)
+        ctrl_body, ctrl_hdrs = _encode_biz_body(allowed_payload, norm_carrier, working_headers)
+        ctrl_resp = _request(norm_method, target_url, data=ctrl_body, headers=ctrl_hdrs, allow_redirects=False, observe_session=False)
+        req_evidence.append(response_evidence(ctrl_resp, "control-write", 0))
+        working_headers = _update_csrf_headers(working_headers, ctrl_resp)
+        if ctrl_resp.get("blocked") == "policy":
+            return _result(
+                "Field Binding",
+                target_url,
+                INCONCLUSIVE,
+                "field_binding",
+                {"blocked": True, "blocked_reason": str(ctrl_resp.get("error") or "policy_blocked"), "writes_emitted": 0},
+                "-",
+                notes="Write request blocked by PolicyEngine.",
+                guard={"transport_ok": False},
+                request_evidence=req_evidence,
+            )
+        ch_ctrl, ch_ctrl_reason = _is_challenge_or_degradation(ctrl_resp)
+        if ch_ctrl or ctrl_resp.get("status") not in {200, 201, 204}:
+            return _result(
+                "Field Binding",
+                target_url,
+                INCONCLUSIVE,
+                "field_binding",
+                {"control_status": ctrl_resp.get("status"), "reason": ch_ctrl_reason or "control_write_failed"},
+                "-",
+                notes="Allowed-field control write did not succeed cleanly.",
+                guard={"transport_ok": bool(ctrl_resp.get("ok"))},
+                request_evidence=req_evidence,
+            )
+
+        ctrl_read_resp = _request("GET", eff_read_url, headers=working_headers, allow_redirects=False, observe_session=False)
+        req_evidence.append(response_evidence(ctrl_read_resp, "control-readback", 0))
+        working_headers = _update_csrf_headers(working_headers, ctrl_read_resp)
+        if not ctrl_read_resp.get("ok") or ctrl_read_resp.get("status") not in {200, 206}:
+            return _result(
+                "Field Binding",
+                target_url,
+                INCONCLUSIVE,
+                "field_binding",
+                {"control_readback_status": ctrl_read_resp.get("status")},
+                "-",
+                notes="Independent GET readback after control write failed.",
+                guard={"transport_ok": bool(ctrl_read_resp.get("ok"))},
+                request_evidence=req_evidence,
+            )
+
+        persisted_violations: list[dict] = []
+        probe_statuses: list[dict] = []
+        repro_cmds: list[str] = []
+        last_probe_read_json = None
+        for idx, cand in enumerate(candidates):
+            fname = cand["name"]
+            fval = cand["value"]
+            if isinstance(pre_json, dict) and fname in pre_json and _field_value_matches(pre_json[fname], fval):
+                # Ensure probe sentinel differs from baseline value.
+                fval = f"probe_{fname}_override" if not isinstance(fval, bool) else (not fval)
+            probe_payload = {**allowed_payload, fname: fval}
+            p_body, p_hdrs = _encode_biz_body(probe_payload, norm_carrier, working_headers)
+            probe_resp = _request(norm_method, target_url, data=p_body, headers=p_hdrs, allow_redirects=False, observe_session=False)
+            req_evidence.append(response_evidence(probe_resp, f"probe-write-{idx}", idx))
+            working_headers = _update_csrf_headers(working_headers, probe_resp)
+            p_status = probe_resp.get("status")
+            ch_probe, ch_probe_reason = _is_challenge_or_degradation(probe_resp)
+            if ch_probe:
+                return _result(
+                    "Field Binding",
+                    target_url,
+                    INCONCLUSIVE,
+                    "field_binding",
+                    {"probe_status": p_status, "field": fname, "reason": ch_probe_reason},
+                    "-",
+                    notes=f"Probe write interrupted by {ch_probe_reason}.",
+                    guard={"transport_ok": bool(probe_resp.get("ok"))},
+                    request_evidence=req_evidence,
+                )
+            if p_status in {400, 403, 422}:
+                probe_statuses.append({"field": fname, "write_status": p_status, "persisted": False, "outcome": "rejected"})
+                continue
+            if p_status not in {200, 201, 204}:
+                probe_statuses.append({"field": fname, "write_status": p_status, "persisted": False, "outcome": "non_success"})
+                continue
+
+            write_echo_json = _json_body(probe_resp)
+            created_id = None
+            if isinstance(write_echo_json, dict):
+                created_id = write_echo_json.get("id")
+                if created_id is None:
+                    for ek, ev in write_echo_json.items():
+                        if str(ek).endswith("_id") and isinstance(ev, (str, int)) and not isinstance(ev, bool):
+                            created_id = ev
+                            break
+                if created_id is None:
+                    for subval in write_echo_json.values():
+                        if isinstance(subval, dict):
+                            created_id = subval.get("id") or next(
+                                (sv for sk, sv in subval.items() if str(sk).endswith("_id") and isinstance(sv, (str, int))),
+                                None,
+                            )
+                            if created_id is not None:
+                                break
+            verify_read_url = eff_read_url
+            if norm_method == "POST" and created_id is not None and eff_read_url.rstrip("/") == target_url.rstrip("/"):
+                detail_cand = f"{eff_read_url.rstrip('/')}/{created_id}"
+                detail_probe = _request("GET", detail_cand, headers=working_headers, allow_redirects=False, observe_session=False)
+                if detail_probe.get("ok") and detail_probe.get("status") == 200:
+                    verify_read_url = detail_cand
+                    read_resp = detail_probe
+                else:
+                    read_resp = _request("GET", eff_read_url, headers=working_headers, allow_redirects=False, observe_session=False)
+            else:
+                read_resp = _request("GET", eff_read_url, headers=working_headers, allow_redirects=False, observe_session=False)
+            req_evidence.append(response_evidence(read_resp, f"probe-readback-{idx}", idx))
+            working_headers = _update_csrf_headers(working_headers, read_resp)
+            r_status = read_resp.get("status")
+            if not read_resp.get("ok") or r_status not in {200, 206}:
+                if r_status in {403, 404} and re.search(
+                    r"(?:tenant|org|owner|custodian|user|assigned|created_by|requested_by)",
+                    fname,
+                    re.I,
+                ):
+                    persisted_violations.append({
+                        "field": fname,
+                        "probe_value": fval,
+                        "observed_value": f"readback_status_{r_status}",
+                        "readback_url": verify_read_url,
+                    })
+                    probe_statuses.append({
+                        "field": fname,
+                        "write_status": p_status,
+                        "readback_status": r_status,
+                        "readback_url": verify_read_url,
+                        "persisted": True,
+                        "outcome": "ownership_or_tenant_rebound",
+                    })
+                    repro_cmds.append(_curl(norm_method, target_url, p_body, p_hdrs))
+                    repro_cmds.append(_curl("GET", verify_read_url, headers=working_headers))
+                    continue
+                if persisted_violations:
+                    probe_statuses.append({
+                        "field": fname,
+                        "write_status": p_status,
+                        "readback_status": r_status,
+                        "readback_url": verify_read_url,
+                        "persisted": False,
+                        "outcome": "readback_unavailable_after_prior_hit",
+                    })
+                    continue
+                return _result(
+                    "Field Binding",
+                    target_url,
+                    INCONCLUSIVE,
+                    "field_binding",
+                    {"probe_readback_status": r_status, "field": fname},
+                    "-",
+                    notes="Independent read-after-write GET failed.",
+                    guard={"transport_ok": bool(read_resp.get("ok"))},
+                    request_evidence=req_evidence,
+                )
+            read_json = _json_body(read_resp)
+            last_probe_read_json = read_json
+            persisted, observed_val = _find_persisted_field(read_json, fname, fval, created_id=created_id)
+            probe_statuses.append({
+                "field": fname,
+                "write_status": p_status,
+                "readback_status": read_resp.get("status"),
+                "readback_url": verify_read_url,
+                "persisted": persisted,
+            })
+            if persisted:
+                persisted_violations.append({"field": fname, "probe_value": fval, "observed_value": observed_val, "readback_url": verify_read_url})
+                repro_cmds.append(_curl(norm_method, target_url, p_body, p_hdrs))
+                repro_cmds.append(_curl("GET", verify_read_url, headers=working_headers))
+
+        diff_summary = summarize_differential_evidence(pre_json, last_probe_read_json, signals=["read_after_write_persistence"] if persisted_violations else [])
+        evidence = {
+            "mode": eff_mode,
+            "method": norm_method,
+            "read_url": eff_read_url,
+            "control_status": ctrl_resp.get("status"),
+            "probes": probe_statuses,
+            "persisted_fields": [item["field"] for item in persisted_violations],
+            "independent_readback_verified": True,
+            "differential": diff_summary,
+            **({"operation_id": operation_id} if operation_id else {}),
+        }
+        if persisted_violations:
+            if eff_mode == "policy":
+                restricted_rule_fields = set(expected_rule.get("restricted_fields") or [])
+                matched_policy = not restricted_rule_fields or any(
+                    item["field"] in restricted_rule_fields for item in persisted_violations
+                )
+                if matched_policy:
+                    return _result(
+                        "Field Binding / Mass Assignment",
+                        target_url,
+                        CONFIRMED,
+                        "field_binding",
+                        evidence,
+                        repro_cmds,
+                        notes="Restricted field binding confirmed by policy rule and independent read-after-write GET.",
+                        severity="high",
+                        guard={
+                            "prerequisites": ["write_isolation attestation", "QA expectation policy rule"],
+                            "controls": ["allowed-field control", "independent read-after-write GET"],
+                            "transport_ok": True,
+                            "decision_rule": "policy_restricted_field_persisted_on_readback",
+                        },
+                        request_evidence=req_evidence,
+                    )
+                return _result(
+                    "Field Binding",
+                    target_url,
+                    INCONCLUSIVE,
+                    "field_binding",
+                    {**evidence, "oracle_gap": True, "reason": "oracle_gap:field_not_in_policy_rule"},
+                    repro_cmds,
+                    notes="Persisted field is not covered by current policy rule.",
+                    guard={"transport_ok": True},
+                    request_evidence=req_evidence,
+                )
+            return _result(
+                "Field Binding / Mass Assignment (Operator Review)",
+                target_url,
+                PROBABLE,
+                "behavioral_differential",
+                evidence,
+                repro_cmds,
+                notes="Candidate restricted field persisted across independent read-after-write GET in blind mode; requires operator review.",
+                severity="medium",
+                guard={
+                    "prerequisites": ["write_isolation attestation", "allowed-field control"],
+                    "controls": ["allowed-field control", "independent read-after-write GET"],
+                    "transport_ok": True,
+                    "decision_rule": "blind_restricted_field_persisted_on_readback",
+                },
+                request_evidence=req_evidence,
+            )
+
+        completion = _build_validator_completion(
+            target_url=target_url,
+            param=eff_param,
+            method=norm_method,
+            carrier=norm_carrier,
+            profile="field_binding",
+            required_checks=["pre_state", "allowed_control", "restricted_field_probe", "read_after_write_get"],
+        )
+        return _result(
+            "Field Binding",
+            target_url,
+            UNCONFIRMED,
+            "field_binding",
+            evidence,
+            repro_cmds or "-",
+            notes="Allowed-field control succeeded and candidate restricted fields were ignored or rejected on independent GET readback.",
+            guard={
+                "prerequisites": ["write_isolation attestation"],
+                "controls": ["allowed-field control", "independent read-after-write GET"],
+                "transport_ok": True,
+                "decision_rule": "control_passed_and_restricted_fields_not_persisted",
+            },
+            request_evidence=req_evidence,
+            signed_completion=completion,
+        )
+
+
+@mcp.tool()
+def validate_access_control(
+    target_url: str,
+    check_category: str,
+    caller_headers_json: str = "{}",
+    caller_alias: str = "",
+    caller_role: str = "",
+    caller_tenant: str = "",
+    owner_headers_json: str = "{}",
+    owner_alias: str = "",
+    owner_tenant: str = "",
+    mode: str = "blind",
+    expected_rule_json: str = "{}",
+    list_fields_json: str = "[]",
+    absent_from_caller_collection: bool = False,
+    repeat_check: bool = True,
+    operation_id: str = "",
+) -> str:
+    """Validate multi-tenant/role/peer access control in Blind Mode or Policy-Verified QA Mode."""
+    scripts_dir = os.path.abspath(os.path.join(_SERVER_DIR, "..", "..", "scripts"))
+    if scripts_dir not in sys.path:
+        sys.path.insert(0, scripts_dir)
+    from cco_validator_core.egress import current_wire_gate, scoped_wire_gate
+    from qa_expectation_policy import evaluate_access_rule
+
+    resolved_caller_h = _resolve_vault_headers(target_url, caller_headers_json, caller_alias)
+    caller_h, caller_err = _strict_identity_headers(json.dumps(resolved_caller_h))
+    if caller_err:
+        return _result("Access Control", target_url, ERROR, "cross_tenant_isolation",
+                       {"argument_error": caller_err}, "-", guard={"transport_ok": False})
+    eff_mode = str(mode or "blind").strip().lower()
+    try:
+        expected_rule = json.loads(expected_rule_json) if expected_rule_json else {}
+    except ValueError:
+        expected_rule = {}
+    if eff_mode == "policy" and (not isinstance(expected_rule, dict) or not expected_rule.get("expect")):
+        return _result(
+            "Access Control",
+            target_url,
+            INCONCLUSIVE,
+            "cross_tenant_isolation",
+            {"oracle_gap": True, "reason": "oracle_gap:missing_policy_rule"},
+            "-",
+            notes="Policy mode missing access rule; zero side effects.",
+            guard={"transport_ok": False, "limitations": ["oracle_gap:missing_policy_rule"]},
+            request_evidence=[],
+        )
+
+    try:
+        raw_list_fields = json.loads(list_fields_json) if list_fields_json else []
+    except ValueError:
+        raw_list_fields = []
+    list_fields = {str(f) for f in raw_list_fields if isinstance(f, str)}
+
+    use_policy_gate = current_wire_gate() is None and (
+        os.environ.get("CCO_SCOPE_FILE") or os.environ.get("CCO_PROGRAM_POLICY_FILE")
+    )
+    gate_ctx = scoped_wire_gate(_standalone_access_control_gate) if use_policy_gate else nullcontext()
+    req_evidence: list[dict] = []
+
+    with _direct_context_scope(
+        target_url=target_url,
+        param=check_category,
+        method="GET",
+        carrier="path",
+        vuln_class=check_category,
+    ), gate_ctx:
+        caller_resp = _request("GET", target_url, headers=caller_h, allow_redirects=False, observe_session=False)
+        req_evidence.append(response_evidence(caller_resp, "caller", 0))
+        ch_caller, ch_reason = _is_challenge_or_degradation(caller_resp)
+        c_status = caller_resp.get("status")
+        if ch_caller:
+            if eff_mode == "policy" and expected_rule.get("expect") == "challenge_or_authz_distinct" and ch_reason == "telemetry_challenge_403":
+                return _result(
+                    "Telemetry Control",
+                    target_url,
+                    UNCONFIRMED,
+                    "cross_tenant_isolation",
+                    {"caller_status": c_status, "telemetry_signal": ch_reason, "distinct_from_authz": True},
+                    "-",
+                    notes="Telemetry challenge 403 observed and distinguished from authorization denial.",
+                    guard={"transport_ok": True, "controls": ["telemetry challenge classification"]},
+                    request_evidence=req_evidence,
+                )
+            return _result(
+                "Access Control",
+                target_url,
+                INCONCLUSIVE,
+                "cross_tenant_isolation",
+                {"caller_status": c_status, "blocked_reason": ch_reason},
+                "-",
+                notes=f"Access check interrupted by {ch_reason}.",
+                guard={"transport_ok": bool(caller_resp.get("ok"))},
+                request_evidence=req_evidence,
+            )
+
+        anon_h = _anonymous_headers(caller_h)
+        anon_resp = _request("GET", target_url, headers=anon_h, allow_redirects=False, observe_session=False)
+        req_evidence.append(response_evidence(anon_resp, "anonymous", 0))
+        anon_status = anon_resp.get("status")
+        ch_anon, ch_anon_reason = _is_challenge_or_degradation(anon_resp)
+        if ch_anon and ch_anon_reason != "telemetry_challenge_403":
+            return _result(
+                "Access Control",
+                target_url,
+                INCONCLUSIVE,
+                "cross_tenant_isolation",
+                {"caller_status": c_status, "anonymous_status": anon_status, "reason": ch_anon_reason},
+                "-",
+                notes="Anonymous baseline transport failed.",
+                guard={"transport_ok": bool(anon_resp.get("ok"))},
+                request_evidence=req_evidence,
+            )
+
+        caller_json = _json_body(caller_resp) if c_status in {200, 206} else None
+        observed_tenants = _extract_tenants_generic(caller_json) if caller_json is not None else set()
+        observed_owners = _extract_owners_generic(caller_json) if caller_json is not None else set()
+        non_list_fields, sensitive_fields = _private_detail_differential(caller_json, list_fields)
+        leaked_fields = sorted(set(non_list_fields) | set(sensitive_fields))
+
+        owner_resp = None
+        owner_json = None
+        resolved_owner_h = _resolve_vault_headers(target_url, owner_headers_json, owner_alias)
+        if any(str(k).lower() in _CREDENTIAL_HEADERS and str(v).strip() for k, v in resolved_owner_h.items()):
+            owner_h, owner_err = _strict_identity_headers(json.dumps(resolved_owner_h))
+            if not owner_err and _identity_fingerprint(owner_h) != _identity_fingerprint(caller_h):
+                owner_resp = _request("GET", target_url, headers=owner_h, allow_redirects=False, observe_session=False)
+                req_evidence.append(response_evidence(owner_resp, "owner", 0))
+                if owner_resp.get("ok") and owner_resp.get("status") in {200, 206}:
+                    owner_json = _json_body(owner_resp)
+
+        # Policy-Verified QA Mode
+        if eff_mode == "policy":
+            foreign_tenant = next((t for t in sorted(observed_tenants) if caller_tenant and t != caller_tenant), "")
+            policy_leaked = (
+                sorted(str(k) for k, v in caller_json.items() if v is not None)
+                if isinstance(caller_json, dict)
+                else leaked_fields
+            )
+            verdict_str, detail_reason = evaluate_access_rule(
+                expected_rule,
+                caller_role=caller_role,
+                caller_tenant=caller_tenant,
+                owner_tenant=owner_tenant,
+                owner_alias=owner_alias,
+                caller_alias=caller_alias,
+                status=c_status,
+                anon_status=anon_status,
+                observed_record_tenant=foreign_tenant,
+                leaked_restricted_fields=policy_leaked,
+                is_challenge_blocked=False,
+            )
+            if verdict_str == CONFIRMED and repeat_check:
+                rep_resp = _request("GET", target_url, headers=caller_h, allow_redirects=False, observe_session=False)
+                req_evidence.append(response_evidence(rep_resp, "caller-repeat", 0))
+                if rep_resp.get("status") != c_status:
+                    verdict_str = INCONCLUSIVE
+                    detail_reason = "non_repeatable_response"
+            repro = [_curl("GET", target_url, headers=caller_h), _curl("GET", target_url, headers=anon_h)] if verdict_str == CONFIRMED else "-"
+            return _result(
+                "Access Control",
+                target_url,
+                verdict_str,
+                "cross_tenant_isolation",
+                {
+                    "mode": "policy",
+                    "check_category": check_category,
+                    "caller_alias": caller_alias,
+                    "caller_role": caller_role,
+                    "caller_tenant": caller_tenant,
+                    "caller_status": c_status,
+                    "anonymous_status": anon_status,
+                    "observed_tenants": sorted(observed_tenants),
+                    "observed_owners": sorted(observed_owners),
+                    "leaked_fields": leaked_fields,
+                    "detail_reason": detail_reason,
+                    **({"operation_id": operation_id} if operation_id else {}),
+                },
+                repro,
+                notes=f"Policy-verified QA verdict ({detail_reason}).",
+                guard={
+                    "prerequisites": ["QA expectation policy rule", "anonymous baseline"],
+                    "controls": ["caller request", "anonymous baseline", "policy rule evaluation"],
+                    "transport_ok": True,
+                    "decision_rule": detail_reason,
+                },
+                request_evidence=req_evidence,
+            )
+
+        # True Blind Mode
+        if c_status in {401, 403, 404}:
+            return _result(
+                "Access Control",
+                target_url,
+                UNCONFIRMED,
+                "cross_tenant_isolation",
+                {
+                    "mode": "blind",
+                    "check_category": check_category,
+                    "caller_status": c_status,
+                    "anonymous_status": anon_status,
+                    "caller_role": caller_role,
+                    "caller_tenant": caller_tenant,
+                },
+                "-",
+                notes="Access denied to non-authorized caller.",
+                guard={"transport_ok": True, "controls": ["caller request", "anonymous baseline"]},
+                request_evidence=req_evidence,
+            )
+
+        if c_status not in {200, 206}:
+            return _result(
+                "Access Control",
+                target_url,
+                INCONCLUSIVE,
+                "cross_tenant_isolation",
+                {"caller_status": c_status, "anonymous_status": anon_status, "check_category": check_category},
+                "-",
+                notes="Unexpected non-2xx/non-403 status.",
+                guard={"transport_ok": True},
+                request_evidence=req_evidence,
+            )
+
+        anon_loc = str(anon_resp.get("location") or "")
+        anon_login_redirect = (
+            isinstance(anon_status, int)
+            and anon_status in {301, 302, 303, 307, 308}
+            and bool(re.search(r"/(?:login|signin|sign-in|auth)(?:/|$|\?)", anon_loc, re.I))
+        )
+        anon_denied = anon_status in {401, 403, 404} or anon_login_redirect
+        if not anon_denied:
+            if c_status in {200, 206} and anon_status in {200, 206}:
+                parsed_path = (urlparse(target_url).path or "/").lower()
+                path_segs = [s for s in parsed_path.split("/") if s]
+                is_public_or_auth = (
+                    parsed_path in {"", "/"}
+                    or bool(re.search(r"\.(?:js|mjs|css|png|jpe?g|gif|svg|ico|map|woff2?|ttf|eot|html|txt)$", parsed_path))
+                    or any(
+                        s in {
+                            "sign-in", "signin", "login", "logout", "sign-out", "signout",
+                            "register", "signup", "sign-up", "health", "healthz", "readyz",
+                            "discovery", "openapi", "openapi.json", "swagger", "swagger.json",
+                            "csrf", "public", "docs", "assets", "static",
+                        }
+                        for s in path_segs
+                    )
+                )
+                is_api_path = "/api/" in parsed_path
+                is_operational_path = is_api_path or any(
+                    s in {"telemetry", "audit", "admin", "internal", "export", "metrics", "analytics", "overview"}
+                    for s in path_segs
+                )
+                anon_text = str(anon_resp.get("text") or "").strip()
+                anon_ctype = str(
+                    (anon_resp.get("headers") or {}).get("Content-Type")
+                    or (anon_resp.get("headers") or {}).get("content-type")
+                    or ""
+                ).lower()
+                anon_json = _json_body(anon_resp)
+                is_html_anon = "<html" in anon_text.lower()[:400] or "<!doctype html" in anon_text.lower()[:400]
+                has_operational_json = (not is_html_anon) and (
+                    (isinstance(anon_json, list) and len(anon_json) > 0)
+                    or (
+                        isinstance(anon_json, dict)
+                        and len(anon_json) > 0
+                        and not (set(anon_json.keys()) <= {"ok", "status", "healthy", "version", "service", "uptime"})
+                    )
+                )
+                has_operational_csv = (
+                    (not is_html_anon)
+                    and ("csv" in anon_ctype)
+                    and len([ln for ln in anon_text.splitlines() if ln.strip()]) >= 2
+                )
+                if not is_public_or_auth and is_operational_path and (has_operational_json or has_operational_csv):
+                    if caller_json is not None and anon_json is not None:
+                        baseline_match = (type(caller_json) is type(anon_json)) and (
+                            (isinstance(anon_json, dict) and set(caller_json.keys()) == set(anon_json.keys()))
+                            or isinstance(anon_json, list)
+                            or _similar(caller_resp, anon_resp) >= 0.70
+                        )
+                    else:
+                        baseline_match = _similar(caller_resp, anon_resp) >= 0.70
+                    repeatable = True
+                    if repeat_check:
+                        rep_anon = _request("GET", target_url, headers=anon_h, allow_redirects=False, observe_session=False)
+                        req_evidence.append(response_evidence(rep_anon, "anonymous-repeat", 0))
+                        rep_anon_json = _json_body(rep_anon)
+                        repeatable = (rep_anon.get("status") == anon_status) and (
+                            (
+                                has_operational_json
+                                and type(rep_anon_json) is type(anon_json)
+                                and (not isinstance(anon_json, dict) or set(rep_anon_json.keys()) == set(anon_json.keys()))
+                            )
+                            or (has_operational_csv and bool(str(rep_anon.get("text") or "").strip()))
+                        )
+                    if repeatable and baseline_match:
+                        if is_api_path and has_operational_json:
+                            return _result(
+                                "Authentication Bypass",
+                                target_url,
+                                CONFIRMED,
+                                "unauthenticated_api_access",
+                                {
+                                    "mode": "blind",
+                                    "check_category": check_category,
+                                    "caller_status": c_status,
+                                    "anonymous_status": anon_status,
+                                    "api_path": True,
+                                    "structured_json": True,
+                                },
+                                [_curl("GET", target_url, headers=anon_h), _curl("GET", target_url, headers=caller_h)],
+                                notes="Non-public API endpoint returned structured operational JSON identically to anonymous callers across repeat control.",
+                                severity="high",
+                                guard={
+                                    "prerequisites": ["non-public API route", "structured operational JSON"],
+                                    "controls": ["anonymous baseline", "repeat anonymous check", "authenticated baseline similarity"],
+                                    "transport_ok": True,
+                                    "decision_rule": "is_api_path and operational_json and anon_200 and repeatable and baseline_match",
+                                },
+                                request_evidence=req_evidence,
+                            )
+                        return _result(
+                            "Unauthenticated Operational Access (Operator Review)",
+                            target_url,
+                            PROBABLE,
+                            "unauthenticated_operational_access",
+                            {
+                                "mode": "blind",
+                                "check_category": check_category,
+                                "caller_status": c_status,
+                                "anonymous_status": anon_status,
+                            },
+                            [_curl("GET", target_url, headers=anon_h), _curl("GET", target_url, headers=caller_h)],
+                            notes="Operational endpoint accessible without authentication; flagged for operator review.",
+                            severity="medium",
+                            guard={
+                                "prerequisites": ["operational path", "structured non-HTML operational content"],
+                                "controls": ["anonymous baseline", "repeat anonymous check"],
+                                "transport_ok": True,
+                            },
+                            request_evidence=req_evidence,
+                        )
+            return _result(
+                "Access Control",
+                target_url,
+                UNCONFIRMED,
+                "cross_tenant_isolation",
+                {"caller_status": c_status, "anonymous_status": anon_status, "public_or_unauthenticated": True},
+                "-",
+                notes="Endpoint is accessible anonymously; not a multi-tenant/role privilege differential.",
+                guard={"transport_ok": True},
+                request_evidence=req_evidence,
+            )
+
+        if check_category == "cross_tenant_read":
+            foreign_tenants = sorted(t for t in observed_tenants if caller_tenant and t != caller_tenant)
+            c_text_ct = str(caller_resp.get("text") or "")
+            c_low_ct = c_text_ct.lower()
+            item_id_ct = urlparse(target_url).path.rstrip("/").rsplit("/", 1)[-1]
+            owner_ok_ct = bool(owner_resp is not None and owner_resp.get("ok") and owner_resp.get("status") in {200, 206})
+            not_soft_denied_ct = not re.search(r"\b(access denied|forbidden|unauthorized|not found)\b", c_text_ct[:600], re.I)
+            html_tenant_leak = bool(
+                caller_json is None
+                and absent_from_caller_collection
+                and owner_tenant
+                and caller_tenant
+                and owner_tenant != caller_tenant
+                and not_soft_denied_ct
+                and owner_ok_ct
+                and (
+                    owner_tenant.lower() in c_low_ct
+                    or (owner_alias and owner_alias.lower() in c_low_ct)
+                    or (bool(item_id_ct) and item_id_ct in c_text_ct and _similar(caller_resp, owner_resp) >= 0.55)
+                )
+            )
+            if (foreign_tenants and absent_from_caller_collection) or html_tenant_leak:
+                if repeat_check:
+                    rep_resp = _request("GET", target_url, headers=caller_h, allow_redirects=False, observe_session=False)
+                    req_evidence.append(response_evidence(rep_resp, "caller-repeat", 0))
+                    if caller_json is not None:
+                        if rep_resp.get("status") != c_status or not (_extract_tenants_generic(_json_body(rep_resp)) - {caller_tenant}):
+                            return _result(
+                                "Cross-Tenant Isolation",
+                                target_url,
+                                INCONCLUSIVE,
+                                "cross_tenant_isolation",
+                                {"caller_status": c_status, "repeat_status": rep_resp.get("status")},
+                                "-",
+                                notes="Cross-tenant observation was not repeatable.",
+                                guard={"transport_ok": True},
+                                request_evidence=req_evidence,
+                            )
+                    elif rep_resp.get("status") != c_status or _similar(caller_resp, rep_resp) < 0.90:
+                        return _result(
+                            "Cross-Tenant Isolation",
+                            target_url,
+                            INCONCLUSIVE,
+                            "cross_tenant_isolation",
+                            {"caller_status": c_status, "repeat_status": rep_resp.get("status")},
+                            "-",
+                            notes="Cross-tenant HTML observation was not repeatable.",
+                            guard={"transport_ok": True},
+                            request_evidence=req_evidence,
+                        )
+                eff_foreign = foreign_tenants or ([owner_tenant] if owner_tenant else [])
+                return _result(
+                    "Cross-Tenant Object Access",
+                    target_url,
+                    CONFIRMED,
+                    "cross_tenant_isolation",
+                    {
+                        "mode": "blind",
+                        "check_category": check_category,
+                        "caller_alias": caller_alias,
+                        "caller_tenant": caller_tenant,
+                        "foreign_tenants_observed": eff_foreign,
+                        "absent_from_caller_collection": True,
+                        "caller_status": c_status,
+                        "anonymous_status": anon_status,
+                    },
+                    [_curl("GET", target_url, headers=caller_h), _curl("GET", target_url, headers=anon_h)],
+                    notes="Cross-tenant read confirmed mathematically: caller tenant != returned record tenant, absent from caller collection, anonymous denied.",
+                    severity="high",
+                    guard={
+                        "prerequisites": ["trusted caller tenant", "caller collection check", "anonymous baseline"],
+                        "controls": ["cross-tenant mismatch", "collection absence", "anonymous denial", "repeatability"],
+                        "transport_ok": True,
+                        "decision_rule": "caller_tenant != record_tenant and absent_from_caller_collection and anon_denied",
+                    },
+                    request_evidence=req_evidence,
+                )
+            return _result(
+                "Cross-Tenant Object Access",
+                target_url,
+                UNCONFIRMED,
+                "cross_tenant_isolation",
+                {"mode": "blind", "caller_status": c_status, "observed_tenants": sorted(observed_tenants), "absent_from_caller_collection": absent_from_caller_collection},
+                "-",
+                notes="No foreign-tenant leak established.",
+                guard={"transport_ok": True},
+                request_evidence=req_evidence,
+            )
+
+        if check_category == "same_tenant_peer_read":
+            distinct_owner_in_record = bool(observed_owners and caller_alias and caller_alias not in observed_owners) or bool(
+                owner_alias and caller_alias and owner_alias != caller_alias and (not observed_owners or owner_alias in observed_owners)
+            )
+            has_private_diff = (absent_from_caller_collection and bool(non_list_fields)) or bool(sensitive_fields)
+            c_text_st = str(caller_resp.get("text") or "")
+            c_low_st = c_text_st.lower()
+            item_id_st = urlparse(target_url).path.rstrip("/").rsplit("/", 1)[-1]
+            owner_ok_st = bool(owner_resp is not None and owner_resp.get("ok") and owner_resp.get("status") in {200, 206})
+            not_soft_denied_st = not re.search(r"\b(access denied|forbidden|unauthorized|not found)\b", c_text_st[:600], re.I)
+            html_peer_leak = bool(
+                caller_json is None
+                and absent_from_caller_collection
+                and owner_alias
+                and caller_alias
+                and owner_alias != caller_alias
+                and not_soft_denied_st
+                and owner_ok_st
+                and (
+                    owner_alias.lower() in c_low_st
+                    or (bool(item_id_st) and item_id_st in c_text_st and _similar(caller_resp, owner_resp) >= 0.55)
+                )
+            )
+            if (distinct_owner_in_record and has_private_diff) or html_peer_leak:
+                if repeat_check:
+                    rep_resp = _request("GET", target_url, headers=caller_h, allow_redirects=False, observe_session=False)
+                    req_evidence.append(response_evidence(rep_resp, "caller-repeat", 0))
+                    if rep_resp.get("status") != c_status:
+                        return _result("Same-Tenant Peer Read", target_url, INCONCLUSIVE, "behavioral_differential",
+                                       {"caller_status": c_status, "repeat_status": rep_resp.get("status")}, "-",
+                                       guard={"transport_ok": True}, request_evidence=req_evidence)
+                diff_summary = summarize_differential_evidence(owner_json, caller_json, signals=["same_tenant_private_fields"], baseline_status=owner_resp.get("status") if owner_resp else None, probe_status=c_status)
+                return _result(
+                    "Same-Tenant Cross-Custodian Private Field Exposure (Operator Review)",
+                    target_url,
+                    PROBABLE,
+                    "behavioral_differential",
+                    {
+                        "mode": "blind",
+                        "check_category": check_category,
+                        "caller_alias": caller_alias,
+                        "owner_alias": owner_alias,
+                        "caller_tenant": caller_tenant,
+                        "observed_owners": sorted(observed_owners),
+                        "non_list_fields": non_list_fields,
+                        "sensitive_fields": sensitive_fields,
+                        "caller_status": c_status,
+                        "anonymous_status": anon_status,
+                        "differential": diff_summary,
+                    },
+                    [_curl("GET", target_url, headers=caller_h), _curl("GET", target_url, headers=anon_h)],
+                    notes="Same-tenant peer accessed non-list/sensitive fields of another custodian's record; flagged for operator review.",
+                    severity="medium",
+                    guard={
+                        "prerequisites": ["same-tenant distinct custodians", "anonymous baseline"],
+                        "controls": ["owner attribution", "list-vs-detail field diff", "anonymous denial"],
+                        "transport_ok": True,
+                        "decision_rule": "distinct_owner and non_list_private_fields and anon_denied",
+                    },
+                    request_evidence=req_evidence,
+                )
+            return _result(
+                "Same-Tenant Peer Read",
+                target_url,
+                UNCONFIRMED,
+                "behavioral_differential",
+                {"mode": "blind", "caller_status": c_status, "non_list_fields": non_list_fields, "sensitive_fields": sensitive_fields},
+                "-",
+                notes="Shared or non-private same-tenant resource.",
+                guard={"transport_ok": True},
+                request_evidence=req_evidence,
+            )
+
+        if check_category == "function_role_access":
+            shared_markers = {"all", "tenant-all", "public", "global", "shared", "common", "system", "*"}
+            effective_tenants = {t for t in observed_tenants if t.lower() not in shared_markers}
+            foreign_tenants = sorted(t for t in effective_tenants if caller_tenant and t != caller_tenant)
+            multi_tenant = len(effective_tenants) > 1 or bool(foreign_tenants)
+            ctype = str((caller_resp.get("headers") or {}).get("Content-Type") or (caller_resp.get("headers") or {}).get("content-type") or "").lower()
+            c_disp = str((caller_resp.get("headers") or {}).get("Content-Disposition") or (caller_resp.get("headers") or {}).get("content-disposition") or "").lower()
+            c_text = str(caller_resp.get("text") or "").strip()
+            o_text = str((owner_resp or {}).get("text") or "").strip()
+            is_html_shell = (caller_json is None) and ("text/html" in ctype or "<html" in c_text.lower()[:400] or "<!doctype html" in c_text.lower()[:400])
+            is_data_export_content = (
+                (caller_json is not None)
+                or ("csv" in ctype)
+                or ("application/json" in ctype)
+                or ("attachment" in c_disp)
+                or (not is_html_shell and ("export" in target_url.lower() or "report" in target_url.lower()) and bool(c_text))
+            )
+            is_export_shape = is_data_export_content and (
+                "csv" in ctype or "attachment" in c_disp or "export" in target_url.lower() or "report" in target_url.lower()
+            ) and bool(c_text)
+            is_admin_path = bool(re.search(r"/(?:admin|internal|audit|manage|superuser)(?:/|$)", urlparse(target_url).path, re.I))
+            has_multi_owner_data = len(observed_owners) > 1 or (bool(observed_owners) and caller_alias not in observed_owners)
+            tenant_scoped_only = bool(caller_tenant and effective_tenants == {caller_tenant})
+            same_admin_export = bool(
+                (is_export_shape or is_admin_path) and not tenant_scoped_only and owner_json is not None and caller_json == owner_json
+            )
+            unfiltered_text_export = False
+            if caller_json is None and is_export_shape and not is_html_shell:
+                c_lines = [ln.strip() for ln in c_text.splitlines() if ln.strip()]
+                o_lines = [ln.strip() for ln in o_text.splitlines() if ln.strip()]
+                if len(c_lines) >= 2 and caller_tenant and any(caller_tenant in ln for ln in c_lines[1:]) and any(caller_tenant not in ln for ln in c_lines[1:]):
+                    unfiltered_text_export = True
+                elif len(o_lines) >= 3 and c_text == o_text:
+                    unfiltered_text_export = True
+            if multi_tenant or unfiltered_text_export or same_admin_export or (is_export_shape and not tenant_scoped_only and has_multi_owner_data):
+                if repeat_check:
+                    rep_resp = _request("GET", target_url, headers=caller_h, allow_redirects=False, observe_session=False)
+                    req_evidence.append(response_evidence(rep_resp, "caller-repeat", 0))
+                    if rep_resp.get("status") != c_status:
+                        return _result("Role Function Access", target_url, INCONCLUSIVE, "role_differential",
+                                       {"caller_status": c_status, "repeat_status": rep_resp.get("status")}, "-",
+                                       guard={"transport_ok": True}, request_evidence=req_evidence)
+                diff_summary = summarize_differential_evidence(owner_json, caller_json, signals=["multi_tenant_or_privileged_export"], baseline_status=owner_resp.get("status") if owner_resp else None, probe_status=c_status)
+                return _result(
+                    "Privileged / Multi-Tenant Endpoint Accessible to Non-Admin (Operator Review)",
+                    target_url,
+                    PROBABLE,
+                    "role_differential",
+                    {
+                        "mode": "blind",
+                        "check_category": check_category,
+                        "caller_alias": caller_alias,
+                        "caller_role": caller_role,
+                        "caller_tenant": caller_tenant,
+                        "observed_tenants": sorted(observed_tenants),
+                        "foreign_tenants_observed": foreign_tenants,
+                        "observed_owners": sorted(observed_owners),
+                        "is_export_shape": is_export_shape,
+                        "caller_status": c_status,
+                        "anonymous_status": anon_status,
+                        "differential": diff_summary,
+                    },
+                    [_curl("GET", target_url, headers=caller_h), _curl("GET", target_url, headers=anon_h)],
+                    notes="Non-admin role accessed multi-tenant/export endpoint matching privileged shape; flagged for operator review.",
+                    severity="medium",
+                    guard={
+                        "prerequisites": ["admin vs non-admin role comparison", "anonymous baseline"],
+                        "controls": ["tenant/export shape analysis", "anonymous denial"],
+                        "transport_ok": True,
+                        "decision_rule": "non_admin_200 and (multi_tenant or privileged_export) and anon_denied",
+                    },
+                    request_evidence=req_evidence,
+                )
+            return _result(
+                "Role Function Access",
+                target_url,
+                UNCONFIRMED,
+                "role_differential",
+                {"mode": "blind", "caller_status": c_status, "observed_tenants": sorted(observed_tenants), "tenant_scoped": True},
+                "-",
+                notes="Endpoint is scoped to caller's own tenant/view; no privileged multi-tenant differential.",
+                guard={"transport_ok": True},
+                request_evidence=req_evidence,
+            )
+
+        return _result(
+            "Access Control",
+            target_url,
+            INCONCLUSIVE,
+            "cross_tenant_isolation",
+            {"error": f"unsupported check_category: {check_category}"},
+            "-",
+            guard={"transport_ok": True},
+            request_evidence=req_evidence,
         )
 
 

@@ -7,7 +7,7 @@ import json
 import copy
 import re
 from typing import Any
-from urllib.parse import parse_qsl, urlencode, urlsplit
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 PROFILES = {
     "readonly_sqli_boolean": ("injection-sqli", "validator_validate_sqli", "differential_boolean"),
@@ -31,6 +31,8 @@ def profile_oracles(profile: str, verdict: str = "") -> frozenset[str]:
     primary = entry[2]
     if profile == "readonly_xss_reflection" and str(verdict or "").upper() != "CONFIRMED":
         return frozenset({primary, "unescaped_reflection"})
+    if profile == "readonly_sqli_boolean":
+        return frozenset({primary, "differential_order_by", "timing_statistical"})
     return frozenset({primary})
 STAGES = ("observed", "eligible", "admitted", "executed", "evidence_accepted")
 OUTCOME_BUCKETS = (
@@ -74,10 +76,33 @@ _XSS_PARAM_NAMES = frozenset({
     "label", "banner", "snippet", "heading", "caption", "description",
     "preview", "echo", "tag", "badge", "highlight", "keyword",
 })
+_HIGH_RECALL_XSS_PARAM_NAMES = _XSS_PARAM_NAMES | frozenset({
+    "q", "query", "search", "term", "filter", "keyword", "input", "value",
+})
 _XSS_PATH_RE = re.compile(
     r"/(?:xss[-_/]?|reflect(?:ion|ed)?|comments?|messages?|preview|echo|banner|dom[-_/]?|feedback|guestbook|highlight|widget)(?:/|$)",
     re.I,
 )
+_HIGH_RECALL_XSS_PATH_RE = re.compile(
+    r"/(?:xss[-_/]?|reflect(?:ion|ed)?|comments?|messages?|preview|echo|banner|dom[-_/]?|feedback|guestbook|highlight|widget|search)(?:/|$)",
+    re.I,
+)
+_SEARCH_FILTER_SUBPATH_RE = re.compile(
+    r"/(?:search|filter|query|find|lookup|list|browse|redirect|continue|auth)(?:/|$)",
+    re.I,
+)
+_NON_TRAVERSAL_QUERY_PARAMS = frozenset({
+    "q", "query", "search", "term", "filter", "keyword",
+    "sort", "order", "order_by", "orderby", "sort_by", "sortby", "dir",
+    "next", "return", "return_to", "returnto", "redirect", "redirect_to", "url", "continue",
+})
+_LOGOUT_OR_STATIC_PATH_RE = re.compile(
+    r"(?:/(?:logout|sign-out|signout|health|healthz|readyz)(?:/|$)|\.(?:js|mjs|css|png|jpe?g|gif|svg|ico|map|woff2?|ttf|eot)$)",
+    re.I,
+)
+_SORT_PARAM_NAMES = frozenset({
+    "sort", "order", "order_by", "orderby", "sort_by", "sortby", "dir",
+})
 _REDIRECT_PARAM_NAMES = frozenset({
     "redirect", "redirect_to", "redirect_url", "redirect_uri",
     "next", "return", "return_to", "returnto", "return_url",
@@ -201,7 +226,14 @@ def _call_profile_eligibility(
     return res if isinstance(res, dict) else None
 
 
-def surface_profile_applicability(url: str, param: str, sample: str, profile: str) -> tuple[bool, bool, str]:
+def surface_profile_applicability(
+    url: str,
+    param: str,
+    sample: str,
+    profile: str,
+    *,
+    high_recall: bool = False,
+) -> tuple[bool, bool, str]:
     """Evaluate ordinary surface applicability strictly from discovered surface fields.
 
     Returns (should_materialize, surface_eligible, reason_code).
@@ -210,9 +242,15 @@ def surface_profile_applicability(url: str, param: str, sample: str, profile: st
     lower_path = path.lower()
     lower_param = str(param or "").lower()
     sample_text = str(sample or "")
+    traversal_path_match = bool(_TRAVERSAL_PATH_RE.search(lower_path))
+    if high_recall and traversal_path_match and (
+        bool(_SEARCH_FILTER_SUBPATH_RE.search(lower_path))
+        or lower_param in _NON_TRAVERSAL_QUERY_PARAMS
+    ):
+        traversal_path_match = False
     is_traversal_surface = (
         lower_param in _TRAVERSAL_PARAM_NAMES
-        or bool(_TRAVERSAL_PATH_RE.search(lower_path))
+        or traversal_path_match
         or bool(_FILENAME_SAMPLE_RE.fullmatch(sample_text))
     )
     is_template_only = bool(_TEMPLATE_PATH_RE.search(lower_path)) or (
@@ -239,14 +277,16 @@ def surface_profile_applicability(url: str, param: str, sample: str, profile: st
             or (bool(sample_text) and bool(_REDIRECT_SAMPLE_RE.fullmatch(sample_text)))
         )
     )
+    xss_param_names = _HIGH_RECALL_XSS_PARAM_NAMES if high_recall else _XSS_PARAM_NAMES
+    xss_path_re = _HIGH_RECALL_XSS_PATH_RE if high_recall else _XSS_PATH_RE
     is_xss_surface = (
         not is_traversal_surface
         and not is_sql_lookup_only
         and not is_template_only
         and not is_redirect_surface
         and (
-            lower_param in _XSS_PARAM_NAMES
-            or bool(_XSS_PATH_RE.search(lower_path))
+            lower_param in xss_param_names
+            or bool(xss_path_re.search(lower_path))
         )
     )
     is_business_surface = (
@@ -260,6 +300,15 @@ def surface_profile_applicability(url: str, param: str, sample: str, profile: st
             or bool(_BIZ_PATH_RE.search(lower_path))
         )
     )
+    if high_recall and profile in {
+        "readonly_xss_reflection",
+        "readonly_open_redirect",
+        "readonly_sqli_boolean",
+        "readonly_ssti_arithmetic",
+    }:
+        if _LOGOUT_OR_STATIC_PATH_RE.search(lower_path):
+            return False, False, "profile_not_applicable_to_surface"
+        return True, True, ""
     if profile == "stateful_business_logic":
         if not is_business_surface:
             return False, False, "profile_not_applicable_to_surface"
@@ -285,6 +334,60 @@ def surface_profile_applicability(url: str, param: str, sample: str, profile: st
             return True, False, "profile_not_applicable_to_surface"
         return True, True, ""
     return True, True, ""
+
+
+def _synthesize_query_sample(param: str, sample: str = "") -> str:
+    """Synthesize a safe non-empty baseline query sample for form/link parameters."""
+    clean = str(sample or "").strip()
+    if clean and clean not in {"<unavailable>", "<redacted>"}:
+        return clean
+    lp = str(param or "").lower()
+    if lp in _REDIRECT_PARAM_NAMES:
+        return "/dashboard"
+    if lp == "dir":
+        return "asc"
+    if lp in _SORT_PARAM_NAMES or lp in {"id", "page", "limit", "offset", "count", "num", "year"} or lp.endswith("_id"):
+        return "1"
+    return "test"
+
+
+def _with_query_sample(url: str, param: str, sample: str) -> str:
+    """Ensure a GET URL includes `param=sample` in its query string."""
+    parsed = urlsplit(url)
+    pairs = parse_qsl(parsed.query, keep_blank_values=True)
+    updated: list[tuple[str, str]] = []
+    replaced = False
+    for key, val in pairs:
+        if key == param and not replaced:
+            updated.append((key, sample))
+            replaced = True
+        else:
+            updated.append((key, val))
+    if not replaced:
+        updated.append((param, sample))
+    return urlunsplit((parsed.scheme, parsed.netloc, parsed.path or "/", urlencode(updated, doseq=True), ""))
+
+
+def _profile_priority(url: str, param: str, sample: str, profile: str) -> int:
+    """Order naturally matching vectors ahead of high-recall cross-profile fallbacks."""
+    lower_path = (urlsplit(url).path or "/").lower()
+    lower_param = str(param or "").lower()
+    if profile == "readonly_open_redirect" and (
+        lower_param in _REDIRECT_PARAM_NAMES or _REDIRECT_PATH_RE.search(lower_path) or "/auth/" in lower_path
+    ):
+        return 0
+    if profile == "readonly_xss_reflection" and (
+        lower_param in _HIGH_RECALL_XSS_PARAM_NAMES or _HIGH_RECALL_XSS_PATH_RE.search(lower_path)
+    ):
+        return 0
+    if profile == "readonly_sqli_boolean" and (
+        lower_param in _SORT_PARAM_NAMES
+        or lower_param in {"id", "user_id", "item_id", "filter", "category"}
+        or _SQL_LOOKUP_PATH_RE.search(lower_path)
+    ):
+        return 0
+    _, strict_ok, _ = surface_profile_applicability(url, param, sample, profile, high_recall=False)
+    return 0 if strict_ok else 1
 
 
 def query_parameters(url: str) -> dict[str, str]:
@@ -530,7 +633,9 @@ def authorization_controls_complete(record: dict[str, Any]) -> bool:
 
 def parameter_candidates(spec: Any, records: list[dict[str, Any]],
                          bindings: dict[str, Any], *,
-                         profile_eligibility: Any = None) -> list[dict[str, Any]]:
+                         profile_eligibility: Any = None,
+                         hydrated_routes: dict[str, list[dict[str, Any]]] | None = None,
+                         high_recall: bool = False) -> list[dict[str, Any]]:
     """Select read-only oracle capabilities from records, not names or truth."""
     output = []
     binding_reason = ""
@@ -538,7 +643,34 @@ def parameter_candidates(spec: Any, records: list[dict[str, Any]],
             item.get("target") != spec.target or item.get("test_data_only") is not True
             or item.get("owned_objects_private") is not True for item in bindings.values())):
         binding_reason = "missing_synthetic_owned_session_prerequisite"
+    expanded_records: list[dict[str, Any]] = []
     for record in records:
+        url = str(record.get("url") or "")
+        method = str(record.get("method", "GET") or "GET").upper()
+        if ("{" in url or "}" in url) and (hydrated_routes or record.get("hydrated_urls")):
+            hydrated = (hydrated_routes or {}).get(f"{method} {url}") or record.get("hydrated_urls") or []
+            if isinstance(hydrated, list) and hydrated:
+                for h_item in hydrated:
+                    if not isinstance(h_item, dict) or not isinstance(h_item.get("url"), str):
+                        continue
+                    slot_name = str(h_item.get("param_name") or "")
+                    filtered_params = [
+                        p for p in (record.get("params") or [])
+                        if not (isinstance(p, dict) and p.get("in") == "path" and (not slot_name or p.get("name") == slot_name))
+                    ]
+                    hydrated_rec = {
+                        **record,
+                        "url": h_item["url"],
+                        "route_template": url,
+                        "params": filtered_params,
+                    }
+                    if h_item.get("identity_ref"):
+                        hydrated_rec["identity_ref"] = h_item["identity_ref"]
+                    expanded_records.append(hydrated_rec)
+                continue
+        expanded_records.append(record)
+
+    for record in expanded_records:
         url = record["url"]
         keys = ("source_spec_id", "source_artifact", "source_sha256")
         provenance = [{key: record[key] for key in keys}] if (all(isinstance(record.get(key), str)
@@ -605,24 +737,32 @@ def parameter_candidates(spec: Any, records: list[dict[str, Any]],
         emitted_biz_routes: set[tuple[str, str]] = set()
         param_order = list(dict.fromkeys([*params, *declared]))
         for param in param_order:
+            carrier = declared.get(param, "query")
             sample = params.get(param, declared_samples.get(param, ""))
+            effective_url = url
+            synthesized_sample = False
+            if high_recall and method == "GET" and carrier == "query" and param not in params:
+                sample = _synthesize_query_sample(param, sample)
+                effective_url = _with_query_sample(url, param, sample)
+                synthesized_sample = True
             for profile, (vector, direct, _) in PROFILES.items():
                 if spec.vector not in ("", "access", vector):
                     continue
                 if profile == "stateful_business_logic" and method == "GET":
                     continue
-                materialize, surface_ok, surface_reason = surface_profile_applicability(url, param, sample, profile)
+                materialize, surface_ok, surface_reason = surface_profile_applicability(
+                    effective_url, param, sample, profile, high_recall=high_recall,
+                )
                 if not materialize:
                     continue
                 if profile == "stateful_business_logic":
                     preferred_biz_param = "op" if "op" in declared else (next(iter(declared), param))
                     if param != preferred_biz_param:
                         continue
-                    biz_route_key = (method, url)
+                    biz_route_key = (method, effective_url)
                     if biz_route_key in emitted_biz_routes:
                         continue
                     emitted_biz_routes.add(biz_route_key)
-                carrier = declared.get(param, "query")
                 policy_reason = ""
                 if method in {"POST", "PUT", "PATCH"}:
                     if profile in {
@@ -633,7 +773,7 @@ def parameter_candidates(spec: Any, records: list[dict[str, Any]],
                         policy_reason = "unsupported_readonly_method"
                     elif surface_ok:
                         decision = _call_profile_eligibility(
-                            profile_eligibility, spec, url, param, carrier, profile, method
+                            profile_eligibility, spec, effective_url, param, carrier, profile, method
                         )
                         if not isinstance(decision, dict) or decision.get("eligible") is not True:
                             policy_reason = str(
@@ -643,7 +783,7 @@ def parameter_candidates(spec: Any, records: list[dict[str, Any]],
                             policy_reason = "unsupported_parameter_carrier"
                 elif surface_ok and profile == "readonly_traversal_application_files":
                     decision = _call_profile_eligibility(
-                        profile_eligibility, spec, url, param, carrier, profile, method
+                        profile_eligibility, spec, effective_url, param, carrier, profile, method
                     )
                     if isinstance(decision, dict):
                         if decision.get("eligible") is not True:
@@ -652,7 +792,7 @@ def parameter_candidates(spec: Any, records: list[dict[str, Any]],
                         policy_reason = "traversal_policy_not_declared"
                 elif surface_ok and profile in {"readonly_xss_reflection", "readonly_open_redirect"}:
                     decision = _call_profile_eligibility(
-                        profile_eligibility, spec, url, param, carrier, profile, method
+                        profile_eligibility, spec, effective_url, param, carrier, profile, method
                     )
                     if isinstance(decision, dict) and decision.get("eligible") is not True:
                         default_reason = (
@@ -663,7 +803,7 @@ def parameter_candidates(spec: Any, records: list[dict[str, Any]],
                         policy_reason = str(decision.get("reason_code") or "") or default_reason
                 if not surface_ok or policy_reason:
                     output.append(candidate(
-                        spec.id, route=url, param=param,
+                        spec.id, route=effective_url, param=param,
                         identity=identity, vector=vector,
                         provenance=provenance,
                         reason=surface_reason or policy_reason,
@@ -677,8 +817,8 @@ def parameter_candidates(spec: Any, records: list[dict[str, Any]],
                 # projecting credentials or silently testing anonymously.
                 if profile == "stateful_business_logic":
                     direct_args = {
-                        "target_url": url,
-                        "kind": infer_business_logic_kind(url, declared_samples),
+                        "target_url": effective_url,
+                        "kind": infer_business_logic_kind(effective_url, declared_samples),
                         "method": method,
                         "carrier": carrier,
                         "param": param,
@@ -690,7 +830,7 @@ def parameter_candidates(spec: Any, records: list[dict[str, Any]],
                         declarations, param, carrier
                     )
                     direct_args = {
-                        "target_url": url,
+                        "target_url": effective_url,
                         "param": param,
                         "method": "POST",
                         "carrier": carrier,
@@ -701,15 +841,17 @@ def parameter_candidates(spec: Any, records: list[dict[str, Any]],
                         direct_args["baseline_value"] = baseline_val
                 else:
                     direct_args = {
-                        "target_url": url, "param": param, "method": "GET", "carrier": "query",
+                        "target_url": effective_url, "param": param, "method": "GET", "carrier": "query",
                     }
                 if profile == "readonly_sqli_boolean":
-                    direct_args["boolean_only"] = True
+                    direct_args["boolean_only"] = not bool(high_recall)
                 hunter_args: dict[str, Any] = {
-                    "target": url, "live": True, "crawl": False,
+                    "target": effective_url, "live": True, "crawl": False,
                     "validation_profile": profile, "fuzz_limit": 4,
                     "max_validations": 16, "candidate_sample_limit": 16, "sleep_s": 0.2,
                 }
+                if high_recall:
+                    hunter_args["high_recall"] = True
                 if identity in bindings:
                     hunter_args["session_bindings"] = json.dumps({identity: bindings[identity]})
                 if profile == "stateful_business_logic":
@@ -731,12 +873,12 @@ def parameter_candidates(spec: Any, records: list[dict[str, Any]],
                     if method in {"POST", "PUT", "PATCH"}
                     else (
                         "unsupported_parameter_carrier" if carrier != "query"
-                        else "missing_observed_query_sample" if param not in params
+                        else "missing_observed_query_sample" if (param not in params and not synthesized_sample)
                         else ""
                     )
                 )
                 output.append(candidate(
-                    spec.id, route=url, param=param,
+                    spec.id, route=effective_url, param=param,
                     identity=identity, vector=vector,
                     tool=tool, arguments=args, provenance=provenance,
                     reason=(
@@ -763,6 +905,28 @@ def parameter_candidates(spec: Any, records: list[dict[str, Any]],
             row["tool"] = ""
             row["arguments"] = {}
             row.pop("recipes", None)
+    if high_recall:
+        # In high-recall blind mode, prefer authenticated observations over anon
+        # so auth-gated endpoints do not fail with 401 when both exist.
+        authed = {
+            (row.get("method", "GET"), row["route"], row["param"], row["vector"]): row
+            for row in output
+            if row["identity_ref"] != "anon" and row["eligible"]
+        }
+        selected = []
+        for row in output:
+            auth_row = authed.get((row.get("method", "GET"), row["route"], row["param"], row["vector"]))
+            if auth_row is not None and row["identity_ref"] == "anon" and row["eligible"]:
+                auth_row["provenance"].extend(row["provenance"])
+            else:
+                selected.append(row)
+        selected.sort(
+            key=lambda row: (
+                0 if row.get("eligible") else 1,
+                _profile_priority(row["route"], row["param"], "", row.get("validation_profile", "")),
+            )
+        )
+        return selected
     # Prefer a provenance-backed anonymous observation of the identical slice.
     # Invalid/contradictory rows remain visible and cannot be hidden by it.
     public = {(row.get("method", "GET"), row["route"], row["param"], row["vector"]): row for row in output

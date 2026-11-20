@@ -772,7 +772,11 @@ def test_recall_b_early_enum_summary_and_auth_json_entry_314159_style(
     assert manifest["budget"]["used"]["tokens"] <= E6_TOKEN_BUDGET
 
     enum_summary = json.loads((run["workdir"] / "summaries/enum-2.json").read_bytes())
-    assert enum_summary["surface"]["routes"] == [manifest["target"]]
+    assert manifest["target"] in enum_summary["surface"]["routes"]
+    assert all(
+        route == manifest["target"] or route.startswith(manifest["target"].rstrip("/") + "/api/records/")
+        for route in enum_summary["surface"]["routes"]
+    )
 
     tool_results = json.loads((run["private"] / "python-tool-results.json").read_bytes())
     idor_loops = [

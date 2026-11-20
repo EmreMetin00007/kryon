@@ -833,7 +833,11 @@ _VALIDATOR_VECTOR_TYPES = {
 # Related, deterministically validated subtypes are defined by code, never
 # chosen by a finding's prose. Keep existing token/upload/authz oracles usable.
 _VALIDATOR_VECTOR_ALIASES = {
-    "authz-idor": ("bola", "bfla", "broken_access_control"),
+    "authz-idor": (
+        "bola", "bfla", "broken_access_control", "cross_tenant_isolation",
+        "cross_tenant_object_access", "access_control", "telemetry_control",
+        "role_function_access", "same_tenant_peer_read",
+    ),
     "authn-session": ("open_redirect", "token_differential_opaque_carrier",
                       "token_round_trip_application_flow"),
     "xss-stored": ("xss_reflected", "reflected_xss", "dom_xss"),
@@ -843,6 +847,7 @@ _VALIDATOR_VECTOR_ALIASES = {
         "sequence_step_skip", "state_transition", "arithmetic_invariant",
         "offset_to_zero", "order_permutation", "rewrite_after_complete",
         "price_manipulation", "mass_assignment", "workflow_bypass", "replay",
+        "field_binding", "field_binding_mass_assignment",
     ),
 }
 

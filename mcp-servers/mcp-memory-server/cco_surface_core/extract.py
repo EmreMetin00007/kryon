@@ -517,10 +517,14 @@ _PAGINATION_KEYS = frozenset({"next", "next_url", "prev", "previous", "prev_url"
 _DIRECT_LINK_KEYS = frozenset({"url", "href", "uri", "link", "action", "endpoint", "self"})
 _ENVELOPE_LINK_LIST_KEYS = frozenset({
     "links", "internal_links", "urls_sample", "pages", "urls_with_params", "form_actions", "js_files", "actions", "forms",
+    "endpoints", "routes", "apis", "resources",
 })
 _ENVELOPE_RECORD_LIST_KEYS = frozenset({"records", "work_queue"})
 _COLLECTION_CONTAINER_KEYS = frozenset({
     "items", "results", "data", "entries", "pagination", "paging", "page_info", "meta", "_links", "hal", "surface",
+})
+_DISCOVERY_SPEC_KEYS = frozenset({
+    "openapi", "openapi_url", "swagger", "swagger_url", "spec", "spec_url", "discovery", "discovery_url",
 })
 _PAGINATION_CONTAINER_KEYS = frozenset({"pagination", "paging", "page_info"})
 _VALID_PARAM_NAME_RE = re.compile(r"[A-Za-z0-9_.:\[\]-]{1,96}")
@@ -749,6 +753,8 @@ def extract_json_hypermedia(
                     _emit(value, link_relation="pagination")
                 elif isinstance(value, dict):
                     _walk(value, depth=depth + 1, parent_key=low, in_pagination=True)
+            elif low in _DISCOVERY_SPEC_KEYS and from_http_body and isinstance(value, str):
+                _emit(value, link_relation="schema", allow_bare_relative=False)
             elif low in _DIRECT_LINK_KEYS:
                 if isinstance(value, str):
                     rel = "self" if low == "self" else ("pagination" if node_pagination else default_rel)

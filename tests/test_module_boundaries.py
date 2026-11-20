@@ -90,7 +90,7 @@ def test_hunter_facade_preserves_mcp_contract():
     ]
     assert list(inspect.signature(module.fuzz_attack_surface).parameters) == [
         "target", "limit", "max_requests", "live", "headers", "sleep_s", "sample_limit", "sql_only",
-        "ssti_only", "traversal_only", "xss_only", "redirect_only"
+        "ssti_only", "traversal_only", "xss_only", "redirect_only", "high_recall"
     ]
     assert list(inspect.signature(module.coverage_report).parameters) == [
         "target", "enqueue_gaps", "campaign_id", "session_bindings", "headers", "request_cost", "max_attempts"
@@ -101,7 +101,7 @@ def test_hunter_facade_preserves_mcp_contract():
     ]
     assert list(inspect.signature(module.run_web_loop).parameters) == [
         "target", "live", "crawl", "zap", "cookie", "headers", "fuzz_limit",
-        "max_validations", "sleep_s", "identities", "blind_discovery", "blind_differential", "blind_max_requests", "session_bindings", "gap_ref", "candidate_sample_limit", "validation_profile",
+        "max_validations", "sleep_s", "identities", "blind_discovery", "blind_differential", "blind_max_requests", "session_bindings", "gap_ref", "candidate_sample_limit", "validation_profile", "high_recall",
     ]
     parameters = inspect.signature(module.run_web_loop).parameters
     assert parameters["blind_discovery"].default is False
@@ -110,7 +110,9 @@ def test_hunter_facade_preserves_mcp_contract():
     assert parameters["session_bindings"].default == ""
     assert parameters["gap_ref"].default == ""
     assert parameters["candidate_sample_limit"].default == 4
+    assert parameters["high_recall"].default is False
     assert inspect.signature(module.fuzz_attack_surface).parameters["sample_limit"].default == 4
+    assert inspect.signature(module.fuzz_attack_surface).parameters["high_recall"].default is False
     assert inspect.signature(module.coverage_report).parameters["campaign_id"].default == 0
 
 

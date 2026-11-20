@@ -155,6 +155,11 @@ def evaluate_probe(conn: sqlite3.Connection, tool_name: str,
             "WHERE signature = ? AND ts > ?",
             (signature, floor)).fetchone()[0]
         limit = threshold()
+        if (
+            "CCO_STUCK_THRESHOLD" not in os.environ
+            and tool_name in {"validator_validate_access_control", "validator_validate_field_binding"}
+        ):
+            limit = max(limit, 64)
         if count >= limit:
             endpoint = signature.split("|", 1)[1] if "|" in signature else signature
             detail = (

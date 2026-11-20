@@ -510,7 +510,7 @@ selected confirm_now waf_blocked surface_queued schema_repair_queue revisit_cand
 expectation test_type missing_coverage blocked_identities authz_candidate
 """.split())
 _PUBLIC_DECISIONS = {"ready", "blocked", "planned", "incomplete", "unknown", "fresh", "stale", "expired",
-                     "LIVE", "PLAN", "CONFIRMED", "UNCONFIRMED", "INCONCLUSIVE", "NOT TESTED", "TESTED",
+                     "LIVE", "PLAN", "CONFIRMED", "PROBABLE", "UNCONFIRMED", "INCONCLUSIVE", "ERROR", "NOT TESTED", "TESTED",
                      "observed", "declared", "anonymous", "anon", "unspecified", "passive_inventory",
                      "discover", "crawl", "fuzz", "validate", "exploit", "identity_discovery", "remaining",
                      "query", "path", "body", "json", "form", "header", "cookie", "authz_oracle", "oob_oracle"}
@@ -615,7 +615,7 @@ _VALIDATOR_HOOKS = {
     "validate_xss_reflection", "validate_command_injection", "validate_xxe", "validate_deserialization",
     "validate_token_differential", "authz_oracle", "oob_oracle",
 }
-_VALIDATOR_VERDICTS = {"CONFIRMED", "UNCONFIRMED", "INCONCLUSIVE", "SKIPPED"}
+_VALIDATOR_VERDICTS = {"CONFIRMED", "UNCONFIRMED", "INCONCLUSIVE", "SKIPPED", "PROBABLE", "ERROR"}
 _PUBLIC_DIAGNOSTICS = {
     "max_validations", "no validator", "not auto-validated", "active_adapter_deferred", "missing_access_context",
     "candidate outside target origin", "authz auto: only GET", "authz auto: no authz validator",

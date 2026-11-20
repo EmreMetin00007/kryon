@@ -440,7 +440,7 @@ def _compact_retired_history_bundle(
     }
 
 
-def _compact_verified_task_contract(body: dict, tasks) -> tuple[dict, bool]:
+def _compact_verified_task_contract(body: dict, tasks, *, minimal: bool = False) -> tuple[dict, bool]:
     """Replace an oversized verified TaskSpec prompt with a compact host pointer.
 
     Used only when bounded_history + history bundling still exceed MAX_PROMPT_TOKENS
@@ -461,8 +461,11 @@ def _compact_verified_task_contract(body: dict, tasks) -> tuple[dict, bool]:
     evidence_dir = Path(spec.evidence_dir).relative_to(tasks.workdir).as_posix()
     wd_prefix = str(tasks.workdir).rstrip("/") + "/"
     host_lines = []
+    keep_prefixes = ("Tools:",) if minimal else (
+        "Scope:", "Tools:", "Object pool:", "Handoff packet:", "Previous summaries:", "Vector:"
+    )
     for line in active_prompt.splitlines():
-        if line.startswith(("Scope:", "Tools:", "Object pool:", "Handoff packet:", "Previous summaries:", "Vector:")):
+        if line.startswith(keep_prefixes):
             if line.startswith(("Object pool:", "Handoff packet:")):
                 label, _, val = line.partition(":")
                 rel = val.strip().replace(wd_prefix, "").split(" (", 1)[0]
@@ -477,8 +480,7 @@ def _compact_verified_task_contract(body: dict, tasks) -> tuple[dict, bool]:
         f"Target: {spec.target}",
         f"Workdir: {tasks.workdir}",
         *host_lines,
-        f"Evidence dir: {evidence_dir}",
-        f"Summary path: summaries/{spec.id}.json",
+        *([] if minimal else [f"Evidence dir: {evidence_dir}", f"Summary path: summaries/{spec.id}.json"]),
         f"Synthetic session references (host-owned): {json.dumps(tasks.bindings, separators=(',', ':'))}",
         f"Commands: Read {contract['path']}; refs under Workdir.",
     ]
@@ -486,6 +488,7 @@ def _compact_verified_task_contract(body: dict, tasks) -> tuple[dict, bool]:
 
     cont_prefix = f"Task: {spec.id}\nPhase: {spec.phase}\nTarget: {spec.target}\nWorkdir: {tasks.workdir}\n"
     cont_suffix = f"Read {contract['path']} only for missing detail; refs under Workdir."
+    ptr_suffix = f"Commands: Read {contract['path']}; refs under Workdir."
     view = copy.deepcopy(body)
     replaced = False
 
@@ -494,12 +497,13 @@ def _compact_verified_task_contract(body: dict, tasks) -> tuple[dict, bool]:
         if active_prompt in text:
             replaced = True
             return text.replace(active_prompt, pointer)
-        if cont_prefix in text and cont_suffix in text:
-            start = text.index(cont_prefix)
-            end = text.index(cont_suffix, start) + len(cont_suffix)
-            if len(pointer) < end - start:
-                replaced = True
-                return text[:start] + pointer + text[end:]
+        for suffix in (cont_suffix, ptr_suffix):
+            if cont_prefix in text and suffix in text:
+                start = text.index(cont_prefix)
+                end = text.index(suffix, start) + len(suffix)
+                if len(pointer) < end - start:
+                    replaced = True
+                    return text[:start] + pointer + text[end:]
         return text
 
     for msg in view["messages"]:
@@ -1130,6 +1134,55 @@ class NativeBrokerCompat(HostBroker):
                 or prompt_bound(provider_json(_completion_preview(candidate)))[0] > max_prompt_tokens
             )
 
+        def _compact_native_metadata_last_resort(candidate):
+            # Last-resort shrink: keep essential runtime allowance fields (especially finalizing)
+            # and preserve archived call IDs while trimming decorative history metadata.
+            trimmed = copy.deepcopy(candidate)
+            changed = False
+            allowance_prefix = "Host runtime allowance: "
+            for msg in trimmed.get("messages", []):
+                content = msg.get("content")
+                if msg.get("role") != "user" or not isinstance(content, str):
+                    continue
+                if content.startswith(_HISTORY_PREFIX):
+                    try:
+                        parsed = json.loads(content[len(_HISTORY_PREFIX) :])
+                    except ValueError:
+                        parsed = None
+                    if isinstance(parsed, dict) and isinstance(parsed.get("content_ref"), dict):
+                        compact_hist = {
+                            "content_ref": {
+                                "path": parsed["content_ref"].get("path"),
+                                "sha256": parsed["content_ref"].get("sha256"),
+                            },
+                            "calls": parsed.get("calls") or [],
+                        }
+                        encoded = _HISTORY_PREFIX + provider_json(compact_hist).decode()
+                        if len(encoded) < len(content):
+                            msg["content"] = encoded
+                            changed = True
+                elif content.startswith(allowance_prefix):
+                    try:
+                        info_obj, end_idx = json.JSONDecoder().raw_decode(content[len(allowance_prefix) :])
+                    except ValueError:
+                        info_obj = None
+                        end_idx = 0
+                    if isinstance(info_obj, dict):
+                        tail = content[len(allowance_prefix) + end_idx :]
+                        compact_info = {
+                            key: info_obj[key]
+                            for key in ("phase", "spec_id", "finalizing", "remaining_tool_calls")
+                            if key in info_obj
+                        }
+                        short_tail = tail if info_obj.get("finalizing") else " Complete Commands."
+                        encoded = allowance_prefix + provider_json(compact_info).decode() + short_tail
+                        if len(encoded) < len(content):
+                            msg["content"] = encoded
+                            changed = True
+            if changed and len(provider_json(trimmed["messages"])) < len(provider_json(candidate["messages"])):
+                return trimmed
+            return candidate
+
         def _shrink_native_worker_request(candidate, metrics, max_context_bytes, max_prompt_tokens):
             from full_agent_history import bounded_history
 
@@ -1166,6 +1219,10 @@ class NativeBrokerCompat(HostBroker):
                 candidate, bundled = _compact_retired_history_bundle(candidate, self.tasks, recent_turns=0)
                 if bundled is not None:
                     metrics.setdefault("history_projections", []).append(bundled)
+            if _over_native_bounds(candidate, max_context_bytes, max_prompt_tokens):
+                candidate, _ = _compact_verified_task_contract(candidate, self.tasks, minimal=True)
+            if _over_native_bounds(candidate, max_context_bytes, max_prompt_tokens):
+                candidate = _compact_native_metadata_last_resort(candidate)
             return candidate
 
         def prepare_request(req_body, metrics):

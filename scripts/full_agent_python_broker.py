@@ -75,19 +75,20 @@ class ClosureError(ValueError):
 class PythonRuntimePolicy(RuntimePolicy):
     """Fixed phase shares, one reserved repair and a consecutive error brake."""
 
-    def __init__(self, budget):
+    def __init__(self, budget, *, phase_call_limits: dict[str, int] | None = None):
         super().__init__(budget)
+        self.phase_call_limits = {**PHASE_CALL_LIMITS, **(phase_call_limits or {})}
         self.limits = {phase: budget.limits["tokens"] * weight // 100
                        for phase, weight in PHASE_WEIGHTS.items()}
         self.limits["planner"] += budget.limits["tokens"] - sum(self.limits.values())
-        self.consecutive_failures = {}
-        self.repairing = set()
-        self.handoff_reserves = {}
-        self.validation_reserves = {}
-        self.checkpoint_reserves = {}
-        self.host_finalizing = set()
-        self.host_continuing = set()
-        self.summary_prompt_tokens = {}
+        self.consecutive_failures: dict[str, int] = {}
+        self.repairing: set[str] = set()
+        self.handoff_reserves: dict[str, int] = {}
+        self.validation_reserves: dict[str, int] = {}
+        self.checkpoint_reserves: dict[str, int] = {}
+        self.host_finalizing: set[str] = set()
+        self.host_continuing: set[str] = set()
+        self.summary_prompt_tokens: dict[str, int] = {}
         self._lock = threading.RLock()
         self._pending_executions: dict[str, dict[str, Any]] = {}
         self._conservative_token_charges: dict[str, int] = {}
@@ -102,11 +103,17 @@ class PythonRuntimePolicy(RuntimePolicy):
             conservative = self._conservative_token_charges.get(phase, 0)
         return max(0, remaining - reserved_tokens - conservative), phase, ident
 
+    def _effective_max_calls(self, spec) -> int:
+        phase_limit = self.phase_call_limits[spec.phase]
+        if phase_limit > PHASE_CALL_LIMITS[spec.phase]:
+            return max(spec.max_calls, phase_limit)
+        return min(spec.max_calls, phase_limit)
+
     def reserve_handoff(self, spec, session_count):
         if spec.phase != "enum" or type(session_count) is not int or session_count < 0:
             raise ValueError("invalid handoff reservation")
         reserve = session_count + 1
-        if reserve > min(spec.max_calls, PHASE_CALL_LIMITS[spec.phase]):
+        if reserve > self._effective_max_calls(spec):
             raise BudgetError("handoff_tool_budget_exhausted")
         self.handoff_reserves[spec.id] = reserve
 
@@ -120,7 +127,7 @@ class PythonRuntimePolicy(RuntimePolicy):
             reserved = (0 if spec.id in self.host_finalizing else
                         self.handoff_reserves.get(spec.id, 0) + self.validation_reserves.get(spec.id, 0)
                         + self.checkpoint_reserves.get(spec.id, 0))
-            return max(0, min(spec.max_calls, PHASE_CALL_LIMITS[spec.phase])
+            return max(0, self._effective_max_calls(spec)
                        - reserved - self.tool_calls.get(spec.id, 0) - pending_calls)
 
     def reserve_execution(self, spec, *, calls: int = 1, estimated_tokens: int = 0, uncertain: bool = False) -> str:
@@ -187,7 +194,7 @@ class PythonRuntimePolicy(RuntimePolicy):
     def prepare(self, spec, prompt_tokens):
         remaining, phase, ident = self.allowance(spec)
         count = self.calls.get(ident, 0)
-        limit = PHASE_CALL_LIMITS[phase]
+        limit = self.phase_call_limits[phase]
         repair = ident in self.repairing
         if count >= limit or (not repair and count >= limit - 1):
             raise BudgetError("phase_call_budget_exhausted")
@@ -238,7 +245,7 @@ class PythonRuntimePolicy(RuntimePolicy):
             if self.consecutive_failures.get(spec.id, 0) >= 2:
                 raise BudgetError("consecutive_tool_failure_limit")
             count = self.tool_calls.get(spec.id, 0)
-            if count >= min(spec.max_calls, PHASE_CALL_LIMITS[spec.phase]):
+            if count >= self._effective_max_calls(spec):
                 raise BudgetError("phase_tool_budget_exhausted")
             active_ticket = getattr(self._active_ticket, "value", None)
             active_item = self._pending_executions.get(active_ticket) if active_ticket else None
@@ -262,7 +269,7 @@ class PythonRuntimePolicy(RuntimePolicy):
         for name in ("finalization_turns", "phase_finalization_turns", "finalization_tool_reserve"):
             snapshot.pop(name)
         return {**snapshot, "schema": "python-runtime-policy/1",
-                "provider_call_limits": PHASE_CALL_LIMITS, "tool_call_limits": PHASE_CALL_LIMITS,
+                "provider_call_limits": dict(self.phase_call_limits), "tool_call_limits": dict(self.phase_call_limits),
                 "consecutive_tool_failure_limit": 2, "summary_repair_limit": 1,
                 "consecutive_failures": dict(self.consecutive_failures),
                 "repairing": sorted(self.repairing),
@@ -1498,7 +1505,10 @@ class PythonBroker(HostBroker):
                                     or not {"param", "method", "carrier", "identity"} <= context.keys()
                                     or context.get("identity") not in {"anon", "anonymous"}):
                                 continue
-                    if (record["target"] != args.get("target_url")
+                    if row["tool"] in {"validator_validate_access_control", "validator_validate_field_binding"}:
+                        if record["target"] != args.get("target_url"):
+                            continue
+                    elif (record["target"] != args.get("target_url")
                             or context.get("param", "") != args.get("param", "")
                             or context.get("method", "GET") != args.get("method", "GET")
                             or context.get("carrier", "query") != args.get("carrier", "query")):
@@ -1512,7 +1522,7 @@ class PythonBroker(HostBroker):
                     # Hunter's evidence contract is its observed validation
                     # queue, not a top-level scalar copied from another run.
                     continue
-                if vector == "authz-idor" and not authorization_controls_complete(record):
+                if vector == "authz-idor" and record.get("oracle") == "content_match" and not authorization_controls_complete(record):
                     continue
                 attempts[record["validation_id"]] = {"vector": vector, "record": record,
                     "tool": row["tool"],
@@ -2031,7 +2041,7 @@ class PythonBroker(HostBroker):
             raise HandoffError("handoff_session_binding_invalid")
         pending = [args for args in checks if not self._fresh_task_session_check(spec, args)]
         self.runtime_policy.reserve_handoff(spec, len(pending))
-        remaining = min(spec.max_calls, PHASE_CALL_LIMITS[spec.phase]) - self.runtime_policy.tool_calls.get(spec.id, 0)
+        remaining = self.runtime_policy._effective_max_calls(spec) - self.runtime_policy.tool_calls.get(spec.id, 0)
         if remaining < len(pending) + 1:
             raise BudgetError("handoff_tool_budget_exhausted")
         self.runtime_policy.host_finalizing.add(spec.id)
@@ -2122,12 +2132,46 @@ class PythonBroker(HostBroker):
                     break
         return list(findings.values())
 
+    def probable_findings(self, spec):
+        """Collect signed operator-review PROBABLE artifacts, never mixed into CONFIRMED findings."""
+        from brain import runtime_root
+        validator_path = str(runtime_root() / "mcp-servers/mcp-validator")
+        if validator_path not in sys.path:
+            sys.path.append(validator_path)
+        from cco_validator_core import artifact_is_current, load_validation
+        probable: dict[str, dict[str, Any]] = {}
+        for row in self.results:
+            if row["spec_id"] != spec.id or not row["tool"].startswith("validator_validate_"):
+                continue
+            try:
+                value = self.read_reference(row["content_ref"])
+            except (ValueError, OSError, TypeError):
+                continue
+            if not isinstance(value, dict) or not value.get("validation_id"):
+                continue
+            record = load_validation(str(value["validation_id"]))
+            if (not record or record.get("verdict") != "PROBABLE"
+                    or record.get("reportable") is True
+                    or not artifact_is_current(record, expected_target=spec.target)):
+                continue
+            probable[record["validation_id"]] = {
+                "validation_id": record["validation_id"],
+                "validation_sha256": record["artifact"]["content_sha256"],
+                "vuln_type": record.get("vuln_type") or "",
+                "oracle": record.get("oracle") or "",
+                "target": record.get("target") or "",
+                "verdict": "PROBABLE",
+                "review_tier": "operator-review",
+                "reportable": False,
+            }
+        return list(probable.values())
+
     def seal(self):
         """Preserve remaining work as NOT TESTED before the existing closure gate."""
         spec = self.tasks.active_spec
         if spec is None or spec.phase != 'report' or 'kali-tools_ledger_checkpoint' not in spec.tools:
             raise ClosureError('closure_phase_invalid')
-        remaining = min(spec.max_calls, PHASE_CALL_LIMITS[spec.phase]) - self.runtime_policy.tool_calls.get(spec.id, 0)
+        remaining = self.runtime_policy._effective_max_calls(spec) - self.runtime_policy.tool_calls.get(spec.id, 0)
         if remaining < 1:
             raise BudgetError('closure_tool_budget_exhausted')
         import hypothesis_ledger as hypotheses
@@ -2144,7 +2188,7 @@ class PythonBroker(HostBroker):
             record, _ = _confirmation_record(finding, vector, ledger)
             if record is None:
                 raise ValueError("validator receipt became stale")
-            if vector == "authz-idor" and not authorization_controls_complete(record):
+            if vector == "authz-idor" and record.get("oracle") == "content_match" and not authorization_controls_complete(record):
                 raise ValueError("validator receipt missing authorization controls")
             hypotheses.mark(ledger, vector, "confirmed", note="host verified validator receipt")
             entry = next(e for e in ledger["hypotheses"] if e["vector"] == vector)

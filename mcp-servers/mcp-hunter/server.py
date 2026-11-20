@@ -458,6 +458,10 @@ def _record_coverage_validation(target, item, result):
         status = "confirmed"
     elif verdict == "UNCONFIRMED":
         status = "tested_clean"
+    elif verdict == "PROBABLE":
+        status = "probable_review"
+    elif verdict == "ERROR":
+        status = "execution_error"
     else:
         status = "inconclusive" if verdict == "INCONCLUSIVE" else "blocked"
     artifact = stored.get("artifact") or {}
@@ -1565,6 +1569,24 @@ def _coverage_report(target: str, enqueue_gaps: bool = False, selected_run: str 
                 })
 
     coverage_pct = round(100 * tested_cells / total_cells) if total_cells else 0
+    ledger_entries = []
+    for ep_row in per_endpoint:
+        for cell in ep_row.get("dimensions") or []:
+            cell_status = cell.get("status") or "not_tested"
+            if cell_status == "confirmed":
+                ledger_entries.append({"ledger_status": "confirmed_violation"})
+            elif cell_status == "tested_clean":
+                ledger_entries.append({"ledger_status": "verified_pass"})
+            elif cell_status == "probable_review":
+                ledger_entries.append({"ledger_status": "probable_review"})
+            elif cell_status == "execution_error":
+                ledger_entries.append({"ledger_status": "execution_error"})
+            elif cell_status == "blocked":
+                ledger_entries.append({"ledger_status": "blocked"})
+            else:
+                ledger_entries.append({"ledger_status": "oracle_gap"})
+    from verdict_ledger import summarize_ledger
+    verdict_ledger = summarize_ledger(ledger_entries, planned=total_cells)
     enqueued = []
     queued_dimensions = []
     campaign_tasks = {"scheduled": [], "deferred": [], "requests_sent": 0}
@@ -1597,6 +1619,10 @@ def _coverage_report(target: str, enqueue_gaps: bool = False, selected_run: str 
         "endpoints": len(endpoints), "tested_classes": sorted(tested),
         "coverage_percent": coverage_pct,
         "cells": {"total_relevant": total_cells, "tested": tested_cells, "untested": total_cells - tested_cells},
+        "verdict_ledger": verdict_ledger,
+        "adjudication_coverage": verdict_ledger["adjudication_coverage"],
+        "oracle_gap": verdict_ledger["oracle_gap"],
+        "probable_review": verdict_ledger["probable_review"],
         "blind_spots": blind_spots,
         "top_gaps": uniq_gaps[:20],
         "per_endpoint": per_endpoint[:40],
@@ -1636,7 +1662,7 @@ def fuzz_attack_surface(target: str, limit: int = 8, max_requests: int = 40,
                         live: bool = False, headers: str = "", sleep_s: float = 0.15,
                         sample_limit: int = 4, sql_only: bool = False, ssti_only: bool = False,
                         traversal_only: bool = False, xss_only: bool = False,
-                        redirect_only: bool = False) -> str:
+                        redirect_only: bool = False, high_recall: bool = False) -> str:
     """P1 — SURFACE CANARY FUZZ. `next_surface_work` kuyruğundaki kayıtlı paramlara
     sınıf-bilinçli canary basar (SQLi/XSS/SSTI/LFI/open-redirect). LLM parse etmez.
 
@@ -1690,6 +1716,7 @@ def fuzz_attack_surface(target: str, limit: int = 8, max_requests: int = 40,
                             str(p.get("name") if isinstance(p, dict) else p),
                             str(p.get("sample", "") if isinstance(p, dict) else ""),
                             prof_name,
+                            high_recall=high_recall,
                         )[1]
                         for p in (record.get("params") or [])
                     )
@@ -2610,15 +2637,25 @@ def _loop_discover(target, cookie="", headers="", sql_only=False, ssti_only=Fals
                    xss_only=False, redirect_only=False):
     profile_only = sql_only or ssti_only or traversal_only or xss_only or redirect_only
     if profile_only:
-        from urllib.parse import urlsplit
-        prefix = urlsplit(target).path.rstrip("/")
+        from urllib.parse import parse_qsl, urlsplit
+        parsed_t = urlsplit(target)
+        prefix = parsed_t.path.rstrip("/")
+        q_pairs = parse_qsl(parsed_t.query, keep_blank_values=True)
+        q_names = {k for k, _ in q_pairs}
         existing = next_work(target, limit=1000, untested_only=False, db_path=MEM_DB)
-        if any(
-            (urlsplit(rec.get("url") or "").path == prefix
-             or urlsplit(rec.get("url") or "").path.startswith(prefix + "/"))
-            and rec.get("params")
-            for rec in existing.get("queue", [])
-        ):
+        def _has_matching_rec(work_res):
+            for rec in work_res.get("queue", []):
+                rec_path = urlsplit(rec.get("url") or "").path.rstrip("/")
+                if not (rec_path == prefix or rec_path.startswith(prefix + "/")):
+                    continue
+                rec_params = {
+                    (p.get("name") if isinstance(p, dict) else str(p))
+                    for p in (rec.get("params") or [])
+                }
+                if rec_params and (not q_names or q_names <= rec_params):
+                    return True
+            return False
+        if _has_matching_rec(existing):
             return json.dumps({"ok": True, "skipped": "surface_already_ingested", "records": []})
     from cco_surface_core.wire import SurfaceBlocked, scoped_surface_requests
     gate = current_policy_gate()
@@ -2627,7 +2664,7 @@ def _loop_discover(target, cookie="", headers="", sql_only=False, ssti_only=Fals
     kali = _load_peer("kali_web_loop", "mcp-kali-tools")
     try:
         with scoped_surface_requests(gate, target):
-            return kali.discover_web_surface(
+            disc_raw = kali.discover_web_surface(
                 target, mode="passive" if profile_only else "active", include_historic=False, include_browser=False,
                 # Observed links already carry parameter samples. Leave
                 # linked endpoint GETs to the validator's controls.
@@ -2635,6 +2672,28 @@ def _loop_discover(target, cookie="", headers="", sql_only=False, ssti_only=Fals
             )
     except SurfaceBlocked as exc:
         return json.dumps({"error": "discovery blocked", "stop_reason": str(exc)})
+    if profile_only:
+        from urllib.parse import parse_qsl, urlsplit
+        parsed_t = urlsplit(target)
+        q_pairs = parse_qsl(parsed_t.query, keep_blank_values=True)
+        if q_pairs:
+            q_names = {k for k, _ in q_pairs}
+            prefix = parsed_t.path.rstrip("/")
+            after = next_work(target, limit=1000, untested_only=False, db_path=MEM_DB)
+            found = any(
+                (urlsplit(rec.get("url") or "").path.rstrip("/") == prefix)
+                and q_names <= {(p.get("name") if isinstance(p, dict) else str(p)) for p in (rec.get("params") or [])}
+                for rec in after.get("queue", [])
+            )
+            if not found:
+                from cco_surface_core.store import ingest_records
+                ingest_records([{
+                    "url": target,
+                    "method": "GET",
+                    "params": [{"name": k, "in": "query", "sample": v} for k, v in q_pairs],
+                    "sources": ["probe"],
+                }], target=target, db_path=MEM_DB, max_records=800)
+    return disc_raw
 
 
 def _loop_crawl(target, cookie="", headers=""):
@@ -2663,13 +2722,14 @@ def _loop_zap(target):
 
 def _loop_fuzz(target, live=True, limit=8, headers="", cookie="", sleep_s=0.15,
                request_field_values=None, sample_limit=4, sql_only=False, ssti_only=False,
-               traversal_only=False, xss_only=False, redirect_only=False):
+               traversal_only=False, xss_only=False, redirect_only=False, high_recall=False):
     with request_fields(request_field_values):
         return fuzz_attack_surface(
             target, limit=int(limit), max_requests=max(20, int(limit) * 5),
             live=bool(live), headers=_headers_json(headers, cookie), sleep_s=float(sleep_s),
             sample_limit=sample_limit, sql_only=sql_only, ssti_only=ssti_only,
             traversal_only=traversal_only, xss_only=xss_only, redirect_only=redirect_only,
+            high_recall=bool(high_recall),
         )
 
 
@@ -3115,6 +3175,7 @@ def run_web_loop(
     gap_ref: str = "",
     candidate_sample_limit: int = 4,
     validation_profile: str = "",
+    high_recall: bool = False,
 ) -> str:
     """Tek çağrıda web zinciri: discover → crawl → fuzz → validator → exploit_confirmed.
 
@@ -3284,7 +3345,7 @@ def run_web_loop(
         crawl_fn=_loop_crawl if live else None,
         zap_fn=None,
         fuzz=(lambda *args, **kwargs: _loop_fuzz(
-            *args, **kwargs, sample_limit=candidate_sample_limit,
+            *args, **kwargs, sample_limit=candidate_sample_limit, high_recall=bool(high_recall),
             **({"sql_only": True} if sql_only
                else {"ssti_only": True} if ssti_only
                else {"traversal_only": True} if traversal_only
@@ -3293,7 +3354,7 @@ def run_web_loop(
                else {})
         )) if live else None,
         validate=(lambda item, **kwargs: _loop_validate(
-            {**item, "boolean_only": True} if sql_only
+            {**item, "boolean_only": not bool(high_recall)} if sql_only
             else ({**item, "bounded_controls": True} if redirect_only else item),
             **kwargs,
         )) if live else None,

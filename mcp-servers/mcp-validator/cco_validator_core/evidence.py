@@ -371,23 +371,33 @@ def _signature_for(record: dict) -> str:
     return hmac.new(_signing_key(create=False), _integrity_payload(record), hashlib.sha256).hexdigest()
 
 
+def _signature_purpose(record: dict) -> str:
+    return "operator-review" if str(record.get("verdict") or "").upper() == "PROBABLE" else "validator-artifact"
+
+
 def _ensure_signature(record: dict) -> None:
     artifact = record.setdefault("artifact", {})
     signature = artifact.setdefault("signature", {})
+    purpose = _signature_purpose(record)
     signature["algorithm"] = SIGNATURE_ALGORITHM
     signature["key_id"] = trust.signing_identity()
+    if purpose == "operator-review":
+        signature["purpose"] = purpose
     signature["value"] = ""
     artifact["content_sha256"] = _canonical_hash(record)
-    signature["value"] = trust.sign(_integrity_payload(record), "validator-artifact")["signature"]
+    signature["value"] = trust.sign(_integrity_payload(record), purpose)["signature"]
 
 
 def _signature_is_valid(record: dict, legacy_private: bool = False) -> bool:
     artifact = record.get("artifact") or {}
     signature = artifact.get("signature") or {}
     if signature.get("algorithm") == SIGNATURE_ALGORITHM:
+        expected_purpose = _signature_purpose(record)
+        if signature.get("purpose") and signature.get("purpose") != expected_purpose:
+            return False
         return trust.verify(_integrity_payload(record), {
             "signature_alg": signature["algorithm"], "key_id": signature.get("key_id"),
-            "signature": signature.get("value")}, "validator-artifact")
+            "signature": signature.get("value")}, expected_purpose)
     if signature.get("algorithm") != LEGACY_SIGNATURE_ALGORITHM:
         return False
     supplied = str(signature.get("value") or "")

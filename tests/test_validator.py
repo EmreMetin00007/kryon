@@ -29,6 +29,8 @@ def test_validator_imports_and_tool_count():
         "validate_stored_reflection",
         "validate_open_redirect",
         "validate_business_logic",
+        "validate_field_binding",
+        "validate_access_control",
         "validate_ssrf_oob",
         "confirm_oob_callback",
         "validate_blind_oob",
@@ -634,4 +636,154 @@ def test_validate_finding_introspection_and_class_agnostic_behavioral_oracle(mon
     assert out["verdict"] == "CONFIRMED"
     assert out["oracle"] == "behavioral_invariant"
     assert out.get("validation_id")
+
+
+def test_access_control_anon_200_api_vs_public_html_and_reports_html_noise_filter(monkeypatch):
+    mod = _v()
+
+    # 1. Non-public /api/ telemetry endpoint returning operational JSON anonymously -> CONFIRMED
+    def fake_api_anon(method, url, **kwargs):
+        return {
+            "ok": True,
+            "status": 200,
+            "len": 64,
+            "time": 0.01,
+            "text": '{"tenants":["t1","t2"],"events":42}',
+            "headers": {"Content-Type": "application/json"},
+            "location": "",
+            "final_url": url,
+            "error": None,
+        }
+
+    monkeypatch.setattr(mod, "_request", fake_api_anon)
+    api_res = json.loads(mod.validate_access_control(
+        target_url="http://t.local/api/v1/telemetry/overview",
+        check_category="function_role_access",
+        caller_headers_json=json.dumps({"Authorization": "Bearer tok-member"}),
+        caller_alias="member-a",
+        caller_role="member",
+        caller_tenant="t1",
+        mode="blind",
+    ))
+    assert api_res["verdict"] == "CONFIRMED"
+    assert api_res["oracle"] == "unauthenticated_api_access"
+    assert api_res["reportable"] is True
+
+    # 2. Public HTML landing page -> UNCONFIRMED
+    def fake_public_html(method, url, **kwargs):
+        return {
+            "ok": True,
+            "status": 200,
+            "len": 45,
+            "time": 0.01,
+            "text": "<!doctype html><html><body>Welcome</body></html>",
+            "headers": {"Content-Type": "text/html"},
+            "location": "",
+            "final_url": url,
+            "error": None,
+        }
+
+    monkeypatch.setattr(mod, "_request", fake_public_html)
+    pub_res = json.loads(mod.validate_access_control(
+        target_url="http://t.local/welcome",
+        check_category="function_role_access",
+        caller_headers_json=json.dumps({"Authorization": "Bearer tok-member"}),
+        caller_alias="member-a",
+        mode="blind",
+    ))
+    assert pub_res["verdict"] == "UNCONFIRMED"
+    assert pub_res["evidence"]["public_or_unauthenticated"] is True
+
+    # 3. Plain HTML /reports navigation shell (anon 302 -> /login) -> UNCONFIRMED (no noisy PROBABLE)
+    def fake_reports_html(method, url, **kwargs):
+        hdrs = kwargs.get("headers") or {}
+        if not hdrs.get("Authorization"):
+            return {
+                "ok": True, "status": 302, "len": 0, "time": 0.01, "text": "",
+                "headers": {"Location": "/login"}, "location": "/login", "final_url": url, "error": None,
+            }
+        return {
+            "ok": True,
+            "status": 200,
+            "len": 90,
+            "time": 0.01,
+            "text": "<html><body><h1>Reports</h1>\n<nav>Menu</nav>\n<p>Pick a view</p></body></html>",
+            "headers": {"Content-Type": "text/html"},
+            "location": "",
+            "final_url": url,
+            "error": None,
+        }
+
+    monkeypatch.setattr(mod, "_request", fake_reports_html)
+    rep_res = json.loads(mod.validate_access_control(
+        target_url="http://t.local/reports",
+        check_category="function_role_access",
+        caller_headers_json=json.dumps({"Authorization": "Bearer tok-member"}),
+        caller_alias="member-a",
+        caller_role="member",
+        caller_tenant="t1",
+        owner_headers_json=json.dumps({"Authorization": "Bearer tok-admin"}),
+        owner_alias="admin-a",
+        mode="blind",
+    ))
+    assert rep_res["verdict"] == "UNCONFIRMED"
+
+
+def test_sqli_order_by_asc_desc_and_case_when_oracles_with_negative_control(monkeypatch):
+    mod = _v()
+
+    # 1. Reversible ASC/DESC differential on ?sort=score
+    def fake_asc_desc(url, payload, **kwargs):
+        if payload == "score DESC":
+            text = "<ul><li>doc-b (20)</li><li>doc-a (10)</li></ul>"
+        elif payload in {"score", "score ASC"}:
+            text = "<ul><li>doc-a (10)</li><li>doc-b (20)</li></ul>"
+        else:
+            text = "<ul><li>doc-a (10)</li><li>doc-b (20)</li></ul>"
+        return {
+            "ok": True, "status": 200, "len": len(text), "time": 0.01,
+            "text": text, "headers": {"Content-Type": "text/html"},
+            "location": "", "final_url": url, "error": None,
+        }
+
+    monkeypatch.setattr(mod, "_send_payload", fake_asc_desc)
+    asc_res = json.loads(mod.validate_sqli("http://t.local/documents?sort=score", param="sort", boolean_only=False))
+    assert asc_res["verdict"] == "CONFIRMED"
+    assert asc_res["oracle"] == "differential_order_by"
+    assert asc_res["evidence"]["order_by_oracle"] == "reversible_direction_differential"
+
+    # 2. Conditional CASE WHEN error differential on ?sort=score
+    def fake_case_when(url, payload, **kwargs):
+        if "1=2" in payload and ("1/0" in payload or "ABS(" in payload or "UNION" in payload):
+            return {
+                "ok": True, "status": 500, "len": 21, "time": 0.01,
+                "text": "Internal Server Error", "headers": {"Content-Type": "text/html"},
+                "location": "", "final_url": url, "error": None,
+            }
+        text = "<ul><li>doc-a (10)</li><li>doc-b (20)</li></ul>"
+        return {
+            "ok": True, "status": 200, "len": len(text), "time": 0.01,
+            "text": text, "headers": {"Content-Type": "text/html"},
+            "location": "", "final_url": url, "error": None,
+        }
+
+    monkeypatch.setattr(mod, "_send_payload", fake_case_when)
+    cw_res = json.loads(mod.validate_sqli("http://t.local/documents?sort=score", param="sort", boolean_only=False))
+    assert cw_res["verdict"] == "CONFIRMED"
+    assert cw_res["oracle"] == "differential_order_by"
+    assert cw_res["evidence"]["order_by_oracle"] == "conditional_error_differential"
+
+    # 3. Negative control: whitelisted/parameterized sort ignores injected SQL clauses identically
+    def fake_safe_sort(url, payload, **kwargs):
+        text = "<ul><li>doc-a (10)</li><li>doc-b (20)</li></ul>"
+        return {
+            "ok": True, "status": 200, "len": len(text), "time": 0.01,
+            "text": text, "headers": {"Content-Type": "text/html"},
+            "location": "", "final_url": url, "error": None,
+        }
+
+    monkeypatch.setattr(mod, "_send_payload", fake_safe_sort)
+    safe_res = json.loads(mod.validate_sqli("http://t.local/documents?sort=score", param="sort", boolean_only=False))
+    assert safe_res["verdict"] == "UNCONFIRMED"
+
 

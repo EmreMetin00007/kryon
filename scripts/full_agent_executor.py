@@ -30,6 +30,8 @@ CATALOG = {
         "validate_xss_reflection",
         "validate_open_redirect",
         "validate_business_logic",
+        "validate_field_binding",
+        "validate_access_control",
         "validate_auth_bypass",
         "validate_idor",
         "session_vault_check",
