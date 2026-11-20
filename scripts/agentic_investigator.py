@@ -69,11 +69,13 @@ _BANNER_MARKERS = (
     "\n[SURFACE FRONTIER]",
     "\n[WRITE-PHASE]",
     "\n[LOOP GUARD]",
+    "\n[BUDGET-WRAPUP]",
     "\n[URGENT]",
 )
 CHARS_PER_TOKEN = 4
 _PROMPT_SOFT_CHAR_LIMIT = 21_000
 _PROMPT_HARD_CHAR_LIMIT = 24_000
+_EPOCH_HARD_CHAR_LIMIT = 32_000
 _FRAMING_RESERVE_TOKENS = 2048
 _LOCAL_READ_TOOLS = frozenset({"read_receipt", "extract_surface", "notebook"})
 
@@ -877,6 +879,8 @@ class AgenticInvestigator:
             "estimated_calls": 0,
         }
         self._last_metrics_paths: tuple[Path, Path] | None = None
+        self._epoch_turn_start: int = 0
+        self._epoch_summary_text: str = ""
 
     def _state_banner(self, turn: int) -> str:
         http_rem = self.http.budget.limit - self.http.budget.used
@@ -915,6 +919,21 @@ class AgenticInvestigator:
                     f"are properly rejected, confirm state persistence with a follow-up GET, and call "
                     f"`record_finding` immediately if a restriction is not enforced."
                 )
+        wrapup_reasons: list[str] = []
+        if tok_lim > 0 and tok_rem <= max(30_000, int(tok_lim * 0.15)):
+            wrapup_reasons.append(f"tokens={tok_rem}/{tok_lim}")
+        if self.max_turns > 5 and (self.max_turns - turn) <= 4:
+            wrapup_reasons.append(f"turns_left={max(0, self.max_turns - turn)}")
+        if self.http.budget.limit > 15 and http_rem <= 10:
+            wrapup_reasons.append(f"http_left={http_rem}/{self.http.budget.limit}")
+        wrapup_line = (
+            f"\n[BUDGET-WRAPUP] Low remaining budget ({', '.join(wrapup_reasons)}): "
+            "stop broad new discovery, immediately call `record_finding` for every verified vulnerability "
+            "already supported by receipts in memory (with exact proof and control receipt IDs), "
+            "and then call `finish` listing any untested areas."
+            if wrapup_reasons
+            else ""
+        )
         return (
             f"\n[STATE] http_budget: {http_rem}/{self.http.budget.limit} left | "
             f"llm_tokens: {tok_rem}/{tok_lim} left | turn: {turn}/{self.max_turns} | "
@@ -923,6 +942,7 @@ class AgenticInvestigator:
             f"{nb_line}"
             f"{frontier_line}"
             f"{write_nudge}"
+            f"{wrapup_line}"
         )
 
     def _last_provider_status(self) -> int | None:
@@ -964,6 +984,50 @@ class AgenticInvestigator:
         elif getattr(self.budget, "blocked", "") == "missing or invalid tokens usage":
             self.budget.blocked = ""
 
+    def _project_epoch_messages(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        max_tool_chars: int = 5200,
+        epoch_turn_start: int | None = None,
+        epoch_summary_text: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Project an append-only, prompt-cache-stable view of the current epoch."""
+        if len(messages) <= 1:
+            return copy.deepcopy(messages)
+
+        turn_groups = _group_turns(messages)
+        raw_start = self._epoch_turn_start if epoch_turn_start is None else epoch_turn_start
+        raw_summary = self._epoch_summary_text if epoch_summary_text is None else epoch_summary_text
+        if raw_start > 0 and raw_start >= len(turn_groups):
+            eff_start = 0
+            eff_summary = ""
+        else:
+            eff_start = raw_start
+            eff_summary = raw_summary
+
+        sys_msg = copy.deepcopy(messages[0])
+        init_user_msg = copy.deepcopy(messages[1])
+        if eff_summary:
+            init_user_msg["content"] = str(init_user_msg.get("content") or "") + eff_summary
+
+        projected: list[dict[str, Any]] = [sys_msg, init_user_msg]
+        for group in turn_groups[eff_start:]:
+            for msg in group:
+                item = copy.deepcopy(msg)
+                if (
+                    item.get("role") == "tool"
+                    and isinstance(item.get("content"), str)
+                    and len(item["content"]) > max_tool_chars
+                ):
+                    item["content"] = _truncate_recent_tool_content(
+                        item["content"],
+                        max_tool_chars,
+                        preserve_banner=True,
+                    )
+                projected.append(item)
+        return projected
+
     def _prepare_bounded_body(
         self,
         messages: list[dict[str, Any]],
@@ -974,58 +1038,105 @@ class AgenticInvestigator:
         avail = self.budget.available("tokens")
         wire_tools_default = compact_tools(TOOL_SCHEMAS, description_limit=140, strip_annotations=False)
         wire_tools_tight = compact_tools(TOOL_SCHEMAS, description_limit=96, strip_annotations=True)
-        schedules: tuple[tuple[int, int, int, bool], ...] = (
-            (3, 5200, 1800, False),
-            (2, 4600, 1400, False),
-            (2, 3200, 1100, True),
-            (1, 2400, 800, True),
-            (1, 1400, 500, True),
-        )
-        init_turns = 3
-        init_max_chars = 5200
-        init_hist_chars = 1800
-        if keep_recent_turns_override is not None:
-            capped_turns = max(1, int(keep_recent_turns_override))
-            schedules = tuple(
-                (min(turns, capped_turns), max_chars, hist_chars, use_tight)
-                for turns, max_chars, hist_chars, use_tight in schedules
-            )
-            if capped_turns == 1:
-                schedules = (
-                    (1, 2400, 800, True),
-                    (1, 1400, 500, True),
-                )
-            init_turns, init_max_chars, init_hist_chars, _ = schedules[0]
-        chosen_msgs = compact_messages_for_context(
-            messages,
-            keep_recent_turns=init_turns,
-            max_recent_tool_chars=init_max_chars,
-            max_history_summary_chars=init_hist_chars,
-        )
-        chosen_tools: list[dict[str, Any]] = wire_tools_default
-        serialized_bytes = 0
-        for turns, max_chars, hist_chars, use_tight_tools in schedules:
-            candidate = compact_messages_for_context(
-                messages,
-                keep_recent_turns=turns,
-                max_recent_tool_chars=max_chars,
-                max_history_summary_chars=hist_chars,
-            )
-            tools_payload = wire_tools_tight if use_tight_tools else wire_tools_default
-            chosen_msgs = candidate
-            chosen_tools = tools_payload
-            serialized_bytes = len(
+
+        def _serialized_len(msgs: list[dict[str, Any]], tools_payload: list[dict[str, Any]]) -> int:
+            return len(
                 json.dumps(
-                    {"messages": candidate, "tools": tools_payload},
+                    {"messages": msgs, "tools": tools_payload},
                     ensure_ascii=False,
                     separators=(",", ":"),
                 ).encode("utf-8")
             )
-            if (
-                serialized_bytes <= _PROMPT_HARD_CHAR_LIMIT
-                and serialized_bytes + _FRAMING_RESERVE_TOKENS + 256 <= avail
-            ):
-                break
+
+        def _fits_epoch_budget(byte_len: int) -> bool:
+            return (
+                byte_len <= _EPOCH_HARD_CHAR_LIMIT
+                and byte_len + _FRAMING_RESERVE_TOKENS + 256 <= avail
+            )
+
+        chosen_msgs: list[dict[str, Any]] | None = None
+        chosen_tools: list[dict[str, Any]] = wire_tools_default
+        serialized_bytes = 0
+
+        turn_groups = _group_turns(messages)
+        epoch_applicable = (
+            keep_recent_turns_override is None
+            and self.execution_mode == "monolithic"
+            and not (self._epoch_turn_start > 0 and self._epoch_turn_start >= len(turn_groups))
+        )
+        if epoch_applicable:
+            epoch_msgs = self._project_epoch_messages(messages, max_tool_chars=5200)
+            epoch_bytes = _serialized_len(epoch_msgs, wire_tools_default)
+            if _fits_epoch_budget(epoch_bytes):
+                chosen_msgs = epoch_msgs
+                chosen_tools = wire_tools_default
+                serialized_bytes = epoch_bytes
+            elif len(turn_groups) - self._epoch_turn_start > 1:
+                cand_start = max(self._epoch_turn_start + 1, len(turn_groups) - 1)
+                cand_summary = _build_rolled_history_summary(
+                    turn_groups[:cand_start],
+                    max_chars=1800,
+                )
+                cand_msgs = self._project_epoch_messages(
+                    messages,
+                    max_tool_chars=5200,
+                    epoch_turn_start=cand_start,
+                    epoch_summary_text=cand_summary,
+                )
+                cand_bytes = _serialized_len(cand_msgs, wire_tools_default)
+                if _fits_epoch_budget(cand_bytes):
+                    self._epoch_turn_start = cand_start
+                    self._epoch_summary_text = cand_summary
+                    chosen_msgs = cand_msgs
+                    chosen_tools = wire_tools_default
+                    serialized_bytes = cand_bytes
+
+        if chosen_msgs is None:
+            schedules: tuple[tuple[int, int, int, bool], ...] = (
+                (3, 5200, 1800, False),
+                (2, 4600, 1400, False),
+                (2, 3200, 1100, True),
+                (1, 2400, 800, True),
+                (1, 1400, 500, True),
+            )
+            init_turns = 3
+            init_max_chars = 5200
+            init_hist_chars = 1800
+            if keep_recent_turns_override is not None:
+                capped_turns = max(1, int(keep_recent_turns_override))
+                schedules = tuple(
+                    (min(turns, capped_turns), max_chars, hist_chars, use_tight)
+                    for turns, max_chars, hist_chars, use_tight in schedules
+                )
+                if capped_turns == 1:
+                    schedules = (
+                        (1, 2400, 800, True),
+                        (1, 1400, 500, True),
+                    )
+                init_turns, init_max_chars, init_hist_chars, _ = schedules[0]
+            chosen_msgs = compact_messages_for_context(
+                messages,
+                keep_recent_turns=init_turns,
+                max_recent_tool_chars=init_max_chars,
+                max_history_summary_chars=init_hist_chars,
+            )
+            chosen_tools = wire_tools_default
+            for turns, max_chars, hist_chars, use_tight_tools in schedules:
+                candidate = compact_messages_for_context(
+                    messages,
+                    keep_recent_turns=turns,
+                    max_recent_tool_chars=max_chars,
+                    max_history_summary_chars=hist_chars,
+                )
+                tools_payload = wire_tools_tight if use_tight_tools else wire_tools_default
+                chosen_msgs = candidate
+                chosen_tools = tools_payload
+                serialized_bytes = _serialized_len(candidate, tools_payload)
+                if (
+                    serialized_bytes <= _PROMPT_HARD_CHAR_LIMIT
+                    and serialized_bytes + _FRAMING_RESERVE_TOKENS + 256 <= avail
+                ):
+                    break
 
         headroom = avail - (serialized_bytes + _FRAMING_RESERVE_TOKENS)
         max_out = min(2048, max(256, headroom)) if headroom > 0 else 2048
@@ -1128,6 +1239,8 @@ class AgenticInvestigator:
                 "finished": self.dispatcher.finished,
                 "finish_summary": self.dispatcher.finish_summary,
                 "untested_areas": self.dispatcher.untested_areas,
+                "epoch_turn_start": self._epoch_turn_start,
+                "epoch_summary_text": self._epoch_summary_text,
             },
         )
 
@@ -1164,6 +1277,13 @@ class AgenticInvestigator:
         self.dispatcher.finished = bool(data.get("finished", False))
         self.dispatcher.finish_summary = str(data.get("finish_summary") or "")
         self.dispatcher.untested_areas = list(data.get("untested_areas") or [])
+        raw_epoch_start = data.get("epoch_turn_start", 0)
+        if isinstance(raw_epoch_start, int) and not isinstance(raw_epoch_start, bool):
+            self._epoch_turn_start = max(0, raw_epoch_start)
+        else:
+            self._epoch_turn_start = 0
+        raw_epoch_summary = data.get("epoch_summary_text", "")
+        self._epoch_summary_text = raw_epoch_summary if isinstance(raw_epoch_summary, str) else ""
         return int(data.get("turn", 0)), data["messages"]
 
     def _ablation_config(self) -> dict[str, Any]:
@@ -1603,6 +1723,8 @@ class AgenticInvestigator:
                 messages = loaded_msgs
 
         if messages is None:
+            self._epoch_turn_start = 0
+            self._epoch_summary_text = ""
             sys_prompt = build_system_prompt(
                 base_url=self.http.base_url,
                 allowed_methods=sorted(self.http.allowed_methods),
@@ -1636,10 +1758,8 @@ class AgenticInvestigator:
                     break
 
                 # Warn the agent when approaching turn or HTTP budget limits so it records findings & finishes.
-                http_rem = self.http.budget.limit - self.http.budget.used
+                # Wrapup directives are emitted at creation time via `_state_banner(...)` so earlier messages remain immutable.
                 self.dispatcher.coverage_gate_enabled = self.max_turns > 5 and (self.max_turns - turn) > 3
-                if (turn >= self.max_turns - 2 or http_rem <= 8) and messages[-1]["role"] == "user":
-                    messages[-1]["content"] += "\n[URGENT] Budget or turns nearly exhausted: verify any remaining finding and call `finish` now."
 
                 resp = self._complete_with_retry(messages)
                 choice = (resp.get("choices") or [{}])[0]
