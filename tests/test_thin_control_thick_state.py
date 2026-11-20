@@ -906,6 +906,21 @@ def test_differential_oracle_stateful_mutating_clean_replay(tmp_path: Path) -> N
             assert v2.stages["stage3_clean_replay"] == "passed_stateful_persistence"
             assert state["put_calls"] == 2
 
+            # Case 2b: Same-actor controls only (e.g. original owner's post-write 404) ->
+            # roster fallback probes distinct-tenant actor (user-beta) and verifies persistence!
+            orig_after_404 = client.request(method="GET", url="/api/v1/records/1", actor="user-alpha")
+            assert orig_after_404["status"] == 404
+            v2b = oracle.verify(
+                canonical_class="mass_assignment",
+                primary_proof=put_proof,
+                proof_receipts=[put_proof],
+                control_receipts=[orig_after_404],
+                evidence_value="org-beta",
+            )
+            assert v2b.verified is True
+            assert v2b.verdict == "VERIFIED"
+            assert v2b.stages["stage3_clean_replay"] == "passed_stateful_persistence"
+
             # Case 3: Truly non-existent resource where neither original actor nor control actor reads 2xx -> REFUTED!
             fake_ctrl = client.request(method="GET", url="/api/v1/records/999", actor="user-beta")
             assert fake_ctrl["status"] == 404

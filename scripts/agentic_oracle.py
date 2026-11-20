@@ -498,8 +498,9 @@ class DifferentialOracle:
 
         # Stateful persistence fallback: when re-executing a non-idempotent write as
         # the original actor returns 403/404/409 (e.g. ownership/tenant already moved),
-        # check whether a previously-denied control actor on the same path now reads
-        # the persisted mutated state (401/403/404 -> 2xx with evidence) in a clean session.
+        # check previously-denied control actors on the same path and (when evidence is
+        # specified) up to 2 distinct-tenant/admin actors from the harness roster to
+        # verify the mutated state persisted in a fresh clean session.
         if (
             replay_target is primary_proof
             and str(primary_proof.get("method") or "").upper() in _MUTATING_METHODS
@@ -507,27 +508,48 @@ class DifferentialOracle:
             and self._has_budget(1)
         ):
             p_path = urlsplit(str(primary_proof.get("url") or primary_proof.get("path") or "")).path.rstrip("/")
-            known_actors = {str(a.get("alias") or "") for a in self.http.actors.summaries()}
-            seen_fallback_actors: set[str] = set()
+            actor_rows = list(self.http.actors.summaries())
+            actor_by_alias = {str(a.get("alias") or ""): a for a in actor_rows}
+            p_tenant = str((actor_by_alias.get(p_actor) or {}).get("tenant") or "").strip().lower()
+
+            fallback_actors: list[str] = []
             for ctrl in eff_controls:
                 c_actor = str(ctrl.get("actor") or "")
                 c_status = int(ctrl.get("status") or 0)
                 c_path = urlsplit(str(ctrl.get("url") or ctrl.get("path") or "")).path.rstrip("/")
                 if (
-                    not c_actor
-                    or c_actor == p_actor
-                    or c_actor not in known_actors
-                    or c_actor in seen_fallback_actors
-                    or c_status not in {401, 403, 404}
-                    or c_path != p_path
+                    c_actor
+                    and c_actor != p_actor
+                    and c_actor in actor_by_alias
+                    and c_actor not in fallback_actors
+                    and c_status in {401, 403, 404}
+                    and c_path == p_path
                 ):
-                    continue
-                seen_fallback_actors.add(c_actor)
+                    fallback_actors.append(c_actor)
+
+            if ev:
+                roster_candidates = [
+                    a
+                    for a in actor_rows
+                    if str(a.get("alias") or "") not in {"", "anon", p_actor}
+                    and str(a.get("alias") or "") not in fallback_actors
+                ]
+                roster_candidates.sort(
+                    key=lambda a: (
+                        1 if (p_tenant and str(a.get("tenant") or "").strip().lower() not in {"", p_tenant}) else 0,
+                        1 if "admin" in str(a.get("role") or "").lower() else 0,
+                    ),
+                    reverse=True,
+                )
+                for row in roster_candidates[:2]:
+                    fallback_actors.append(str(row.get("alias") or ""))
+
+            for fb_actor in fallback_actors[:3]:
                 if not self._has_budget(1):
                     break
                 try:
                     fb_rec = self._run_clean_session_request(
-                        actor=c_actor,
+                        actor=fb_actor,
                         method="GET",
                         url=str(primary_proof.get("url") or "/"),
                     )
