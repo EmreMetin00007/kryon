@@ -1,0 +1,1119 @@
+"""Read-only, same-origin scope-locked headless Playwright integration for the agentic engine.
+
+Provides two bounded capabilities:
+1. ``run_browser_crawl``: SPA/Shadow-DOM surface discovery backed by ``cco_surface_core.crawl``
+   with strict same-origin filtering, WireBudget accounting, host-side actor auth injection,
+   and automatic ingestion into ``SurfaceFrontierTracker``.
+2. ``inspect_rendered_page``: Isolated read-only Chromium QA inspector for a single rendered
+   page, capturing CSP headers, runtime fetch/XHR metadata via ``build_runtime_hook_script``,
+   console error counts, and optional rendered-DOM marker placement checks.
+"""
+from __future__ import annotations
+
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import nullcontext
+import inspect
+from pathlib import Path
+import sys
+from typing import Any, Callable, Sequence
+from urllib.parse import parse_qsl, urljoin, urlsplit, urlunsplit
+
+from agentic_http import (
+    AgenticHTTPClient,
+    BudgetExhaustedError,
+    ScopeViolationError,
+    is_static_asset_url,
+)
+from agentic_surface import SurfaceFrontierTracker
+
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+_SURFACE_CORE_PARENT = _REPO_ROOT / "mcp-servers" / "mcp-memory-server"
+_BROWSER_CORE_PARENT = _REPO_ROOT / "mcp-servers" / "mcp-browser"
+for _parent in (_SURFACE_CORE_PARENT, _BROWSER_CORE_PARENT):
+    if str(_parent) not in sys.path:
+        sys.path.insert(0, str(_parent))
+
+try:
+    from cco_surface_core.crawl import (  # noqa: E402
+        CHROMIUM_ARGS as _CRAWL_CHROMIUM_ARGS,
+        HAS_PLAYWRIGHT as _CRAWL_HAS_PLAYWRIGHT,
+        crawl_site as _default_crawl_site,
+        run_playwright_sync as _crawl_run_playwright_sync,
+    )
+except Exception:  # pragma: no cover - optional dependency fallback
+    _CRAWL_CHROMIUM_ARGS = ["--no-sandbox", "--disable-dev-shm-usage"]
+    _CRAWL_HAS_PLAYWRIGHT = False
+    _default_crawl_site = None  # type: ignore[assignment]
+    _crawl_run_playwright_sync = None  # type: ignore[assignment]
+
+try:
+    from cco_browser_core.hooks import (  # type: ignore[import-not-found]  # noqa: E402
+        build_runtime_hook_script as _build_runtime_hook_script,
+        normalize_runtime_events as _normalize_runtime_events,
+    )
+except Exception:  # pragma: no cover - optional dependency fallback
+    _build_runtime_hook_script = None  # type: ignore[assignment]
+    _normalize_runtime_events = None  # type: ignore[assignment]
+
+try:
+    from playwright.sync_api import sync_playwright as _sync_playwright  # type: ignore[import-not-found]
+
+    _PW_IMPORT_OK = True
+except Exception:  # pragma: no cover - optional dependency fallback
+    _sync_playwright = None  # type: ignore[assignment]
+    _PW_IMPORT_OK = False
+
+CHROMIUM_ARGS: list[str] = list(_CRAWL_CHROMIUM_ARGS)
+HAS_PLAYWRIGHT: bool = bool(_CRAWL_HAS_PLAYWRIGHT and _PW_IMPORT_OK)
+
+_MAX_PAGES_UPPER = 12
+_MAX_WAIT_MS = 2000
+_MIN_TIMEOUT_MS = 1000
+_MAX_TIMEOUT_MS = 30000
+
+_MAX_RETURNED_PAGES = 12
+_MAX_RETURNED_LINKS = 60
+_MAX_RETURNED_FORMS = 30
+_MAX_RETURNED_XHR = 40
+_MAX_RETURNED_RUNTIME_REQUESTS = 40
+
+_EXCLUDED_BROWSER_HEADERS = frozenset({
+    "cookie",
+    "host",
+    "origin",
+    "referer",
+    "content-length",
+    "connection",
+    "transfer-encoding",
+    "proxy-authorization",
+    "user-agent",
+})
+_NON_HTTP_SCHEMES = ("javascript:", "mailto:", "data:", "blob:", "tel:", "about:")
+_BROWSER_USER_AGENT = (
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+    "Chrome/120.0.0.0 Safari/537.36"
+)
+
+_COLLECT_RUNTIME_JS = r"""() => {
+  const rt = window.__ccoRuntime;
+  if (!rt) return {events: [], state: {}};
+  return {
+    events: Array.isArray(rt.events) ? rt.events : [],
+    state: typeof rt.snapshot === "function" ? rt.snapshot() : {},
+  };
+}"""
+
+_INSPECT_DOM_JS = r"""(marker) => {
+  const title = String(document.title || "").slice(0, 180);
+  const innerText = document.body ? String(document.body.innerText || "") : "";
+  const outerHTML = document.documentElement ? String(document.documentElement.outerHTML || "") : "";
+  if (!marker) {
+    return {
+      title,
+      checked: false,
+      in_inner_text: false,
+      in_outer_html: false,
+      in_script_or_event_attr: false,
+      script_matches: 0,
+      event_attr_matches: [],
+    };
+  }
+  const inInnerText = innerText.includes(marker);
+  const inOuterHtml = outerHTML.includes(marker);
+  let scriptMatches = 0;
+  const eventAttrMatches = [];
+  const walk = (root) => {
+    if (!root || !root.querySelectorAll) return;
+    for (const sc of root.querySelectorAll("script")) {
+      const txt = String(sc.textContent || "");
+      const src = String(sc.getAttribute("src") || "");
+      if (txt.includes(marker) || src.includes(marker)) {
+        scriptMatches += 1;
+      }
+    }
+    for (const el of root.querySelectorAll("*")) {
+      if (el.attributes) {
+        for (const attr of el.attributes) {
+          const aname = String(attr.name || "").toLowerCase();
+          const aval = String(attr.value || "");
+          if (!aval.includes(marker)) continue;
+          if (
+            aname.startsWith("on")
+            || (
+              (aname === "href" || aname === "src" || aname === "action" || aname === "formaction")
+              && /^\s*javascript:/i.test(aval)
+            )
+          ) {
+            const tag = String(el.tagName || "").toLowerCase();
+            const label = `${tag}[${aname}]`;
+            if (!eventAttrMatches.includes(label) && eventAttrMatches.length < 20) {
+              eventAttrMatches.push(label);
+            }
+          }
+        }
+      }
+      if (el.shadowRoot) walk(el.shadowRoot);
+    }
+  };
+  walk(document);
+  return {
+    title,
+    checked: true,
+    in_inner_text: inInnerText,
+    in_outer_html: inOuterHtml,
+    in_script_or_event_attr: scriptMatches > 0 || eventAttrMatches.length > 0,
+    script_matches: scriptMatches,
+    event_attr_matches: eventAttrMatches,
+  };
+}"""
+
+
+def _run_sync(fn: Callable[[], dict[str, Any]], *, timeout: float = 120.0) -> dict[str, Any]:
+    """Run synchronous Playwright work safely even if an asyncio loop is active."""
+    if callable(_crawl_run_playwright_sync):
+        return _crawl_run_playwright_sync(fn, timeout=timeout)
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return fn()
+    with ThreadPoolExecutor(max_workers=1, thread_name_prefix="agentic-pw") as pool:
+        return pool.submit(fn).result(timeout=timeout)
+
+
+def _parse_cookie_pairs(cookie_blob: str) -> list[tuple[str, str]]:
+    """Parse a raw Cookie header string into ordered (name, value) pairs."""
+    pairs: list[tuple[str, str]] = []
+    index: dict[str, int] = {}
+    for chunk in str(cookie_blob or "").split(";"):
+        part = chunk.strip()
+        if not part or "=" not in part:
+            continue
+        name, value = part.split("=", 1)
+        clean_name = name.strip()
+        clean_val = value.strip()
+        if not clean_name:
+            continue
+        if clean_name in index:
+            pairs[index[clean_name]] = (clean_name, clean_val)
+        else:
+            index[clean_name] = len(pairs)
+            pairs.append((clean_name, clean_val))
+    return pairs
+
+
+def _normalize_browser_auth_parts(
+    *,
+    cookie_blob: str = "",
+    cookies_map: dict[str, Any] | None = None,
+    base_headers: dict[str, Any] | None = None,
+    access_token: str = "",
+) -> tuple[str, dict[str, str]]:
+    """Build host-side Playwright ``(cookie_header, extra_headers)`` from session state."""
+    header_cookie_chunks: list[str] = []
+    extra_headers: dict[str, str] = {}
+    for raw_k, raw_v in (base_headers or {}).items():
+        key = str(raw_k or "").strip()
+        if not key or raw_v is None:
+            continue
+        val = str(raw_v)
+        low = key.lower()
+        if low == "cookie":
+            if val.strip():
+                header_cookie_chunks.append(val.strip())
+            continue
+        if low in _EXCLUDED_BROWSER_HEADERS:
+            continue
+        extra_headers[key] = val
+
+    merged_cookies: dict[str, str] = {}
+    for blob in [*header_cookie_chunks, str(cookie_blob or "").strip()]:
+        for ck, cv in _parse_cookie_pairs(blob):
+            merged_cookies[ck] = cv
+    for ck, cv in sorted((cookies_map or {}).items(), key=lambda kv: str(kv[0])):
+        clean_k = str(ck or "").strip()
+        if clean_k and cv is not None:
+            merged_cookies[clean_k] = str(cv)
+
+    cookie_hdr = "; ".join(f"{k}={v}" for k, v in merged_cookies.items())
+    if not cookie_hdr:
+        fallback_blob = "; ".join(c for c in [*header_cookie_chunks, str(cookie_blob or "").strip()] if c)
+        cookie_hdr = fallback_blob
+
+    clean_token = str(access_token or "").strip()
+    if clean_token and not any(k.lower() == "authorization" for k in extra_headers):
+        extra_headers["Authorization"] = f"Bearer {clean_token}"
+
+    return cookie_hdr, extra_headers
+
+
+def _extract_actor_browser_auth(http: AgenticHTTPClient, actor: str) -> tuple[str, dict[str, str]]:
+    """Extract host-side Playwright ``(cookie_header, extra_headers)`` for ``actor``.
+
+    Uses ``http.actors.get_browser_auth_state(actor)`` when available, otherwise reads
+    ``ActorSession`` cookies/access_token/base_headers under lock. Returns ``("", {})``
+    for ``"anon"``. Values returned here are strictly for host-side Playwright use and
+    must NEVER be included in any tool output dictionary.
+    """
+    clean_actor = str(actor or "anon").strip() or "anon"
+    if clean_actor == "anon":
+        return "", {}
+
+    get_state = getattr(http.actors, "get_browser_auth_state", None)
+    if callable(get_state):
+        state = get_state(clean_actor)
+        if isinstance(state, tuple) and len(state) == 2:
+            raw_cookie, raw_headers = state
+            if isinstance(raw_cookie, dict):
+                return _normalize_browser_auth_parts(
+                    cookies_map=raw_cookie,
+                    base_headers=raw_headers if isinstance(raw_headers, dict) else {},
+                )
+            return _normalize_browser_auth_parts(
+                cookie_blob=str(raw_cookie or ""),
+                base_headers=raw_headers if isinstance(raw_headers, dict) else {},
+            )
+        if isinstance(state, dict):
+            raw_hdrs = state.get("extra_headers") or state.get("headers") or state.get("base_headers")
+            return _normalize_browser_auth_parts(
+                cookie_blob=str(state.get("cookie") or ""),
+                cookies_map=state.get("cookies") if isinstance(state.get("cookies"), dict) else None,
+                base_headers=raw_hdrs if isinstance(raw_hdrs, dict) else None,
+                access_token=str(state.get("access_token") or state.get("bearer_token") or ""),
+            )
+        return "", {}
+
+    session = http.actors.get(clean_actor)
+    lock = getattr(session, "_lock", None)
+    ctx = lock if lock is not None else nullcontext()
+    with ctx:
+        base_headers = dict(getattr(session, "base_headers", None) or {})
+        cookies_map = dict(getattr(session, "cookies", None) or {})
+        access_token = str(getattr(session, "access_token", "") or "").strip()
+
+    return _normalize_browser_auth_parts(
+        cookies_map=cookies_map,
+        base_headers=base_headers,
+        access_token=access_token,
+    )
+
+
+def _collect_actor_secrets(
+    http: AgenticHTTPClient,
+    cookie_hdr: str,
+    extra_headers: dict[str, str],
+) -> list[str]:
+    """Collect sensitive strings for defense-in-depth scrubbing of model-facing outputs."""
+    secrets: list[str] = []
+    all_secrets_fn = getattr(http.actors, "all_secrets", None)
+    if callable(all_secrets_fn):
+        for val in all_secrets_fn() or ():
+            sval = str(val or "")
+            if len(sval) >= 4:
+                secrets.append(sval)
+    if len(cookie_hdr) >= 4:
+        secrets.append(cookie_hdr)
+    for _, cv in _parse_cookie_pairs(cookie_hdr):
+        if len(cv) >= 4:
+            secrets.append(cv)
+    for hk, hv in extra_headers.items():
+        if hk.lower() in {"authorization", "cookie", "x-api-key", "x-csrf-token"} and len(hv) >= 4:
+            secrets.append(hv)
+            parts = hv.strip().split(None, 1)
+            if len(parts) == 2 and len(parts[1].strip()) >= 4:
+                secrets.append(parts[1].strip())
+    return sorted(set(secrets), key=len, reverse=True)
+
+
+def _redact_secrets(text: str, secrets: Sequence[str]) -> str:
+    """Scrub any known actor secret values from a model-facing string."""
+    out = str(text or "")
+    for secret in secrets:
+        if secret and secret in out:
+            out = out.replace(secret, "<REDACTED>")
+    return out
+
+
+def _resolve_and_check_scope(http: AgenticHTTPClient, raw_url: str) -> str:
+    """Resolve ``raw_url`` against ``http.base_url`` and enforce strict scope rules."""
+    raw = str(raw_url or "").strip()
+    if not raw:
+        raise ScopeViolationError("URL is required")
+    if raw.startswith("//"):
+        raise ScopeViolationError(f"scheme-relative cross-origin URL blocked: {raw}")
+
+    resolve_fn = getattr(http, "resolve_in_scope", None)
+    if callable(resolve_fn):
+        clean_url, _path, _query = resolve_fn(raw)
+    else:
+        base_parsed = urlsplit(http.base_url)
+        resolved = urljoin(http.base_url, raw)
+        parsed = urlsplit(resolved)
+        if (parsed.scheme, parsed.netloc) != (base_parsed.scheme, base_parsed.netloc):
+            raise ScopeViolationError(
+                f"out-of-scope URL {resolved!r}; allowed origin is {http.base_url}"
+            )
+        clean_url = urlunsplit((parsed.scheme, parsed.netloc, parsed.path or "/", parsed.query, ""))
+
+    frag = urlsplit(raw).fragment
+    full_url = f"{clean_url}#{frag}" if frag.startswith("/") else clean_url
+
+    check_scope = getattr(http, "_check_scope", None)
+    if callable(check_scope):
+        decision = check_scope(full_url)
+        if decision is False:
+            raise ScopeViolationError(f"URL excluded by scope policy: {full_url!r}")
+
+    return full_url
+
+
+def _budget_remaining(http: AgenticHTTPClient) -> int:
+    """Return remaining WireBudget allowance on ``http``."""
+    budget = http.budget
+    lock = getattr(budget, "_lock", None)
+    ctx = lock if lock is not None else nullcontext()
+    with ctx:
+        if getattr(budget, "blocked_reason", ""):
+            return 0
+        return max(0, int(budget.limit) - int(budget.used))
+
+
+def _consume_budget(http: AgenticHTTPClient, count: int) -> int:
+    """Consume up to ``count`` requests from ``http.budget``."""
+    consumed = 0
+    for _ in range(max(0, int(count))):
+        allowed, _reason = http.budget.consume()
+        if not allowed:
+            break
+        consumed += 1
+    return consumed
+
+
+def _compact_same_origin_url(
+    raw_url: str,
+    *,
+    base_url: str,
+    base_scheme: str,
+    base_netloc: str,
+    allow_fragment_route: bool = False,
+) -> str | None:
+    """Validate strict same-origin and compact to a relative ``/path?query`` string."""
+    raw = str(raw_url or "").strip()
+    if not raw:
+        return None
+    low = raw.lower()
+    if low.startswith(_NON_HTTP_SCHEMES):
+        return None
+    resolved = urljoin(base_url, raw)
+    parsed = urlsplit(resolved)
+    if parsed.scheme not in {"http", "https"}:
+        return None
+    if parsed.scheme != base_scheme or parsed.netloc != base_netloc:
+        return None
+    path = parsed.path or "/"
+    compact = f"{path}?{parsed.query}" if parsed.query else path
+    if allow_fragment_route and parsed.fragment.startswith("/"):
+        compact = f"{compact}#{parsed.fragment}"
+    return compact
+
+
+def _fn_prefers_headers_kwarg(fn: Callable[..., Any]) -> bool:
+    """Return True if ``fn`` explicitly accepts ``headers`` rather than ``extra_headers``."""
+    try:
+        params = inspect.signature(fn).parameters
+    except (TypeError, ValueError):
+        return False
+    return "headers" in params and "extra_headers" not in params
+
+
+def _extract_safe_field_names(raw_fields: Any) -> list[str]:
+    """Extract deduplicated form/body parameter names ONLY (never values or passwords)."""
+    if not isinstance(raw_fields, (list, tuple)):
+        return []
+    names: list[str] = []
+    seen: set[str] = set()
+    for item in raw_fields:
+        if isinstance(item, dict):
+            name = str(item.get("name") or "").strip()
+        else:
+            name = str(item or "").strip()
+        if name and name not in seen:
+            seen.add(name)
+            names.append(name[:64])
+        if len(names) >= 24:
+            break
+    return names
+
+
+def _build_crawl_wire_gate(http: AgenticHTTPClient) -> Callable[[str, str, dict[str, Any]], tuple[bool, str]]:
+    """Build a read-only same-origin wire gate for ``cco_surface_core.crawl.crawl_site``."""
+
+    def _gate(method: str, req_url: str, _req_headers: dict[str, Any]) -> tuple[bool, str]:
+        norm_method = str(method or "").strip().upper()
+        if norm_method not in {"GET", "HEAD", "OPTIONS"}:
+            return False, "read_only_crawl_method_blocked"
+        try:
+            _resolve_and_check_scope(http, req_url)
+        except ScopeViolationError:
+            return False, "scope_violation"
+        return True, "allowed"
+
+    # Budget accounting for agentic crawls is owned by run_browser_crawl on http.budget.
+    setattr(_gate, "accounts_campaign_requests", True)
+    return _gate
+
+
+def run_browser_crawl(
+    http: AgenticHTTPClient,
+    surface_tracker: SurfaceFrontierTracker | None,
+    *,
+    url: str = "/",
+    actor: str = "anon",
+    max_pages: int = 6,
+    wait_ms: int = 400,
+    timeout_ms: int = 12000,
+    crawl_fn: Callable[..., dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Run a bounded, read-only, same-origin Playwright crawl and ingest into ``surface_tracker``."""
+    full_url = _resolve_and_check_scope(http, url)
+    base_parsed = urlsplit(http.base_url)
+    base_scheme = base_parsed.scheme
+    base_netloc = base_parsed.netloc
+    compact_start = (
+        _compact_same_origin_url(
+            full_url,
+            base_url=http.base_url,
+            base_scheme=base_scheme,
+            base_netloc=base_netloc,
+            allow_fragment_route=True,
+        )
+        or "/"
+    )
+
+    clean_actor = str(actor or "anon").strip() or "anon"
+    cookie_hdr, extra_headers = _extract_actor_browser_auth(http, clean_actor)
+    secrets = _collect_actor_secrets(http, cookie_hdr, extra_headers)
+
+    remaining = _budget_remaining(http)
+    if remaining <= 0:
+        raise BudgetExhaustedError("campaign request budget exhausted")
+
+    clamped_pages = max(1, min(int(max_pages), _MAX_PAGES_UPPER))
+    eff_max_pages = min(clamped_pages, remaining)
+    eff_wait_ms = max(0, min(int(wait_ms), _MAX_WAIT_MS))
+    eff_timeout_ms = max(_MIN_TIMEOUT_MS, min(int(timeout_ms), _MAX_TIMEOUT_MS))
+
+    if crawl_fn is None and (not HAS_PLAYWRIGHT or _default_crawl_site is None):
+        return {
+            "ok": False,
+            "error": "playwright_unavailable",
+            "pages_crawled": 0,
+            "pages": [],
+            "links": [],
+            "forms": [],
+            "xhr_calls": [],
+        }
+
+    if crawl_fn is not None:
+        call_kwargs: dict[str, Any] = {
+            "allow_subdomains": False,
+            "max_pages": eff_max_pages,
+            "wait_ms": eff_wait_ms,
+            "timeout_ms": eff_timeout_ms,
+            "cookie": cookie_hdr,
+        }
+        if _fn_prefers_headers_kwarg(crawl_fn):
+            call_kwargs["headers"] = extra_headers
+        else:
+            call_kwargs["extra_headers"] = extra_headers
+        raw = crawl_fn(full_url, **call_kwargs)
+    else:
+        assert _default_crawl_site is not None
+        raw = _default_crawl_site(
+            full_url,
+            max_pages=eff_max_pages,
+            cookie=cookie_hdr,
+            headers=extra_headers,
+            timeout_ms=eff_timeout_ms,
+            allow_subdomains=False,
+            wait_ms=eff_wait_ms,
+            wire_gate=_build_crawl_wire_gate(http),
+        )
+
+    raw_dict = raw if isinstance(raw, dict) else {}
+    raw_pages_val = raw_dict.get("pages")
+    raw_pages: list[Any] = raw_pages_val if isinstance(raw_pages_val, list) else []
+
+    if not raw_dict.get("ok"):
+        if raw_pages:
+            _consume_budget(http, min(remaining, len(raw_pages)))
+        err_text = _redact_secrets(str(raw_dict.get("error") or "browser_crawl_failed"), secrets)[:300]
+        return {
+            "ok": False,
+            "error": err_text,
+            "start_url": compact_start,
+            "actor": clean_actor,
+            "pages_crawled": 0,
+            "pages": [],
+            "links": [],
+            "forms": [],
+            "xhr_calls": [],
+            "truncated": False,
+        }
+
+    pages_to_charge = min(remaining, max(1, len(raw_pages)))
+    _consume_budget(http, pages_to_charge)
+
+    # 1. Filter & compact pages strictly to same-origin
+    all_pages: list[dict[str, Any]] = []
+    seen_pages: set[str] = set()
+    for p_item in raw_pages:
+        if isinstance(p_item, dict):
+            raw_p_url = str(p_item.get("url") or "")
+            p_status = int(p_item.get("status") or 0)
+            p_title = _redact_secrets(str(p_item.get("title") or "").strip(), secrets)[:120]
+            p_ctype = str(p_item.get("content_type") or "").strip().lower()[:64]
+        else:
+            raw_p_url = str(p_item or "")
+            p_status = 0
+            p_title = ""
+            p_ctype = ""
+        compact_p = _compact_same_origin_url(
+            raw_p_url,
+            base_url=full_url,
+            base_scheme=base_scheme,
+            base_netloc=base_netloc,
+            allow_fragment_route=True,
+        )
+        if compact_p is None or compact_p in seen_pages:
+            continue
+        seen_pages.add(compact_p)
+        page_entry: dict[str, Any] = {
+            "url": _redact_secrets(compact_p, secrets),
+            "status": p_status,
+            "title": p_title,
+        }
+        if p_ctype:
+            page_entry["content_type"] = p_ctype
+        all_pages.append(page_entry)
+
+    # 2. Filter, drop static assets, deduplicate & compact links + hash routes
+    all_links: list[str] = []
+    seen_links: set[str] = set()
+    raw_link_sources: list[Any] = []
+    if isinstance(raw_dict.get("links"), list):
+        raw_link_sources.extend(raw_dict["links"])
+    if isinstance(raw_dict.get("hash_routes"), list):
+        raw_link_sources.extend(raw_dict["hash_routes"])
+    for l_item in raw_link_sources:
+        raw_l = str(l_item.get("url") or "") if isinstance(l_item, dict) else str(l_item or "")
+        compact_l = _compact_same_origin_url(
+            raw_l,
+            base_url=full_url,
+            base_scheme=base_scheme,
+            base_netloc=base_netloc,
+            allow_fragment_route=True,
+        )
+        if compact_l is None or is_static_asset_url(compact_l):
+            continue
+        safe_l = _redact_secrets(compact_l, secrets)
+        if safe_l not in seen_links:
+            seen_links.add(safe_l)
+            all_links.append(safe_l)
+
+    # 3. Filter, deduplicate & compact forms (field names only, NEVER values)
+    all_forms: list[dict[str, Any]] = []
+    seen_forms: set[tuple[str, str, tuple[str, ...]]] = set()
+    raw_forms_val = raw_dict.get("forms")
+    raw_forms: list[Any] = raw_forms_val if isinstance(raw_forms_val, list) else []
+    for f_item in raw_forms:
+        if not isinstance(f_item, dict):
+            continue
+        page_ref = str(f_item.get("page") or full_url)
+        raw_action = str(f_item.get("action") or f_item.get("url") or page_ref)
+        compact_action = _compact_same_origin_url(
+            raw_action,
+            base_url=urljoin(full_url, page_ref),
+            base_scheme=base_scheme,
+            base_netloc=base_netloc,
+        )
+        if compact_action is None:
+            continue
+        method = str(f_item.get("method") or "GET").strip().upper() or "GET"
+        fields = _extract_safe_field_names(f_item.get("fields") or f_item.get("params") or [])
+        safe_action = _redact_secrets(compact_action, secrets)
+        form_key = (method, safe_action, tuple(fields))
+        if form_key in seen_forms:
+            continue
+        seen_forms.add(form_key)
+        all_forms.append({
+            "action": safe_action,
+            "method": method,
+            "fields": fields,
+        })
+
+    # 4. Filter, deduplicate & compact XHR / fetch calls
+    all_xhr: list[dict[str, Any]] = []
+    xhr_index: dict[tuple[str, str], dict[str, Any]] = {}
+    raw_xhr_sources: list[Any] = []
+    for key_name in ("xhr", "xhr_calls", "api_requests"):
+        val = raw_dict.get(key_name)
+        if isinstance(val, list):
+            raw_xhr_sources.extend(val)
+    for x_item in raw_xhr_sources:
+        if not isinstance(x_item, dict):
+            continue
+        raw_x_url = str(x_item.get("url") or "")
+        compact_x = _compact_same_origin_url(
+            raw_x_url,
+            base_url=full_url,
+            base_scheme=base_scheme,
+            base_netloc=base_netloc,
+        )
+        if compact_x is None:
+            continue
+        x_method = str(x_item.get("method") or "GET").strip().upper() or "GET"
+        x_status = int(x_item.get("status") or 0)
+        body_fields = _extract_safe_field_names(x_item.get("body_fields") or [])
+        safe_x_url = _redact_secrets(compact_x, secrets)
+        x_key = (x_method, safe_x_url)
+        existing = xhr_index.get(x_key)
+        if existing is not None:
+            if x_status and not existing.get("status"):
+                existing["status"] = x_status
+            if body_fields:
+                merged_bf = list(dict.fromkeys([*(existing.get("body_fields") or []), *body_fields]))[:24]
+                existing["body_fields"] = merged_bf
+            continue
+        entry: dict[str, Any] = {
+            "method": x_method,
+            "url": safe_x_url,
+            "status": x_status,
+        }
+        if body_fields:
+            entry["body_fields"] = body_fields
+        xhr_index[x_key] = entry
+        all_xhr.append(entry)
+
+    # 5. Ingest discovered same-origin surface into SurfaceFrontierTracker
+    if surface_tracker is not None:
+        surface_payload: dict[str, Any] = {
+            "url": full_url,
+            "links": [{"url": link_u, "method": "GET"} for link_u in all_links],
+            "spa_routes": [{"url": p["url"], "method": "GET"} for p in all_pages],
+            "forms": [
+                {
+                    "url": f["action"],
+                    "method": f["method"],
+                    "params": list(f["fields"]),
+                }
+                for f in all_forms
+            ],
+            "js_calls": [
+                {
+                    "url": x["url"],
+                    "method": x["method"],
+                    "params": list(x.get("body_fields") or []),
+                }
+                for x in all_xhr
+            ],
+        }
+        surface_tracker.ingest_surface(surface_payload, actor=clean_actor)
+
+    truncated = bool(
+        len(all_pages) > _MAX_RETURNED_PAGES
+        or len(all_links) > _MAX_RETURNED_LINKS
+        or len(all_forms) > _MAX_RETURNED_FORMS
+        or len(all_xhr) > _MAX_RETURNED_XHR
+        or (eff_max_pages < clamped_pages and len(raw_pages) >= eff_max_pages)
+    )
+
+    return {
+        "ok": True,
+        "start_url": compact_start,
+        "actor": clean_actor,
+        "pages_crawled": len(all_pages),
+        "pages": all_pages[:_MAX_RETURNED_PAGES],
+        "links": all_links[:_MAX_RETURNED_LINKS],
+        "forms": all_forms[:_MAX_RETURNED_FORMS],
+        "xhr_calls": all_xhr[:_MAX_RETURNED_XHR],
+        "truncated": truncated,
+    }
+
+
+def _redact_query_to_same_origin(
+    raw_url: str,
+    *,
+    base_url: str,
+    base_scheme: str,
+    base_netloc: str,
+) -> tuple[str, str, list[str]] | None:
+    """Resolve ``raw_url`` strictly on same-origin and redact all query parameter values."""
+    compact = _compact_same_origin_url(
+        raw_url,
+        base_url=base_url,
+        base_scheme=base_scheme,
+        base_netloc=base_netloc,
+    )
+    if compact is None:
+        return None
+    parsed = urlsplit(compact)
+    path = parsed.path or "/"
+    q_names = sorted({k.strip() for k, _ in parse_qsl(parsed.query, keep_blank_values=True) if k.strip()})
+    safe_url = f"{path}?{'&'.join(f'{k}=<value>' for k in q_names)}" if q_names else path
+    return safe_url, path, q_names
+
+
+def _sanitize_runtime_requests(
+    raw_events: Any,
+    *,
+    base_url: str,
+    base_scheme: str,
+    base_netloc: str,
+) -> list[dict[str, Any]]:
+    """Normalize runtime fetch/XHR hook metadata into compact same-origin dicts without values."""
+    if callable(_normalize_runtime_events) and isinstance(raw_events, list):
+        normalized = _normalize_runtime_events(raw_events)
+        source_items = normalized.get("requests") if isinstance(normalized, dict) else []
+    elif isinstance(raw_events, list):
+        source_items = raw_events
+    else:
+        source_items = []
+
+    cleaned: list[dict[str, Any]] = []
+    seen: set[tuple[Any, ...]] = set()
+    for item in source_items if isinstance(source_items, list) else []:
+        if not isinstance(item, dict):
+            continue
+        kind = str(item.get("kind") or "fetch").strip().lower()
+        if kind == "websocket":
+            continue
+        raw_u = str(item.get("url") or item.get("path") or "")
+        redacted = _redact_query_to_same_origin(
+            raw_u,
+            base_url=base_url,
+            base_scheme=base_scheme,
+            base_netloc=base_netloc,
+        )
+        if redacted is None:
+            continue
+        safe_url, path, q_names = redacted
+        method = str(item.get("method") or "GET").strip().upper() or "GET"
+        header_names = _extract_safe_field_names(item.get("header_names") or [])
+        body_fields = _extract_safe_field_names(item.get("body_fields") or [])
+        raw_status = item.get("status")
+        status = int(raw_status) if isinstance(raw_status, (int, float)) else 0
+        dedup_key = (kind, method, safe_url, status, tuple(header_names), tuple(body_fields))
+        if dedup_key in seen:
+            continue
+        seen.add(dedup_key)
+        rec: dict[str, Any] = {
+            "kind": kind,
+            "method": method,
+            "url": safe_url,
+            "path": path,
+            "query_params": q_names,
+            "header_names": header_names,
+            "body_fields": body_fields,
+            "status": status,
+        }
+        cleaned.append(rec)
+        if len(cleaned) >= _MAX_RETURNED_RUNTIME_REQUESTS:
+            break
+    return cleaned
+
+
+def _inspect_rendered_page_playwright(
+    http: AgenticHTTPClient,
+    *,
+    full_url: str,
+    cookie_hdr: str,
+    extra_headers: dict[str, str],
+    marker: str,
+    wait_ms: int,
+    timeout_ms: int,
+) -> dict[str, Any]:
+    """Execute read-only isolated Chromium page inspection synchronously."""
+    assert _sync_playwright is not None
+
+    def _run() -> dict[str, Any]:
+        console_error_count = 0
+        blocked_requests: list[dict[str, str]] = []
+
+        def _inc_console_error() -> None:
+            nonlocal console_error_count
+            console_error_count += 1
+
+        with _sync_playwright() as playwright:
+            browser = playwright.chromium.launch(headless=True, args=CHROMIUM_ARGS)
+            context = browser.new_context(
+                ignore_https_errors=True,
+                service_workers="block",
+                user_agent=_BROWSER_USER_AGENT,
+            )
+            try:
+                if callable(_build_runtime_hook_script):
+                    context.add_init_script(_build_runtime_hook_script())
+
+                cookie_pairs = _parse_cookie_pairs(cookie_hdr)
+                if cookie_pairs:
+                    context.add_cookies([
+                        {"name": cname, "value": cval, "url": http.base_url}
+                        for cname, cval in cookie_pairs
+                    ])
+
+                async def _on_websocket(socket: Any) -> None:
+                    route_obj = getattr(socket, "_impl_obj", socket)
+                    closing = route_obj.close(code=1008, reason="readonly inspector: websocket blocked")
+                    if inspect.isawaitable(closing):
+                        await closing
+
+                def _on_route(route: Any) -> None:
+                    req = route.request
+                    req_method = str(getattr(req, "method", "GET") or "GET").strip().upper()
+                    req_url = str(getattr(req, "url", "") or "")
+                    if req_method not in {"GET", "HEAD"}:
+                        blocked_requests.append({"method": req_method, "reason": "non_readonly_method"})
+                        route.abort("blockedbyclient")
+                        return
+                    try:
+                        _resolve_and_check_scope(http, req_url)
+                    except ScopeViolationError:
+                        blocked_requests.append({"method": req_method, "reason": "off_origin"})
+                        route.abort("blockedbyclient")
+                        return
+                    if extra_headers:
+                        try:
+                            merged = dict(req.all_headers() or {})
+                        except Exception:
+                            merged = dict(getattr(req, "headers", None) or {})
+                        existing_lower = {str(k).lower() for k in merged}
+                        for hk, hv in extra_headers.items():
+                            if hk.lower() not in existing_lower:
+                                merged[hk] = hv
+                        route.continue_(headers=merged)
+                    else:
+                        route.continue_()
+
+                if hasattr(context, "route_web_socket"):
+                    context.route_web_socket("**/*", _on_websocket)
+                context.route("**/*", _on_route)
+
+                page = context.new_page()
+                page.on(
+                    "console",
+                    lambda msg: _inc_console_error()
+                    if str(getattr(msg, "type", "") or "").lower() == "error"
+                    else None,
+                )
+                page.on("pageerror", lambda _err: _inc_console_error())
+
+                resp = page.goto(full_url, wait_until="domcontentloaded", timeout=timeout_ms)
+                if wait_ms > 0:
+                    page.wait_for_timeout(wait_ms)
+
+                final_raw_url = str(page.url or full_url)
+                # Confirm the document stayed on the authorized origin before evaluating DOM.
+                _resolve_and_check_scope(http, final_raw_url)
+
+                status = int(resp.status) if resp is not None else 0
+                raw_headers = resp.headers if resp is not None and isinstance(resp.headers, dict) else {}
+                csp_value = ""
+                for hk, hv in raw_headers.items():
+                    if str(hk).lower() == "content-security-policy":
+                        csp_value = str(hv or "").strip()
+                        break
+
+                try:
+                    rt_payload = page.evaluate(_COLLECT_RUNTIME_JS)
+                except Exception:
+                    rt_payload = {"events": [], "state": {}}
+                rt_events = rt_payload.get("events") if isinstance(rt_payload, dict) else []
+
+                try:
+                    dom_info = page.evaluate(_INSPECT_DOM_JS, marker)
+                except Exception:
+                    dom_info = {}
+
+                return {
+                    "ok": True,
+                    "url": final_raw_url,
+                    "status": status,
+                    "title": str(dom_info.get("title") or "") if isinstance(dom_info, dict) else "",
+                    "csp": csp_value,
+                    "runtime_events": rt_events if isinstance(rt_events, list) else [],
+                    "console_error_count": console_error_count,
+                    "blocked_request_count": len(blocked_requests),
+                    "marker_check": {
+                        "checked": bool(dom_info.get("checked")) if isinstance(dom_info, dict) else False,
+                        "in_inner_text": bool(dom_info.get("in_inner_text")) if isinstance(dom_info, dict) else False,
+                        "in_outer_html": bool(dom_info.get("in_outer_html")) if isinstance(dom_info, dict) else False,
+                        "in_script_or_event_attr": (
+                            bool(dom_info.get("in_script_or_event_attr")) if isinstance(dom_info, dict) else False
+                        ),
+                        "script_matches": int(dom_info.get("script_matches") or 0) if isinstance(dom_info, dict) else 0,
+                        "event_attr_matches": (
+                            list(dom_info.get("event_attr_matches") or [])[:20] if isinstance(dom_info, dict) else []
+                        ),
+                    },
+                }
+            finally:
+                context.close()
+                browser.close()
+
+    return _run_sync(_run, timeout=max(30.0, (timeout_ms / 1000.0) + 15.0))
+
+
+def inspect_rendered_page(
+    http: AgenticHTTPClient,
+    *,
+    url: str,
+    actor: str = "anon",
+    marker: str = "",
+    wait_ms: int = 300,
+    timeout_ms: int = 10000,
+    runner: Callable[..., dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Inspect a single rendered page in a strictly read-only, same-origin Chromium context."""
+    full_url = _resolve_and_check_scope(http, url)
+    base_parsed = urlsplit(http.base_url)
+    base_scheme = base_parsed.scheme
+    base_netloc = base_parsed.netloc
+    compact_requested = (
+        _compact_same_origin_url(
+            full_url,
+            base_url=http.base_url,
+            base_scheme=base_scheme,
+            base_netloc=base_netloc,
+            allow_fragment_route=True,
+        )
+        or "/"
+    )
+
+    clean_actor = str(actor or "anon").strip() or "anon"
+    cookie_hdr, extra_headers = _extract_actor_browser_auth(http, clean_actor)
+    secrets = _collect_actor_secrets(http, cookie_hdr, extra_headers)
+
+    eff_wait_ms = max(0, min(int(wait_ms), _MAX_WAIT_MS))
+    eff_timeout_ms = max(_MIN_TIMEOUT_MS, min(int(timeout_ms), _MAX_TIMEOUT_MS))
+    clean_marker = str(marker or "")
+
+    if _budget_remaining(http) <= 0:
+        raise BudgetExhaustedError("campaign request budget exhausted")
+
+    if runner is None and (not HAS_PLAYWRIGHT or _sync_playwright is None):
+        return {
+            "ok": False,
+            "error": "playwright_unavailable",
+        }
+
+    allowed, reason = http.budget.consume()
+    if not allowed:
+        raise BudgetExhaustedError(reason)
+
+    try:
+        if runner is not None:
+            runner_kwargs: dict[str, Any] = {
+                "cookie": cookie_hdr,
+                "marker": clean_marker,
+                "wait_ms": eff_wait_ms,
+                "timeout_ms": eff_timeout_ms,
+            }
+            if _fn_prefers_headers_kwarg(runner):
+                runner_kwargs["headers"] = extra_headers
+            else:
+                runner_kwargs["extra_headers"] = extra_headers
+            raw = runner(full_url, **runner_kwargs)
+        else:
+            raw = _inspect_rendered_page_playwright(
+                http,
+                full_url=full_url,
+                cookie_hdr=cookie_hdr,
+                extra_headers=extra_headers,
+                marker=clean_marker,
+                wait_ms=eff_wait_ms,
+                timeout_ms=eff_timeout_ms,
+            )
+    except ScopeViolationError:
+        return {
+            "ok": False,
+            "error": "off_origin_navigation",
+            "url": compact_requested,
+            "actor": clean_actor,
+        }
+    except Exception as exc:
+        return {
+            "ok": False,
+            "error": _redact_secrets(f"{type(exc).__name__}: {str(exc)[:240]}", secrets),
+            "url": compact_requested,
+            "actor": clean_actor,
+        }
+
+    raw_dict = raw if isinstance(raw, dict) else {}
+    if not raw_dict.get("ok"):
+        return {
+            "ok": False,
+            "error": _redact_secrets(str(raw_dict.get("error") or "inspect_failed"), secrets)[:300],
+            "url": compact_requested,
+            "actor": clean_actor,
+        }
+
+    final_url = (
+        _compact_same_origin_url(
+            str(raw_dict.get("url") or full_url),
+            base_url=http.base_url,
+            base_scheme=base_scheme,
+            base_netloc=base_netloc,
+            allow_fragment_route=True,
+        )
+        or compact_requested
+    )
+    csp_raw = str(raw_dict.get("csp") or "").strip()
+    csp_safe = _redact_secrets(csp_raw, secrets)[:512]
+    title_safe = _redact_secrets(str(raw_dict.get("title") or "").strip(), secrets)[:180]
+
+    raw_rt_source = raw_dict.get("runtime_requests")
+    if raw_rt_source is None:
+        raw_rt_source = raw_dict.get("runtime_events")
+    runtime_requests = _sanitize_runtime_requests(
+        raw_rt_source,
+        base_url=full_url,
+        base_scheme=base_scheme,
+        base_netloc=base_netloc,
+    )
+
+    raw_marker_val = raw_dict.get("marker_check")
+    raw_marker: dict[str, Any] = raw_marker_val if isinstance(raw_marker_val, dict) else {}
+    marker_check = {
+        "checked": bool(raw_marker.get("checked")) if raw_marker else bool(clean_marker),
+        "in_inner_text": bool(raw_marker.get("in_inner_text")),
+        "in_outer_html": bool(raw_marker.get("in_outer_html")),
+        "in_script_or_event_attr": bool(raw_marker.get("in_script_or_event_attr")),
+        "script_matches": int(raw_marker.get("script_matches") or 0),
+        "event_attr_matches": [
+            str(x)[:64] for x in (raw_marker.get("event_attr_matches") or []) if str(x).strip()
+        ][:20],
+    }
+
+    return {
+        "ok": True,
+        "url": _redact_secrets(final_url, secrets),
+        "actor": clean_actor,
+        "status": int(raw_dict.get("status") or 0),
+        "title": title_safe,
+        "csp_present": bool(csp_safe),
+        "csp": csp_safe,
+        "runtime_requests": runtime_requests,
+        "console_error_count": int(raw_dict.get("console_error_count") or 0),
+        "blocked_request_count": int(raw_dict.get("blocked_request_count") or 0),
+        "marker_check": marker_check,
+    }
+
+
+__all__ = [
+    "CHROMIUM_ARGS",
+    "HAS_PLAYWRIGHT",
+    "_extract_actor_browser_auth",
+    "inspect_rendered_page",
+    "run_browser_crawl",
+]

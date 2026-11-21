@@ -64,7 +64,7 @@ from agentic_context import (
     effective_tokens_from_usage as effective_tokens_from_usage,
     estimate_tokens as estimate_tokens,
 )
-from agentic_http import AgenticHTTPClient
+from agentic_http import AgenticHTTPClient, ServiceDegradationError
 from agentic_oracle import DifferentialOracle
 from agentic_receipts import ReceiptStore
 from agentic_scheduler import (
@@ -1645,6 +1645,10 @@ class AgenticInvestigator:
             status = self._classify_budget_error(exc, is_shard=is_shard)
             if checkpoint_fn is not None:
                 checkpoint_fn(last_completed_turn, status, messages)
+        except ServiceDegradationError:
+            status = "service_degraded"
+            if checkpoint_fn is not None:
+                checkpoint_fn(last_completed_turn, status, messages)
         except Exception as exc:
             status = f"error:{type(exc).__name__}"
             if checkpoint_fn is not None:
@@ -1851,7 +1855,7 @@ class AgenticInvestigator:
             boot_findings_snap = copy.deepcopy(self.dispatcher.findings)
 
             if (
-                boot_status == "budget_exhausted"
+                boot_status in {"budget_exhausted", "service_degraded"}
                 or self.budget.remaining_seconds() <= 5
                 or self.budget.available("tokens") < 2500
                 or (self.http.budget.limit - self.http.budget.used) <= 0

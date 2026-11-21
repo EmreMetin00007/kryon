@@ -103,7 +103,9 @@ warn_unused_ignores = false
 follow_imports = "skip"
 files = [
   "scripts/agent_cli.py",
+  "scripts/agentic_browser.py",
   "scripts/agentic_context.py",
+  "scripts/agentic_crypto.py",
   "scripts/agentic_evidence.py",
   "scripts/agentic_http.py",
   "scripts/agentic_investigator.py",
@@ -116,6 +118,8 @@ files = [
   "scripts/agentic_sharding.py",
   "scripts/agentic_surface.py",
   "scripts/agentic_tools.py",
+  "scripts/agentic_vault.py",
+  "scripts/agentic_waf.py",
   "scripts/attempt_ledger.py",
   "scripts/authz_matrix.py",
   "scripts/chain_transport.py",
@@ -149,6 +153,7 @@ files = [
   "scripts/runtime_paths.py",
   "scripts/session_store.py",
   "scripts/signed_completion.py",
+  "scripts/target_bootstrap.py",
   "scripts/task_spec.py",
   "scripts/tool_counts.py",
   "scripts/wire_budget.py",

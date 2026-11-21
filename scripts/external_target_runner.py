@@ -12,7 +12,7 @@ import sys
 import tempfile
 import time
 from typing import Any, Sequence
-from urllib.parse import urljoin, urlsplit
+from urllib.parse import urljoin
 import uuid
 
 import requests
@@ -37,69 +37,15 @@ from full_agent_tasks import TaskRegistry  # noqa: E402
 from orchestration_spec import dump_specs  # noqa: E402
 from policy_engine import PolicyEngine  # noqa: E402
 from provider_auth import authorize_provider  # noqa: E402
+from target_bootstrap import (  # noqa: E402
+    _ADMIN_ROLES,
+    load_credentials_bundle,
+    normalize_loopback_origin,
+    select_representative_accounts,
+)
 
 SCHEMA = "external-target-run/1"
 _ALL_MUTATING_METHODS = ("POST", "PUT", "PATCH", "DELETE", "CONNECT", "TRACE")
-_ADMIN_ROLES = frozenset({"platform_admin", "tenant_admin", "admin", "superadmin"})
-
-
-def normalize_loopback_origin(raw_url: str) -> str:
-    """Validate and normalize an explicit owned loopback origin URL."""
-    raw = str(raw_url or "").strip()
-    if not raw:
-        raise ValueError("target URL is required")
-    parsed = urlsplit(raw)
-    if parsed.scheme != "http" or parsed.hostname != "127.0.0.1" or not parsed.port:
-        raise ValueError("external target must be an explicit http://127.0.0.1:<port>/ origin")
-    if parsed.path not in {"", "/"} or parsed.username or parsed.password or parsed.query or parsed.fragment:
-        raise ValueError("external target must be a clean origin without path, credentials, query, or fragment")
-    return f"http://127.0.0.1:{parsed.port}/"
-
-
-def load_credentials_bundle(path: Path | None) -> dict[str, Any]:
-    """Load public target metadata and synthetic test accounts from an operator bundle."""
-    if path is None:
-        return {}
-    data = json.loads(Path(path).expanduser().resolve(strict=True).read_text(encoding="utf-8"))
-    if not isinstance(data, dict):
-        raise ValueError("credentials file must be a JSON object")
-    return data
-
-
-def select_representative_accounts(
-    accounts: Sequence[dict[str, Any]],
-    *,
-    max_members: int = 4,
-    max_admins: int = 1,
-) -> list[dict[str, Any]]:
-    """Select bounded synthetic accounts spanning tenants, roles, and peer comparisons."""
-    cleaned = [dict(row) for row in accounts if isinstance(row, dict) and row.get("alias") and row.get("password")]
-    if max_members < 0 or max_admins < 0:
-        raise ValueError("account limits must be non-negative")
-    admins = [row for row in cleaned if str(row.get("role") or "").lower() in _ADMIN_ROLES]
-    members = [row for row in cleaned if str(row.get("role") or "").lower() not in _ADMIN_ROLES]
-
-    selected_members: list[dict[str, Any]] = []
-    seen_tenants: set[str] = set()
-    seen_roles: set[str] = set()
-    # First pass: maximize role and tenant diversity; second pass: keep same-tenant peers for BOLA.
-    for row in members:
-        if len(selected_members) >= max_members:
-            break
-        tenant = str(row.get("tenant") or "")
-        role = str(row.get("role") or "")
-        if tenant not in seen_tenants or role not in seen_roles:
-            selected_members.append(row)
-            seen_tenants.add(tenant)
-            seen_roles.add(role)
-    for row in members:
-        if len(selected_members) >= max_members:
-            break
-        if row not in selected_members:
-            selected_members.append(row)
-
-    selected_admins = admins[:max_admins]
-    return [*selected_members, *selected_admins]
 
 
 def external_policy_config(

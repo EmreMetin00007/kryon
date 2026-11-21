@@ -72,14 +72,21 @@ from agentic_evidence import (
     score_evidence_value as score_evidence_value,
     select_primary_proof as select_primary_proof,
 )
+from agentic_browser import (
+    inspect_rendered_page as inspect_rendered_page,
+    run_browser_crawl as run_browser_crawl,
+)
+from agentic_crypto import analyze_token as analyze_token
 from agentic_http import (
     AgenticHTTPClient,
     BudgetExhaustedError,
     MethodNotAllowedError,
     ScopeViolationError,
+    ServiceDegradationError,
     is_static_asset_url as is_static_asset_url,
 )
 from agentic_oob import LoopbackCallbackServer
+from agentic_waf import detect_waf_block as detect_waf_block
 from agentic_oracle import (
     check_bola_false_positive,
     find_persistent_render_get_receipt,
@@ -149,17 +156,17 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                 "type": "object",
                 "properties": {
                     "method": {"type": "string", "description": "HTTP method (defaults GET; POST if body)."},
-                    "url": {"type": "string", "description": "Path or same-origin URL."},
-                    "actor": {"type": "string", "description": "Actor alias or 'anon'."},
-                    "headers": {"type": "object", "additionalProperties": {"type": "string"}, "description": "Extra headers."},
-                    "query": {"type": "object", "additionalProperties": {"type": "string"}, "description": "Query params."},
-                    "json_body": {"description": "JSON body."},
+                    "url": {"type": "string"},
+                    "actor": {"type": "string"},
+                    "headers": {"type": "object", "additionalProperties": {"type": "string"}},
+                    "query": {"type": "object", "additionalProperties": {"type": "string"}},
+                    "json_body": {},
                     "base_receipt_id": {"type": "string", "description": "GET receipt_id for base JSON."},
-                    "json_merge": {"type": "object", "description": "JSON keys to deep-merge."},
-                    "form_body": {"type": "object", "additionalProperties": {"type": "string"}, "description": "Form body."},
-                    "raw_body": {"type": "string", "description": "Raw body."},
-                    "force": {"type": "boolean", "description": "Bypass GET cache."},
-                    "save_session_as": {"type": "string", "description": "Alias for captured session."},
+                    "json_merge": {"type": "object"},
+                    "form_body": {"type": "object", "additionalProperties": {"type": "string"}},
+                    "raw_body": {"type": "string"},
+                    "force": {"type": "boolean"},
+                    "save_session_as": {"type": "string", "description": "Captured session alias."},
                 },
                 "required": ["url"],
             },
@@ -173,10 +180,10 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "receipt_id": {"type": "string", "description": "Receipt ID."},
-                    "offset": {"type": "integer", "description": "Start offset (default 0)."},
-                    "limit": {"type": "integer", "description": "Max chars (default 4000)."},
-                    "regex": {"type": "string", "description": "Regex filter."},
+                    "receipt_id": {"type": "string"},
+                    "offset": {"type": "integer"},
+                    "limit": {"type": "integer"},
+                    "regex": {"type": "string"},
                 },
                 "required": ["receipt_id"],
             },
@@ -190,16 +197,16 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "receipt_id": {"type": "string", "description": "Baseline receipt_id."},
-                    "actor": {"type": "string", "description": "Target actor or 'anon'."},
-                    "method": {"type": "string", "description": "Method override."},
-                    "url": {"type": "string", "description": "URL/path override."},
-                    "query_overrides": {"type": "object", "additionalProperties": {"type": "string"}, "description": "Query overrides."},
-                    "header_overrides": {"type": "object", "additionalProperties": {"type": "string"}, "description": "Header overrides."},
-                    "base_receipt_id": {"type": "string", "description": "GET receipt_id for base JSON."},
-                    "json_merge": {"type": "object", "description": "JSON keys to deep-merge."},
-                    "json_overrides": {"type": "object", "description": "JSON fields to merge."},
-                    "force": {"type": "boolean", "description": "Bypass GET cache."},
+                    "receipt_id": {"type": "string"},
+                    "actor": {"type": "string"},
+                    "method": {"type": "string"},
+                    "url": {"type": "string"},
+                    "query_overrides": {"type": "object", "additionalProperties": {"type": "string"}},
+                    "header_overrides": {"type": "object", "additionalProperties": {"type": "string"}},
+                    "base_receipt_id": {"type": "string"},
+                    "json_merge": {"type": "object"},
+                    "json_overrides": {"type": "object"},
+                    "force": {"type": "boolean"},
                 },
                 "required": ["receipt_id"],
             },
@@ -209,12 +216,10 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "extract_surface",
-            "description": "Extract links, forms, JS routes, OpenAPI ops, and IDs from a receipt_id at 0 HTTP cost.",
+            "description": "Extract links, forms, JS/client-logic, OpenAPI/GraphQL/Postman ops, and IDs at 0 HTTP cost.",
             "parameters": {
                 "type": "object",
-                "properties": {
-                    "receipt_id": {"type": "string", "description": "Stored receipt_id."},
-                },
+                "properties": {"receipt_id": {"type": "string"}},
                 "required": ["receipt_id"],
             },
         },
@@ -230,11 +235,10 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                     "action": {
                         "type": "string",
                         "enum": ["read", "update", "add_hypothesis", "update_hypothesis", "add_note"],
-                        "description": "Notebook action.",
                     },
-                    "surface_notes": {"type": "string", "description": "Surface summary."},
-                    "hypothesis": {"type": "object", "description": "{id,target,vuln_class,status,notes}."},
-                    "note": {"type": "string", "description": "Note text."},
+                    "surface_notes": {"type": "string"},
+                    "hypothesis": {"type": "object", "description": "{id,target,vuln_class,status,notes}"},
+                    "note": {"type": "string"},
                 },
                 "required": ["action"],
             },
@@ -248,9 +252,9 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "action": {"type": "string", "enum": ["create_url", "poll"], "description": "create_url or poll."},
-                    "label": {"type": "string", "description": "Callback label."},
-                    "token": {"type": "string", "description": "Token (empty=all)."},
+                    "action": {"type": "string", "enum": ["create_url", "poll"]},
+                    "label": {"type": "string"},
+                    "token": {"type": "string"},
                 },
                 "required": ["action"],
             },
@@ -264,17 +268,49 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "url": {"type": "string", "description": "Path or same-origin URL."},
-                    "method": {"type": "string", "description": "HTTP method."},
-                    "actor": {"type": "string", "description": "Actor alias or 'anon'."},
-                    "headers": {"type": "object", "additionalProperties": {"type": "string"}, "description": "Extra headers."},
-                    "query": {"type": "object", "additionalProperties": {"type": "string"}, "description": "Query params."},
-                    "json_body": {"description": "JSON body."},
-                    "form_body": {"type": "object", "additionalProperties": {"type": "string"}, "description": "Form body."},
-                    "raw_body": {"type": "string", "description": "Raw body."},
-                    "count": {"type": "integer", "description": "Parallel count (2-5, default 3)."},
+                    "url": {"type": "string"},
+                    "method": {"type": "string"},
+                    "actor": {"type": "string"},
+                    "headers": {"type": "object", "additionalProperties": {"type": "string"}},
+                    "query": {"type": "object", "additionalProperties": {"type": "string"}},
+                    "json_body": {},
+                    "form_body": {"type": "object", "additionalProperties": {"type": "string"}},
+                    "raw_body": {"type": "string"},
+                    "count": {"type": "integer", "description": "2-5 (default 3)."},
                 },
                 "required": ["url", "method", "actor"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "browser_crawl",
+            "description": "Read-only same-origin headless browser crawl (SPA/Shadow DOM/XHR) or rendered DOM/CSP inspect.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "mode": {"type": "string", "enum": ["crawl", "inspect"]},
+                    "url": {"type": "string"},
+                    "actor": {"type": "string"},
+                    "max_pages": {"type": "integer", "description": "1-12 (default 6)."},
+                    "marker": {"type": "string"},
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "analyze_token",
+            "description": "Offline read-only inspection of JWTs, opaque tokens, or serialized blobs (0 HTTP cost).",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "value": {"type": "string"},
+                    "kind": {"type": "string", "enum": ["auto", "jwt", "opaque", "serialization"]},
+                },
+                "required": ["value"],
             },
         },
     },
@@ -286,18 +322,18 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "title": {"type": "string", "description": "Title."},
+                    "title": {"type": "string"},
                     "class_type": {
                         "type": "string",
-                        "description": "Class: bola, tenant_isolation, bfla, auth_bypass, mass_assignment, reflected_xss, stored_xss, sqli_read, sqli, open_redirect, csrf, ssti, xxe, ssrf, path_traversal, info_disclosure, business_logic, race_condition, other.",
+                        "description": "bola, tenant_isolation, bfla, auth_bypass, mass_assignment, reflected_xss, stored_xss, sqli_read, sqli, open_redirect, csrf, ssti, xxe, ssrf, path_traversal, info_disclosure, business_logic, race_condition, other",
                     },
-                    "method": {"type": "string", "description": "HTTP method."},
-                    "url": {"type": "string", "description": "Endpoint path or URL."},
-                    "actor_alias": {"type": "string", "description": "Proof actor."},
-                    "proof_receipt_ids": {"type": "array", "items": {"type": "string"}, "description": "Proof IDs."},
-                    "control_receipt_ids": {"type": "array", "items": {"type": "string"}, "description": "Control IDs."},
-                    "evidence_value": {"type": "string", "description": "Observed evidence."},
-                    "summary": {"type": "string", "description": "Summary."},
+                    "method": {"type": "string"},
+                    "url": {"type": "string"},
+                    "actor_alias": {"type": "string"},
+                    "proof_receipt_ids": {"type": "array", "items": {"type": "string"}},
+                    "control_receipt_ids": {"type": "array", "items": {"type": "string"}},
+                    "evidence_value": {"type": "string"},
+                    "summary": {"type": "string"},
                     "severity": {"type": "string", "enum": ["critical", "high", "medium", "low"]},
                 },
                 "required": [
@@ -322,8 +358,8 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "summary": {"type": "string", "description": "Final summary."},
-                    "untested_areas": {"type": "array", "items": {"type": "string"}, "description": "Untested areas."},
+                    "summary": {"type": "string"},
+                    "untested_areas": {"type": "array", "items": {"type": "string"}},
                 },
                 "required": ["summary"],
             },
@@ -549,6 +585,8 @@ class ToolDispatcher:
             "read_receipt": self._tool_read_receipt,
             "replay_as": self._tool_replay_as,
             "extract_surface": self._tool_extract_surface,
+            "browser_crawl": self._tool_browser_crawl,
+            "analyze_token": self._tool_analyze_token,
             "notebook": self._tool_notebook,
             "callback_listener": self._tool_callback_listener,
             "concurrent_check": self._tool_concurrent_check,
@@ -560,6 +598,8 @@ class ToolDispatcher:
             return json.dumps({"error": f"unknown tool: {name}"})
         try:
             return fn(args or {})
+        except ServiceDegradationError:
+            raise
         except (ScopeViolationError, MethodNotAllowedError, BudgetExhaustedError, KeyError, ValueError) as exc:
             return json.dumps({"error": type(exc).__name__, "message": str(exc)})
         except Exception as exc:
@@ -682,6 +722,9 @@ class ToolDispatcher:
             hints = _build_surface_hints(receipt, self.http.base_url)
             if hints:
                 preview["surface_hints"] = hints
+        waf_info = detect_waf_block(receipt)
+        if waf_info is not None:
+            preview["waf_block"] = waf_info
         return wrap_untrusted(preview)
 
     def _tool_read_receipt(self, args: dict[str, Any]) -> str:
@@ -768,13 +811,49 @@ class ToolDispatcher:
         )
         self.surface_tracker.ingest_receipt(baseline)
         self._ingest_receipt_hooks(current)
+        replay_preview = _format_receipt_preview(current, preview_chars=1800)
+        waf_info = detect_waf_block(current)
+        if waf_info is not None:
+            replay_preview["waf_block"] = waf_info
         out = {
             "baseline_receipt_id": baseline["receipt_id"],
             "baseline_actor": baseline["actor"],
-            "replay": _format_receipt_preview(current, preview_chars=1800),
+            "replay": replay_preview,
             "diff": _compute_structural_diff(baseline, current),
         }
         return wrap_untrusted(out)
+
+    def _tool_browser_crawl(self, args: dict[str, Any]) -> str:
+        mode = str(args.get("mode") or "crawl").strip().lower()
+        url = str(args.get("url") or "/").strip() or "/"
+        actor = str(args.get("actor") or "anon").strip() or "anon"
+        if mode == "inspect":
+            result = inspect_rendered_page(
+                self.http,
+                url=url,
+                actor=actor,
+                marker=str(args.get("marker") or ""),
+            )
+            return wrap_untrusted(result)
+        raw_max_pages = args.get("max_pages", 6)
+        try:
+            max_pages = int(raw_max_pages)
+        except (TypeError, ValueError):
+            max_pages = 6
+        result = run_browser_crawl(
+            self.http,
+            self.surface_tracker,
+            url=url,
+            actor=actor,
+            max_pages=max_pages,
+        )
+        return wrap_untrusted(result)
+
+    def _tool_analyze_token(self, args: dict[str, Any]) -> str:
+        value = str(args.get("value") or "")
+        kind = str(args.get("kind") or "auto").strip().lower() or "auto"
+        result = analyze_token(value, kind=kind)
+        return json.dumps(result, ensure_ascii=False)
 
     def _tool_extract_surface(self, args: dict[str, Any]) -> str:
         receipt = self.receipts.get(str(args.get("receipt_id") or ""))

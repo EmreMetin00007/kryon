@@ -16,8 +16,9 @@ if str(SCRIPTS) not in sys.path:
     sys.path.insert(0, str(SCRIPTS))
 
 import agentic_report  # noqa: E402
-import external_target_runner as ext  # noqa: E402
+import agentic_vault  # noqa: E402
 import llm_config  # noqa: E402
+import target_bootstrap  # noqa: E402
 from provider_auth import authorize_provider  # noqa: E402
 from agentic_http import ActorManager, AgenticHTTPClient  # noqa: E402
 from agentic_investigator import (  # noqa: E402
@@ -103,15 +104,30 @@ def run_agentic_target(
     bootstrap_model: str = "",
     epoch_char_limit: int = 0,
     cache_token_weight: float = 0.10,
+    scope_file: Path | None = None,
+    allow_non_loopback: bool = False,
+    max_degradation_streak: int = 5,
+    vault_home: Path | None = None,
+    vault_key_name: str = "",
 ) -> tuple[Path, dict[str, Any]]:
-    """Run (or plan when execute=False) AgenticInvestigator against an owned loopback target."""
+    """Run (or plan when execute=False) AgenticInvestigator against an authorized target."""
     if isinstance(cache_token_weight, bool):
         raise ValueError("cache_token_weight must be between 0.0 and 1.0")
     eff_cache_weight = float(cache_token_weight)
     if not (0.0 <= eff_cache_weight <= 1.0):
         raise ValueError(f"cache_token_weight must be between 0.0 and 1.0, got {cache_token_weight!r}")
-    bundle = ext.load_credentials_bundle(credentials_file)
-    base = ext.normalize_loopback_origin(target or str(bundle.get("target_url") or ""))
+    if credentials_file is not None:
+        bundle = target_bootstrap.load_credentials_bundle(credentials_file)
+    elif vault_home is not None and str(vault_key_name or "").strip():
+        bundle = agentic_vault.load_vault_credentials(vault_home, str(vault_key_name).strip())
+    else:
+        bundle = {}
+    base, scope_meta = target_bootstrap.resolve_target_origin(
+        target or str(bundle.get("target_url") or ""),
+        scope_file=scope_file,
+        allow_non_loopback=bool(allow_non_loopback),
+    )
+    eff_excluded_paths = list(scope_meta.get("excluded_paths") or [])
     eff_run_id = str(run_id or bundle.get("run_id") or "").strip() or uuid.uuid4().hex
     raw_scope = bundle.get("scope_rules")
     scope_rules: dict[str, Any] = raw_scope if isinstance(raw_scope, dict) else {}
@@ -127,7 +143,7 @@ def run_agentic_target(
         for item in (discovery_hints if discovery_hints else (bundle.get("discovery") or []))
         if isinstance(item, str) and str(item).strip()
     ] or ["/"]
-    accounts = ext.select_representative_accounts(
+    accounts = target_bootstrap.select_representative_accounts(
         bundle.get("test_accounts") or [],
         max_members=max_member_accounts,
         max_admins=max_admin_accounts,
@@ -202,6 +218,12 @@ def run_agentic_target(
             "schema": SCHEMA,
             "mode": "plan_only",
             "target": base,
+            "scope": {
+                "loopback_only": bool(scope_meta.get("loopback_only", True)),
+                "scope_file": scope_meta.get("scope_file"),
+                "excluded_paths_count": len(eff_excluded_paths),
+                "max_degradation_streak": max(0, int(max_degradation_streak)),
+            },
             "run_id": eff_run_id,
             "models": models,
             "provider_kind": auth["provider_kind"],
@@ -259,14 +281,23 @@ def run_agentic_target(
         actors=actors,
         allowed_methods=eff_methods,
         max_requests=eff_http_budget,
+        excluded_paths=eff_excluded_paths,
+        max_degradation_streak=max(0, int(max_degradation_streak)),
     )
 
+    scope_summary = {
+        "loopback_only": bool(scope_meta.get("loopback_only", True)),
+        "scope_file": scope_meta.get("scope_file"),
+        "excluded_paths_count": len(eff_excluded_paths),
+        "max_degradation_streak": max(0, int(max_degradation_streak)),
+    }
     manifest: dict[str, Any] = {
         "schema": SCHEMA,
         "mode": "agentic",
         "status": "starting",
         "run_id": eff_run_id,
         "target": base,
+        "scope": scope_summary,
         "models": models,
         "provider_kind": auth["provider_kind"],
         "allowed_methods": eff_methods,
@@ -431,6 +462,34 @@ def main(argv: list[str] | None = None) -> int:
         default=0.10,
         help="Effective token weight in [0.0, 1.0] for cached prompt tokens (default: 0.10)",
     )
+    parser.add_argument(
+        "--scope-file",
+        type=Path,
+        default=None,
+        help="Optional explicit scope.json file (required when --allow-non-loopback is set)",
+    )
+    parser.add_argument(
+        "--allow-non-loopback",
+        action="store_true",
+        help="Allow non-loopback http(s) target origin explicitly verified by --scope-file",
+    )
+    parser.add_argument(
+        "--max-degradation-streak",
+        type=int,
+        default=5,
+        help="Stop gracefully after N consecutive 429/502/503/504 responses (0 disables, default: 5)",
+    )
+    parser.add_argument(
+        "--vault-home",
+        type=Path,
+        default=None,
+        help="Optional CredentialVault directory for encrypted credential bundle lookup",
+    )
+    parser.add_argument(
+        "--vault-key-name",
+        default="",
+        help="Credential bundle key name inside --vault-home",
+    )
     args = parser.parse_args(argv)
     if not (0.0 <= float(args.cache_token_weight) <= 1.0):
         parser.error("--cache-token-weight must be between 0.0 and 1.0")
@@ -474,6 +533,11 @@ def main(argv: list[str] | None = None) -> int:
         bootstrap_model=args.bootstrap_model,
         epoch_char_limit=args.epoch_char_limit,
         cache_token_weight=args.cache_token_weight,
+        scope_file=args.scope_file,
+        allow_non_loopback=args.allow_non_loopback,
+        max_degradation_streak=args.max_degradation_streak,
+        vault_home=args.vault_home,
+        vault_key_name=args.vault_key_name,
     )
     print(json.dumps({
         "artifact": str(path),

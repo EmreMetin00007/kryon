@@ -979,6 +979,38 @@ class SurfaceFrontierTracker:
                     actor=actor,
                     current_url=curr_url,
                 )
+        for pop in (surface.get("postman_ops") or []):
+            if isinstance(pop, dict):
+                self._register_discovered_url(
+                    str(pop.get("url") or ""),
+                    method=str(pop.get("method") or "GET"),
+                    params=pop.get("body_keys") or (),
+                    actor=actor,
+                    current_url=curr_url,
+                )
+        client_logic = surface.get("client_logic")
+        if isinstance(client_logic, dict):
+            for ep in (client_logic.get("endpoints") or []):
+                if isinstance(ep, dict):
+                    ep_url = str(ep.get("path") or ep.get("url") or "")
+                    ep_params = [
+                        *(ep.get("query_params") or []),
+                        *(ep.get("body_fields") or []),
+                    ]
+                    self._register_discovered_url(
+                        ep_url,
+                        method=str(ep.get("method") or "GET"),
+                        params=ep_params,
+                        actor=actor,
+                        current_url=curr_url,
+                    )
+        if surface.get("graphql_ops") and curr_url:
+            self._register_discovered_url(
+                curr_url,
+                method="POST",
+                actor=actor,
+                current_url=curr_url,
+            )
 
     def unvisited_routes(self) -> list[str]:
         """Return discovered routes and parameterized endpoints not yet tested."""

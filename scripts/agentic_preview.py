@@ -6,15 +6,41 @@ import json
 from pathlib import Path
 import re
 import sys
-from typing import Any
-from urllib.parse import urlsplit
+from typing import Any, Callable
+from urllib.parse import urljoin, urlsplit
 
 from agentic_http import is_static_asset_url
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 _SURFACE_CORE_PARENT = _REPO_ROOT / "mcp-servers" / "mcp-memory-server"
+_KALI_TOOLS_PARENT = _REPO_ROOT / "mcp-servers" / "mcp-kali-tools"
 if str(_SURFACE_CORE_PARENT) not in sys.path:
     sys.path.insert(0, str(_SURFACE_CORE_PARENT))
+
+_CLIENT_LOGIC_LOADED = False
+_BUILD_CLIENT_LOGIC_MAP: Callable[..., dict[str, Any]] | None = None
+_POSTMAN_VAR_PREFIX_RE = re.compile(r"^\{\{[^}]+\}\}(/.*)$")
+_SIGNING_HEADER_RE = re.compile(r"(?:sign|signature|hmac|digest)", re.I)
+
+
+def _load_build_client_logic_map() -> Callable[..., dict[str, Any]] | None:
+    """Lazily import cco_js_core.client_logic.build_client_logic_map if available."""
+    global _CLIENT_LOGIC_LOADED, _BUILD_CLIENT_LOGIC_MAP
+    if _CLIENT_LOGIC_LOADED:
+        return _BUILD_CLIENT_LOGIC_MAP
+    _CLIENT_LOGIC_LOADED = True
+    try:
+        kali_path = str(_KALI_TOOLS_PARENT)
+        if _KALI_TOOLS_PARENT.is_dir() and kali_path not in sys.path:
+            sys.path.insert(0, kali_path)
+        from cco_js_core.client_logic import (  # type: ignore[import-not-found]
+            build_client_logic_map,
+        )
+
+        _BUILD_CLIENT_LOGIC_MAP = build_client_logic_map
+    except Exception:
+        _BUILD_CLIENT_LOGIC_MAP = None
+    return _BUILD_CLIENT_LOGIC_MAP
 
 from cco_surface_core.extract import (  # noqa: E402
     extract_css,
@@ -397,6 +423,368 @@ def _extract_candidate_ids(obj: Any, *, limit: int = 40) -> list[dict[str, str]]
     return found
 
 
+def _extract_graphql_operations(parsed: dict[str, Any]) -> list[dict[str, Any]]:
+    """Extract compact GraphQL query/mutation operations from an introspection __schema."""
+    schema: dict[str, Any] | None = None
+    raw_data = parsed.get("data")
+    if isinstance(raw_data, dict) and isinstance(raw_data.get("__schema"), dict):
+        schema = raw_data["__schema"]
+    elif isinstance(parsed.get("__schema"), dict):
+        schema = parsed["__schema"]
+    if schema is None:
+        return []
+
+    raw_types = schema.get("types")
+    if not isinstance(raw_types, list):
+        return []
+
+    if "queryType" in schema:
+        qt = schema.get("queryType")
+        query_name = str(qt.get("name") or "").strip() if isinstance(qt, dict) else ""
+    else:
+        query_name = "Query"
+
+    if "mutationType" in schema:
+        mt = schema.get("mutationType")
+        mutation_name = str(mt.get("name") or "").strip() if isinstance(mt, dict) else ""
+    else:
+        mutation_name = "Mutation"
+
+    ops: list[dict[str, Any]] = []
+    seen: set[tuple[str, str]] = set()
+    for type_obj in raw_types:
+        if not isinstance(type_obj, dict):
+            continue
+        tname = str(type_obj.get("name") or "").strip()
+        if not tname:
+            continue
+        if query_name and tname == query_name:
+            kind = "query"
+        elif mutation_name and tname == mutation_name:
+            kind = "mutation"
+        else:
+            continue
+        fields = type_obj.get("fields")
+        if not isinstance(fields, list):
+            continue
+        for field in fields:
+            if not isinstance(field, dict):
+                continue
+            fname = str(field.get("name") or "").strip()
+            if not fname or fname.startswith("__"):
+                continue
+            dedup_key = (kind, fname)
+            if dedup_key in seen:
+                continue
+            seen.add(dedup_key)
+            args: list[str] = []
+            raw_args = field.get("args")
+            if isinstance(raw_args, list):
+                for arg in raw_args:
+                    if not isinstance(arg, dict):
+                        continue
+                    aname = str(arg.get("name") or "").strip()
+                    if aname and aname not in args:
+                        args.append(aname[:80])
+                        if len(args) >= 20:
+                            break
+            ops.append({"kind": kind, "name": fname[:120], "args": args})
+            if len(ops) >= 60:
+                return ops
+    return ops
+
+
+def _postman_request_url(req_url: Any) -> str:
+    """Normalize a Postman v2.x request URL field (string or structured dict)."""
+    if isinstance(req_url, str):
+        return req_url.strip()
+    if not isinstance(req_url, dict):
+        return ""
+    raw = str(req_url.get("raw") or "").strip()
+    if raw:
+        return raw
+    protocol = str(req_url.get("protocol") or "https").strip()
+    host_val = req_url.get("host")
+    if isinstance(host_val, list):
+        host = ".".join(str(part).strip() for part in host_val if str(part).strip())
+    else:
+        host = str(host_val or "").strip()
+    port = str(req_url.get("port") or "").strip()
+    path_val = req_url.get("path")
+    if isinstance(path_val, list):
+        path = "/" + "/".join(str(seg).strip("/") for seg in path_val if str(seg).strip("/"))
+    else:
+        path_str = str(path_val or "").strip()
+        path = path_str if (not path_str or path_str.startswith("/")) else "/" + path_str
+    query_parts: list[str] = []
+    raw_query = req_url.get("query")
+    if isinstance(raw_query, list):
+        for q in raw_query:
+            if isinstance(q, dict) and q.get("key") and not q.get("disabled"):
+                query_parts.append(str(q["key"]).strip())
+    q_suffix = ("?" + "&".join(f"{k}=" for k in query_parts[:15])) if query_parts else ""
+    if host:
+        if host.startswith("{{") and host.endswith("}}"):
+            return f"{host}{path}{q_suffix}"
+        authority = f"{host}:{port}" if port else host
+        return f"{protocol}://{authority}{path}{q_suffix}"
+    return f"{path}{q_suffix}" if path else ""
+
+
+def _postman_body_keys(req_body: Any) -> list[str]:
+    """Extract only key names (never values) from a Postman v2.x request body."""
+    if not isinstance(req_body, dict):
+        return []
+    keys: list[str] = []
+
+    def _add(name: Any) -> None:
+        clean = str(name or "").strip()[:80]
+        if clean and clean not in keys and len(keys) < 25:
+            keys.append(clean)
+
+    mode = str(req_body.get("mode") or "").strip().lower()
+    raw_text = req_body.get("raw")
+    if (mode == "raw" or (not mode and isinstance(raw_text, str))) and isinstance(raw_text, str):
+        stripped = raw_text.strip()
+        if stripped.startswith("{"):
+            try:
+                parsed_body = json.loads(stripped)
+            except ValueError:
+                parsed_body = None
+            if isinstance(parsed_body, dict):
+                for k in parsed_body.keys():
+                    _add(k)
+
+    for field_name in ("urlencoded", "formdata"):
+        entries = req_body.get(field_name)
+        if isinstance(entries, list):
+            for entry in entries:
+                if isinstance(entry, dict) and entry.get("key") and not entry.get("disabled"):
+                    _add(entry["key"])
+
+    if mode == "graphql" and isinstance(req_body.get("graphql"), dict):
+        gql_vars = req_body["graphql"].get("variables")
+        if isinstance(gql_vars, str) and gql_vars.strip().startswith("{"):
+            try:
+                parsed_vars = json.loads(gql_vars)
+            except ValueError:
+                parsed_vars = None
+            if isinstance(parsed_vars, dict):
+                for k in parsed_vars.keys():
+                    _add(k)
+        elif isinstance(gql_vars, dict):
+            for k in gql_vars.keys():
+                _add(k)
+    return keys
+
+
+def _extract_postman_operations(
+    parsed: dict[str, Any],
+    base_url: str,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Recursively extract up to 60 operations and same-origin links from Postman v2.x JSON."""
+    if not isinstance(parsed.get("info"), dict) or not isinstance(parsed.get("item"), list):
+        return [], []
+
+    base_netloc = urlsplit(base_url).netloc
+    ops: list[dict[str, Any]] = []
+    same_origin_links: list[dict[str, Any]] = []
+
+    def _walk(items: list[Any], depth: int = 0) -> None:
+        if depth > 16 or len(ops) >= 60:
+            return
+        for entry in items:
+            if len(ops) >= 60:
+                return
+            if not isinstance(entry, dict):
+                continue
+            req = entry.get("request")
+            if isinstance(req, str):
+                method = "GET"
+                raw_url = req.strip()
+                body_keys: list[str] = []
+            elif isinstance(req, dict):
+                method = str(req.get("method") or "GET").strip().upper() or "GET"
+                raw_url = _postman_request_url(req.get("url"))
+                body_keys = _postman_body_keys(req.get("body"))
+            else:
+                raw_url = ""
+                method = "GET"
+                body_keys = []
+
+            if raw_url:
+                ops.append({
+                    "method": method,
+                    "url": raw_url[:240],
+                    "body_keys": body_keys,
+                })
+                var_match = _POSTMAN_VAR_PREFIX_RE.match(raw_url)
+                resolved = ""
+                if var_match:
+                    resolved = urljoin(base_url.rstrip("/") + "/", var_match.group(1))
+                elif raw_url.startswith("/"):
+                    resolved = urljoin(base_url.rstrip("/") + "/", raw_url)
+                else:
+                    parsed_u = urlsplit(raw_url)
+                    if parsed_u.scheme in {"http", "https"} and parsed_u.netloc and parsed_u.netloc == base_netloc:
+                        resolved = raw_url
+                if resolved and not is_static_asset_url(resolved):
+                    same_origin_links.append({
+                        "method": method,
+                        "url": resolved,
+                        "params": body_keys,
+                    })
+
+            children = entry.get("item")
+            if isinstance(children, list):
+                _walk(children, depth + 1)
+
+    _walk(parsed["item"])
+    return ops, same_origin_links
+
+
+def _extract_js_client_logic(
+    body: str,
+    url: str,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, Any]]:
+    """Run passive cco_js_core Client Logic Map on JS source without exposing secret values."""
+    if not body or not body.strip():
+        return [], [], {}
+    build_fn = _load_build_client_logic_map()
+    if build_fn is None:
+        return [], [], {}
+    try:
+        cl_map = build_fn(body, parser="static")
+    except Exception:
+        return [], [], {}
+    if not isinstance(cl_map, dict):
+        return [], [], {}
+
+    raw_endpoints: list[dict[str, Any]] = []
+    for ep in cl_map.get("endpoints") or []:
+        if isinstance(ep, dict):
+            raw_endpoints.append(ep)
+    sm = cl_map.get("source_map")
+    if isinstance(sm, dict):
+        for orig_ep in sm.get("original_endpoints") or []:
+            if isinstance(orig_ep, dict):
+                raw_endpoints.append(orig_ep)
+
+    merged_calls: list[dict[str, Any]] = []
+    merged_links: list[dict[str, Any]] = []
+    compact_endpoints: list[dict[str, Any]] = []
+    signing_indicators: list[str] = []
+    coverage_gaps: list[str] = []
+
+    def _add_unique(target: list[str], value: str, cap: int) -> None:
+        clean = value.strip()
+        if clean and clean not in target and len(target) < cap:
+            target.append(clean)
+
+    signing_meta = cl_map.get("signing")
+    if isinstance(signing_meta, dict):
+        for fn_name in signing_meta.get("functions") or []:
+            _add_unique(signing_indicators, str(fn_name)[:80], 20)
+
+    seen_ep_keys: set[tuple[str, str]] = set()
+    for ep in raw_endpoints:
+        method = str(ep.get("method") or "GET").strip().upper() or "GET"
+        path = str(ep.get("path") or "").strip()[:240]
+        q_params = [str(p)[:64] for p in (ep.get("query_params") or []) if p][:15]
+        b_fields = [str(f)[:64] for f in (ep.get("body_fields") or []) if f][:20]
+        h_names = [str(h)[:64] for h in (ep.get("headers") or []) if h][:15]
+        signers = [str(s)[:80] for s in (ep.get("signer_functions") or []) if s][:10]
+        runtime_required = bool(ep.get("runtime_required"))
+
+        for s in signers:
+            _add_unique(signing_indicators, s, 20)
+        for h in h_names:
+            if _SIGNING_HEADER_RE.search(h):
+                _add_unique(signing_indicators, h, 20)
+
+        if path and (method, path) not in seen_ep_keys and len(compact_endpoints) < 40:
+            seen_ep_keys.add((method, path))
+            compact_endpoints.append({
+                "method": method,
+                "path": path,
+                "query_params": q_params,
+                "body_fields": b_fields,
+                "headers": h_names,
+                "signer_functions": signers,
+                "runtime_required": runtime_required,
+            })
+
+        if path.startswith(("/", "http://", "https://")):
+            resolved = urljoin(url, path)
+            if not is_static_asset_url(resolved):
+                all_params = list(dict.fromkeys([*q_params, *b_fields]))[:15]
+                merged_calls.append({
+                    "method": method,
+                    "url": resolved,
+                    "sources": ["client-logic"],
+                    "params": [{"name": p, "in": "body" if p in b_fields else "query", "sample": ""} for p in all_params],
+                })
+                merged_links.append({
+                    "method": method,
+                    "url": resolved,
+                    "params": all_params,
+                })
+
+        if runtime_required:
+            if not path:
+                expr = str(ep.get("url_expression") or "<dynamic>").strip()[:80]
+                _add_unique(coverage_gaps, f"dynamic_endpoint_runtime_required:{method} {expr}", 20)
+            elif signers:
+                _add_unique(coverage_gaps, f"signed_endpoint_runtime_required:{method} {path}", 20)
+            elif "{id}" in path:
+                _add_unique(coverage_gaps, f"dynamic_endpoint_runtime_required:{method} {path}", 20)
+
+    validation_fields: list[str] = []
+    for rule in cl_map.get("validation_rules") or []:
+        if isinstance(rule, dict) and rule.get("field"):
+            _add_unique(validation_fields, str(rule["field"])[:64], 30)
+
+    storage_keys: list[str] = []
+    for sk in cl_map.get("storage_keys") or []:
+        _add_unique(storage_keys, str(sk)[:80], 30)
+
+    source_maps: list[str] = []
+    if isinstance(sm, dict):
+        if sm.get("url"):
+            _add_unique(source_maps, str(sm["url"])[:200], 20)
+        for src in sm.get("sources") or []:
+            _add_unique(source_maps, str(src)[:200], 20)
+        if sm.get("present") and not source_maps:
+            _add_unique(source_maps, "inline", 20)
+
+    for gap in cl_map.get("coverage_gaps") or []:
+        if isinstance(gap, dict):
+            code = str(gap.get("code") or gap.get("reason_code") or "").strip()
+            detail = str(gap.get("detail") or gap.get("message") or "").strip()
+            label = f"{code}: {detail}" if (code and detail) else (code or detail)
+            _add_unique(coverage_gaps, label[:160], 20)
+
+    if not any((
+        compact_endpoints,
+        signing_indicators,
+        validation_fields,
+        storage_keys,
+        source_maps,
+        coverage_gaps,
+    )):
+        return merged_calls, merged_links, {}
+
+    client_logic: dict[str, Any] = {
+        "endpoints": compact_endpoints,
+        "signing_indicators": signing_indicators,
+        "validation_fields": validation_fields,
+        "storage_keys": storage_keys,
+        "source_maps": source_maps,
+        "coverage_gaps": coverage_gaps,
+    }
+    return merged_calls, merged_links, client_logic
+
+
 def _extract_surface_summary(receipt: dict[str, Any], base_url: str) -> dict[str, Any]:
     """Extract normalized attack-surface artifacts from a stored receipt at 0 HTTP cost."""
     body = receipt.get("body") or ""
@@ -410,6 +798,9 @@ def _extract_surface_summary(receipt: dict[str, Any], base_url: str) -> dict[str
     spa_routes: list[dict[str, Any]] = []
     spec_urls: list[str] = []
     openapi_ops: list[dict[str, Any]] = []
+    graphql_ops: list[dict[str, Any]] = []
+    postman_ops: list[dict[str, Any]] = []
+    client_logic: dict[str, Any] = {}
     candidate_ids: list[dict[str, str]] = []
 
     raw_headers = receipt.get("response_headers") or receipt.get("headers")
@@ -435,8 +826,13 @@ def _extract_surface_summary(receipt: dict[str, Any], base_url: str) -> dict[str
         except ValueError:
             parsed = None
         if isinstance(parsed, (dict, list)):
-            if isinstance(parsed, dict) and "paths" in parsed and ("openapi" in parsed or "swagger" in parsed):
-                openapi_ops = _extract_openapi_operations(parsed, base)
+            if isinstance(parsed, dict):
+                if "paths" in parsed and ("openapi" in parsed or "swagger" in parsed):
+                    openapi_ops = _extract_openapi_operations(parsed, base)
+                graphql_ops = _extract_graphql_operations(parsed)
+                postman_ops, postman_links = _extract_postman_operations(parsed, base)
+                if postman_links:
+                    links.extend(postman_links)
             hypermedia, _ = extract_json_hypermedia(parsed, url, origin_url=base)
             for item in hypermedia:
                 if not is_static_asset_url(item.get("url", "")):
@@ -463,13 +859,24 @@ def _extract_surface_summary(receipt: dict[str, Any], base_url: str) -> dict[str
                         seen_html_ids.add(("path_id", seg))
                         candidate_ids.append({"field": "path_id", "value": seg})
 
-    if "javascript" in ctype or urlsplit(url).path.lower().endswith((".js", ".mjs")):
+    if "javascript" in ctype or "ecmascript" in ctype or urlsplit(url).path.lower().endswith((".js", ".mjs")):
         js_calls.extend(extract_js_calls(body, url, limit=80))
         for rec in extract_js(body, url, limit=60):
             if not is_static_asset_url(rec.get("url", "")):
                 links.append(rec)
         spa_routes.extend(extract_spa_routes(body, url, limit=60))
         spec_urls.extend(find_spec_urls(body, url))
+        cl_calls, cl_links, client_logic = _extract_js_client_logic(body, url)
+        seen_js_call_keys = {
+            (str(c.get("method") or "GET").upper(), str(c.get("url") or ""))
+            for c in js_calls
+        }
+        for call in cl_calls:
+            ckey = (str(call.get("method") or "GET").upper(), str(call.get("url") or ""))
+            if ckey not in seen_js_call_keys:
+                seen_js_call_keys.add(ckey)
+                js_calls.append(call)
+        links.extend(cl_links)
 
     if "css" in ctype or urlsplit(url).path.lower().endswith(".css"):
         for rec in extract_css(body, url, limit=120):
@@ -519,7 +926,7 @@ def _extract_surface_summary(receipt: dict[str, Any], base_url: str) -> dict[str
     )
     compact_forms = [_compact_surface_item(f) for f in forms[:30]]
 
-    return {
+    summary: dict[str, Any] = {
         "receipt_id": receipt["receipt_id"],
         "url": url,
         "content_type": ctype,
@@ -531,6 +938,13 @@ def _extract_surface_summary(receipt: dict[str, Any], base_url: str) -> dict[str
         "spa_routes": spa_routes[:40],
         "links": dedup_links[:60],
     }
+    if client_logic:
+        summary["client_logic"] = client_logic
+    if graphql_ops:
+        summary["graphql_ops"] = graphql_ops[:60]
+    if postman_ops:
+        summary["postman_ops"] = postman_ops[:60]
+    return summary
 
 
 def _build_surface_hints(

@@ -16,6 +16,7 @@ import zlib
 import requests
 
 from agentic_receipts import ReceiptStore
+from target_bootstrap import ScopeGuard
 from wire_budget import WireBudget
 
 STATIC_EXTENSIONS = frozenset({
@@ -24,10 +25,11 @@ STATIC_EXTENSIONS = frozenset({
 })
 _MUTATING_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
 _AUTH_OVERRIDE_HEADERS = frozenset({"authorization", "cookie"})
+_DEGRADATION_STATUS_CODES = frozenset({429, 502, 503, 504})
 
 
 class ScopeViolationError(ValueError):
-    """Raised when a requested URL leaves the authorized target origin."""
+    """Raised when a requested URL leaves the authorized target origin or hits an excluded path."""
 
 
 class MethodNotAllowedError(ValueError):
@@ -36,6 +38,10 @@ class MethodNotAllowedError(ValueError):
 
 class BudgetExhaustedError(RuntimeError):
     """Raised when WireBudget refuses another live HTTP request."""
+
+
+class ServiceDegradationError(RuntimeError):
+    """Raised when consecutive 429/502/503/504 responses indicate target degradation."""
 
 
 def normalize_origin(raw_url: str) -> str:
@@ -368,6 +374,33 @@ class ActorManager:
             if cap_refresh:
                 session.refresh_token = cap_refresh
 
+    def get_browser_auth_state(self, actor_alias: str) -> dict[str, Any]:
+        """Return host-side cookies and auth headers for browser contexts (never expose to LLM)."""
+        session = self.get(actor_alias)
+        if session.alias == "anon":
+            return {"cookies": {}, "headers": {}}
+        with session._lock:
+            if not session.authenticated:
+                return {"cookies": {}, "headers": {}}
+            cookies: dict[str, str] = dict(session.cookies)
+            auth_headers: dict[str, str] = {}
+            for key, val in session.base_headers.items():
+                if key.lower() == "cookie":
+                    for part in str(val).split(";"):
+                        if "=" in part:
+                            ck, cv = part.split("=", 1)
+                            ck_clean = ck.strip()
+                            cv_clean = cv.strip()
+                            if ck_clean and cv_clean:
+                                cookies.setdefault(ck_clean, cv_clean)
+                else:
+                    auth_headers[str(key)] = str(val)
+            if session.access_token and not any(k.lower() == "authorization" for k in auth_headers):
+                auth_headers["Authorization"] = f"Bearer {session.access_token}"
+            if session.csrf_token and not any(k.lower() == "x-csrf-token" for k in auth_headers):
+                auth_headers["X-CSRF-Token"] = session.csrf_token
+            return {"cookies": cookies, "headers": auth_headers}
+
 
 def _decode_raw_response(raw_bytes: bytes, content_encoding: str) -> bytes:
     """Best-effort decompression that survives mismatched gzip headers."""
@@ -402,10 +435,16 @@ class AgenticHTTPClient:
         wire_budget: WireBudget | None = None,
         timeout_s: float = 15.0,
         max_response_bytes: int = 4 * 1024 * 1024,
+        excluded_paths: Sequence[str] = (),
+        max_degradation_streak: int = 5,
     ):
         self.base_url = normalize_origin(base_url)
         parsed_origin = urlsplit(self.base_url)
         self._origin = (parsed_origin.scheme, parsed_origin.netloc)
+        self.scope_guard = ScopeGuard(self.base_url, tuple(excluded_paths or ()))
+        self.excluded_paths: tuple[str, ...] = self.scope_guard.excluded_paths
+        self.max_degradation_streak: int = max(0, int(max_degradation_streak))
+        self._degradation_streak: int = 0
         self.receipt_store = receipt_store
         self.actors = actors or ActorManager()
         self.allowed_methods = frozenset(
@@ -447,7 +486,7 @@ class AgenticHTTPClient:
                 pass
 
     def resolve_in_scope(self, url_or_path: str) -> tuple[str, str, str]:
-        """Resolve relative path or URL and verify exact origin match."""
+        """Resolve relative path or URL and verify exact origin match and excluded paths."""
         raw = str(url_or_path or "").strip()
         if not raw:
             raise ScopeViolationError("URL is required")
@@ -460,6 +499,10 @@ class AgenticHTTPClient:
                 f"out-of-scope URL {resolved!r}; allowed origin is {self.base_url}"
             )
         clean_url = urlunsplit((parsed.scheme, parsed.netloc, parsed.path or "/", parsed.query, ""))
+        try:
+            self.scope_guard.check_url(clean_url)
+        except ValueError as exc:
+            raise ScopeViolationError(str(exc)) from exc
         return clean_url, parsed.path or "/", parsed.query
 
     def _merge_query(self, url: str, query_params: dict[str, Any] | None) -> tuple[str, str, str]:
@@ -476,6 +519,23 @@ class AgenticHTTPClient:
         new_query = urlencode(sorted(existing.items()))
         rebuilt = urlunsplit((parsed.scheme, parsed.netloc, parsed.path or "/", new_query, ""))
         return self.resolve_in_scope(rebuilt)
+
+    def _record_degradation_status(self, *, status: int, url: str) -> None:
+        """Track consecutive 429/502/503/504 responses and stop gracefully on degradation."""
+        if self.max_degradation_streak <= 0 or status <= 0:
+            return
+        streak = 0
+        with self._lock:
+            if status in _DEGRADATION_STATUS_CODES:
+                self._degradation_streak += 1
+                streak = self._degradation_streak
+            else:
+                self._degradation_streak = 0
+        if streak >= self.max_degradation_streak:
+            raise ServiceDegradationError(
+                f"target service degradation detected after {streak} consecutive "
+                f"HTTP 429/502/503/504 responses (last status={status}, url={url})"
+            )
 
     def _send_wire(
         self,
@@ -574,6 +634,7 @@ class AgenticHTTPClient:
 
         elapsed_ms = (time.monotonic() - started) * 1000.0
         if not record_receipt:
+            self._record_degradation_status(status=int(status), url=str(url))
             return {
                 "receipt_id": "",
                 "actor": str(actor or "anon"),
@@ -612,6 +673,7 @@ class AgenticHTTPClient:
             saved_session_meta["source_receipt_id"] = rec["receipt_id"]
             rec = dict(rec)
             rec["saved_session"] = saved_session_meta
+        self._record_degradation_status(status=int(status), url=str(url))
         return rec
 
     def _budget_remaining(self) -> int:
@@ -651,7 +713,7 @@ class AgenticHTTPClient:
                     )
                     if 200 <= receipt["status"] < 300:
                         return True
-                except BudgetExhaustedError:
+                except (BudgetExhaustedError, ServiceDegradationError):
                     raise
                 except Exception:
                     pass
@@ -710,6 +772,8 @@ class AgenticHTTPClient:
                     body_preview="",
                     record_receipt=False,
                 )
+            except (BudgetExhaustedError, ServiceDegradationError):
+                raise
             except Exception:
                 pass
 
