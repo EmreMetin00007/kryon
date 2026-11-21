@@ -652,12 +652,14 @@ class _FakeWrapupTransport:
     def __init__(self, responses: list[dict[str, Any]]) -> None:
         self._responses = list(responses)
         self.calls = 0
+        self.bodies: list[dict[str, Any]] = []
         self.session_gate = SessionGate()
         self.provider_responses: list[dict[str, Any]] = []
 
-    def complete(self, _request_body: dict[str, Any], *, minimum_output_tokens: int = 16) -> dict[str, Any]:
+    def complete(self, request_body: dict[str, Any], *, minimum_output_tokens: int = 16) -> dict[str, Any]:
         del minimum_output_tokens
         self.calls += 1
+        self.bodies.append(dict(request_body))
         if not self._responses:
             return {"choices": [{"message": {"content": "", "tool_calls": []}}]}
         return self._responses.pop(0)
@@ -804,3 +806,155 @@ def test_agent_cli_agentic_subcommand_dispatch(monkeypatch: pytest.MonkeyPatch, 
         "--max-turns",
         "25",
     ]]
+
+
+# ---------------------------------------------------------------------------
+# 7. Two-phase asymmetric scout -> deep handoff
+# ---------------------------------------------------------------------------
+
+
+def test_two_phase_scout_to_deep_handoff(tmp_path: Path, phase1_server: str) -> None:
+    store, _actors, client, _disp = _make_phase1_env(tmp_path, phase1_server, with_oracle=False)
+    budget = SharedBudget(http=100, tokens=400_000, seconds=600)
+    transport = _FakeWrapupTransport([
+        # Turn 1 (scout): fetch /search?q=manifest
+        {
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [{
+                        "id": "tc_s1",
+                        "type": "function",
+                        "function": {"name": "http_request", "arguments": json.dumps({"url": "/search?q=manifest", "actor": "anon"})},
+                    }],
+                },
+            }],
+            "usage": {"prompt_tokens": 500, "completion_tokens": 80, "total_tokens": 580},
+        },
+        # Turn 2 (scout): calls finish -> triggers handoff to deep-model
+        {
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [{
+                        "id": "tc_s2",
+                        "type": "function",
+                        "function": {"name": "finish", "arguments": json.dumps({"summary": "scout mapped search"})},
+                    }],
+                },
+            }],
+            "usage": {"prompt_tokens": 600, "completion_tokens": 90, "total_tokens": 690},
+        },
+        # Turn 3 (deep): receives fresh handoff packet and probes the unprobed param
+        {
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [{
+                        "id": "tc_d1",
+                        "type": "function",
+                        "function": {"name": "http_request", "arguments": json.dumps({"url": "/search?q=%3Csvg/onload=1%3E", "actor": "anon"})},
+                    }],
+                },
+            }],
+            "usage": {"prompt_tokens": 700, "completion_tokens": 100, "total_tokens": 800},
+        },
+        # Turn 4 (deep): finishes cleanly once frontier is cleared
+        {
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [{
+                        "id": "tc_d2",
+                        "type": "function",
+                        "function": {"name": "finish", "arguments": json.dumps({"summary": "deep pass verified"})},
+                    }],
+                },
+            }],
+            "usage": {"prompt_tokens": 750, "completion_tokens": 80, "total_tokens": 830},
+        },
+    ])
+    inv = AgenticInvestigator(
+        http_client=client,
+        receipt_store=store,
+        transport=transport,
+        budget=budget,
+        model="deep-model",
+        scout_model="scout-model",
+        scout_max_turns=2,
+        scout_token_share=0.40,
+        root_dir=tmp_path,
+        max_turns=10,
+    )
+    try:
+        res = inv.run()
+        assert res["status"] == "finished"
+        assert len(transport.bodies) == 4
+        assert transport.bodies[0]["model"] == "scout-model"
+        assert transport.bodies[1]["model"] == "scout-model"
+        assert transport.bodies[2]["model"] == "deep-model"
+        assert transport.bodies[3]["model"] == "deep-model"
+        # Phase 2 starts with fresh 2-message handoff (no raw scout transcript)
+        p2_msgs = transport.bodies[2]["messages"]
+        assert len(p2_msgs) == 2
+        assert "PHASE 2 DEEP VERIFICATION HANDOFF" in p2_msgs[0]["content"]
+        assert "[HANDOFF SUMMARY]" in p2_msgs[1]["content"]
+        assert "req-0001" in p2_msgs[1]["content"]
+        hs = res["handoff_summary"]
+        assert hs["scout_model"] == "scout-model"
+        assert hs["deep_model"] == "deep-model"
+        assert hs["scout_calls"] == 2
+        assert hs["deep_calls"] == 2
+        assert hs["scout_tokens"] == 1270
+        assert hs["deep_tokens"] == 1630
+    finally:
+        client.close()
+
+
+def test_agentic_runner_scout_model_validates_same_provider(tmp_path: Path) -> None:
+    cfg = tmp_path / "llm.json"
+    cfg.write_text(
+        json.dumps({
+            "schema": "cco-llm/1",
+            "model": "gw/deep-model",
+            "providers": {
+                "gw": {
+                    "base_url": "https://gateway.example.invalid/v1",
+                    "models": ["deep-model", "scout-model"],
+                    "api_key_env": "GW_KEY",
+                    "api_key_header": "Authorization",
+                },
+                "other": {
+                    "base_url": "https://other.example.invalid/v1",
+                    "models": ["other-scout"],
+                    "api_key_env": "OTHER_KEY",
+                    "api_key_header": "Authorization",
+                },
+            },
+        }),
+        encoding="utf-8",
+    )
+    plan_path, plan = agentic_runner.run_agentic_target(
+        target="http://127.0.0.1:18899/",
+        provider_config=cfg,
+        model="gw/deep-model",
+        scout_model="gw/scout-model",
+        output_dir=tmp_path / "plan-ok",
+        execute=False,
+    )
+    assert plan_path.is_file()
+    assert plan["models"]["scout"] == "gw/scout-model"
+
+    with pytest.raises(ValueError, match="one provider"):
+        agentic_runner.run_agentic_target(
+            target="http://127.0.0.1:18899/",
+            provider_config=cfg,
+            model="gw/deep-model",
+            scout_model="other/other-scout",
+            output_dir=tmp_path / "plan-bad",
+            execute=False,
+        )

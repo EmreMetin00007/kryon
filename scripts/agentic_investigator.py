@@ -9,6 +9,7 @@ import re
 import tempfile
 import time
 from typing import Any, Callable
+from urllib.parse import urlsplit
 
 from agentic_bsag import (
     NODE_ARTIFACT,
@@ -814,12 +815,21 @@ class AgenticInvestigator:
         micro_budget: int = 14,
         synthesis_interval: int = 3,
         enable_telemetry: bool | None = None,
+        scout_model: str | None = None,
+        scout_max_turns: int = 22,
+        scout_token_share: float = 0.40,
     ):
         self.http = http_client
         self.receipts = receipt_store
         self.transport = transport
         self.budget = budget
         self.model = model
+        self.scout_model = str(scout_model or "").strip()
+        self.scout_max_turns = max(1, int(scout_max_turns))
+        self.scout_token_share = min(0.85, max(0.10, float(scout_token_share)))
+        self._active_model = self.model
+        self._handoff_phase = "single"
+        self._handoff_summary: dict[str, Any] | None = None
         self.root_dir = Path(root_dir).expanduser().resolve()
         self.checkpoint_path = self.root_dir / "checkpoint.json"
         self.discovery_hints = [str(h) for h in (discovery_hints or ["/"]) if str(h).strip()] or ["/"]
@@ -1158,7 +1168,7 @@ class AgenticInvestigator:
         headroom = avail - (serialized_bytes + _FRAMING_RESERVE_TOKENS)
         max_out = min(2048, max(256, headroom)) if headroom > 0 else 2048
         body: dict[str, Any] = {
-            "model": self.model,
+            "model": self._active_model,
             "messages": chosen_msgs,
             "tools": chosen_tools,
             "tool_choice": "auto",
@@ -1726,6 +1736,109 @@ class AgenticInvestigator:
 
         return self._result_summary(status)
 
+    def _build_handoff_packet(self, *, reason: str, next_turn: int) -> tuple[str, str]:
+        """Construct a compact, target-agnostic Phase 2 deep-verification prompt from Phase 1 state."""
+        sys_prompt = (
+            build_system_prompt(
+                base_url=self.http.base_url,
+                allowed_methods=sorted(self.http.allowed_methods),
+                actor_summaries=self.http.actors.summaries(),
+                discovery_hints=self.discovery_hints,
+                http_budget=self.http.budget.limit,
+            )
+            + "\n\nPHASE 2 DEEP VERIFICATION HANDOFF:\n"
+            "- A fast Phase 1 scout already mapped initial routes, established sessions (including dynamically registered actors), "
+            "and recorded verified findings listed below.\n"
+            "- Do NOT re-discover already-visited routes or re-record already-verified findings.\n"
+            "- Focus immediately on high-value untested gaps: allowed mutating endpoints (PUT/PATCH/POST mass assignment & authorization), "
+            "untested concrete object IDs across peer and cross-tenant actors (including UI<->API sibling parity), unprobed query/form "
+            "parameters (SQLi, XSS, open redirect), and deeper multi-step or business-logic workflows.\n"
+            "- Reuse existing receipt_ids with `replay_as` or `read_receipt` where helpful, and call `record_finding` immediately upon verification."
+        )
+
+        lines: list[str] = [
+            f"[HANDOFF SUMMARY] reason={reason} | scout_model={self.scout_model} | deep_model={self.model} | "
+            f"findings_so_far={len(self.dispatcher.findings)} | receipts_so_far={self.receipts.count()}"
+        ]
+        if self.dispatcher.findings:
+            f_rows = []
+            for f in self.dispatcher.findings[:20]:
+                ev = str(f.get("evidence_value") or "")[:70]
+                f_rows.append(
+                    f"  - {f.get('finding_id')} [{f.get('class_type')}] {f.get('method')} {f.get('path') or f.get('url')} "
+                    f"actor={f.get('actor_alias') or f.get('actor')} ev={ev!r}"
+                )
+            lines.append("[VERIFIED FINDINGS (DO NOT DUPLICATE)]\n" + "\n".join(f_rows))
+        else:
+            lines.append("[VERIFIED FINDINGS] none yet")
+
+        tracker = self.dispatcher.surface_tracker
+        frontier = tracker.high_value_frontier()
+        frontier_compact = json.dumps(frontier, ensure_ascii=False, separators=(",", ":"))
+        if len(frontier_compact) > 1400:
+            frontier_compact = frontier_compact[:1397] + "..."
+        lines.append(f"[REMAINING FRONTIER]\n{frontier_compact}")
+
+        declared_writes = sorted(f"{m} {p}" for m, p in tracker.declared_write_ops)
+        tested_writes = sorted(f"{m} {p}" for m, p in tracker.tested_write_ops)
+        if declared_writes:
+            lines.append(
+                f"[WRITE OPS] declared={declared_writes[:12]} | tested={tested_writes[:12]}"
+            )
+        if tracker.discovered_params:
+            param_items = [
+                f"{tmpl}:{sorted(ps)[:4]}"
+                for tmpl, ps in sorted(tracker.discovered_params.items())[:12]
+            ]
+            lines.append("[DISCOVERED PARAMS] " + ", ".join(param_items))
+
+        # Compact receipt index (prefer distinct (actor, method, path) up to 45 entries)
+        seen_sig: set[tuple[str, str, str, int]] = set()
+        rec_lines: list[str] = []
+        for rid in self.receipts.list_ids():
+            try:
+                rec = self.receipts.get(rid)
+            except Exception:
+                continue
+            actor = str(rec.get("actor") or "anon")
+            method = str(rec.get("method") or "GET")
+            url = str(rec.get("url") or "")
+            parsed = urlsplit(url)
+            short_path = parsed.path + (f"?{parsed.query}" if parsed.query else "")
+            if len(short_path) > 72:
+                short_path = short_path[:69] + "..."
+            status = int(rec.get("status") or 0)
+            sig = (actor, method, short_path, status)
+            if sig in seen_sig:
+                continue
+            seen_sig.add(sig)
+            rlen = int(rec.get("response_length") or len(str(rec.get("body") or "")))
+            rec_lines.append(f"  {rid} {actor} {method} {short_path} -> {status} ({rlen}B)")
+            if len(rec_lines) >= 45:
+                break
+        if rec_lines:
+            lines.append("[NOTABLE RECEIPTS]\n" + "\n".join(rec_lines))
+
+        nb = self.dispatcher.notebook_state
+        scout_notes_parts: list[str] = []
+        if nb.get("surface_notes"):
+            scout_notes_parts.append(str(nb["surface_notes"])[:350])
+        if nb.get("notes"):
+            scout_notes_parts.extend(str(n)[:160] for n in nb["notes"][-4:])
+        if self.dispatcher.finish_summary:
+            scout_notes_parts.append("scout_summary: " + self.dispatcher.finish_summary[:300])
+        if scout_notes_parts:
+            lines.append("[SCOUT NOTES]\n" + " | ".join(scout_notes_parts)[:800])
+
+        user_prompt = (
+            "Phase 2 deep verification begins now. Review the Phase 1 handoff packet below and immediately test "
+            "remaining high-value targets (write endpoints, untested concrete object IDs across actors, unprobed parameters, "
+            "and multi-step workflows) without repeating verified findings.\n\n"
+            + "\n".join(lines)
+            + self._state_banner(next_turn)
+        )
+        return sys_prompt, user_prompt
+
     def _run_monolithic(self, *, resume: bool = False) -> dict[str, Any]:
         """Run (or resume) the ReAct investigator loop until finish or budget/turn exhaustion."""
         start_turn = 1
@@ -1738,6 +1851,19 @@ class AgenticInvestigator:
                     return self._result_summary("finished")
                 start_turn = last_turn + 1
                 messages = loaded_msgs
+
+        handoff_enabled = bool(self.scout_model and self.scout_model != self.model and not resume)
+        scout_start_tokens = self.token_usage["total_tokens"]
+        scout_start_calls = self.transport.calls
+        scout_start_http = self.http.budget.used
+        scout_token_cap = max(20_000, int(self.budget.limits["tokens"] * self.scout_token_share))
+        scout_turn_limit = min(self.scout_max_turns, max(1, self.max_turns - 4))
+        if handoff_enabled:
+            self._handoff_phase = "scout"
+            self._active_model = self.scout_model
+        else:
+            self._handoff_phase = "single"
+            self._active_model = self.model
 
         if messages is None:
             self._epoch_turn_start = 0
@@ -1765,8 +1891,44 @@ class AgenticInvestigator:
         empty_nudges = 0
         last_completed_turn = start_turn - 1
         recent_local_reads: list[tuple[int, str, str, str]] = []
+
+        def _enter_deep_phase(reason: str, completed_turn: int) -> None:
+            nonlocal messages, empty_nudges, recent_local_reads
+            self._handoff_summary = {
+                "scout_model": self.scout_model,
+                "deep_model": self.model,
+                "handoff_reason": reason,
+                "handoff_after_turn": completed_turn,
+                "scout_calls": self.transport.calls - scout_start_calls,
+                "scout_tokens": self.token_usage["total_tokens"] - scout_start_tokens,
+                "scout_http": self.http.budget.used - scout_start_http,
+                "scout_findings": len(self.dispatcher.findings),
+            }
+            self._handoff_phase = "deep"
+            self._active_model = self.model
+            self._epoch_turn_start = 0
+            self._epoch_summary_text = ""
+            self.dispatcher.finished = False
+            self.dispatcher.finish_rejections = 0
+            p2_sys, p2_usr = self._build_handoff_packet(reason=reason, next_turn=completed_turn + 1)
+            self.dispatcher.finish_summary = ""
+            messages = [
+                {"role": "system", "content": p2_sys},
+                {"role": "user", "content": p2_usr},
+            ]
+            empty_nudges = 0
+            recent_local_reads = []
+
         try:
             for turn in range(start_turn, self.max_turns + 1):
+                if self._handoff_phase == "scout":
+                    scout_tokens_used = self.token_usage["total_tokens"] - scout_start_tokens
+                    if turn > scout_turn_limit or scout_tokens_used >= scout_token_cap:
+                        _enter_deep_phase(
+                            "scout_turn_limit" if turn > scout_turn_limit else "scout_token_cap",
+                            turn - 1,
+                        )
+
                 if self.dispatcher.finished:
                     status = "finished"
                     break
@@ -1777,6 +1939,8 @@ class AgenticInvestigator:
                 # Warn the agent when approaching turn, token, or HTTP budget limits so it records findings & finishes.
                 # Wrapup directives are emitted at creation time via `_state_banner(...)` so earlier messages remain immutable.
                 self._sync_coverage_gate(turn)
+                if self._handoff_phase == "scout" and turn >= scout_turn_limit - 1:
+                    self.dispatcher.coverage_gate_enabled = False
 
                 resp = self._complete_with_retry(messages)
                 choice = (resp.get("choices") or [{}])[0]
@@ -1795,6 +1959,8 @@ class AgenticInvestigator:
 
                 if tool_calls:
                     self._sync_coverage_gate(turn)
+                    if self._handoff_phase == "scout" and turn >= scout_turn_limit - 1:
+                        self.dispatcher.coverage_gate_enabled = False
                     empty_nudges = 0
                     recent_local_reads = [entry for entry in recent_local_reads if turn - entry[0] <= 8]
                     for idx, tc in enumerate(tool_calls):
@@ -1845,6 +2011,15 @@ class AgenticInvestigator:
                 else:
                     empty_nudges += 1
                     if empty_nudges >= 3:
+                        if (
+                            self._handoff_phase == "scout"
+                            and turn < self.max_turns - 1
+                            and self.budget.available("tokens") >= 15_000
+                        ):
+                            last_completed_turn = turn
+                            _enter_deep_phase("scout_stopped_no_tool_calls", turn)
+                            self._save_checkpoint(turn=turn, status="in_progress", messages=messages)
+                            continue
                         status = "stopped_no_tool_calls"
                         last_completed_turn = turn
                         self._save_checkpoint(turn=turn, status=status, messages=messages)
@@ -1859,6 +2034,14 @@ class AgenticInvestigator:
 
                 last_completed_turn = turn
                 if self.dispatcher.finished:
+                    if (
+                        self._handoff_phase == "scout"
+                        and turn < self.max_turns - 1
+                        and self.budget.available("tokens") >= 15_000
+                    ):
+                        _enter_deep_phase("scout_finished", turn)
+                        self._save_checkpoint(turn=turn, status="in_progress", messages=messages)
+                        continue
                     status = "finished"
                     self._save_checkpoint(turn=turn, status=status, messages=messages)
                     break
@@ -1873,6 +2056,17 @@ class AgenticInvestigator:
             self._save_checkpoint(turn=last_completed_turn, status=status, messages=messages)
             raise
         finally:
+            if self._handoff_summary is not None:
+                self._handoff_summary.update(
+                    deep_calls=max(0, self.transport.calls - scout_start_calls - self._handoff_summary["scout_calls"]),
+                    deep_tokens=max(
+                        0,
+                        self.token_usage["total_tokens"] - scout_start_tokens - self._handoff_summary["scout_tokens"],
+                    ),
+                    deep_http=max(0, self.http.budget.used - scout_start_http - self._handoff_summary["scout_http"]),
+                    deep_findings=max(0, len(self.dispatcher.findings) - self._handoff_summary["scout_findings"]),
+                    total_findings=len(self.dispatcher.findings),
+                )
             if self.telemetry is not None or self.bsag is not None:
                 self.write_metrics()
 
@@ -1895,6 +2089,8 @@ class AgenticInvestigator:
             "token_usage": dict(self.token_usage),
             "checkpoint_path": str(self.checkpoint_path),
         }
+        if self._handoff_summary is not None:
+            out["handoff_summary"] = dict(self._handoff_summary)
         if self.bsag is not None:
             out["bsag_summary"] = self.bsag.metrics_snapshot()
         if self._last_metrics_paths is not None:

@@ -65,6 +65,9 @@ def run_agentic_target(
     provider_config: Path = llm_config.default_config(),
     model: str = "",
     worker_model: str = "",
+    scout_model: str = "",
+    scout_turns: int = 22,
+    scout_token_share: float = 0.40,
     api_key_env: str | None = None,
     output_dir: Path,
     http_budget: int | None = None,
@@ -124,6 +127,14 @@ def run_agentic_target(
     )
     models = auth["models"]
     provider = llm_config.provider_settings(provider_config, models)
+    eff_scout_model = str(scout_model or "").strip()
+    scout_model_id = ""
+    if eff_scout_model:
+        scout_sel = llm_config.model_selection(provider_config, model=models["worker"], worker_model=eff_scout_model)
+        scout_provider = llm_config.provider_settings(provider_config, scout_sel)
+        provider["models"] = set(provider["models"]) | set(scout_provider["models"])
+        models = {**models, "scout": scout_sel["worker"]}
+        scout_model_id = scout_sel["worker"].split("/", 1)[1]
 
     output = Path(output_dir).expanduser().resolve()
     output.mkdir(parents=True, exist_ok=True)
@@ -240,6 +251,9 @@ def run_agentic_target(
             intervention_mode=ablation_cfg["intervention"],
             execution_mode=ablation_cfg["execution_mode"],
             enable_telemetry=True,
+            scout_model=scout_model_id or None,
+            scout_max_turns=scout_turns,
+            scout_token_share=scout_token_share,
         )
         run_info = investigator.run(resume=resume)
         manifest.update(run_info)
@@ -302,6 +316,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--provider-config", type=Path, default=llm_config.default_config())
     parser.add_argument("--model", default="")
     parser.add_argument("--worker-model", default="")
+    parser.add_argument("--scout-model", default="", help="Optional Phase 1 scout model (same provider) for 2-phase handoff")
+    parser.add_argument("--scout-turns", type=int, default=22, help="Max Phase 1 scout turns before handoff")
+    parser.add_argument("--scout-token-share", type=float, default=0.40, help="Max token budget fraction for Phase 1 scout")
     parser.add_argument("--api-key-env", default=None)
     parser.add_argument("--output-dir", "--output", dest="output_dir", type=Path, required=True)
     parser.add_argument("--http-budget", "--max-requests", dest="http_budget", type=int, default=None)
@@ -333,6 +350,9 @@ def main(argv: list[str] | None = None) -> int:
         provider_config=args.provider_config,
         model=args.model,
         worker_model=args.worker_model,
+        scout_model=args.scout_model,
+        scout_turns=args.scout_turns,
+        scout_token_share=args.scout_token_share,
         api_key_env=args.api_key_env,
         output_dir=args.output_dir,
         http_budget=args.http_budget,
