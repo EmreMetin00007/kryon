@@ -1,19 +1,20 @@
 # Dokümantasyon dizini
 
-Başlangıç noktası [English README](../README.md) · [Türkçe README](../README.tr.md). Bu dizin yalnızca güncel Python + LLM
-motoru ve P5–P9 yetenek belgelerini içerir.
+Başlangıç noktası [English README](../README.md) · [Türkçe README](../README.tr.md). Bu dizin güncel
+**`cco-agent agentic` (Sharded ReAct)** mimarisini, operasyon/güvenlik rehberlerini ve
+eski Python Engine / P5–P9 sözleşme belgelerini içerir.
 
 ## Güncel rehberler
 
 | Konu | Belge |
 | --- | --- |
-| Python motoru durumu ve eksikler (E1–E9) | [PYTHON_ENGINE_GAPS.md](PYTHON_ENGINE_GAPS.md) |
-| Bileşenler ve veri sınırları | [Mimari](architecture.md) |
+| Güncel `agentic` Mimarisi (`cco-agent agentic` / Sharded ReAct Motoru) | [Mimari](architecture.md) |
 | Operasyon, güvenlik ve kampanyalar | [Operasyon](operations.md) |
-| MCP araç kataloğu | [MCP referansı](mcp-reference.md) |
 | Tekrarlanabilir lab ve doğrulama sonuçları | [Benchmark ve Doğrulama Kartı](benchmark-scorecard.md) |
+| MCP araç kataloğu (eski Python Engine / `mcp-servers/*`) | [MCP referansı](mcp-reference.md) |
+| Eski Python Engine durumu ve eksikler (E1–E9) | [PYTHON_ENGINE_GAPS.md](PYTHON_ENGINE_GAPS.md) |
 
-## P5–P9 yetenek belgeleri
+## P5–P9 yetenek ve sözleşme belgeleri (eski Python Engine)
 
 | Aşama | Belge |
 | --- | --- |

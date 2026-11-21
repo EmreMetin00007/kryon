@@ -21,7 +21,6 @@ SCRIPTS = Path(__file__).resolve().parent
 if str(SCRIPTS) not in sys.path:
     sys.path.insert(0, str(SCRIPTS))
 
-import full_agent_e6_benchmark as e6  # noqa: E402
 import full_agent_launcher as launcher  # noqa: E402
 import full_agent_preflight as preflight  # noqa: E402
 import llm_config  # noqa: E402
@@ -37,6 +36,7 @@ from full_agent_python_solver import PythonSolver  # noqa: E402
 from full_agent_tasks import TaskRegistry  # noqa: E402
 from orchestration_spec import dump_specs  # noqa: E402
 from policy_engine import PolicyEngine  # noqa: E402
+from provider_auth import authorize_provider  # noqa: E402
 
 SCHEMA = "external-target-run/1"
 _ALL_MUTATING_METHODS = ("POST", "PUT", "PATCH", "DELETE", "CONNECT", "TRACE")
@@ -455,7 +455,7 @@ def run_external_target(
         max_admins=max_admin_accounts,
     )
 
-    auth = e6.authorize_provider(
+    auth = authorize_provider(
         provider_config,
         model=model,
         worker_model=worker_model,

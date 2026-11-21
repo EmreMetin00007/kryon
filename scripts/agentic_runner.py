@@ -17,8 +17,8 @@ if str(SCRIPTS) not in sys.path:
 
 import agentic_report  # noqa: E402
 import external_target_runner as ext  # noqa: E402
-import full_agent_e6_benchmark as e6  # noqa: E402
 import llm_config  # noqa: E402
+from provider_auth import authorize_provider  # noqa: E402
 from agentic_http import ActorManager, AgenticHTTPClient  # noqa: E402
 from agentic_investigator import (  # noqa: E402
     _EPOCH_HARD_CHAR_LIMIT,
@@ -133,7 +133,7 @@ def run_agentic_target(
         max_admins=max_admin_accounts,
     )
 
-    auth = e6.authorize_provider(
+    auth = authorize_provider(
         provider_config,
         model=model,
         worker_model=worker_model,
