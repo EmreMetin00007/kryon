@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import base64
+from collections.abc import Mapping
 import copy
 import re
 from html import unescape
 from typing import Any
-from urllib.parse import urljoin, urlparse, urlsplit
+from urllib.parse import unquote, urljoin, urlparse, urlsplit
 
 from .normalize import normalize_url, params_from_url, safe_sample, same_host
 
@@ -37,7 +39,75 @@ JS_PATTERNS = [
     re.compile(r"""fetch\(\s*['"]([^'"]+)['"]"""),
     re.compile(r"""axios\.[a-z]+\(\s*['"]([^'"]+)['"]""", re.I),
     re.compile(r"""(?:url|path|endpoint|href)\s*[:=]\s*['"]([^'"]+)['"]""", re.I),
+    re.compile(r"""['"`](\.{1,2}/[A-Za-z0-9._~:/?#\[\]@!$&()*+,;=%-]+)['"`]"""),
+    re.compile(r"""['"`](/[A-Za-z0-9._~-][A-Za-z0-9._~/?#=&%-]*)['"`]"""),
+    re.compile(
+        r"""['"`]([A-Za-z0-9_-]+(?:/[A-Za-z0-9._~-]+)+"""
+        r"""(?:\.[A-Za-z][A-Za-z0-9]{1,5}(?:\?[A-Za-z0-9._~:/?#\[\]@!$&()*+,;=%-]*)?"""
+        r"""|\?[A-Za-z0-9._~:/?#\[\]@!$&()*+,;=%-]+))['"`]"""
+    ),
+    re.compile(
+        r"""(?:window\.)?location(?:\.(?:assign|replace))?\s*(?:=|\()\s*['"`]([^'"`\s]+)['"`]""",
+        re.I,
+    ),
 ]
+
+_REFRESH_URL_RE = re.compile(
+    r"""(?:^|[;\s,])url\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s;,"']+))""",
+    re.I,
+)
+_LINK_HEADER_URI_RE = re.compile(r"<([^<>\s][^<>]*)>")
+_CSS_IMPORT_RE = re.compile(
+    r"""@import\s+(?:url\(\s*(?:"([^"]*)"|'([^']*)'|([^)\s]+))\s*\)|"([^"]*)"|'([^']*)'|([^\s;]+))""",
+    re.I,
+)
+_CSS_URL_RE = re.compile(
+    r"""url\(\s*(?:"([^"]*)"|'([^']*)'|([^)"'\s][^)]*?))\s*\)""",
+    re.I,
+)
+_SCRIPT_BLOCK_RE = re.compile(r"<script\b([^>]*)>[\s\S]*?</script>", re.I)
+_STYLE_BLOCK_RE = re.compile(r"<style\b([^>]*)>([\s\S]*?)</style>", re.I)
+_HTML_COMMENT_RE = re.compile(r"<!--([\s\S]*?)-->")
+_BASE_HREF_RE = re.compile(
+    r"""<base\b[^>]*\bhref\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'=<>`]+))""",
+    re.I,
+)
+_DOCTYPE_SYSTEM_RE = re.compile(
+    r"""<!DOCTYPE\b[^>]*\bSYSTEM\s+(?:"([^"]+)"|'([^']+)')""",
+    re.I,
+)
+_TAG_START_RE = re.compile(r"<([A-Za-z][A-Za-z0-9:_-]*)(?=[\s/>])")
+_HTML_ATTR_RE = re.compile(
+    r"""([A-Za-z_:][A-Za-z0-9_.:-]*)\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'=<>`]+))"""
+)
+_NG_HREF_LITERAL_RE = re.compile(r"""\{\{\s*(['"])(.*?)\1\s*\}\}""")
+_EMBEDDED_HTML_ATTR_RE = re.compile(
+    r"<[A-Za-z][^>]*(?:href|src|formaction|xlink:href|action)\s*=",
+    re.I,
+)
+_URL_LIKE_PARAM_RE = re.compile(
+    r"^(?:(?:https?:)?//\S+|/\S+|\./\S+|\.\./\S+|[A-Za-z0-9._~/-]+\.[A-Za-z][A-Za-z0-9]{1,7}(?:[?#].*)?)$",
+    re.I,
+)
+_HTML_URL_ATTRS = frozenset({
+    "href", "src", "formaction", "action", "poster", "cite", "longdesc",
+    "lowsrc", "dynsrc", "background", "data", "codebase", "archive",
+    "manifest", "profile", "implementation", "xlink:href", "ng-href",
+})
+_META_URL_KEY_HINTS = (
+    "url", "uri", "image", "img", "icon", "config", "tile",
+    "endpoint", "src", "href", "link", "redirect", "next", "starturl",
+)
+_TEXT_ABS_URL_RE = re.compile(r"""https?://[^\s<>"'`()]+""", re.I)
+_TEXT_REL_DOT_RE = re.compile(r"""(?:^|[\s(\["'=,:;])(\.{1,2}/[^\s<>"'`(),;]+)""")
+_TEXT_REL_FILE_RE = re.compile(
+    r"""(?:^|[\s(\["'=,:;])(/?[A-Za-z0-9_-]+(?:/[A-Za-z0-9._~-]+)+\."""
+    r"""(?:html?|xhtml|shtml|php\d?|phtml|aspx?|ashx|asmx|jspx?|do|action|cgi|pl|py|rb|"""
+    r"""json|xml|txt|md|csv|ya?ml|js|mjs|ts|css|svg|pdf|zip|tar|gz|bak|old|orig|conf|"""
+    r"""cfg|ini|log|sql|env|map|wasm|swf|jar|woff2?|ttf|eot|png|jpe?g|gif|webp|ico|bmp|"""
+    r"""mp4|webm|mp3|wav)(?:\?[A-Za-z0-9._~:/?#\[\]@!$&'*+,;=%-]+)?)""",
+    re.I,
+)
 
 
 def _record(url: str, method: str = "GET", source: str = "", params=None, extra=None):
@@ -49,21 +119,310 @@ def _record(url: str, method: str = "GET", source: str = "", params=None, extra=
     return item
 
 
-def extract_html(html: str, base: str, allow_subdomains: bool = False) -> list[dict]:
-    records = []
-    seen = set()
-    for match in HREF_RE.finditer(html or ""):
-        url = normalize_url(match.group(1), base=base)
+def _extract_refresh_url(value: str) -> str:
+    match = _REFRESH_URL_RE.search(value or "")
+    if not match:
+        return ""
+    return (match.group(1) or match.group(2) or match.group(3) or "").strip()
+
+
+def _looks_url_like(value: str) -> bool:
+    text = (value or "").strip()
+    if not text or any(ch.isspace() or ord(ch) < 32 for ch in text):
+        return False
+    return bool(_URL_LIKE_PARAM_RE.match(text))
+
+
+def _iter_header_pairs(headers: Any) -> list[tuple[str, str]]:
+    if headers is None:
+        return []
+    if hasattr(headers, "multi_items"):
+        raw_pairs = headers.multi_items()
+    elif isinstance(headers, Mapping):
+        raw_pairs = headers.items()
+    elif isinstance(headers, (list, tuple)):
+        raw_pairs = headers
+    else:
+        return []
+    pairs: list[tuple[str, str]] = []
+    for item in raw_pairs:
+        if not isinstance(item, tuple) or len(item) != 2:
+            continue
+        pairs.append((str(item[0]).strip().lower(), str(item[1]).strip()))
+    return pairs
+
+
+def extract_http_headers(
+    headers: Any,
+    base: str,
+    allow_subdomains: bool = False,
+) -> list[dict]:
+    """Extract normalized same-host URLs from Location, Content-Location, Refresh, and Link headers."""
+    records: list[dict] = []
+    seen: set[str] = set()
+
+    def _emit(raw_target: str) -> None:
+        candidate = (raw_target or "").strip()
+        if not candidate:
+            return
+        url = normalize_url(candidate, base=base)
         if not url or not same_host(url, base, allow_subdomains=allow_subdomains):
+            return
+        if url in seen:
+            return
+        seen.add(url)
+        records.append(_record(url, "GET", "header", params_from_url(url)))
+
+    for name, value in _iter_header_pairs(headers):
+        if not value:
             continue
-        key = ("GET", url)
-        if key in seen:
+        if name in {"location", "content-location"}:
+            _emit(value)
+        elif name == "refresh":
+            _emit(_extract_refresh_url(value))
+        elif name == "link":
+            for match in _LINK_HEADER_URI_RE.finditer(value):
+                _emit(match.group(1))
+    return records
+
+
+def extract_css(
+    text: str,
+    base: str,
+    allow_subdomains: bool = False,
+    limit: int | None = 120,
+) -> list[dict]:
+    """Extract @import and url(...) resource URLs from CSS text."""
+    if limit is not None and limit <= 0:
+        return []
+    source = text or ""
+    records: list[dict] = []
+    seen: set[str] = set()
+
+    def _emit(raw_target: str) -> bool:
+        candidate = (raw_target or "").strip()
+        if not candidate or candidate.startswith("#") or candidate.lower().startswith("data:"):
+            return False
+        url = normalize_url(candidate, base=base)
+        if not url or not same_host(url, base, allow_subdomains=allow_subdomains):
+            return False
+        if url in seen:
+            return False
+        seen.add(url)
+        records.append(_record(url, "GET", "css", params_from_url(url)))
+        return limit is not None and len(records) >= limit
+
+    for match in _CSS_IMPORT_RE.finditer(source):
+        candidate = next((g for g in match.groups() if g is not None), "")
+        if _emit(candidate):
+            return records
+    for match in _CSS_URL_RE.finditer(source):
+        candidate = next((g for g in match.groups() if g is not None), "")
+        if _emit(candidate):
+            return records
+    return records
+
+
+def _iter_html_tags(fragment: str) -> list[tuple[str, str, int, int]]:
+    """Return quote-aware (tag_lower, attrs_str, start, end) tuples in linear time."""
+    tags: list[tuple[str, str, int, int]] = []
+    length = len(fragment)
+    pos = 0
+    while pos < length:
+        match = _TAG_START_RE.search(fragment, pos)
+        if not match:
+            break
+        tag = match.group(1).lower()
+        cursor = match.end()
+        quote: str | None = None
+        limit = min(length, cursor + 16384)
+        gt_pos = -1
+        while cursor < limit:
+            ch = fragment[cursor]
+            if quote:
+                if ch == quote:
+                    quote = None
+            else:
+                if ch in ("'", '"'):
+                    quote = ch
+                elif ch == ">":
+                    gt_pos = cursor
+                    break
+            cursor += 1
+        if gt_pos < 0:
+            pos = match.end()
             continue
-        seen.add(key)
-        rec = _record(url, "GET", "html")
-        rec["params"] = params_from_url(url)
-        records.append(rec)
-    for form in FORM_RE.finditer(html or ""):
+        tags.append((tag, fragment[match.end():gt_pos], match.start(), gt_pos + 1))
+        pos = gt_pos + 1
+    return tags
+
+
+def _decode_svg_data_uri(uri: str) -> str:
+    _, sep, payload = uri.partition(",")
+    if not sep or not payload:
+        return ""
+    header = uri[:len(uri) - len(payload) - 1].lower()
+    if ";base64" in header:
+        try:
+            return base64.b64decode(payload.strip(), validate=False).decode("utf-8", "replace")
+        except (ValueError, TypeError):
+            return ""
+    return unquote(payload)
+
+
+def _extract_html_impl(
+    html: str,
+    base: str,
+    allow_subdomains: bool = False,
+    depth: int = 0,
+) -> list[dict]:
+    raw = html or ""
+    records: list[dict] = []
+    seen_get: set[str] = set()
+
+    style_blocks: list[str] = [m.group(2) or "" for m in _STYLE_BLOCK_RE.finditer(raw)]
+    stripped_bodies = _SCRIPT_BLOCK_RE.sub(lambda m: f"<script{m.group(1)}></script>", raw)
+    stripped_bodies = _STYLE_BLOCK_RE.sub(lambda m: f"<style{m.group(1)}></style>", stripped_bodies)
+    comment_bodies: list[str] = [m.group(1) or "" for m in _HTML_COMMENT_RE.finditer(stripped_bodies)]
+    no_comments = _HTML_COMMENT_RE.sub(" ", stripped_bodies)
+
+    effective_base = base
+
+    def _emit_html(raw_target: str, *, resolve_base: str | None = None) -> str:
+        candidate = (raw_target or "").strip()
+        if not candidate:
+            return ""
+        url = normalize_url(candidate, base=resolve_base or effective_base)
+        if not url or not same_host(url, base, allow_subdomains=allow_subdomains):
+            return ""
+        if url not in seen_get:
+            seen_get.add(url)
+            rec = _record(url, "GET", "html")
+            rec["params"] = params_from_url(url)
+            records.append(rec)
+        return url
+
+    base_match = _BASE_HREF_RE.search(no_comments)
+    if base_match:
+        raw_base = unescape(base_match.group(1) or base_match.group(2) or base_match.group(3) or "").strip()
+        resolved_base = _emit_html(raw_base, resolve_base=base)
+        if resolved_base:
+            effective_base = resolved_base
+
+    for dtd_m in _DOCTYPE_SYSTEM_RE.finditer(no_comments):
+        _emit_html(unescape(dtd_m.group(1) or dtd_m.group(2) or ""))
+
+    def _scan_text_segment(segment: str) -> None:
+        if not segment or not segment.strip():
+            return
+        for m in _TEXT_ABS_URL_RE.finditer(segment):
+            _emit_html(m.group(0).rstrip(".,;:!?]"))
+        for m in _TEXT_REL_DOT_RE.finditer(segment):
+            _emit_html(m.group(1).rstrip(".,;:!?]"))
+        for m in _TEXT_REL_FILE_RE.finditer(segment):
+            _emit_html(m.group(1).rstrip(".,;:!?]"))
+
+    def _scan_fragment(fragment: str, frag_depth: int) -> None:
+        tags = _iter_html_tags(fragment)
+        text_cursor = 0
+        for tag, attrs_str, tag_start, tag_end in tags:
+            if tag_start > text_cursor:
+                _scan_text_segment(fragment[text_cursor:tag_start])
+            text_cursor = tag_end
+
+            meta_attrs: dict[str, str] = {}
+            param_value = ""
+            for attr_m in _HTML_ATTR_RE.finditer(attrs_str):
+                attr_name = attr_m.group(1).lower()
+                raw_val = attr_m.group(2) if attr_m.group(2) is not None else (
+                    attr_m.group(3) if attr_m.group(3) is not None else (attr_m.group(4) or "")
+                )
+                val = unescape(raw_val).strip()
+
+                if tag == "meta" and attr_name in {"http-equiv", "name", "property", "content"}:
+                    meta_attrs[attr_name] = val
+                elif tag == "param" and attr_name == "value":
+                    param_value = val
+                elif tag == "iframe" and attr_name == "srcdoc" and frag_depth < 3 and val:
+                    for sub_rec in _extract_html_impl(
+                        val,
+                        effective_base,
+                        allow_subdomains=allow_subdomains,
+                        depth=frag_depth + 1,
+                    ):
+                        if sub_rec.get("sources") == ["form"]:
+                            records.append(sub_rec)
+                        elif sub_rec.get("url") and sub_rec["url"] not in seen_get:
+                            seen_get.add(sub_rec["url"])
+                            records.append(sub_rec)
+                elif attr_name == "ping":
+                    for item in val.split():
+                        _emit_html(item)
+                elif attr_name == "srcset":
+                    for part in val.split(","):
+                        tokens = part.strip().split()
+                        if tokens:
+                            _emit_html(tokens[0])
+                elif attr_name in _HTML_URL_ATTRS:
+                    if tag == "form" and attr_name == "action":
+                        continue
+                    if attr_name == "ng-href":
+                        val = _NG_HREF_LITERAL_RE.sub(r"\2", val)
+                    if val.lower().startswith("data:image/svg+xml"):
+                        if frag_depth < 3:
+                            svg_text = _decode_svg_data_uri(val)
+                            if svg_text:
+                                _scan_fragment(svg_text, frag_depth + 1)
+                    else:
+                        _emit_html(val)
+
+            if tag == "param" and param_value and _looks_url_like(param_value):
+                _emit_html(param_value)
+            elif tag == "meta" and meta_attrs.get("content"):
+                content = meta_attrs["content"]
+                http_equiv = meta_attrs.get("http-equiv", "").strip().lower()
+                if http_equiv == "refresh":
+                    _emit_html(_extract_refresh_url(content))
+                elif http_equiv.startswith("content-security-policy"):
+                    for directive in content.split(";"):
+                        tokens = directive.strip().split()
+                        if not tokens:
+                            continue
+                        dname = tokens[0].lower()
+                        if dname == "report-uri":
+                            for tok in tokens[1:]:
+                                _emit_html(tok.strip("'\""))
+                        elif dname == "report-to":
+                            for tok in tokens[1:]:
+                                cand = tok.strip("'\"")
+                                if _looks_url_like(cand):
+                                    _emit_html(cand)
+                elif frag_depth < 3 and "<" in content and _EMBEDDED_HTML_ATTR_RE.search(content):
+                    _scan_fragment(content, frag_depth + 1)
+                else:
+                    meta_key = (meta_attrs.get("name") or meta_attrs.get("property") or "").lower()
+                    if any(hint in meta_key for hint in _META_URL_KEY_HINTS):
+                        stripped_content = content.strip()
+                        if stripped_content.lower().startswith(("http://", "https://", "//", "/", "./", "../")):
+                            _emit_html(stripped_content)
+
+        if text_cursor < len(fragment):
+            _scan_text_segment(fragment[text_cursor:])
+
+    _scan_fragment(no_comments, depth)
+    for comment_body in comment_bodies:
+        _scan_fragment(comment_body, depth)
+
+    for css_body in style_blocks:
+        if not css_body.strip():
+            continue
+        for css_rec in extract_css(css_body, effective_base, allow_subdomains=allow_subdomains):
+            css_url = css_rec["url"]
+            if css_url not in seen_get:
+                seen_get.add(css_url)
+                records.append(css_rec)
+
+    for form in FORM_RE.finditer(no_comments):
         attrs, body = form.group(1), form.group(2)
         action_m = FORM_ACTION_RE.search(attrs or "")
         method_m = FORM_METHOD_RE.search(attrs or "")
@@ -71,7 +430,7 @@ def extract_html(html: str, base: str, allow_subdomains: bool = False) -> list[d
         action = action_m.group(1) if action_m else ""
         method = (method_m.group(1) if method_m else "GET").upper() or "GET"
         enctype = (enctype_m.group(1) if enctype_m else "").split(";", 1)[0].strip().lower()
-        url = normalize_url(action or ".", base=base)
+        url = normalize_url(action or ".", base=effective_base)
         if not url or not same_host(url, base, allow_subdomains=allow_subdomains):
             continue
         norm_method = method if method in {"GET", "POST", "PUT", "PATCH", "DELETE"} else "POST"
@@ -98,6 +457,10 @@ def extract_html(html: str, base: str, allow_subdomains: bool = False) -> list[d
         rec = _record(url, norm_method, "form", params, extra=extra)
         records.append(rec)
     return records
+
+
+def extract_html(html: str, base: str, allow_subdomains: bool = False) -> list[dict]:
+    return _extract_html_impl(html, base, allow_subdomains=allow_subdomains, depth=0)
 
 
 def extract_robots(text: str, base: str) -> list[dict]:
@@ -157,8 +520,52 @@ _SPA_ROUTE_PATH_RE = re.compile(
     r"""\bpath\s*:\s*(['"`])(/[^'"`\s<>]{2,})\1""",
     re.I,
 )
+_SPA_ANGULAR_WHEN_RE = re.compile(
+    r"""\.when\s*\(\s*(['"`])(/[^'"`\s<>]+)\1""",
+    re.I,
+)
+_SPA_UI_ROUTER_URL_RE = re.compile(
+    r"""\burl\s*:\s*(['"`])(/[^'"`\s<>]{2,})\1""",
+    re.I,
+)
+_SPA_REACT_BASENAME_TAG_RE = re.compile(
+    r"""<[A-Za-z]*Router\b[^>]*\bbasename\s*=\s*(?:(['"])([^'"]+)\1|\{\s*(['"])([^'"]+)\3\s*\})""",
+    re.I,
+)
+_SPA_REACT_BASENAME_OPT_RE = re.compile(
+    r"""\bbasename\s*:\s*(['"`])(/[^'"`\s<>]*)\1""",
+    re.I,
+)
+_SPA_REACT_ROUTE_RE = re.compile(
+    r"""<Route\b[^>]*\bpath\s*=\s*(?:(['"])([^'"]+)\1|\{\s*(['"])([^'"]+)\3\s*\})""",
+    re.I,
+)
+_SPA_REACT_LINK_RE = re.compile(
+    r"""<(?:Nav)?Link\b[^>]*\bto\s*=\s*(?:(['"])([^'"]+)\1|\{\s*(['"])([^'"]+)\3\s*\})""",
+    re.I,
+)
 _SPA_COLON_PARAM_RE = re.compile(r":([A-Za-z_][A-Za-z0-9_]*)")
 _STATIC_SPA_EXT_RE = re.compile(r"\.(?:png|jpe?g|gif|css|ico|svg|woff2?|ttf|map|js|mjs)(?:\?|$)", re.I)
+_JS_LINE_COMMENT_RE = re.compile(r"(?:^|[\s;{}(),])//([^\n\r]*)")
+_JS_BLOCK_COMMENT_RE = re.compile(r"/\*([\s\S]*?)\*/")
+_JS_COMMENT_SLASH_PATH_RE = re.compile(
+    r"""(?:^|[\s(\["'=,:;])(/[A-Za-z0-9._~-]+(?:/[A-Za-z0-9._~-]+)*(?:\?[A-Za-z0-9._~:/?#\[\]@!$&'*+,;=%-]+)?)"""
+)
+_JS_VAR_ASSIGN_RE = re.compile(
+    r"""(?:^|[;\n\r{},])\s*(?:(?:var|let|const)\s+)?([A-Za-z_$][\w$]*)\s*=\s*(['"`])([^'"`\n\r\\]{0,512})\2""",
+    re.M,
+)
+_JS_CONCAT_ASSIGN_RE = re.compile(
+    r"""(?:^|[;\n\r{},])\s*(?:(?:var|let|const)\s+)?([A-Za-z_$][\w$]*)\s*=\s*([^;\n\r{}()]+?\+[^;\n\r{}()]+)""",
+    re.M,
+)
+_JS_CONCAT_EXPR_RE = re.compile(
+    r"""(?:^|[^\w$'"`.])((?:['"`][^'"`\n\r]*['"`]|[A-Za-z_$][\w$]*)(?:\s*\+\s*(?:['"`][^'"`\n\r]*['"`]|[A-Za-z_$][\w$]*)){1,11})(?=$|[^\w$'"`.])"""
+)
+_JS_OPERAND_TOK_RE = re.compile(
+    r"""'([^'\n\r]*)'|"([^"\n\r]*)"|`([^`\n\r]*)`|([A-Za-z_$][\w$]*)"""
+)
+_JS_STATIC_EXTS = (".png", ".jpg", ".jpeg", ".gif", ".css", ".ico", ".svg", ".woff", ".woff2")
 _GRAPHQL_VAR_RE = re.compile(
     r"(?:query|mutation|subscription)\s*(?:[A-Za-z_]\w*\s*)?\(([^)]*)\)", re.S)
 _GRAPHQL_VAR_NAME_RE = re.compile(r"\$([A-Za-z_]\w*)\s*:")
@@ -256,7 +663,7 @@ def _template_url(raw: str) -> tuple[str, list[str]]:
 
 def find_spec_urls(text: str, base: str, allow_subdomains: bool = False) -> list[str]:
     urls, seen = [], set()
-    matches = []
+    matches: list[re.Match[str]] = []
     for pattern in (_SPEC_URL_RE, _SPEC_NAME_RE, _SPEC_ASSIGN_RE):
         matches.extend(pattern.finditer(text or ""))
     for match in matches:
@@ -428,6 +835,30 @@ def extract_inline_scripts(html: str) -> list[str]:
     return scripts
 
 
+def _normalize_spa_basename(raw: str) -> str:
+    cleaned = (raw or "").strip()
+    if not cleaned or cleaned == "/":
+        return ""
+    if not cleaned.startswith("/"):
+        cleaned = "/" + cleaned
+    return cleaned.rstrip("/")
+
+
+def _join_spa_basename(basename: str, raw_path: str) -> str:
+    path = (raw_path or "").strip()
+    if not path or "*" in path:
+        return ""
+    if not basename:
+        return path
+    if path.startswith("#/"):
+        return path
+    if path == basename or path.startswith(basename + "/"):
+        return path
+    if path == "/":
+        return basename
+    return basename + "/" + path.lstrip("/")
+
+
 def extract_spa_routes(
     text: str,
     base: str,
@@ -439,11 +870,20 @@ def extract_spa_routes(
     records: list[dict] = []
     seen: set[str] = set()
 
+    basename = ""
+    bn_match = _SPA_REACT_BASENAME_TAG_RE.search(source)
+    if bn_match:
+        basename = _normalize_spa_basename(bn_match.group(2) or bn_match.group(4) or "")
+    else:
+        bn_opt = _SPA_REACT_BASENAME_OPT_RE.search(source)
+        if bn_opt:
+            basename = _normalize_spa_basename(bn_opt.group(2) or "")
+
     def _emit_route(raw_path: str, source_tag: str) -> None:
         if limit is not None and len(records) >= limit:
             return
         cleaned = _SPA_COLON_PARAM_RE.sub(r"{\1}", str(raw_path or "").strip())
-        if not cleaned or _STATIC_SPA_EXT_RE.search(cleaned):
+        if not cleaned or "*" in cleaned or _STATIC_SPA_EXT_RE.search(cleaned):
             return
         if cleaned.startswith("#/"):
             cleaned = cleaned[1:]
@@ -467,29 +907,136 @@ def extract_spa_routes(
 
     for match in _SPA_HASH_ROUTE_RE.finditer(source):
         _emit_route(match.group(2), "spa-hash")
-    for pattern in (_SPA_ROUTER_CALL_RE, _SPA_ROUTE_PATH_RE):
+    for pattern in (_SPA_ROUTER_CALL_RE, _SPA_ROUTE_PATH_RE, _SPA_ANGULAR_WHEN_RE, _SPA_UI_ROUTER_URL_RE):
         for match in pattern.finditer(source):
             _emit_route(match.group(2), "spa-route")
+    for pattern in (_SPA_REACT_ROUTE_RE, _SPA_REACT_LINK_RE):
+        for match in pattern.finditer(source):
+            raw_p = match.group(2) or match.group(4) or ""
+            _emit_route(_join_spa_basename(basename, raw_p), "spa-route")
     return records
 
 
+def _eval_js_concat(expr: str, symtab: dict[str, str]) -> str | None:
+    parts: list[str] = []
+    pos = 0
+    s = (expr or "").strip()
+    while pos < len(s):
+        m = _JS_OPERAND_TOK_RE.match(s, pos)
+        if not m:
+            return None
+        if m.group(1) is not None or m.group(2) is not None or m.group(3) is not None:
+            lit = m.group(1) if m.group(1) is not None else (
+                m.group(2) if m.group(2) is not None else (m.group(3) or "")
+            )
+            if "${" in lit:
+                return None
+            parts.append(lit)
+        else:
+            ident = m.group(4)
+            if not ident or ident not in symtab:
+                return None
+            parts.append(symtab[ident])
+        pos = m.end()
+        rest = s[pos:].lstrip()
+        if not rest:
+            break
+        if not rest.startswith("+"):
+            return None
+        pos = len(s) - len(rest) + 1
+        while pos < len(s) and s[pos].isspace():
+            pos += 1
+        if pos >= len(s):
+            return None
+    if len(parts) < 2:
+        return None
+    return "".join(parts)
+
+
+def _looks_js_url_or_path(val: str) -> bool:
+    if not val or any(ch.isspace() or ord(ch) < 32 for ch in val):
+        return False
+    low = val.lower()
+    if low.startswith(("http://", "https://", "//", "/", "./", "../")):
+        return True
+    if re.fullmatch(r"[A-Za-z0-9._~-]+(?:/[A-Za-z0-9._~-]+)+(?:\?[^\s]*)?", val):
+        return True
+    return bool(re.fullmatch(r"[A-Za-z0-9._~-]+\.[A-Za-z][A-Za-z0-9]{1,5}(?:\?[^\s]*)?", val))
+
+
 def extract_js(text: str, base: str, allow_subdomains: bool = False, limit: int | None = 80) -> list[dict]:
-    records = []
-    seen = set()
+    if limit is not None and limit <= 0:
+        return []
+    source = text or ""
+    records: list[dict] = []
+    seen: set[str] = set()
+
+    def _emit_js(candidate: str) -> bool:
+        cand = (candidate or "").strip()
+        if not cand or "${" in cand:
+            return False
+        if cand.lower().endswith(_JS_STATIC_EXTS):
+            return False
+        url = normalize_url(cand, base=base)
+        if not url or not same_host(url, base, allow_subdomains=allow_subdomains):
+            return False
+        if urlparse(url).path.lower().endswith(_JS_STATIC_EXTS):
+            return False
+        if url in seen:
+            return False
+        seen.add(url)
+        records.append(_record(url, "GET", "js", params_from_url(url)))
+        return limit is not None and len(records) >= limit
+
     for pattern in JS_PATTERNS:
-        for match in pattern.findall(text or ""):
+        for match in pattern.findall(source):
             candidate = match if isinstance(match, str) else match[0]
-            if candidate.endswith((".png", ".jpg", ".jpeg", ".gif", ".css", ".ico", ".svg", ".woff", ".woff2")):
-                continue
-            url = normalize_url(candidate, base=base)
-            if not url or not same_host(url, base, allow_subdomains=allow_subdomains):
-                continue
-            if url in seen:
-                continue
-            seen.add(url)
-            records.append(_record(url, "GET", "js", params_from_url(url)))
-            if limit is not None and len(records) >= limit:
+            if _emit_js(candidate):
                 return records
+
+    for comment_re in (_JS_LINE_COMMENT_RE, _JS_BLOCK_COMMENT_RE):
+        for cm in comment_re.finditer(source):
+            cbody = cm.group(1) or ""
+            for m in _TEXT_ABS_URL_RE.finditer(cbody):
+                if _emit_js(m.group(0).rstrip(".,;:!?]")):
+                    return records
+            for m in _TEXT_REL_DOT_RE.finditer(cbody):
+                if _emit_js(m.group(1).rstrip(".,;:!?]")):
+                    return records
+            for m in _JS_COMMENT_SLASH_PATH_RE.finditer(cbody):
+                if _emit_js(m.group(1).rstrip(".,;:!?]")):
+                    return records
+
+    js_slice = source[:65536]
+    symtab: dict[str, str] = {}
+    for vm in _JS_VAR_ASSIGN_RE.finditer(js_slice):
+        symtab[vm.group(1)] = vm.group(3)
+        if len(symtab) >= 512:
+            break
+
+    if symtab:
+        for _ in range(2):
+            changed = False
+            for am in _JS_CONCAT_ASSIGN_RE.finditer(js_slice):
+                if len(symtab) >= 512:
+                    break
+                resolved = _eval_js_concat(am.group(2), symtab)
+                if resolved is not None:
+                    var_name = am.group(1)
+                    if symtab.get(var_name) != resolved:
+                        symtab[var_name] = resolved
+                        changed = True
+                    if _looks_js_url_or_path(resolved) and _emit_js(resolved):
+                        return records
+            if not changed:
+                break
+
+    for em in _JS_CONCAT_EXPR_RE.finditer(js_slice):
+        resolved = _eval_js_concat(em.group(1), symtab)
+        if resolved is not None and _looks_js_url_or_path(resolved):
+            if _emit_js(resolved):
+                return records
+
     return records
 
 

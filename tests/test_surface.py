@@ -752,3 +752,155 @@ def test_baseline_contract_xml_vs_multipart():
     assert mp_probe["data"] is None  # kardes yok
     assert mp_probe["baseline_files"] == {"doc": ("cco_probe.txt", "1")}
     assert mp_probe["files"] == {"doc": ("cco_probe.txt", "PAYLOAD")}
+
+
+def test_extract_http_headers_parses_standard_discovery_headers():
+    from cco_surface_core.extract import extract_http_headers
+
+    headers = {
+        "location": "/redirected?step=1",
+        "Content-Location": "/v1/canonical",
+        "REFRESH": "10; url=/delayed/next",
+        "Link": '</api/items?page=2>; rel="next", <https://other.example/x>; rel="canonical", <./sibling>; rel="prev"',
+    }
+    recs = extract_http_headers(headers, "http://t.local/app/")
+    urls = {r["url"] for r in recs}
+    assert urls == {
+        "http://t.local/redirected?step=1",
+        "http://t.local/v1/canonical",
+        "http://t.local/delayed/next",
+        "http://t.local/api/items?page=2",
+        "http://t.local/app/sibling",
+    }
+    assert all(r["method"] == "GET" and r["sources"] == ["header"] for r in recs)
+    page2 = next(r for r in recs if "page=2" in r["url"])
+    assert page2["params"] == [{"name": "page", "in": "query", "sample": "2"}]
+
+
+def test_extract_css_handles_import_and_url_and_skips_data_and_fragments():
+    from cco_surface_core.extract import extract_css
+
+    css = """
+    @import "/styles/base.css";
+    @import url('../styles/theme.css');
+    @font-face { src: url("/fonts/inter.woff2") format("woff2"); }
+    .hero { background: url(images/banner.png?v=2); mask: url(#clip); icon: url(data:image/svg+xml,<svg/>); }
+    .ext { background: url(https://cdn.other.test/a.png); }
+    """
+    recs = extract_css(css, "http://t.local/assets/main.css")
+    urls = {r["url"] for r in recs}
+    assert urls == {
+        "http://t.local/styles/base.css",
+        "http://t.local/styles/theme.css",
+        "http://t.local/fonts/inter.woff2",
+        "http://t.local/assets/images/banner.png?v=2",
+    }
+    assert all(r["method"] == "GET" and r["sources"] == ["css"] for r in recs)
+
+
+def test_extract_html_handles_w3c_tags_base_meta_srcdoc_svg_css_and_text():
+    html = """<!DOCTYPE html SYSTEM "/dtd/custom.dtd">
+    <html>
+      <head>
+        <base href="http://t.local/sub/">
+        <meta http-equiv="refresh" content="3; url=refreshed.html">
+        <meta http-equiv="Content-Security-Policy" content="default-src 'self'; report-uri /csp-report; report-to /csp-v2">
+        <meta name="msapplication-config" content="./browserconfig.xml">
+        <meta name="reading" content="<a href='meta-link.html'>read</a>">
+        <style>@import "inline.css"; .b { background: url(bg/pic.png); }</style>
+      </head>
+      <body>
+        <img srcset="img/one.png 1x,
+                     /img/two.png 2x">
+        <a href=unquoted.html ping="ping1 /ping2">go</a>
+        <a ng-href="{{'ng/target'}}">ng</a>
+        <button formaction="/alt-action">btn</button>
+        <svg><use xlink:href="icons.svg#i"/></svg>
+        <object data="data:image/svg+xml,%3Csvg%3E%3Ca%20xlink:href%3D%22svg-inner.html%22%3E%3C/a%3E%3C/svg%3E"></object>
+        <param name="movie" value="player.swf">
+        <param name="src" value="/param/stream">
+        <param name="autoplay" value="true">
+        <iframe srcdoc="&lt;a href=&quot;frame-link.html&quot;&gt;in&lt;/a&gt;"></iframe>
+        <!--[if IE]><link rel="stylesheet" href="ie-only.css"><![endif]-->
+        <form action="submit-form" method="POST"><input name="item" value="1"></form>
+        <p>Check https://t.local/docs/manual.pdf and ./rel/guide.html or ../up/notes.txt and api/v1/schema.json.</p>
+        <p>Ignore prose like and/or, text/html, 12px/1.5em, example.com/foo.</p>
+      </body>
+    </html>
+    """
+    recs = extract_html(html, "http://t.local/start/page.html")
+    get_urls = {r["url"] for r in recs if r["method"] == "GET"}
+    assert "http://t.local/sub/" in get_urls
+    assert "http://t.local/dtd/custom.dtd" in get_urls
+    assert "http://t.local/sub/refreshed.html" in get_urls
+    assert "http://t.local/csp-report" in get_urls
+    assert "http://t.local/csp-v2" in get_urls
+    assert "http://t.local/sub/browserconfig.xml" in get_urls
+    assert "http://t.local/sub/meta-link.html" in get_urls
+    assert "http://t.local/sub/inline.css" in get_urls
+    assert "http://t.local/sub/bg/pic.png" in get_urls
+    assert "http://t.local/sub/img/one.png" in get_urls
+    assert "http://t.local/img/two.png" in get_urls
+    assert "http://t.local/sub/unquoted.html" in get_urls
+    assert "http://t.local/sub/ping1" in get_urls
+    assert "http://t.local/ping2" in get_urls
+    assert "http://t.local/sub/ng/target" in get_urls
+    assert "http://t.local/alt-action" in get_urls
+    assert "http://t.local/sub/icons.svg" in get_urls
+    assert "http://t.local/sub/svg-inner.html" in get_urls
+    assert "http://t.local/sub/player.swf" in get_urls
+    assert "http://t.local/param/stream" in get_urls
+    assert "http://t.local/sub/frame-link.html" in get_urls
+    assert "http://t.local/sub/ie-only.css" in get_urls
+    assert "https://t.local/docs/manual.pdf" in get_urls
+    assert "http://t.local/sub/rel/guide.html" in get_urls
+    assert "http://t.local/up/notes.txt" in get_urls
+    assert "http://t.local/sub/api/v1/schema.json" in get_urls
+    assert not any(u.endswith(("/true", "/or", "/html", "/1.5em", "/foo")) for u in get_urls)
+    # <form action="submit-form" method="POST"> must not duplicate as GET html link
+    assert not any(r["url"] == "http://t.local/sub/submit-form" and r["method"] == "GET" for r in recs)
+    form_rec = next(r for r in recs if r["url"] == "http://t.local/sub/submit-form")
+    assert form_rec["method"] == "POST" and form_rec["sources"] == ["form"]
+
+
+def test_extract_js_comments_concat_and_spa_angular_react_basename():
+    from cco_surface_core.extract import extract_spa_routes
+
+    js = """
+    // Debug endpoint: https://t.local/debug/metrics
+    /* Legacy path: ./legacy/report.json */
+    var domain = 'http://t.local/';
+    var ver = 'api/v2';
+    var full = domain + ver;
+    var seg = 'users';
+    fetch("/a/" + seg);
+    const localRel = './cfg/app.json';
+    const subPath = 'v1/items?active=1';
+    """
+    js_recs = extract_js(js, "http://t.local/")
+    js_urls = {r["url"] for r in js_recs}
+    assert {
+        "https://t.local/debug/metrics",
+        "http://t.local/legacy/report.json",
+        "http://t.local/api/v2",
+        "http://t.local/a/users",
+        "http://t.local/cfg/app.json",
+        "http://t.local/v1/items?active=1",
+    } <= js_urls
+
+    spa_src = """
+    $routeProvider.when('/ng-items/:itemId', {templateUrl: 't.html'});
+    $stateProvider.state('detail', {url: '/ui-detail/:uid'});
+    <BrowserRouter basename="/portal">
+      <Route path="/billing" element={<Billing />} />
+      <Link to="/settings">Settings</Link>
+    </BrowserRouter>
+    """
+    spa_recs = extract_spa_routes(spa_src, "http://t.local/")
+    spa_urls = {r["url"] for r in spa_recs}
+    assert {
+        "http://t.local/ng-items/{itemId}",
+        "http://t.local/ui-detail/{uid}",
+        "http://t.local/portal/billing",
+        "http://t.local/portal/settings",
+    } <= spa_urls

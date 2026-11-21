@@ -64,7 +64,9 @@ if str(_SURFACE_CORE_PARENT) not in sys.path:
     sys.path.insert(0, str(_SURFACE_CORE_PARENT))
 
 from cco_surface_core.extract import (  # noqa: E402
+    extract_css,
     extract_html,
+    extract_http_headers,
     extract_inline_scripts,
     extract_js,
     extract_js_calls,
@@ -2068,6 +2070,22 @@ def _extract_surface_summary(receipt: dict[str, Any], base_url: str) -> dict[str
     openapi_ops: list[dict[str, Any]] = []
     candidate_ids: list[dict[str, str]] = []
 
+    raw_headers = receipt.get("response_headers") or receipt.get("headers")
+    redir_loc = str(receipt.get("redirect_location") or "").strip()
+    hdr_input: Any = {}
+    if isinstance(raw_headers, dict):
+        hdr_input = dict(raw_headers)
+        if redir_loc and not any(str(k).lower() == "location" for k in hdr_input):
+            hdr_input["Location"] = redir_loc
+    elif raw_headers:
+        hdr_input = raw_headers
+    elif redir_loc:
+        hdr_input = {"Location": redir_loc}
+    if hdr_input:
+        for rec in extract_http_headers(hdr_input, url):
+            if not is_static_asset_url(rec.get("url", "")):
+                links.append(rec)
+
     stripped = body.lstrip()
     if "json" in ctype or stripped.startswith(("{", "[")):
         try:
@@ -2110,6 +2128,11 @@ def _extract_surface_summary(receipt: dict[str, Any], base_url: str) -> dict[str
                 links.append(rec)
         spa_routes.extend(extract_spa_routes(body, url, limit=60))
         spec_urls.extend(find_spec_urls(body, url))
+
+    if "css" in ctype or urlsplit(url).path.lower().endswith(".css"):
+        for rec in extract_css(body, url, limit=120):
+            if not is_static_asset_url(rec.get("url", "")):
+                links.append(rec)
 
     if urlsplit(url).path.lower().endswith("/robots.txt"):
         links.extend(extract_robots(body, url))
@@ -2576,12 +2599,25 @@ class ToolDispatcher:
             )
         status = int(receipt.get("status") or 0)
         ctype = (receipt.get("content_type") or "").lower()
+        resp_headers = receipt.get("response_headers") or receipt.get("headers") or {}
+        has_discovery_headers = (
+            isinstance(resp_headers, dict)
+            and any(
+                str(k).lower() in {"link", "content-location", "refresh", "location"}
+                and str(v or "").strip()
+                for k, v in resp_headers.items()
+            )
+        ) or bool(str(receipt.get("redirect_location") or "").strip())
+        url_path = urlsplit(str(receipt.get("url") or "")).path.lower()
         if 200 <= status < 400 and (
             "html" in ctype
             or "javascript" in ctype
             or "ecmascript" in ctype
             or "json" in ctype
             or "openapi" in ctype
+            or "css" in ctype
+            or url_path.endswith(".css")
+            or has_discovery_headers
         ):
             hints = _build_surface_hints(receipt, self.http.base_url)
             if hints:

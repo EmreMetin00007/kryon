@@ -8,9 +8,24 @@ import sys
 from concurrent.futures import ThreadPoolExecutor
 from http.cookies import SimpleCookie
 from pathlib import Path
-from urllib.parse import urlparse, urlsplit, urlunsplit
+from typing import Any
+from urllib.parse import urljoin, urlparse, urlsplit, urlunsplit
 
 from .parsers import parse_browser_crawl
+
+try:
+    from .extract import extract_css, extract_http_headers
+except ImportError:  # pragma: no cover - fallback for older cco_surface_core
+    def extract_http_headers(headers, base: str, allow_subdomains: bool = False) -> list[dict]:  # type: ignore[no-redef]
+        return []
+
+    def extract_css(  # type: ignore[no-redef]
+        text: str,
+        base: str,
+        allow_subdomains: bool = False,
+        limit: int | None = 120,
+    ) -> list[dict]:
+        return []
 
 try:
     from playwright.sync_api import sync_playwright  # type: ignore
@@ -52,13 +67,214 @@ def run_playwright_sync(fn, timeout: float = 180):
         return pool.submit(fn).result(timeout=timeout)
 
 
+def _is_non_static_url(url: str) -> bool:
+    path = urlparse(str(url or "")).path.lower()
+    return not any(path.endswith(ext) for ext in SKIP_EXT)
+
+
 def _is_enqueueable(url: str) -> bool:
     path = urlparse(url).path.lower()
     if any(path.endswith(ext) for ext in SKIP_EXT):
         return False
-    if path.endswith(".js"):
+    if path.endswith((".js", ".mjs")):
         return False
     return True
+
+
+_COLLECT_DOM_JS = r"""() => {
+  const links = [];
+  const scripts = [];
+  const hashes = [];
+  const forms = [];
+  const walk = (root) => {
+    if (!root || !root.querySelectorAll) return;
+    const pushUrl = (raw, isScript) => {
+      const val = String(raw || '').trim();
+      if (!val) return;
+      const low = val.toLowerCase();
+      if (
+        low.startsWith('javascript:')
+        || low.startsWith('mailto:')
+        || low.startsWith('data:')
+        || low.startsWith('blob:')
+        || low.startsWith('tel:')
+      ) {
+        return;
+      }
+      if (val.startsWith('#/')) {
+        hashes.push(val);
+        return;
+      }
+      if (val.startsWith('#')) return;
+      if (isScript) scripts.push(val);
+      else links.push(val);
+    };
+    const attrs = [
+      ['a[href]', 'href', false],
+      ['area[href]', 'href', false],
+      ['link[href]', 'href', false],
+      ['script[src]', 'src', true],
+      ['iframe[src]', 'src', false],
+      ['frame[src]', 'src', false],
+      ['embed[src]', 'src', false],
+      ['object[data]', 'data', false],
+      ['source[src]', 'src', false],
+      ['video[src]', 'src', false],
+      ['audio[src]', 'src', false],
+      ['video[poster]', 'poster', false],
+      ['img[longdesc]', 'longdesc', false],
+      ['img[lowsrc]', 'lowsrc', false],
+      ['form[action]', 'action', false],
+      ['button[formaction]', 'formaction', false],
+      ['[cite]', 'cite', false],
+      ['[ng-href]', 'ng-href', false],
+    ];
+    for (const [sel, attr, isScript] of attrs) {
+      for (const el of root.querySelectorAll(sel)) {
+        pushUrl(el.getAttribute(attr), isScript);
+      }
+    }
+    for (const el of root.querySelectorAll('[xlink\\:href]')) {
+      pushUrl(
+        el.getAttribute('xlink:href')
+          || (el.getAttributeNS ? el.getAttributeNS('http://www.w3.org/1999/xlink', 'href') : ''),
+        false
+      );
+    }
+    for (const el of root.querySelectorAll('img[srcset], source[srcset]')) {
+      const raw = String(el.getAttribute('srcset') || '');
+      for (const part of raw.split(',')) {
+        const candidate = part.trim().split(/\s+/)[0];
+        if (candidate) pushUrl(candidate, false);
+      }
+    }
+    for (const el of root.querySelectorAll('[ping]')) {
+      const raw = String(el.getAttribute('ping') || '');
+      for (const tok of raw.trim().split(/\s+/)) {
+        if (tok) pushUrl(tok, false);
+      }
+    }
+    for (const form of root.querySelectorAll('form')) {
+      const fields = [];
+      for (const inp of form.querySelectorAll('input, textarea, select')) {
+        const name = inp.getAttribute('name') || '';
+        if (!name) continue;
+        const typ = inp.getAttribute('type') || 'text';
+        const val = typ.toLowerCase() === 'password' ? '' : (inp.getAttribute('value') || '');
+        fields.push({name, type: typ, value: val});
+      }
+      forms.push({
+        action: form.getAttribute('action') || '',
+        method: (form.getAttribute('method') || 'GET').toUpperCase(),
+        enctype: form.getAttribute('enctype') || '',
+        fields,
+      });
+    }
+    for (const el of root.querySelectorAll('*')) {
+      if (el.shadowRoot) walk(el.shadowRoot);
+    }
+  };
+  walk(document);
+  return {links, scripts, hashes, forms};
+}"""
+
+
+_CLICK_SAFE_INTERACTIVE_JS = r"""() => {
+  const destructive = /delete|remove|logout|sign.?out|purchase|pay|reset|revoke|destroy/i;
+  const clicked = window.__ccoSafeClicked || (window.__ccoSafeClicked = new WeakSet());
+  const nonSubmit = [];
+  const submitCandidates = [];
+  const walk = (root) => {
+    if (!root || !root.querySelectorAll) return;
+    for (const el of root.querySelectorAll('button, input[type="button"], input[type="submit"], [onclick], [ng-click]')) {
+      if (clicked.has(el)) continue;
+      if (el.disabled || el.getAttribute('aria-disabled') === 'true') continue;
+      if (el.getAttribute('href')) continue;
+      if (el.getAttribute('role') === 'tab' || el.hasAttribute('aria-controls')) continue;
+      const rect = el.getBoundingClientRect ? el.getBoundingClientRect() : {width: 0, height: 0};
+      if (!rect.width || !rect.height) continue;
+      const hay = [
+        el.textContent || '',
+        el.id || '',
+        el.getAttribute('name') || '',
+        el.getAttribute('aria-label') || '',
+        el.getAttribute('value') || '',
+        el.getAttribute('onclick') || '',
+        el.getAttribute('ng-click') || '',
+      ].join(' ');
+      if (destructive.test(hay)) continue;
+      const tag = (el.tagName || '').toLowerCase();
+      const typ = (el.getAttribute('type') || '').toLowerCase();
+      const isNativeSubmit = (
+        (tag === 'input' && typ === 'submit')
+        || (tag === 'button' && typ === 'submit' && !!el.closest('form')
+            && !el.hasAttribute('onclick') && !el.hasAttribute('ng-click'))
+      );
+      if (isNativeSubmit) submitCandidates.push(el);
+      else nonSubmit.push(el);
+    }
+    for (const el of root.querySelectorAll('*')) {
+      if (el.shadowRoot) walk(el.shadowRoot);
+    }
+  };
+  walk(document);
+  const target = nonSubmit[0] || submitCandidates[0] || null;
+  if (!target) return {clicked: false};
+  clicked.add(target);
+  const label = (
+    target.id
+    || target.getAttribute('aria-label')
+    || target.textContent
+    || target.tagName
+    || ''
+  ).trim().slice(0, 80);
+  target.click();
+  return {clicked: true, control: label || 'button'};
+}"""
+
+
+def _click_safe_interactive(
+    page,
+    frontier,
+    max_actions: int,
+    harvest,
+    ensure_active,
+    wait_ms: int = 0,
+    metadata_fn=None,
+) -> int:
+    """Click a bounded slice of safe non-destructive triggers (including Shadow DOM)."""
+    budget = min(8, max(0, int(max_actions)))
+    if budget <= 0:
+        return 0
+    used = 0
+    start_url = page.url
+    meta_page = metadata_fn(start_url) if callable(metadata_fn) else start_url
+    for _ in range(budget):
+        ensure_active()
+        try:
+            res = page.evaluate(_CLICK_SAFE_INTERACTIVE_JS)
+        except Exception:
+            break
+        if not isinstance(res, dict) or not res.get("clicked"):
+            break
+        used += 1
+        settle_ms = max(25, min(int(wait_ms or 0), 150))
+        page.wait_for_timeout(settle_ms)
+        ensure_active()
+        operations = harvest()
+        if operations:
+            frontier.features.append({
+                "page": meta_page,
+                "identity": frontier.identity,
+                "action": "click",
+                "control": str(res.get("control") or "button"),
+                "operations": list(dict.fromkeys(operations)),
+                "operation_yield": len(set(operations)),
+            })
+        if page.url != start_url:
+            frontier.add(page.url, source="runtime-click", kind="page")
+            break
+    return used
 
 
 def _parse_header_blob(headers) -> dict:
@@ -215,14 +431,14 @@ class _SessionGateAdapter:
 def _crawl_site_sync(start, max_pages, extra_headers, timeout_ms, allow_subdomains, wait_ms,
                      scope, engine, tool_name, install_gate, wire_gate, identity="anonymous",
                      source_records=None, max_actions=40):
-    captured = []
-    pages = []
-    forms = []
-    links = []
-    hash_routes = []
-    js_files = []
-    asset_texts = []
-    errors = []
+    captured: list[dict[str, Any]] = []
+    pages: list[dict[str, Any]] = []
+    forms: list[dict[str, Any]] = []
+    links: list[str] = []
+    hash_routes: list[str] = []
+    js_files: list[str] = []
+    asset_texts: list[dict[str, Any]] = []
+    errors: list[dict[str, Any]] = []
     from feature_frontier import UnifiedFrontier, metadata_url
     from crawl_auth import CrawlAuthBoundary
     from runtime_feature_crawl import explore_features
@@ -231,7 +447,7 @@ def _crawl_site_sync(start, max_pages, extra_headers, timeout_ms, allow_subdomai
     frontier.add_records(source_records or [])
     auth = CrawlAuthBoundary(getattr(engine, "session", {}).get("check_url", start),
                              authenticated=identity != "anonymous")
-    visited = set()
+    visited: set[str] = set()
     action_budget = max(0, int(max_actions))
 
     origin = _origin(start)
@@ -252,41 +468,193 @@ def _crawl_site_sync(start, max_pages, extra_headers, timeout_ms, allow_subdomai
         except Exception:
             return []
 
+    seen_forms: set[tuple] = set()
+    captured_css_urls: set[str] = set()
+
+    def _add_form_entry(page_url: str, action: str, method: str, enctype: str, raw_fields) -> None:
+        if not permitted(action):
+            return
+        norm_method = (method or "GET").upper()
+        norm_enctype = (enctype or "").split(";", 1)[0].strip().lower()
+        content_type = ""
+        if norm_method != "GET":
+            content_type = norm_enctype or "application/x-www-form-urlencoded"
+        fields = []
+        sig_fields = []
+        for raw_f in raw_fields or []:
+            if not isinstance(raw_f, dict):
+                continue
+            name = str(raw_f.get("name") or "")
+            if not name:
+                continue
+            typ = str(raw_f.get("type") or "text")
+            field_item = {"name": name, "type": typ}
+            if typ.lower() != "password":
+                raw_val = str(raw_f.get("value") or "")
+                if raw_val:
+                    from .normalize import safe_sample
+                    sampled = safe_sample(name, raw_val)
+                    if sampled and sampled != "<redacted>":
+                        field_item["value"] = sampled
+            fields.append(field_item)
+            sig_fields.append((name, typ))
+        sig = (page_url, action, norm_method, tuple(sig_fields))
+        if sig in seen_forms:
+            return
+        seen_forms.add(sig)
+        form_entry = {
+            "page": page_url,
+            "action": action,
+            "method": norm_method,
+            "fields": fields,
+        }
+        if content_type:
+            form_entry["content_type"] = content_type
+        forms.append(form_entry)
+
+    def _record_xhr_request(req, status: int = 0) -> None:
+        req_method = str(getattr(req, "method", "GET") or "GET").upper()
+        req_type = str(getattr(req, "resource_type", "") or "").lower()
+        req_url = str(getattr(req, "url", "") or "")
+        if (
+            req_type in ("xhr", "fetch", "eventsource")
+            and req_method in {"GET", "HEAD", "OPTIONS", "POST", "PUT", "PATCH"}
+            and req_url
+            and permitted(req_url)
+        ):
+            cur_page = metadata_url(page.url)
+            for existing in captured:
+                if (
+                    existing.get("method") == req_method
+                    and existing.get("url") == req_url
+                    and existing.get("identity") == identity
+                    and existing.get("page") == cur_page
+                ):
+                    if status and not existing.get("status"):
+                        existing["status"] = status
+                    return
+            item = {
+                "method": req_method,
+                "url": req_url,
+                "resource_type": req_type,
+                "identity": identity,
+                "page": cur_page,
+                "status": status,
+            }
+            headers_map: dict[str, Any] = {}
+            try:
+                headers_map = req.headers or {}
+            except Exception:
+                headers_map = {}
+            ctype = headers_map.get("content-type") or headers_map.get("Content-Type") or ""
+            if ctype:
+                item["content_type"] = ctype
+            if req_method in {"POST", "PUT", "PATCH"}:
+                try:
+                    post_data = req.post_data
+                except Exception:
+                    post_data = None
+                fields = _safe_body_fields(post_data, str(ctype))
+                if fields:
+                    item["body_fields"] = fields
+            captured.append(item)
+            frontier.add(req_url, source="runtime-xhr", kind="operation", method=req_method)
+
+    def _on_request(req):
+        try:
+            req_method = str(getattr(req, "method", "GET") or "GET").upper()
+            if req_method in {"POST", "PUT", "PATCH"}:
+                _record_xhr_request(req, status=0)
+        except Exception:
+            pass
+
     def _on_response(resp):
         try:
             req = resp.request
-            req_method = str(req.method or "GET").upper()
-            if (req.resource_type in ("xhr", "fetch")
-                    and req_method in {"GET", "HEAD", "OPTIONS", "POST", "PUT", "PATCH"}
-                    and permitted(req.url)):
-                item = {
-                    "method": req_method,
-                    "url": req.url,
-                    "resource_type": req.resource_type,
-                    "identity": identity,
-                    "page": metadata_url(page.url),
-                    "status": resp.status,
-                }
-                headers_map = {}
+            req_method = str(getattr(req, "method", "GET") or "GET").upper()
+            req_type = str(getattr(req, "resource_type", "") or "").lower()
+            req_url = str(getattr(req, "url", "") or "")
+            resp_url = str(getattr(resp, "url", "") or req_url)
+            resp_status = int(getattr(resp, "status", 0) or 0)
+
+            try:
+                resp_headers = resp.headers or {}
+            except Exception:
+                resp_headers = {}
+
+            if resp_headers and resp_url and permitted(resp_url):
+                for rec in extract_http_headers(resp_headers, resp_url):
+                    hdr_url = str(rec.get("url") or "")
+                    if hdr_url and permitted(hdr_url) and _is_non_static_url(hdr_url):
+                        frontier.add(
+                            hdr_url,
+                            source="runtime-header",
+                            kind="page" if _is_enqueueable(hdr_url) else "bundle",
+                            method=str(rec.get("method") or "GET").upper(),
+                        )
+                        links.append(hdr_url)
+
+            resp_ctype = str(
+                resp_headers.get("content-type") or resp_headers.get("Content-Type") or ""
+            ).split(";", 1)[0].strip().lower()
+            resp_path = urlsplit(resp_url).path.lower() if resp_url else ""
+            if (
+                resp_url
+                and permitted(resp_url)
+                and 200 <= resp_status < 400
+                and ("css" in resp_ctype or resp_path.endswith(".css") or req_type == "stylesheet")
+            ):
                 try:
-                    headers_map = req.headers or {}
+                    css_text = resp.text()
                 except Exception:
-                    headers_map = {}
-                ctype = headers_map.get("content-type") or headers_map.get("Content-Type") or ""
-                if ctype:
-                    item["content_type"] = ctype
-                if req_method in {"POST", "PUT", "PATCH"}:
-                    try:
-                        post_data = req.post_data
-                    except Exception:
-                        post_data = None
-                    fields = _safe_body_fields(post_data, str(ctype))
-                    if fields:
-                        item["body_fields"] = fields
-                captured.append(item)
-                frontier.add(req.url, source="runtime-xhr", kind="operation", method=req_method)
-            elif req.resource_type == "script":
-                frontier.add(req.url, source="runtime-bundle", kind="bundle")
+                    css_text = ""
+                if isinstance(css_text, str) and css_text:
+                    if resp_url not in captured_css_urls:
+                        captured_css_urls.add(resp_url)
+                        asset_texts.append({
+                            "url": resp_url,
+                            "content_type": resp_ctype or "text/css",
+                            "text": css_text[:200_000],
+                        })
+                    for rec in extract_css(css_text, resp_url, limit=120):
+                        css_u = str(rec.get("url") or "")
+                        if css_u and permitted(css_u) and _is_non_static_url(css_u):
+                            frontier.add(
+                                css_u,
+                                source="runtime-css",
+                                kind="page" if _is_enqueueable(css_u) else "bundle",
+                            )
+                            links.append(css_u)
+
+            if req_type in ("xhr", "fetch", "eventsource") and req_method in {
+                "GET", "HEAD", "OPTIONS", "POST", "PUT", "PATCH"
+            }:
+                _record_xhr_request(req, status=resp_status)
+            elif req_type == "script":
+                frontier.add(req_url, source="runtime-bundle", kind="bundle")
+                if permitted(req_url):
+                    js_files.append(req_url)
+            elif req_type == "document":
+                if req_url and permitted(req_url) and _is_non_static_url(req_url):
+                    frontier.add(
+                        req_url,
+                        source="runtime-document",
+                        kind="page" if _is_enqueueable(req_url) else "bundle",
+                    )
+                    links.append(req_url)
+            elif (
+                req_type not in {"image", "media", "font", "stylesheet"}
+                and req_url
+                and permitted(req_url)
+                and _is_non_static_url(req_url)
+            ):
+                frontier.add(
+                    req_url,
+                    source="runtime-network",
+                    kind="page" if _is_enqueueable(req_url) else "bundle",
+                    method=req_method,
+                )
+                links.append(req_url)
         except Exception:
             pass
 
@@ -327,6 +695,7 @@ def _crawl_site_sync(start, max_pages, extra_headers, timeout_ms, allow_subdomai
                 context.add_cookies([{"name": name, "value": morsel.value, "url": origin_url}
                                      for name, morsel in parsed_cookie.items()])
             page = context.new_page()
+            page.on("request", _on_request)
             page.on("response", _on_response)
             def ensure_active():
                 from browser_session_control import check_bound_session
@@ -342,12 +711,48 @@ def _crawl_site_sync(start, max_pages, extra_headers, timeout_ms, allow_subdomai
                     raise ValueError("crawl navigated outside allowed scope")
 
             def collect():
-                from urllib.parse import urljoin
                 frag = urlsplit(page.url).fragment
                 if frag.startswith("/"):
                     hash_url = urljoin(start, frag)
                     if permitted(hash_url):
                         hash_routes.append(hash_url)
+                try:
+                    dom_data = page.evaluate(_COLLECT_DOM_JS)
+                except Exception:
+                    dom_data = None
+                if isinstance(dom_data, dict):
+                    for raw_h in dom_data.get("hashes") or []:
+                        h_str = str(raw_h or "").strip()
+                        if h_str.startswith("#/"):
+                            hash_url = urljoin(start, h_str[1:])
+                            if permitted(hash_url):
+                                hash_routes.append(hash_url)
+                    for raw_link in dom_data.get("links") or []:
+                        absolute = urljoin(page.url, str(raw_link or ""))
+                        if _is_enqueueable(absolute):
+                            frontier.add(absolute, source="runtime-link", kind="page")
+                        elif absolute.lower().endswith((".js", ".mjs")):
+                            frontier.add(absolute, source="runtime-bundle", kind="bundle")
+                        if permitted(absolute):
+                            links.append(absolute)
+                    for raw_script in dom_data.get("scripts") or []:
+                        absolute = urljoin(page.url, str(raw_script or ""))
+                        frontier.add(absolute, source="runtime-bundle", kind="bundle")
+                        if permitted(absolute):
+                            js_files.append(absolute)
+                    for raw_form in dom_data.get("forms") or []:
+                        if not isinstance(raw_form, dict):
+                            continue
+                        action = urljoin(page.url, str(raw_form.get("action") or "") or page.url)
+                        _add_form_entry(
+                            page.url,
+                            action,
+                            str(raw_form.get("method") or "GET"),
+                            str(raw_form.get("enctype") or ""),
+                            raw_form.get("fields") or [],
+                        )
+                    return
+
                 for anchor in page.query_selector_all("a[href]"):
                     href = anchor.get_attribute("href") or ""
                     if not href or href.startswith(("javascript:", "mailto:", "data:")):
@@ -433,40 +838,32 @@ def _crawl_site_sync(start, max_pages, extra_headers, timeout_ms, allow_subdomai
                         return [item["method"] + " " + metadata_url(item["url"]) for item in new]
                     action_budget -= explore_features(page, frontier, action_budget, feature_harvest,
                                                       ensure_active, wait_ms)
+                    action_budget -= _click_safe_interactive(
+                        page,
+                        frontier,
+                        action_budget,
+                        feature_harvest,
+                        ensure_active,
+                        wait_ms,
+                        metadata_fn=metadata_url,
+                    )
 
                     for form in page.query_selector_all("form"):
-                        from urllib.parse import urljoin
                         action = urljoin(page.url, form.get_attribute("action") or page.url)
-                        if not permitted(action):
-                            continue
-                        method = (form.get_attribute("method") or "GET").upper()
-                        enctype = (form.get_attribute("enctype") or "").split(";", 1)[0].strip().lower()
-                        content_type = ""
-                        if method != "GET":
-                            content_type = enctype or "application/x-www-form-urlencoded"
-                        fields = []
+                        raw_fields = []
                         for inp in form.query_selector_all("input, textarea, select"):
-                            name = inp.get_attribute("name") or ""
-                            typ = inp.get_attribute("type") or "text"
-                            if name:
-                                field_item = {"name": name, "type": typ}
-                                if typ.lower() != "password":
-                                    raw_val = inp.get_attribute("value") or ""
-                                    if raw_val:
-                                        from .normalize import safe_sample
-                                        sampled = safe_sample(name, raw_val)
-                                        if sampled and sampled != "<redacted>":
-                                            field_item["value"] = sampled
-                                fields.append(field_item)
-                        form_entry = {
-                            "page": current,
-                            "action": action,
-                            "method": method,
-                            "fields": fields,
-                        }
-                        if content_type:
-                            form_entry["content_type"] = content_type
-                        forms.append(form_entry)
+                            raw_fields.append({
+                                "name": inp.get_attribute("name") or "",
+                                "type": inp.get_attribute("type") or "text",
+                                "value": inp.get_attribute("value") or "",
+                            })
+                        _add_form_entry(
+                            current,
+                            action,
+                            form.get_attribute("method") or "GET",
+                            form.get_attribute("enctype") or "",
+                            raw_fields,
+                        )
 
                 except Exception as exc:
                     errors.append({"url": current, "error": str(exc)[:160]})
