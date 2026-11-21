@@ -26,6 +26,7 @@ from agentic_investigator import (  # noqa: E402
     effective_tokens_from_usage,
 )
 from agentic_receipts import ReceiptStore  # noqa: E402
+from agentic_tools import TOOL_SCHEMAS, ToolDispatcher  # noqa: E402
 from full_agent_budget import SharedBudget  # noqa: E402
 from full_agent_provider import MeteredProviderTransport, SessionGate  # noqa: E402
 
@@ -1317,3 +1318,325 @@ def test_runner_cache_token_weight_plan_and_validation(tmp_path: Path) -> None:
             "--output-dir", str(tmp_path / "plan-cli-bad"),
             "--cache-token-weight", "1.5",
         ])
+
+
+# ---------------------------------------------------------------------------
+# 7. http_request method inference, stringified body parsing & discovery gate
+# ---------------------------------------------------------------------------
+
+
+def _parse_tool_preview(raw_output: str) -> dict[str, Any]:
+    inner = raw_output.split("<<<UNTRUSTED_TARGET_RESPONSE>>>\n", 1)[1].rsplit(
+        "\n<<<END_UNTRUSTED_TARGET_RESPONSE>>>", 1
+    )[0]
+    return json.loads(inner)
+
+
+def test_http_request_method_inference_body_normalization_and_warning(tmp_path: Path) -> None:
+    http_schema = next(t["function"] for t in TOOL_SCHEMAS if t["function"]["name"] == "http_request")
+    assert http_schema["parameters"]["required"] == ["url"]
+    method_desc = http_schema["parameters"]["properties"]["method"]["description"]
+    assert len(method_desc) <= 140
+    assert "POST if body" in method_desc
+
+    seen_requests: list[dict[str, Any]] = []
+
+    class _EchoHandler(BaseHTTPRequestHandler):
+        def log_message(self, *_args: object) -> None:
+            pass
+
+        def _handle(self, method: str) -> None:
+            length = int(self.headers.get("Content-Length", "0"))
+            raw_body = self.rfile.read(length).decode("utf-8", errors="replace") if length > 0 else ""
+            seen_requests.append({
+                "method": method,
+                "path": urlsplit(self.path).path,
+                "content_type": self.headers.get("Content-Type", ""),
+                "body": raw_body,
+            })
+            payload = json.dumps({"method": method, "body": raw_body}).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+        def do_GET(self) -> None:
+            self._handle("GET")
+
+        def do_POST(self) -> None:
+            self._handle("POST")
+
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), _EchoHandler)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    base_url = f"http://127.0.0.1:{srv.server_address[1]}/"
+    store, client, _ = _make_deps(
+        tmp_path,
+        base_url=base_url,
+        http_limit=20,
+        accounts=[{"alias": "anon", "role": "anonymous", "tenant": "public"}],
+    )
+    disp = ToolDispatcher(http_client=client, receipt_store=store, root_dir=tmp_path)
+    try:
+        # 1. Omitting method with no body defaults to GET and has no method_warning.
+        p_get = _parse_tool_preview(disp.dispatch("http_request", {"url": "/ping"}))
+        assert p_get["method"] == "GET"
+        assert "method_warning" not in p_get
+
+        # 2. Omitting method while supplying stringified json_body infers POST and parses to JSON dict.
+        p_json = _parse_tool_preview(
+            disp.dispatch(
+                "http_request",
+                {"url": "/submit-json", "json_body": '{"email": "a@b.test"}'},
+            )
+        )
+        assert p_json["method"] == "POST"
+        assert "method_warning" not in p_json
+        assert seen_requests[-1]["method"] == "POST"
+        assert json.loads(seen_requests[-1]["body"]) == {"email": "a@b.test"}
+
+        # 3. Omitting method while supplying stringified form_body infers POST and encodes form dict.
+        p_form = _parse_tool_preview(
+            disp.dispatch(
+                "http_request",
+                {"url": "/submit-form", "form_body": '{"user": "alice", "role": "member"}'},
+            )
+        )
+        assert p_form["method"] == "POST"
+        assert "method_warning" not in p_form
+        assert seen_requests[-1]["method"] == "POST"
+        assert "application/x-www-form-urlencoded" in seen_requests[-1]["content_type"]
+        assert "user=alice" in seen_requests[-1]["body"]
+
+        # 4. Explicit method="GET" with body honors GET and emits non-blocking method_warning.
+        p_warn = _parse_tool_preview(
+            disp.dispatch(
+                "http_request",
+                {"method": "GET", "url": "/get-with-body", "json_body": {"k": "v"}},
+            )
+        )
+        assert p_warn["method"] == "GET"
+        assert "method_warning" in p_warn
+        assert "method='POST'" in p_warn["method_warning"]
+
+        # 5. Intentional non-JSON string in json_body is left untouched (not broken) and infers POST.
+        p_raw_str = _parse_tool_preview(
+            disp.dispatch(
+                "http_request",
+                {"url": "/raw-json-str", "json_body": "plain-string-payload"},
+            )
+        )
+        assert p_raw_str["method"] == "POST"
+        assert json.loads(seen_requests[-1]["body"]) == "plain-string-payload"
+    finally:
+        client.close()
+        srv.shutdown()
+        srv.server_close()
+
+
+def _start_barrier_target() -> tuple[ThreadingHTTPServer, str]:
+    class _Handler(BaseHTTPRequestHandler):
+        def log_message(self, *_args: object) -> None:
+            pass
+
+        def do_POST(self) -> None:
+            length = int(self.headers.get("Content-Length", "0"))
+            _ = self.rfile.read(length)
+            path = urlsplit(self.path).path
+            if path == "/api/auth":
+                body = json.dumps({"token": "boot-tok-123"}).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
+            self.send_response(404)
+            self.end_headers()
+
+        def do_GET(self) -> None:
+            path = urlsplit(self.path).path
+            if path == "/":
+                html = (
+                    "<html><body>"
+                    "<form method='post' action='/api/auth'><input name='user'/></form>"
+                    "<a href='/alpha'>A</a><a href='/alpha/1'>A1</a>"
+                    "<a href='/api/alpha'>AA</a><a href='/api/alpha/1'>AA1</a>"
+                    "<a href='/beta'>B</a><a href='/beta/2'>B2</a>"
+                    "<a href='/api/beta'>AB</a><a href='/api/beta/2'>AB2</a>"
+                    "<a href='/gamma'>G</a><a href='/gamma/3'>G3</a>"
+                    "<a href='/api/gamma'>AG</a><a href='/api/gamma/3'>AG3</a>"
+                    "</body></html>"
+                ).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html")
+                self.send_header("Content-Length", str(len(html)))
+                self.end_headers()
+                self.wfile.write(html)
+                return
+            if path == "/api/alpha/1":
+                if self.headers.get("Authorization") != "Bearer boot-tok-123":
+                    self.send_response(401)
+                    self.end_headers()
+                    return
+                body = json.dumps({"id": 1, "secret": "ALPHA_SEC"}).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
+            if path in {"/api/beta/2", "/api/gamma/3"}:
+                body = json.dumps({"ok": True}).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
+            self.send_response(404)
+            self.end_headers()
+
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    return srv, f"http://127.0.0.1:{srv.server_address[1]}/"
+
+
+def test_discovery_finish_gate_rejects_anon_only_accepts_post_auth_and_last_turns(tmp_path: Path) -> None:
+    srv, base_url = _start_barrier_target()
+    try:
+        # Case A: bootstrap_discovery_only rejects premature anon-only finish,
+        # then accepts finish after POST auth + post-auth GET 2xx crawl, and resets gate for Stage 2.
+        dir_a = tmp_path / "case_a"
+        dir_a.mkdir()
+        store_a, client_a, budget_a = _make_deps(
+            dir_a,
+            base_url=base_url,
+            http_limit=60,
+            token_limit=400_000,
+            accounts=[{"alias": "anon", "role": "anonymous", "tenant": "public"}],
+        )
+        boot_finish_replies: list[dict[str, Any]] = []
+        shard_gate_states: list[bool] = []
+        lock = threading.Lock()
+        boot_step = [0]
+
+        def _handler_a(_idx: int, body: dict[str, Any]) -> dict[str, Any]:
+            msgs = body.get("messages") or []
+            sys_msg = str((msgs[0] if msgs else {}).get("content") or "")
+            if "SUBSYSTEM SHARD SCOPE (" not in sys_msg:
+                with lock:
+                    boot_step[0] += 1
+                    step = boot_step[0]
+                if step == 1:
+                    return _multi_resp([
+                        ("a1", "http_request", {"url": "/", "actor": "anon"}),
+                        ("a2", "http_request", {"url": "/api/alpha/1", "actor": "anon"}),
+                    ])
+                if step == 2:
+                    # Extract surface to populate multi-family routes, then attempt premature finish.
+                    return _multi_resp([
+                        ("a2b", "extract_surface", {"receipt_id": "req-0001"}),
+                        ("a3", "finish", {"summary": "too early"}),
+                    ])
+                if step == 3:
+                    for m in msgs:
+                        if m.get("role") == "tool" and m.get("tool_call_id") == "a3":
+                            boot_finish_replies.append(json.loads(str(m.get("content") or "{}").split("\n[", 1)[0]))
+                    # Authenticate via inferred POST (no explicit method) + perform post-auth GET 2xx.
+                    return _multi_resp([
+                        (
+                            "a4",
+                            "http_request",
+                            {"url": "/api/auth", "json_body": '{"user":"u1"}', "save_session_as": "dyn-u1"},
+                        ),
+                        ("a5", "http_request", {"url": "/api/alpha/1", "actor": "dyn-u1"}),
+                    ])
+                if step == 4:
+                    return _tool_resp("a6", "finish", {"summary": "post-auth crawl done"})
+                return _tool_resp("a7", "finish", {"summary": "fallback"})
+            shard_gate_states.append(inv_a.dispatcher.discovery_finish_gate)
+            return _tool_resp(f"s_{_idx}", "finish", {"summary": "shard done"})
+
+        inv_a = AgenticInvestigator(
+            http_client=client_a,
+            receipt_store=store_a,
+            transport=_ScriptedTransport(_handler_a),  # type: ignore[arg-type]
+            budget=budget_a,
+            model="strong-model",
+            bootstrap_model="fast-boot",
+            root_dir=dir_a,
+            max_turns=36,
+            execution_mode="sharded",
+            max_shards=3,
+            bootstrap_turns=12,
+            shard_turns=4,
+            sleep_fn=lambda _s: None,
+        )
+        res_a = inv_a.run()
+        client_a.close()
+        assert res_a["status"] == "finished"
+        assert boot_finish_replies and boot_finish_replies[0]["rejected"] is True
+        assert boot_finish_replies[0]["finished"] is False
+        assert inv_a.dispatcher.finish_rejections == 1
+        assert inv_a.dispatcher.discovery_finish_gate is False
+        assert shard_gate_states and all(g is False for g in shard_gate_states)
+        assert len(res_a["sharding_summary"]["shards"]) >= 2
+
+        # Case B: Last 2 turns of bootstrap_discovery_only allow premature finish even with barrier & anon-only,
+        # and fallback to monolithic resets discovery_finish_gate = False.
+        dir_b = tmp_path / "case_b"
+        dir_b.mkdir()
+        store_b, client_b, budget_b = _make_deps(
+            dir_b,
+            base_url=base_url,
+            http_limit=60,
+            token_limit=400_000,
+            accounts=[{"alias": "anon", "role": "anonymous", "tenant": "public"}],
+        )
+        b_step = [0]
+        cont_gate_states: list[bool] = []
+
+        def _handler_b(_idx: int, body: dict[str, Any]) -> dict[str, Any]:
+            msgs = body.get("messages") or []
+            sys_msg = str((msgs[0] if msgs else {}).get("content") or "")
+            usr_msg = str((msgs[1] if len(msgs) > 1 else {}).get("content") or "")
+            if "Stage 1 discovery is complete." in usr_msg:
+                cont_gate_states.append(inv_b.dispatcher.discovery_finish_gate)
+                return _tool_resp(f"mc_{_idx}", "finish", {"summary": "monolithic cont done"})
+            if "SUBSYSTEM SHARD SCOPE (" not in sys_msg:
+                b_step[0] += 1
+                step = b_step[0]
+                if step == 1:
+                    return _tool_resp("b1", "http_request", {"url": "/api/alpha/1", "actor": "anon"})
+                if step == 2:
+                    # Turn 2 of boot_max_turns=4 is still gated -> rejected
+                    return _tool_resp("b2", "finish", {"summary": "early turn 2"})
+                # Turn 3 of boot_max_turns=4 (last 2 turns) -> accepted!
+                return _tool_resp("b3", "finish", {"summary": "allowed in last 2 turns"})
+            return _tool_resp(f"sb_{_idx}", "finish", {"summary": "shard done"})
+
+        inv_b = AgenticInvestigator(
+            http_client=client_b,
+            receipt_store=store_b,
+            transport=_ScriptedTransport(_handler_b),  # type: ignore[arg-type]
+            budget=budget_b,
+            model="strong-model",
+            bootstrap_model="fast-boot",
+            root_dir=dir_b,
+            max_turns=12,
+            execution_mode="sharded",
+            max_shards=2,
+            bootstrap_turns=4,
+            shard_turns=4,
+            sleep_fn=lambda _s: None,
+        )
+        res_b = inv_b.run()
+        client_b.close()
+        assert res_b["status"] == "finished"
+        assert b_step[0] == 3
+        assert cont_gate_states and all(g is False for g in cont_gate_states)
+        assert inv_b.dispatcher.discovery_finish_gate is False
+    finally:
+        srv.shutdown()
+        srv.server_close()

@@ -1031,24 +1031,33 @@ class AgenticInvestigator:
         dispatcher: ToolDispatcher | None = None,
         max_turns_override: int | None = None,
         allow_coverage_gate: bool = True,
+        allow_discovery_gate: bool = False,
+        disable_gate_last_n_turns: int = 0,
         shard_token_quota: int | None = None,
         shard_tokens_used: int | None = None,
     ) -> bool:
-        """Align `coverage_gate_enabled` with `[BUDGET-WRAPUP]` so `finish` is never rejected during wrapup."""
+        """Align `coverage_gate_enabled` and `discovery_finish_gate` with `[BUDGET-WRAPUP]` so `finish` is never rejected during wrapup."""
         eff_disp = dispatcher if dispatcher is not None else self.dispatcher
         eff_max_turns = max_turns_override if max_turns_override is not None else self.max_turns
-        enabled = (
+        wrapup_reasons = self._wrapup_reasons(
+            turn,
+            max_turns_override=eff_max_turns,
+            shard_token_quota=shard_token_quota,
+            shard_tokens_used=shard_tokens_used,
+        )
+        eff_enabled = (
             allow_coverage_gate
             and eff_max_turns > 5
-            and not self._wrapup_reasons(
-                turn,
-                max_turns_override=eff_max_turns,
-                shard_token_quota=shard_token_quota,
-                shard_tokens_used=shard_tokens_used,
-            )
+            and not wrapup_reasons
         )
-        eff_disp.coverage_gate_enabled = enabled
-        return enabled
+        eff_disp.coverage_gate_enabled = eff_enabled
+        eff_disp.discovery_finish_gate = bool(
+            allow_discovery_gate
+            and not eff_enabled
+            and not wrapup_reasons
+            and not (disable_gate_last_n_turns > 0 and turn > eff_max_turns - disable_gate_last_n_turns)
+        )
+        return eff_enabled
 
     def _state_banner(
         self,
@@ -1749,6 +1758,7 @@ class AgenticInvestigator:
                     category=arm.category,
                 )
                 self.dispatcher.coverage_gate_enabled = False
+                self.dispatcher.discovery_finish_gate = False
                 self.dispatcher.finished = False
                 self.dispatcher.consume_step_deltas()
 
@@ -2128,6 +2138,7 @@ class AgenticInvestigator:
         epoch_state: dict[str, Any] | None = None,
         model_name: str | None = None,
         allow_coverage_gate: bool = True,
+        allow_discovery_gate: bool = False,
         disable_gate_last_n_turns: int = 0,
         checkpoint_fn: Callable[[int, str, list[dict[str, Any]]], None] | None = None,
         handoff_scout_cfg: dict[str, Any] | None = None,
@@ -2216,6 +2227,8 @@ class AgenticInvestigator:
                     dispatcher=dispatcher,
                     max_turns_override=max_turns,
                     allow_coverage_gate=allow_coverage_gate,
+                    allow_discovery_gate=allow_discovery_gate,
+                    disable_gate_last_n_turns=disable_gate_last_n_turns,
                     shard_token_quota=shard_token_quota,
                     shard_tokens_used=cur_shard_tokens,
                 )
@@ -2223,6 +2236,7 @@ class AgenticInvestigator:
                     dispatcher.coverage_gate_enabled = False
                 if disable_gate_last_n_turns > 0 and turn > max_turns - disable_gate_last_n_turns:
                     dispatcher.coverage_gate_enabled = False
+                    dispatcher.discovery_finish_gate = False
 
                 resp = self._complete_with_retry(
                     messages,
@@ -2253,6 +2267,8 @@ class AgenticInvestigator:
                         dispatcher=dispatcher,
                         max_turns_override=max_turns,
                         allow_coverage_gate=allow_coverage_gate,
+                        allow_discovery_gate=allow_discovery_gate,
+                        disable_gate_last_n_turns=disable_gate_last_n_turns,
                         shard_token_quota=shard_token_quota,
                         shard_tokens_used=cur_shard_tokens,
                     )
@@ -2260,6 +2276,7 @@ class AgenticInvestigator:
                         dispatcher.coverage_gate_enabled = False
                     if disable_gate_last_n_turns > 0 and turn > max_turns - disable_gate_last_n_turns:
                         dispatcher.coverage_gate_enabled = False
+                        dispatcher.discovery_finish_gate = False
                     empty_nudges = 0
                     recent_local_reads = [entry for entry in recent_local_reads if turn - entry[0] <= 8]
                     for idx, tc in enumerate(tool_calls):
@@ -2567,6 +2584,7 @@ class AgenticInvestigator:
             )
             boot_excluded_tools: frozenset[str] | None = frozenset({"record_finding"})
             boot_allow_coverage_gate = False
+            boot_allow_discovery_gate = True
         else:
             init_prompt = (
                 "Begin the security investigation of the authorized target. "
@@ -2577,6 +2595,7 @@ class AgenticInvestigator:
             )
             boot_excluded_tools = None
             boot_allow_coverage_gate = True
+            boot_allow_discovery_gate = False
 
         boot_messages: list[dict[str, Any]] = [
             {"role": "system", "content": base_sys_prompt},
@@ -2592,12 +2611,14 @@ class AgenticInvestigator:
                 epoch_state=boot_epoch_state,
                 model_name=boot_model,
                 allow_coverage_gate=boot_allow_coverage_gate,
-                disable_gate_last_n_turns=2 if boot_allow_coverage_gate else 0,
+                allow_discovery_gate=boot_allow_discovery_gate,
+                disable_gate_last_n_turns=2 if (boot_allow_coverage_gate or boot_allow_discovery_gate) else 0,
                 checkpoint_fn=lambda t, st, msgs: self._save_checkpoint(turn=t, status=st, messages=msgs),
                 usage_sink=boot_usage,
                 calls_sink=boot_calls,
                 excluded_tools=boot_excluded_tools,
             )
+            self.dispatcher.discovery_finish_gate = False
             boot_findings_snap = copy.deepcopy(self.dispatcher.findings)
 
             if (
@@ -2728,6 +2749,7 @@ class AgenticInvestigator:
                 try:
                     shard_dispatcher.surface_tracker.load_dict(copy.deepcopy(bootstrap_surface_snap))
                     shard_dispatcher.coverage_gate_enabled = False
+                    shard_dispatcher.discovery_finish_gate = False
                     shard_dispatcher.set_active_context(worker_id=cluster.shard_id, category=cluster.name)
 
                     shard_epoch_state: dict[str, Any] = {"turn_start": 0, "summary_text": "", "advancements": 0}
@@ -2776,6 +2798,7 @@ class AgenticInvestigator:
                             epoch_state=shard_epoch_state,
                             model_name=self.model,
                             allow_coverage_gate=False,
+                            allow_discovery_gate=False,
                             checkpoint_fn=_shard_ckpt,
                             shard_cluster=cluster,
                             usage_sink=shard_usage,

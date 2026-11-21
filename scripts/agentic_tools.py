@@ -184,7 +184,7 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "method": {"type": "string", "description": "HTTP method."},
+                    "method": {"type": "string", "description": "HTTP method (defaults GET; POST if body)."},
                     "url": {"type": "string", "description": "Path or same-origin URL."},
                     "actor": {"type": "string", "description": "Actor alias or 'anon'."},
                     "headers": {"type": "object", "additionalProperties": {"type": "string"}, "description": "Extra headers."},
@@ -2341,6 +2341,9 @@ class ToolDispatcher:
             actor_summaries=self.http.actors.summaries(),
         )
         self.coverage_gate_enabled: bool = True
+        self.discovery_finish_gate: bool = False
+        self._auth_barrier_or_write_seen: bool = False
+        self._non_anon_2xx_reads: int = 0
         self.finish_rejections: int = 0
         self.max_finish_rejections: int = 3
         self.finished: bool = False
@@ -2385,6 +2388,18 @@ class ToolDispatcher:
             dv, de = self.bsag.ingest_receipt(receipt)
             self._step_delta_v += dv
             self._step_delta_e += de
+        status = int(receipt.get("status") or 0)
+        actor = str(receipt.get("actor") or "anon")
+        method = str(receipt.get("method") or "GET").upper()
+        if (
+            status in {401, 403}
+            or (300 <= status < 400 and actor == "anon")
+            or bool(self.surface_tracker.declared_write_ops)
+            or bool(self.surface_tracker.discovered_write_ops)
+        ):
+            self._auth_barrier_or_write_seen = True
+        if actor != "anon" and method == "GET" and 200 <= status < 300:
+            self._non_anon_2xx_reads += 1
         if self.telemetry is not None:
             ep_id = self.bsag.endpoint_node_id(receipt.get("url") or "/") if self.bsag is not None else self.active_node_id
             self.telemetry.emit(
@@ -2493,6 +2508,22 @@ class ToolDispatcher:
 
     def _tool_http_request(self, args: dict[str, Any]) -> str:
         json_body = args.get("json_body")
+        if isinstance(json_body, str) and json_body.lstrip().startswith(("{", "[")):
+            try:
+                parsed_json = json.loads(json_body)
+            except ValueError:
+                parsed_json = None
+            if isinstance(parsed_json, (dict, list)):
+                json_body = parsed_json
+        form_body = args.get("form_body")
+        if isinstance(form_body, str) and form_body.lstrip().startswith("{"):
+            try:
+                parsed_form = json.loads(form_body)
+            except ValueError:
+                parsed_form = None
+            if isinstance(parsed_form, dict):
+                form_body = parsed_form
+        raw_body = args.get("raw_body")
         base_receipt_id = str(args.get("base_receipt_id") or "").strip()
         json_merge = args.get("json_merge") if isinstance(args.get("json_merge"), dict) else (
             args.get("mutate_json") if isinstance(args.get("mutate_json"), dict) else None
@@ -2510,20 +2541,39 @@ class ToolDispatcher:
             else:
                 json_body = copy.deepcopy(json_merge)
 
+        raw_method = str(args.get("method") or "").strip().upper()
+        has_payload = (
+            json_body is not None
+            or form_body is not None
+            or raw_body is not None
+            or bool(base_receipt_id)
+            or (json_merge is not None)
+        )
+        if raw_method:
+            eff_method = raw_method
+        elif has_payload and "POST" in self.http.allowed_methods:
+            eff_method = "POST"
+        else:
+            eff_method = "GET"
+
         receipt = self.http.request(
-            method=str(args.get("method") or "GET"),
+            method=eff_method,
             url=str(args.get("url") or ""),
             actor=str(args.get("actor") or "anon"),
             headers=args.get("headers"),
             query=args.get("query"),
             json_body=json_body,
-            form_body=args.get("form_body"),
-            raw_body=args.get("raw_body"),
+            form_body=form_body,
+            raw_body=raw_body,
             force=bool(args.get("force", False)),
             save_session_as=str(args.get("save_session_as") or ""),
         )
         self._ingest_receipt_hooks(receipt)
         preview = _format_receipt_preview(receipt)
+        if eff_method == "GET" and has_payload:
+            preview["method_warning"] = (
+                "GET request sent with request body; set method='POST' for form/JSON submissions."
+            )
         status = int(receipt.get("status") or 0)
         ctype = (receipt.get("content_type") or "").lower()
         if 200 <= status < 400 and (
@@ -3783,6 +3833,30 @@ class ToolDispatcher:
                 ),
                 "remaining_frontier": frontier,
             })
+        elif (
+            self.discovery_finish_gate
+            and rem_ratio > 0.20
+            and self.finish_rejections < self.max_finish_rejections
+        ):
+            non_anon_actors = [a for a in self.surface_tracker.actors if a != "anon"]
+            if self._auth_barrier_or_write_seen and (len(non_anon_actors) == 0 or self._non_anon_2xx_reads == 0):
+                self.finish_rejections += 1
+                return json.dumps({
+                    "finished": False,
+                    "rejected": True,
+                    "nudge_count": self.finish_rejections,
+                    "max_nudges": self.max_finish_rejections,
+                    "http_budget_remaining": http_rem,
+                    "http_budget_limit": self.http.budget.limit,
+                    "http_budget_remaining_pct": round(rem_ratio * 100, 1),
+                    "reason": (
+                        f"Premature finish rejected ({self.finish_rejections}/{self.max_finish_rejections}): "
+                        f"{round(rem_ratio * 100, 1)}% HTTP budget remaining ({http_rem}/{self.http.budget.limit}). "
+                        "Auth barriers, redirects, or write/form endpoints were observed without an authenticated "
+                        "post-auth GET 2xx crawl yet; register/sign in an actor via "
+                        "http_request(method='POST', ..., save_session_as=...) and fetch post-auth pages before calling finish."
+                    ),
+                })
 
         self.finished = True
         self.finish_summary = str(args.get("summary") or "").strip()
