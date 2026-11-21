@@ -91,6 +91,9 @@ def run_agentic_target(
     verification_gate: str = "differential",
     intervention: str = "off",
     execution_mode: str = "monolithic",
+    max_shards: int = 3,
+    bootstrap_turns: int = 12,
+    shard_turns: int = 25,
 ) -> tuple[Path, dict[str, Any]]:
     """Run (or plan when execute=False) AgenticInvestigator against an owned loopback target."""
     bundle = ext.load_credentials_bundle(credentials_file)
@@ -152,6 +155,11 @@ def run_agentic_target(
         "intervention": str(intervention or "lazy").strip().lower(),
         "execution_mode": str(execution_mode or "ephemeral").strip().lower(),
     }
+    sharding_cfg = {
+        "max_shards": max(1, int(max_shards)),
+        "bootstrap_turns": max(1, int(bootstrap_turns)),
+        "shard_turns": max(1, int(shard_turns)),
+    }
 
     if not execute:
         plan_path = output / "agentic-plan.json"
@@ -166,6 +174,7 @@ def run_agentic_target(
             "allowed_methods": eff_methods,
             "discovery_hints": eff_discovery_hints,
             "ablation": ablation_cfg,
+            "sharding": sharding_cfg,
             "selected_accounts": [
                 {"alias": row["alias"], "tenant": row.get("tenant", ""), "role": row.get("role", "")}
                 for row in accounts
@@ -227,6 +236,7 @@ def run_agentic_target(
         "allowed_methods": eff_methods,
         "discovery_hints": eff_discovery_hints,
         "ablation": ablation_cfg,
+        "sharding": sharding_cfg,
         "limits": limits,
     }
     manifest_path = output / "manifest.json"
@@ -254,6 +264,9 @@ def run_agentic_target(
             scout_model=scout_model_id or None,
             scout_max_turns=scout_turns,
             scout_token_share=scout_token_share,
+            max_shards=sharding_cfg["max_shards"],
+            bootstrap_turns=sharding_cfg["bootstrap_turns"],
+            shard_turns=sharding_cfg["shard_turns"],
         )
         run_info = investigator.run(resume=resume)
         manifest.update(run_info)
@@ -341,7 +354,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--scheduler", choices=["ucb", "prompt_only", "round_robin"], default="prompt_only")
     parser.add_argument("--verification-gate", choices=["differential", "llm_self_judge"], default="differential")
     parser.add_argument("--intervention", choices=["lazy", "always_on", "off"], default="off")
-    parser.add_argument("--execution-mode", choices=["ephemeral", "monolithic"], default="monolithic")
+    parser.add_argument("--execution-mode", choices=["ephemeral", "monolithic", "sharded"], default="monolithic")
+    parser.add_argument("--max-shards", type=int, default=3, help="Max subsystem shards for sharded mode")
+    parser.add_argument("--bootstrap-turns", type=int, default=12, help="Stage 1 bootstrap turns for sharded mode")
+    parser.add_argument("--shard-turns", type=int, default=25, help="Stage 2 per-shard turn budget for sharded mode")
     args = parser.parse_args(argv)
 
     path, doc = run_agentic_target(
@@ -376,6 +392,9 @@ def main(argv: list[str] | None = None) -> int:
         verification_gate=args.verification_gate,
         intervention=args.intervention,
         execution_mode=args.execution_mode,
+        max_shards=args.max_shards,
+        bootstrap_turns=args.bootstrap_turns,
+        shard_turns=args.shard_turns,
     )
     print(json.dumps({
         "artifact": str(path),

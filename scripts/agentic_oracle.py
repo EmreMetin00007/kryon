@@ -85,6 +85,10 @@ _INPUT_DIFF_CLASSES = frozenset({
 })
 _ACCESS_CLASSES = frozenset({"auth_bypass", "bfla", "bola", "tenant_isolation"})
 _MUTATING_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
+_WRITE_METHODS = frozenset({"POST", "PUT", "PATCH"})
+_PERSISTENT_CLASSES = frozenset({"stored_xss", "mass_assignment", "ssti"})
+_API_PREFIX_SEGMENTS = frozenset({"api", "v1", "v2", "v3", "v4"})
+_API_VERSION_SEG_RE = re.compile(r"^v\d+$", re.I)
 
 
 def _extract_owner_and_tenant_from_receipt(
@@ -297,24 +301,181 @@ def _receipt_contains_evidence(receipt: dict[str, Any], evidence_value: str) -> 
     return ev in f"{body}\n{loc}\n{hdrs}".lower()
 
 
+def _receipt_content_type(receipt: dict[str, Any]) -> str:
+    """Return normalized lowercase media type from receipt metadata or Content-Type header."""
+    ctype = str(receipt.get("content_type") or "").strip().lower()
+    if ctype:
+        return ctype.split(";", 1)[0].strip()
+    headers = receipt.get("response_headers") or {}
+    if isinstance(headers, dict):
+        for k, v in headers.items():
+            if str(k).lower() == "content-type":
+                return str(v).split(";", 1)[0].strip().lower()
+    return ""
+
+
+def is_html_receipt(receipt: dict[str, Any]) -> bool:
+    """Return True if the receipt has an HTML content-type (e.g. text/html or application/xhtml+xml)."""
+    return "html" in _receipt_content_type(receipt)
+
+
+def receipt_body_contains_verbatim(receipt: dict[str, Any], evidence_value: str) -> bool:
+    """Return True if non-empty `evidence_value` appears verbatim (unescaped) in the receipt body."""
+    ev = str(evidence_value or "").strip()
+    if not ev:
+        return False
+    body = str(receipt.get("body") or "")
+    return ev in body or ev.lower() in body.lower()
+
+
+def _receipt_seq_num(receipt: dict[str, Any]) -> int:
+    rid = str(receipt.get("receipt_id") or "").strip()
+    if rid.startswith("req-") and rid[4:].isdigit():
+        return int(rid[4:])
+    return 0
+
+
+def _norm_url_path(url_or_path: str) -> str:
+    path = urlsplit(str(url_or_path or "")).path or "/"
+    if len(path) > 1:
+        path = path.rstrip("/")
+    return path.lower()
+
+
+def _strip_api_prefix(segs: list[str]) -> list[str]:
+    idx = 0
+    while idx < len(segs):
+        seg = segs[idx]
+        if seg in _API_PREFIX_SEGMENTS or _API_VERSION_SEG_RE.fullmatch(seg):
+            idx += 1
+        else:
+            break
+    return segs[idx:] if idx < len(segs) else segs
+
+
+def _segments_related(w_segs: list[str], r_segs: list[str]) -> bool:
+    if w_segs == r_segs:
+        return True
+    # Parent/ancestor read: /<res>/<id>/reply -> /<res>/<id> or /<res>
+    if r_segs and len(r_segs) < len(w_segs) and w_segs[: len(r_segs)] == r_segs:
+        return True
+    # Top-level collection write rendering on root page: /posts -> /
+    if not r_segs and len(w_segs) == 1:
+        return True
+    # Child read after collection write: /<res> -> /<res>/<id>
+    if w_segs and len(w_segs) < len(r_segs) and r_segs[: len(w_segs)] == w_segs:
+        return True
+    # Sibling under same non-API-root parent: /<res>/<id>/reply -> /<res>/<id>/thread
+    if len(w_segs) >= 2 and len(r_segs) >= 2 and w_segs[:-1] == r_segs[:-1]:
+        parent = w_segs[-2]
+        if parent not in _API_PREFIX_SEGMENTS and not _API_VERSION_SEG_RE.fullmatch(parent):
+            return True
+    return False
+
+
+def is_persistent_read_path_related(
+    write_receipt_or_url: dict[str, Any] | str,
+    read_url_or_path: str,
+) -> bool:
+    """Return True if a read GET path is the same, parent/ancestor, child, sibling, or redirect target of a write."""
+    if isinstance(write_receipt_or_url, dict):
+        w_url = str(write_receipt_or_url.get("url") or write_receipt_or_url.get("path") or "")
+        redir = str(write_receipt_or_url.get("redirect_location") or "").strip()
+        if redir and _norm_url_path(redir) == _norm_url_path(read_url_or_path):
+            return True
+    else:
+        w_url = str(write_receipt_or_url or "")
+
+    w_path = _norm_url_path(w_url)
+    r_path = _norm_url_path(read_url_or_path)
+    if w_path == r_path:
+        return True
+
+    w_segs = [s for s in w_path.split("/") if s]
+    r_segs = [s for s in r_path.split("/") if s]
+    if _segments_related(w_segs, r_segs):
+        return True
+
+    w_stripped = _strip_api_prefix(w_segs)
+    r_stripped = _strip_api_prefix(r_segs)
+    if (w_stripped != w_segs or r_stripped != r_segs) and _segments_related(w_stripped, r_stripped):
+        return True
+    return False
+
+
+def find_persistent_render_get_receipt(
+    write_receipt: dict[str, Any],
+    candidates: Sequence[dict[str, Any]],
+    evidence_value: str,
+    *,
+    canonical_class: str = "",
+) -> dict[str, Any] | None:
+    """Select the strongest 2xx GET persistence/render proof matching a mutating write receipt."""
+    w_actor = str(write_receipt.get("actor") or "")
+    w_path = _norm_url_path(str(write_receipt.get("url") or write_receipt.get("path") or ""))
+    ev = str(evidence_value or "").strip()
+
+    matched: list[dict[str, Any]] = []
+    for r in candidates:
+        if str(r.get("method") or "").upper() != "GET":
+            continue
+        status = int(r.get("status") or 0)
+        if not (200 <= status < 300):
+            continue
+        r_url = str(r.get("url") or r.get("path") or "")
+        if not is_persistent_read_path_related(write_receipt, r_url):
+            continue
+        if canonical_class == "stored_xss":
+            if not is_html_receipt(r):
+                continue
+            if ev and not receipt_body_contains_verbatim(r, ev):
+                continue
+        elif ev and not _receipt_contains_evidence(r, ev):
+            continue
+        matched.append(r)
+
+    if not matched:
+        return None
+    matched.sort(
+        key=lambda r: (
+            1 if (ev and receipt_body_contains_verbatim(r, ev)) else 0,
+            1 if is_html_receipt(r) else 0,
+            1 if _norm_url_path(str(r.get("url") or r.get("path") or "")) == w_path else 0,
+            1 if str(r.get("actor") or "") == w_actor else 0,
+            _receipt_seq_num(r),
+        ),
+        reverse=True,
+    )
+    return matched[0]
+
+
 def _select_mutating_get_proof(
     primary_proof: dict[str, Any],
     proof_receipts: list[dict[str, Any]],
     evidence_value: str,
+    *,
+    canonical_class: str = "",
 ) -> dict[str, Any] | None:
     """Select the best 2xx GET persistence proof for a mutating primary receipt.
 
-    Non-idempotent mutations (e.g. ownership or tenant transfers) may revoke the
-    original actor's access after succeeding, so a follow-up 2xx GET from either
-    the original actor or a newly-authorized actor is a safer and more accurate
-    Stage 3 clean-replay target than blindly re-issuing the write.
+    Non-idempotent mutations (e.g. ownership/tenant transfers or stored XSS/SSTI
+    writes) may be unsafe to replay directly or may render on a parent/sibling GET
+    endpoint, so replaying the follow-up 2xx GET is safer and more accurate.
     """
     p_method = str(primary_proof.get("method") or "").upper()
     if p_method not in _MUTATING_METHODS:
         return None
     p_actor = str(primary_proof.get("actor") or "")
-    p_path = urlsplit(str(primary_proof.get("url") or primary_proof.get("path") or "")).path.rstrip("/")
+    p_path = _norm_url_path(str(primary_proof.get("url") or primary_proof.get("path") or ""))
     ev = str(evidence_value or "").strip()
+
+    if canonical_class == "stored_xss":
+        return find_persistent_render_get_receipt(
+            primary_proof,
+            proof_receipts,
+            ev,
+            canonical_class="stored_xss",
+        )
 
     candidates = [
         r
@@ -330,8 +491,10 @@ def _select_mutating_get_proof(
     candidates.sort(
         key=lambda r: (
             1 if (ev and _receipt_contains_evidence(r, ev)) else 0,
-            1 if urlsplit(str(r.get("url") or r.get("path") or "")).path.rstrip("/") == p_path else 0,
+            1 if is_persistent_read_path_related(primary_proof, str(r.get("url") or r.get("path") or "")) else 0,
+            1 if _norm_url_path(str(r.get("url") or r.get("path") or "")) == p_path else 0,
             1 if str(r.get("actor") or "") == p_actor else 0,
+            _receipt_seq_num(r),
         ),
         reverse=True,
     )
@@ -537,10 +700,70 @@ class DifferentialOracle:
 
         stages: dict[str, Any] = {}
         ev = str(evidence_value or "").strip()
-        p_actor = str(primary_proof.get("actor") or "anon")
-        p_status = int(primary_proof.get("status") or 0)
-        p_masked = mask_dynamic_fields(str(primary_proof.get("body") or ""), preserve_values=(ev,))
-        p_loc = str(primary_proof.get("redirect_location") or "")
+        render_proof: dict[str, Any] | None = None
+        if canonical_class == "stored_xss":
+            if str(primary_proof.get("method") or "").upper() == "GET" and 200 <= int(primary_proof.get("status") or 0) < 300:
+                render_proof = primary_proof
+            else:
+                render_proof = _select_mutating_get_proof(
+                    primary_proof,
+                    proof_receipts,
+                    ev,
+                    canonical_class="stored_xss",
+                )
+            if render_proof is None:
+                stages["stage1_control"] = "failed_missing_render_get"
+                return OracleVerdict(
+                    verified=False,
+                    verdict="REFUTED",
+                    reason="stored_xss requires a 2xx text/html GET render receipt containing evidence_value unescaped verbatim.",
+                    mode=self.mode,
+                    stages=stages,
+                )
+            if not is_html_receipt(render_proof):
+                stages["stage1_control"] = "failed_non_html_render"
+                return OracleVerdict(
+                    verified=False,
+                    verdict="REFUTED",
+                    reason="stored_xss render GET receipt must have HTML (text/html) content-type.",
+                    mode=self.mode,
+                    stages=stages,
+                )
+            if ev and not receipt_body_contains_verbatim(render_proof, ev):
+                stages["stage1_control"] = "failed_missing_unescaped_evidence"
+                return OracleVerdict(
+                    verified=False,
+                    verdict="REFUTED",
+                    reason="stored_xss render GET receipt does not contain evidence_value unescaped verbatim in HTML body.",
+                    mode=self.mode,
+                    stages=stages,
+                )
+        elif canonical_class in _PERSISTENT_CLASSES:
+            render_proof = _select_mutating_get_proof(
+                primary_proof,
+                proof_receipts,
+                ev,
+                canonical_class=canonical_class,
+            )
+
+        diff_target = primary_proof
+        if canonical_class == "stored_xss" and render_proof is not None:
+            diff_target = render_proof
+        elif (
+            canonical_class in _PERSISTENT_CLASSES
+            and render_proof is not None
+            and (
+                not ev
+                or not _receipt_contains_evidence(primary_proof, ev)
+                or any(str(c.get("method") or "").upper() == "GET" for c in control_receipts)
+            )
+        ):
+            diff_target = render_proof
+
+        p_actor = str(diff_target.get("actor") or "anon")
+        p_status = int(diff_target.get("status") or 0)
+        p_masked = mask_dynamic_fields(str(diff_target.get("body") or ""), preserve_values=(ev,))
+        p_loc = str(diff_target.get("redirect_location") or "")
 
         # --- Stage 1: Falsification / Control Baseline Check ---
         ctrl_probe_rid = ""
@@ -548,10 +771,10 @@ class DifferentialOracle:
         if not eff_controls and self._has_budget(2):
             try:
                 if canonical_class in _INPUT_DIFF_CLASSES:
-                    ctrl_url = self._benign_control_url(str(primary_proof.get("url") or "/"))
+                    ctrl_url = self._benign_control_url(str(diff_target.get("url") or "/"))
                     probe = self._run_clean_session_request(
                         actor=p_actor,
-                        method="GET" if primary_proof.get("method") == "GET" else str(primary_proof.get("method") or "GET"),
+                        method="GET" if diff_target.get("method") == "GET" else str(diff_target.get("method") or "GET"),
                         url=ctrl_url,
                     )
                     ctrl_probe_rid = probe["receipt_id"]
@@ -566,6 +789,12 @@ class DifferentialOracle:
                     eff_controls.append(probe)
             except Exception:
                 pass
+
+        diff_controls = eff_controls
+        if str(diff_target.get("method") or "").upper() == "GET":
+            get_ctrls = [c for c in eff_controls if str(c.get("method") or "").upper() == "GET"]
+            if get_ctrls:
+                diff_controls = get_ctrls
 
         # Catch-all / soft-404 decoy check for auth_bypass HTML responses
         if (
@@ -595,9 +824,23 @@ class DifferentialOracle:
             except Exception:
                 pass
 
-        # Check benign control equivalence for input/mutation classes
+        # Check benign control equivalence and stored_xss baseline absence for input/mutation classes
         if canonical_class in _INPUT_DIFF_CLASSES:
-            same_actor_ctrls = [c for c in eff_controls if str(c.get("actor") or "") == p_actor]
+            if canonical_class == "stored_xss" and ev:
+                p_count = str(diff_target.get("body") or "").lower().count(ev.lower())
+                for ctrl in diff_controls:
+                    c_count = str(ctrl.get("body") or "").lower().count(ev.lower())
+                    if c_count >= p_count or c_count > 0 and p_count <= c_count:
+                        stages["stage1_control"] = "failed_evidence_in_baseline"
+                        return OracleVerdict(
+                            verified=False,
+                            verdict="REFUTED",
+                            reason="Benign baseline GET control already contains the claimed stored_xss evidence_value.",
+                            mode=self.mode,
+                            stages=stages,
+                            control_probe_receipt_id=ctrl_probe_rid,
+                        )
+            same_actor_ctrls = [c for c in diff_controls if str(c.get("actor") or "") == p_actor]
             for ctrl in same_actor_ctrls:
                 c_masked = mask_dynamic_fields(str(ctrl.get("body") or ""), preserve_values=(ev,))
                 c_status = int(ctrl.get("status") or 0)
@@ -648,14 +891,14 @@ class DifferentialOracle:
         # --- Stage 2: Dynamic-Field-Masked Structural & Access-Boundary Diff ---
         if canonical_class in _INPUT_DIFF_CLASSES:
             has_masked_diff = False
-            for ctrl in eff_controls:
+            for ctrl in diff_controls:
                 c_masked = mask_dynamic_fields(str(ctrl.get("body") or ""), preserve_values=(ev,))
                 c_status = int(ctrl.get("status") or 0)
                 c_loc = str(ctrl.get("redirect_location") or "")
                 if c_status != p_status or c_masked != p_masked or urlsplit(c_loc).netloc != urlsplit(p_loc).netloc:
                     has_masked_diff = True
                     break
-            if eff_controls and not has_masked_diff:
+            if diff_controls and not has_masked_diff:
                 stages["stage2_diff"] = "failed_masked_equivalence"
                 return OracleVerdict(
                     verified=False,
@@ -715,8 +958,18 @@ class DifferentialOracle:
             )
 
         # Prefer replaying a 2xx GET persistence proof receipt when one is present
-        # (including cross-actor GETs after non-idempotent ownership/tenant transfers).
-        replay_target = _select_mutating_get_proof(primary_proof, proof_receipts, ev) or primary_proof
+        # (including cross-actor GETs after non-idempotent ownership/tenant transfers
+        # and read/render GETs for stored_xss / ssti / mass_assignment).
+        replay_target = (
+            render_proof
+            or _select_mutating_get_proof(
+                primary_proof,
+                proof_receipts,
+                ev,
+                canonical_class=canonical_class,
+            )
+            or primary_proof
+        )
         replayed_via_stateful_fallback = False
 
         try:
@@ -829,6 +1082,29 @@ class DifferentialOracle:
                     verified=False,
                     verdict="REFUTED",
                     reason="Clean-session replay did not reproduce external redirect Location host.",
+                    mode=self.mode,
+                    stages=stages,
+                    clean_replay_receipt_id=replay_rec["receipt_id"],
+                    control_probe_receipt_id=ctrl_probe_rid,
+                )
+        elif canonical_class == "stored_xss":
+            if not is_html_receipt(replay_rec):
+                stages["stage3_clean_replay"] = "failed_non_html_replay"
+                return OracleVerdict(
+                    verified=False,
+                    verdict="REFUTED",
+                    reason="Clean-session GET replay did not return HTML (text/html) content-type.",
+                    mode=self.mode,
+                    stages=stages,
+                    clean_replay_receipt_id=replay_rec["receipt_id"],
+                    control_probe_receipt_id=ctrl_probe_rid,
+                )
+            if ev and not receipt_body_contains_verbatim(replay_rec, ev):
+                stages["stage3_clean_replay"] = "failed_missing_evidence"
+                return OracleVerdict(
+                    verified=False,
+                    verdict="REFUTED",
+                    reason="Clean-session GET replay did not persist unescaped evidence_value in HTML body.",
                     mode=self.mode,
                     stages=stages,
                     clean_replay_receipt_id=replay_rec["receipt_id"],

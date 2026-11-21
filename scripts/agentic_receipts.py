@@ -180,25 +180,26 @@ class ReceiptStore:
             }
             _atomic_write_json(self.receipts_dir / f"{receipt_id}.json", receipt)
             self._cache[receipt_id] = receipt
-            return receipt
+            return dict(receipt)
 
     def get(self, receipt_id: str) -> dict[str, Any]:
         """Load a receipt by ID from cache or disk."""
         rid = self.validate_receipt_id(receipt_id)
         with self._lock:
             if rid in self._cache:
-                return self._cache[rid]
+                return dict(self._cache[rid])
         path = self.receipts_dir / f"{rid}.json"
         if not path.is_file():
             raise KeyError(f"receipt not found: {rid}")
         data = json.loads(path.read_text(encoding="utf-8"))
         with self._lock:
             self._cache[rid] = data
-        return data
+        return dict(data)
 
     def list_ids(self) -> list[str]:
         """Return sorted receipt IDs on disk."""
-        return sorted(p.stem for p in self.receipts_dir.glob("req-*.json") if p.stem[4:].isdigit())
+        with self._lock:
+            return sorted(p.stem for p in self.receipts_dir.glob("req-*.json") if p.stem[4:].isdigit())
 
     def count(self) -> int:
         return len(self.list_ids())

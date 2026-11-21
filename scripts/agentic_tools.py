@@ -10,6 +10,7 @@ from pathlib import Path
 import re
 import sys
 import tempfile
+import threading
 from typing import Any
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
@@ -20,7 +21,13 @@ from agentic_http import (
     ScopeViolationError,
     is_static_asset_url,
 )
-from agentic_oracle import check_bola_false_positive
+from agentic_oracle import (
+    check_bola_false_positive,
+    find_persistent_render_get_receipt,
+    is_html_receipt,
+    is_persistent_read_path_related,
+    receipt_body_contains_verbatim,
+)
 from agentic_receipts import DEFAULT_PREVIEW_CHARS, ReceiptStore
 from agentic_surface import SurfaceFrontierTracker
 
@@ -431,6 +438,8 @@ _CLASS_ALIASES = {
 _READ_SQLI_HINTS = ("order by", "order_by", "sort", "read", "differential", "boolean", "error-based", "error based", "case when")
 _ADMIN_ROLE_TOKENS = ("admin", "superadmin", "administrator", "root", "superuser", "sysadmin", "staff")
 _READONLY_ROLES = frozenset({"viewer", "readonly", "read_only", "guest", "auditor", "observer"})
+_PERSISTENT_VULN_CLASSES = frozenset({"stored_xss", "mass_assignment", "ssti"})
+_MUTATING_WRITE_METHODS = frozenset({"POST", "PUT", "PATCH"})
 
 
 def _deep_merge_json(base: dict[str, Any], patch: dict[str, Any]) -> dict[str, Any]:
@@ -1144,7 +1153,7 @@ def select_primary_proof(
     ctrl_haystacks = _build_control_haystacks(control_receipts)
     ev_low_spec = score_evidence_value(ev_clean) < _HIGH_SPEC_THRESHOLD
 
-    def _rank_key(r: dict[str, Any]) -> tuple[int, int, int, tuple[int, int, str]]:
+    def _rank_key(r: dict[str, Any]) -> tuple[int, int, int, int, tuple[int, int, str]]:
         actor = str(r.get("actor") or "")
         meta = actor_meta_map.get(actor) or {}
         role = str(meta.get("role") or ("anonymous" if actor == "anon" else "member")).lower()
@@ -1163,6 +1172,11 @@ def select_primary_proof(
         else:
             elig_tier = 0
 
+        if canonical_class == "stored_xss":
+            render_tier = 0 if (str(r.get("method") or "").upper() == "GET" and is_html_receipt(r)) else 1
+        else:
+            render_tier = 0
+
         ev_match_rank = 0 if (not ev_clean or _receipt_contains_value(r, ev_clean)) else 1
         if ev_low_spec:
             sec_score, _ = _best_secret_for_receipt(r, ctrl_haystacks)
@@ -1172,6 +1186,7 @@ def select_primary_proof(
 
         return (
             elig_tier,
+            render_tier,
             ev_match_rank,
             spec_rank,
             _actor_priority_key(
@@ -2290,6 +2305,8 @@ class ToolDispatcher:
         bsag: Any | None = None,
         oracle: Any | None = None,
         telemetry: Any | None = None,
+        findings_path: str | Path | None = None,
+        persist_findings: bool = True,
     ):
         self.http = http_client
         self.receipts = receipt_store
@@ -2303,13 +2320,24 @@ class ToolDispatcher:
         self._step_delta_v: int = 0
         self._step_delta_e: int = 0
         self._step_claim_submitted: bool = False
+        self._findings_lock = threading.RLock()
+        self._notebook_lock = threading.RLock()
+        self.persist_findings: bool = bool(persist_findings)
         self.notebook_path = self.root_dir / "notebook.json"
-        self.findings_path = self.root_dir / "findings.json"
+        self.findings_path = (
+            Path(findings_path).expanduser().resolve()
+            if findings_path is not None
+            else (self.root_dir / "findings.json")
+        )
         self.notebook_state: dict[str, Any] = self._load_json(
             self.notebook_path,
             default={"surface_notes": "", "hypotheses": [], "notes": []},
         )
-        self.findings: list[dict[str, Any]] = self._load_json(self.findings_path, default=[])
+        self.findings: list[dict[str, Any]] = (
+            self._load_json(self.findings_path, default=[])
+            if self.persist_findings
+            else []
+        )
         self.surface_tracker = SurfaceFrontierTracker(
             base_url=self.http.base_url,
             allowed_methods=sorted(self.http.allowed_methods),
@@ -2389,10 +2417,14 @@ class ToolDispatcher:
         return json.loads(json.dumps(default))
 
     def _save_notebook(self) -> None:
-        _atomic_write_json(self.notebook_path, self.notebook_state)
+        with self._notebook_lock:
+            _atomic_write_json(self.notebook_path, self.notebook_state)
 
     def _save_findings(self) -> None:
-        _atomic_write_json(self.findings_path, self.findings)
+        if not self.persist_findings:
+            return
+        with self._findings_lock:
+            _atomic_write_json(self.findings_path, self.findings)
 
     def dispatch(self, name: str, args: dict[str, Any]) -> str:
         handlers = {
@@ -2596,30 +2628,31 @@ class ToolDispatcher:
 
     def _tool_notebook(self, args: dict[str, Any]) -> str:
         action = str(args.get("action") or "read").strip().lower()
-        if action == "update" and args.get("surface_notes") is not None:
-            self.notebook_state["surface_notes"] = str(args["surface_notes"])[:6000]
-        elif action in {"add_hypothesis", "update_hypothesis"}:
-            hyp = args.get("hypothesis")
-            if not isinstance(hyp, dict) or not hyp.get("id"):
-                return json.dumps({"error": "hypothesis object with 'id' is required"})
-            hid = str(hyp["id"])
-            existing = [h for h in self.notebook_state["hypotheses"] if h.get("id") != hid]
-            existing.append({
-                "id": hid,
-                "target": str(hyp.get("target") or ""),
-                "vuln_class": str(hyp.get("vuln_class") or ""),
-                "status": str(hyp.get("status") or "open"),
-                "notes": str(hyp.get("notes") or "")[:500],
-            })
-            self.notebook_state["hypotheses"] = existing[-50:]
-        elif action == "add_note":
-            note = str(args.get("note") or "").strip()
-            if note:
-                self.notebook_state["notes"] = [*self.notebook_state.get("notes", []), note[:400]][-40:]
-        elif action != "read":
-            return json.dumps({"error": f"unsupported notebook action: {action}"})
-        self._save_notebook()
-        return json.dumps(self.notebook_state, ensure_ascii=False)
+        with self._notebook_lock:
+            if action == "update" and args.get("surface_notes") is not None:
+                self.notebook_state["surface_notes"] = str(args["surface_notes"])[:6000]
+            elif action in {"add_hypothesis", "update_hypothesis"}:
+                hyp = args.get("hypothesis")
+                if not isinstance(hyp, dict) or not hyp.get("id"):
+                    return json.dumps({"error": "hypothesis object with 'id' is required"})
+                hid = str(hyp["id"])
+                existing = [h for h in self.notebook_state["hypotheses"] if h.get("id") != hid]
+                existing.append({
+                    "id": hid,
+                    "target": str(hyp.get("target") or ""),
+                    "vuln_class": str(hyp.get("vuln_class") or ""),
+                    "status": str(hyp.get("status") or "open"),
+                    "notes": str(hyp.get("notes") or "")[:500],
+                })
+                self.notebook_state["hypotheses"] = existing[-50:]
+            elif action == "add_note":
+                note = str(args.get("note") or "").strip()
+                if note:
+                    self.notebook_state["notes"] = [*self.notebook_state.get("notes", []), note[:400]][-40:]
+            elif action != "read":
+                return json.dumps({"error": f"unsupported notebook action: {action}"})
+            self._save_notebook()
+            return json.dumps(self.notebook_state, ensure_ascii=False)
 
     def _receipt_contains_evidence(self, receipt: dict[str, Any], evidence: str) -> tuple[bool, str]:
         needle = evidence.strip()
@@ -2635,6 +2668,217 @@ class ToolDispatcher:
         if lower_needle in headers_text.lower():
             return True, headers_text[:MAX_PROOF_EXCERPT_CHARS]
         return False, ""
+
+    def _find_followup_persistent_get(
+        self,
+        *,
+        primary: dict[str, Any],
+        canonical_class: str,
+        evidence_value: str,
+        exclude_ids: set[str],
+    ) -> dict[str, Any] | None:
+        """Locate a newer 2xx GET render/persistence receipt in ReceiptStore for a write proof."""
+        p_rid = str(primary.get("receipt_id") or "")
+        p_seq = int(p_rid[4:]) if p_rid.startswith("req-") and p_rid[4:].isdigit() else 0
+        p_ts = str(primary.get("timestamp") or "")
+        ev = str(evidence_value or "").strip()
+        candidates: list[dict[str, Any]] = []
+        for rid in self.receipts.list_ids():
+            if rid in exclude_ids:
+                continue
+            try:
+                cand = self.receipts.get(rid)
+            except (KeyError, ValueError):
+                continue
+            c_seq = int(rid[4:]) if rid.startswith("req-") and rid[4:].isdigit() else 0
+            if p_seq > 0 and c_seq > 0:
+                if c_seq <= p_seq:
+                    continue
+            elif p_ts and str(cand.get("timestamp") or "") < p_ts:
+                continue
+            if str(cand.get("method") or "").upper() != "GET":
+                continue
+            if not (200 <= int(cand.get("status") or 0) < 300):
+                continue
+            c_url = str(cand.get("url") or cand.get("path") or "")
+            if not is_persistent_read_path_related(primary, c_url):
+                continue
+            if canonical_class == "stored_xss":
+                if not is_html_receipt(cand):
+                    continue
+                if ev and not receipt_body_contains_verbatim(cand, ev):
+                    continue
+            elif ev and not self._receipt_contains_evidence(cand, ev)[0]:
+                continue
+            candidates.append(cand)
+        if not candidates:
+            return None
+        return find_persistent_render_get_receipt(
+            primary,
+            candidates,
+            ev,
+            canonical_class=canonical_class,
+        )
+
+    def _try_merge_existing_finding_locked(
+        self,
+        *,
+        canonical_class: str,
+        route_template: str,
+        raw_url: str,
+        method: str,
+        effective_actor: str,
+        effective_norm_path: str,
+        evidence_value: str,
+        proof_ids: list[str],
+        control_ids: list[str],
+        actor_meta: dict[str, dict[str, str]],
+    ) -> dict[str, Any] | None:
+        """Merge into an existing finding sharing `(route_template, class_type)` under `_findings_lock`."""
+        for existing in self.findings:
+            existing_class = normalize_vuln_class(
+                str(existing.get("class_type") or ""),
+                method=str(existing.get("method") or ""),
+                title=str(existing.get("title") or ""),
+                summary=str(existing.get("summary") or ""),
+            )
+            existing_tmpl = str(
+                existing.get("route_template")
+                or normalize_route_template(str(existing.get("url") or existing.get("path") or ""))
+            )
+            same_or_overlap = existing_tmpl == route_template and (
+                existing_class == canonical_class
+                or ({existing_class, canonical_class} == {"auth_bypass", "bfla"})
+            )
+            if not same_or_overlap:
+                continue
+
+            merged_proof_ids = list(dict.fromkeys([*(existing.get("proof_receipt_ids") or []), *proof_ids]))
+            merged_ctrl_ids = list(dict.fromkeys([*(existing.get("control_receipt_ids") or []), *control_ids]))
+            all_proof_recs: list[dict[str, Any]] = []
+            for rid in merged_proof_ids:
+                try:
+                    rec = self.receipts.get(rid)
+                    if 200 <= int(rec.get("status", 0)) < 400:
+                        all_proof_recs.append(rec)
+                except (KeyError, ValueError):
+                    continue
+            all_ctrl_recs: list[dict[str, Any]] = []
+            for rid in merged_ctrl_ids:
+                try:
+                    all_ctrl_recs.append(self.receipts.get(rid))
+                except (KeyError, ValueError):
+                    continue
+
+            resolved_class = canonical_class
+            if {existing_class, canonical_class} == {"auth_bypass", "bfla"}:
+                resolved_class = _resolve_route_auth_bypass_vs_bfla(
+                    route_template,
+                    all_proof_recs,
+                    all_ctrl_recs,
+                    actor_meta_map=actor_meta,
+                    receipt_store=self.receipts,
+                    exact_path=effective_norm_path,
+                    method=method,
+                )
+            existing["class_type"] = resolved_class
+            existing["route_template"] = route_template
+            existing["proof_receipt_ids"] = merged_proof_ids
+            existing["control_receipt_ids"] = merged_ctrl_ids
+            existing_ev = str(existing.get("evidence_value") or existing.get("marker") or "").strip()
+            ex_score = score_evidence_value(existing_ev)
+            in_score = score_evidence_value(evidence_value)
+            ctrl_haystacks = _build_control_haystacks(all_ctrl_recs)
+            if existing_ev and _value_in_controls(existing_ev, ctrl_haystacks) and ex_score < _HIGH_SPEC_THRESHOLD:
+                ex_score = min(ex_score, 10)
+            if evidence_value and _value_in_controls(evidence_value, ctrl_haystacks) and in_score < _HIGH_SPEC_THRESHOLD:
+                in_score = min(in_score, 10)
+            if not existing_ev or (in_score >= _HIGH_SPEC_THRESHOLD and in_score > ex_score) or (in_score >= ex_score + 15):
+                ev_str = evidence_value
+            else:
+                ev_str = existing_ev
+            if all_proof_recs and resolved_class not in {"open_redirect", "reflected_xss", "stored_xss"}:
+                eligible_all = _filter_class_eligible_proofs(
+                    resolved_class,
+                    all_proof_recs,
+                    all_ctrl_recs,
+                    actor_meta_map=actor_meta,
+                    receipt_store=self.receipts,
+                    route_template=route_template,
+                    evidence_value=ev_str,
+                )
+                promoted_ev, _ = _select_stronger_evidence_from_receipts(
+                    resolved_class,
+                    ev_str,
+                    eligible_all,
+                    all_ctrl_recs,
+                )
+                if promoted_ev:
+                    ev_str = promoted_ev
+            existing["evidence_value"] = ev_str
+            existing["marker"] = ev_str
+
+            if all_proof_recs:
+                best, ordered_actors = select_primary_proof(
+                    resolved_class,
+                    all_proof_recs,
+                    all_ctrl_recs,
+                    actor_meta_map=actor_meta,
+                    receipt_store=self.receipts,
+                    route_template=route_template,
+                    evidence_value=ev_str,
+                )
+                best_actor = str(best.get("actor") or effective_actor or "anon").strip() or "anon"
+                existing["actor"] = best_actor
+                existing["actor_alias"] = best_actor
+                resolved_best_url, clean_best_path, _ = self.http.resolve_in_scope(best["url"] or raw_url)
+                existing["observed_status"] = best["status"]
+                existing["url"] = resolved_best_url
+                existing["path"] = clean_best_path
+                existing["method"] = best["method"]
+                prior_actors = [str(a) for a in (existing.get("supporting_actors") or []) if str(a)]
+                existing["supporting_actors"] = list(dict.fromkeys([*ordered_actors, *prior_actors]))
+                existing["evidence_excerpts"] = [
+                    {
+                        "receipt_id": r["receipt_id"],
+                        "actor": r["actor"],
+                        "method": r["method"],
+                        "url": r["url"],
+                        "status": r["status"],
+                        "excerpt": build_receipt_excerpt(r, ev_str, max_chars=MAX_PROOF_EXCERPT_CHARS),
+                    }
+                    for r in all_proof_recs
+                ]
+                existing["control_excerpts"] = [
+                    {
+                        "receipt_id": c["receipt_id"],
+                        "actor": c["actor"],
+                        "method": c["method"],
+                        "url": c["url"],
+                        "status": c["status"],
+                        "excerpt": build_receipt_excerpt(c, "", max_chars=MAX_CONTROL_EXCERPT_CHARS),
+                    }
+                    for c in all_ctrl_recs
+                ]
+                existing["evidence"] = compose_finding_evidence(
+                    best,
+                    all_proof_recs,
+                    all_ctrl_recs,
+                    ev_str,
+                    max_proof_chars=MAX_PROOF_EXCERPT_CHARS,
+                    max_control_chars=MAX_CONTROL_EXCERPT_CHARS,
+                )
+            self._save_findings()
+            return {
+                "accepted": True,
+                "duplicate": True,
+                "merged": True,
+                "finding_id": existing["finding_id"],
+                "class_type": existing["class_type"],
+                "primary_actor": existing.get("actor"),
+                "supporting_actors": existing.get("supporting_actors", []),
+            }
+        return None
 
     def _tool_record_finding(self, args: dict[str, Any]) -> str:
         title = str(args.get("title") or "").strip()
@@ -2679,7 +2923,8 @@ class ToolDispatcher:
                     f"proof receipts had: {[(r['receipt_id'], r['actor'], r['path']) for r in proof_receipts]}"
                 ),
             })
-        primary = matching_proofs[0]
+        write_primary = matching_proofs[0]
+        primary = write_primary
         if primary["method"] != method and not (canonical_class == "mass_assignment" and primary["method"] == "GET"):
             return json.dumps({
                 "rejected": True,
@@ -2691,13 +2936,46 @@ class ToolDispatcher:
                 "reason": f"primary proof receipt {primary['receipt_id']} has non-success status {primary['status']}",
             })
 
+        # For persistent Write -> Read classes, auto-attach a newer 2xx GET render/persistence
+        # receipt from ReceiptStore when the caller passed only the mutating write receipt.
+        if (
+            canonical_class in _PERSISTENT_VULN_CLASSES
+            and str(write_primary.get("method") or "").upper() in _MUTATING_WRITE_METHODS
+        ):
+            existing_render = find_persistent_render_get_receipt(
+                write_primary,
+                proof_receipts,
+                evidence_value,
+                canonical_class=canonical_class,
+            )
+            if existing_render is None:
+                followup_get = self._find_followup_persistent_get(
+                    primary=write_primary,
+                    canonical_class=canonical_class,
+                    evidence_value=evidence_value,
+                    exclude_ids=set(proof_ids) | set(control_ids),
+                )
+                if followup_get is not None:
+                    proof_receipts.append(followup_get)
+                    proof_ids.append(str(followup_get["receipt_id"]))
+
         def _is_compatible_proof_receipt(r: dict[str, Any]) -> bool:
-            if normalize_route_template(r["url"]) != route_template:
+            r_method = str(r.get("method") or "").upper()
+            r_status = int(r.get("status") or 0)
+            if not (200 <= r_status < 400):
                 return False
-            if not (200 <= int(r.get("status") or 0) < 400):
-                return False
-            if r["method"] != method and not (canonical_class == "mass_assignment" and r["method"] == "GET"):
-                return False
+            is_persistent_get = (
+                canonical_class in _PERSISTENT_VULN_CLASSES
+                and str(write_primary.get("method") or "").upper() in _MUTATING_WRITE_METHODS
+                and r_method == "GET"
+                and 200 <= r_status < 300
+                and is_persistent_read_path_related(write_primary, str(r.get("url") or r.get("path") or ""))
+            )
+            if not is_persistent_get:
+                if normalize_route_template(r["url"]) != route_template:
+                    return False
+                if r_method != method and not (canonical_class == "mass_assignment" and r_method == "GET"):
+                    return False
             if canonical_class == "auth_bypass" and not _is_genuine_anon_2xx(r, actor_meta):
                 return False
             return True
@@ -2733,22 +3011,56 @@ class ToolDispatcher:
                 return json.dumps({"rejected": True, "reason": "evidence_value must be a real observed value, not a status/placeholder"})
 
         if not found_in_proof:
-            # Verify evidence_value appears verbatim in matching_proofs first, then any compatible proof receipt.
-            for r in matching_proofs:
-                ok, ex = self._receipt_contains_evidence(r, evidence_value)
-                if ok:
-                    found_in_proof = True
-                    excerpt = ex
-                    primary = r
-                    break
-            if not found_in_proof:
-                for r in compatible_proofs:
+            if canonical_class == "stored_xss":
+                get_candidates: list[dict[str, Any]] = []
+                seen_get_rids: set[str] = set()
+                for r in [primary, *compatible_proofs]:
+                    rid = str(r.get("receipt_id") or "")
+                    if rid in seen_get_rids:
+                        continue
+                    seen_get_rids.add(rid)
+                    if str(r.get("method") or "").upper() == "GET" and 200 <= int(r.get("status") or 0) < 300:
+                        get_candidates.append(r)
+                html_get_candidates = [r for r in get_candidates if is_html_receipt(r)]
+                if not html_get_candidates:
+                    return json.dumps({
+                        "rejected": True,
+                        "reason": (
+                            "stored_xss requires a 2xx text/html GET render receipt "
+                            "containing evidence_value unescaped verbatim"
+                        ),
+                    })
+                for r in html_get_candidates:
+                    if receipt_body_contains_verbatim(r, evidence_value):
+                        found_in_proof = True
+                        primary = r
+                        excerpt = build_receipt_excerpt(r, evidence_value, max_chars=MAX_PROOF_EXCERPT_CHARS)
+                        break
+                if not found_in_proof:
+                    return json.dumps({
+                        "rejected": True,
+                        "reason": (
+                            f"evidence_value {evidence_value!r} was not found unescaped verbatim "
+                            "in HTML GET render receipt(s)"
+                        ),
+                    })
+            else:
+                # Verify evidence_value appears verbatim in matching_proofs first, then any compatible proof receipt.
+                for r in matching_proofs:
                     ok, ex = self._receipt_contains_evidence(r, evidence_value)
                     if ok:
                         found_in_proof = True
                         excerpt = ex
                         primary = r
                         break
+                if not found_in_proof:
+                    for r in compatible_proofs:
+                        ok, ex = self._receipt_contains_evidence(r, evidence_value)
+                        if ok:
+                            found_in_proof = True
+                            excerpt = ex
+                            primary = r
+                            break
         if not found_in_proof:
             return json.dumps({
                 "rejected": True,
@@ -2797,22 +3109,28 @@ class ToolDispatcher:
             ctype = (primary.get("content_type") or "").lower()
             if "json" in ctype:
                 return json.dumps({"rejected": True, "reason": "JSON content-type reflection is not executable HTML XSS"})
+            if canonical_class == "stored_xss" and not is_html_receipt(primary):
+                return json.dumps({"rejected": True, "reason": "stored_xss requires HTML (text/html) content-type on render GET receipt"})
             if not any(c.get("response_sha256") != primary.get("response_sha256") for c in control_receipts):
                 return json.dumps({"rejected": True, "reason": "control receipt is identical to proof receipt"})
-            if canonical_class == "reflected_xss":
-                p_body = str(primary.get("body") or "")
-                needle_low = evidence_value.lower()
-                p_count = p_body.lower().count(needle_low)
-                c_counts = [str(c.get("body") or "").lower().count(needle_low) for c in control_receipts]
-                if c_counts and p_count <= min(c_counts):
-                    return json.dumps({
-                        "rejected": True,
-                        "reason": (
-                            f"evidence_value {evidence_value!r} appears {p_count} time(s) in proof and "
-                            f"{min(c_counts)} time(s) in control receipt (static template markup); "
-                            "specify the exact reflected payload string that only appears in the proof response"
-                        ),
-                    })
+            p_body = str(primary.get("body") or "")
+            needle_low = evidence_value.lower()
+            p_count = p_body.lower().count(needle_low)
+            ctrl_pool = (
+                [c for c in control_receipts if str(c.get("method") or "").upper() == "GET"] or control_receipts
+                if canonical_class == "stored_xss"
+                else control_receipts
+            )
+            c_counts = [str(c.get("body") or "").lower().count(needle_low) for c in ctrl_pool]
+            if c_counts and p_count <= min(c_counts):
+                return json.dumps({
+                    "rejected": True,
+                    "reason": (
+                        f"evidence_value {evidence_value!r} appears {p_count} time(s) in proof and "
+                        f"{min(c_counts)} time(s) in control receipt (static template markup); "
+                        "specify the exact reflected payload string that only appears in the proof response"
+                    ),
+                })
 
         elif canonical_class in {"sqli", "sqli_read"}:
             if not any(
@@ -2876,6 +3194,15 @@ class ToolDispatcher:
             ok, ex = self._receipt_contains_evidence(r, evidence_value)
             if not ok and original_evidence_value and original_evidence_value != evidence_value:
                 ok, ex = self._receipt_contains_evidence(r, original_evidence_value)
+            if (
+                not ok
+                and canonical_class in _PERSISTENT_VULN_CLASSES
+                and str(r.get("method") or "").upper() in _MUTATING_WRITE_METHODS
+                and _norm_path(r["url"]) == target_norm_path
+                and 200 <= int(r.get("status") or 0) < 400
+            ):
+                ok = True
+                ex = build_receipt_excerpt(r, evidence_value, max_chars=MAX_PROOF_EXCERPT_CHARS)
             if not ok and len(proof_receipts) > 1 and canonical_class not in {"open_redirect", "reflected_xss", "stored_xss"}:
                 ok = True
                 ex = build_receipt_excerpt(r, evidence_value, max_chars=MAX_PROOF_EXCERPT_CHARS)
@@ -2975,143 +3302,21 @@ class ToolDispatcher:
         excerpt_by_rid = {r["receipt_id"]: ex for r, ex in valid_proof_records}
 
         # Deduplicate & merge by route_template for auth_bypass/bfla overlap or identical canonical_class.
-        for existing in self.findings:
-            existing_class = normalize_vuln_class(
-                str(existing.get("class_type") or ""),
-                method=str(existing.get("method") or ""),
-                title=str(existing.get("title") or ""),
-                summary=str(existing.get("summary") or ""),
+        with self._findings_lock:
+            merged_resp = self._try_merge_existing_finding_locked(
+                canonical_class=canonical_class,
+                route_template=route_template,
+                raw_url=raw_url,
+                method=method,
+                effective_actor=effective_actor,
+                effective_norm_path=effective_norm_path,
+                evidence_value=evidence_value,
+                proof_ids=proof_ids,
+                control_ids=control_ids,
+                actor_meta=actor_meta,
             )
-            existing_tmpl = str(existing.get("route_template") or normalize_route_template(str(existing.get("url") or existing.get("path") or "")))
-            same_or_overlap = existing_tmpl == route_template and (
-                existing_class == canonical_class
-                or ({existing_class, canonical_class} == {"auth_bypass", "bfla"})
-            )
-            if same_or_overlap:
-                merged_proof_ids = list(dict.fromkeys([*(existing.get("proof_receipt_ids") or []), *proof_ids]))
-                merged_ctrl_ids = list(dict.fromkeys([*(existing.get("control_receipt_ids") or []), *control_ids]))
-                all_proof_recs: list[dict[str, Any]] = []
-                for rid in merged_proof_ids:
-                    try:
-                        rec = self.receipts.get(rid)
-                        if 200 <= int(rec.get("status", 0)) < 400:
-                            all_proof_recs.append(rec)
-                    except (KeyError, ValueError):
-                        continue
-                all_ctrl_recs: list[dict[str, Any]] = []
-                for rid in merged_ctrl_ids:
-                    try:
-                        all_ctrl_recs.append(self.receipts.get(rid))
-                    except (KeyError, ValueError):
-                        continue
-
-                if {existing_class, canonical_class} == {"auth_bypass", "bfla"}:
-                    canonical_class = _resolve_route_auth_bypass_vs_bfla(
-                        route_template,
-                        all_proof_recs,
-                        all_ctrl_recs,
-                        actor_meta_map=actor_meta,
-                        receipt_store=self.receipts,
-                        exact_path=effective_norm_path,
-                        method=method,
-                    )
-                existing["class_type"] = canonical_class
-                existing["route_template"] = route_template
-                existing["proof_receipt_ids"] = merged_proof_ids
-                existing["control_receipt_ids"] = merged_ctrl_ids
-                existing_ev = str(existing.get("evidence_value") or existing.get("marker") or "").strip()
-                ex_score = score_evidence_value(existing_ev)
-                in_score = score_evidence_value(evidence_value)
-                ctrl_haystacks = _build_control_haystacks(all_ctrl_recs)
-                if existing_ev and _value_in_controls(existing_ev, ctrl_haystacks) and ex_score < _HIGH_SPEC_THRESHOLD:
-                    ex_score = min(ex_score, 10)
-                if evidence_value and _value_in_controls(evidence_value, ctrl_haystacks) and in_score < _HIGH_SPEC_THRESHOLD:
-                    in_score = min(in_score, 10)
-                if not existing_ev or (in_score >= _HIGH_SPEC_THRESHOLD and in_score > ex_score) or (in_score >= ex_score + 15):
-                    ev_str = evidence_value
-                else:
-                    ev_str = existing_ev
-                if all_proof_recs and canonical_class not in {"open_redirect", "reflected_xss", "stored_xss"}:
-                    eligible_all = _filter_class_eligible_proofs(
-                        canonical_class,
-                        all_proof_recs,
-                        all_ctrl_recs,
-                        actor_meta_map=actor_meta,
-                        receipt_store=self.receipts,
-                        route_template=route_template,
-                        evidence_value=ev_str,
-                    )
-                    promoted_ev, _ = _select_stronger_evidence_from_receipts(
-                        canonical_class,
-                        ev_str,
-                        eligible_all,
-                        all_ctrl_recs,
-                    )
-                    if promoted_ev:
-                        ev_str = promoted_ev
-                existing["evidence_value"] = ev_str
-                existing["marker"] = ev_str
-
-                if all_proof_recs:
-                    best, ordered_actors = select_primary_proof(
-                        canonical_class,
-                        all_proof_recs,
-                        all_ctrl_recs,
-                        actor_meta_map=actor_meta,
-                        receipt_store=self.receipts,
-                        route_template=route_template,
-                        evidence_value=ev_str,
-                    )
-                    best_actor = str(best.get("actor") or effective_actor or "anon").strip() or "anon"
-                    existing["actor"] = best_actor
-                    existing["actor_alias"] = best_actor
-                    resolved_best_url, clean_best_path, _ = self.http.resolve_in_scope(best["url"] or raw_url)
-                    existing["observed_status"] = best["status"]
-                    existing["url"] = resolved_best_url
-                    existing["path"] = clean_best_path
-                    existing["method"] = best["method"]
-                    prior_actors = [str(a) for a in (existing.get("supporting_actors") or []) if str(a)]
-                    existing["supporting_actors"] = list(dict.fromkeys([*ordered_actors, *prior_actors]))
-                    existing["evidence_excerpts"] = [
-                        {
-                            "receipt_id": r["receipt_id"],
-                            "actor": r["actor"],
-                            "method": r["method"],
-                            "url": r["url"],
-                            "status": r["status"],
-                            "excerpt": build_receipt_excerpt(r, ev_str, max_chars=MAX_PROOF_EXCERPT_CHARS),
-                        }
-                        for r in all_proof_recs
-                    ]
-                    existing["control_excerpts"] = [
-                        {
-                            "receipt_id": c["receipt_id"],
-                            "actor": c["actor"],
-                            "method": c["method"],
-                            "url": c["url"],
-                            "status": c["status"],
-                            "excerpt": build_receipt_excerpt(c, "", max_chars=MAX_CONTROL_EXCERPT_CHARS),
-                        }
-                        for c in all_ctrl_recs
-                    ]
-                    existing["evidence"] = compose_finding_evidence(
-                        best,
-                        all_proof_recs,
-                        all_ctrl_recs,
-                        ev_str,
-                        max_proof_chars=MAX_PROOF_EXCERPT_CHARS,
-                        max_control_chars=MAX_CONTROL_EXCERPT_CHARS,
-                    )
-                self._save_findings()
-                return json.dumps({
-                    "accepted": True,
-                    "duplicate": True,
-                    "merged": True,
-                    "finding_id": existing["finding_id"],
-                    "class_type": existing["class_type"],
-                    "primary_actor": existing.get("actor"),
-                    "supporting_actors": existing.get("supporting_actors", []),
-                })
+            if merged_resp is not None:
+                return json.dumps(merged_resp)
 
         best_primary, ordered_actors = select_primary_proof(
             canonical_class,
@@ -3212,60 +3417,77 @@ class ToolDispatcher:
             max_control_chars=MAX_CONTROL_EXCERPT_CHARS,
         )
         resolved_url, clean_path, _ = self.http.resolve_in_scope(best_primary["url"] or raw_url)
-        finding_id = f"F-{len(self.findings) + 1:03d}"
-        finding = {
-            "finding_id": finding_id,
-            "title": title,
-            "class_type": canonical_class,
-            "route_template": route_template,
-            "method": best_primary["method"],
-            "url": resolved_url,
-            "path": clean_path,
-            "actor": best_actor,
-            "actor_alias": best_actor,
-            "observed_status": best_primary["status"],
-            "status": "verified",
-            "oracle_verdict": oracle_verdict_str,
-            "clean_replay_receipt_id": clean_replay_rid,
-            "severity": severity if severity in {"critical", "high", "medium", "low"} else "high",
-            "evidence_value": evidence_value,
-            "marker": evidence_value,
-            "evidence": best_evidence or excerpt_by_rid.get(best_primary["receipt_id"], excerpt),
-            "summary": summary,
-            "proof_receipt_ids": proof_ids,
-            "control_receipt_ids": control_ids,
-            "supporting_actors": ordered_actors,
-            "evidence_excerpts": [
-                {
-                    "receipt_id": r["receipt_id"],
-                    "actor": r["actor"],
-                    "method": r["method"],
-                    "url": r["url"],
-                    "status": r["status"],
-                    "excerpt": ex[:MAX_PROOF_EXCERPT_CHARS],
-                }
-                for r, ex in valid_proof_records
-            ],
-            "control_excerpts": [
-                {
-                    "receipt_id": c["receipt_id"],
-                    "actor": c["actor"],
-                    "method": c["method"],
-                    "url": c["url"],
-                    "status": c["status"],
-                    "excerpt": build_receipt_excerpt(c, "", max_chars=MAX_CONTROL_EXCERPT_CHARS),
-                }
-                for c in control_receipts
-            ],
-        }
-        self.findings.append(finding)
-        self._save_findings()
+        with self._findings_lock:
+            merged_resp = self._try_merge_existing_finding_locked(
+                canonical_class=canonical_class,
+                route_template=route_template,
+                raw_url=raw_url,
+                method=method,
+                effective_actor=effective_actor,
+                effective_norm_path=effective_norm_path,
+                evidence_value=evidence_value,
+                proof_ids=proof_ids,
+                control_ids=control_ids,
+                actor_meta=actor_meta,
+            )
+            if merged_resp is not None:
+                return json.dumps(merged_resp)
+
+            finding_id = f"F-{len(self.findings) + 1:03d}"
+            finding = {
+                "finding_id": finding_id,
+                "title": title,
+                "class_type": canonical_class,
+                "route_template": route_template,
+                "method": best_primary["method"],
+                "url": resolved_url,
+                "path": clean_path,
+                "actor": best_actor,
+                "actor_alias": best_actor,
+                "observed_status": best_primary["status"],
+                "status": "verified",
+                "oracle_verdict": oracle_verdict_str,
+                "clean_replay_receipt_id": clean_replay_rid,
+                "severity": severity if severity in {"critical", "high", "medium", "low"} else "high",
+                "evidence_value": evidence_value,
+                "marker": evidence_value,
+                "evidence": best_evidence or excerpt_by_rid.get(best_primary["receipt_id"], excerpt),
+                "summary": summary,
+                "proof_receipt_ids": proof_ids,
+                "control_receipt_ids": control_ids,
+                "supporting_actors": ordered_actors,
+                "evidence_excerpts": [
+                    {
+                        "receipt_id": r["receipt_id"],
+                        "actor": r["actor"],
+                        "method": r["method"],
+                        "url": r["url"],
+                        "status": r["status"],
+                        "excerpt": ex[:MAX_PROOF_EXCERPT_CHARS],
+                    }
+                    for r, ex in valid_proof_records
+                ],
+                "control_excerpts": [
+                    {
+                        "receipt_id": c["receipt_id"],
+                        "actor": c["actor"],
+                        "method": c["method"],
+                        "url": c["url"],
+                        "status": c["status"],
+                        "excerpt": build_receipt_excerpt(c, "", max_chars=MAX_CONTROL_EXCERPT_CHARS),
+                    }
+                    for c in control_receipts
+                ],
+            }
+            self.findings.append(finding)
+            self._save_findings()
+            total_findings = len(self.findings)
         return json.dumps({
             "accepted": True,
             "finding_id": finding_id,
             "class_type": canonical_class,
             "primary_actor": best_actor,
-            "total_findings": len(self.findings),
+            "total_findings": total_findings,
         })
 
     def _tool_finish(self, args: dict[str, Any]) -> str:
@@ -3300,8 +3522,10 @@ class ToolDispatcher:
         self.finish_summary = str(args.get("summary") or "").strip()
         raw_untested = args.get("untested_areas")
         self.untested_areas = [str(x) for x in raw_untested] if isinstance(raw_untested, list) else []
+        with self._findings_lock:
+            total_findings = len(self.findings)
         return json.dumps({
             "finished": True,
-            "total_findings": len(self.findings),
+            "total_findings": total_findings,
             "untested_areas": self.untested_areas,
         })

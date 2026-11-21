@@ -1,12 +1,14 @@
 """Clean ReAct tool-calling investigator loop over MeteredProviderTransport."""
 from __future__ import annotations
 
+import concurrent.futures
 import copy
 import json
 import os
 from pathlib import Path
 import re
 import tempfile
+import threading
 import time
 from typing import Any, Callable
 from urllib.parse import urlsplit
@@ -28,8 +30,10 @@ from agentic_scheduler import (
     ArmSelection,
     LazyInterventionMonitor,
 )
+from agentic_sharding import SubsystemCluster, build_shard_prompts, cluster_discovered_surface
+from agentic_surface import SurfaceFrontierTracker
 from agentic_telemetry import TelemetryLogger, write_process_metrics
-from agentic_tools import TOOL_SCHEMAS, ToolDispatcher
+from agentic_tools import TOOL_SCHEMAS, ToolDispatcher, canonicalize_and_deduplicate_findings
 from full_agent_budget import BudgetError, SharedBudget, compact_tools
 from full_agent_provider import MeteredProviderTransport, SessionGate
 
@@ -818,6 +822,9 @@ class AgenticInvestigator:
         scout_model: str | None = None,
         scout_max_turns: int = 22,
         scout_token_share: float = 0.40,
+        max_shards: int = 3,
+        bootstrap_turns: int = 12,
+        shard_turns: int = 25,
     ):
         self.http = http_client
         self.receipts = receipt_store
@@ -827,9 +834,14 @@ class AgenticInvestigator:
         self.scout_model = str(scout_model or "").strip()
         self.scout_max_turns = max(1, int(scout_max_turns))
         self.scout_token_share = min(0.85, max(0.10, float(scout_token_share)))
+        self.max_shards = max(1, int(max_shards))
+        self.bootstrap_turns = max(1, int(bootstrap_turns))
+        self.shard_turns = max(1, int(shard_turns))
         self._active_model = self.model
         self._handoff_phase = "single"
         self._handoff_summary: dict[str, Any] | None = None
+        self._sharding_summary: dict[str, Any] | None = None
+        self._stats_lock = threading.Lock()
         self.root_dir = Path(root_dir).expanduser().resolve()
         self.checkpoint_path = self.root_dir / "checkpoint.json"
         self.discovery_hints = [str(h) for h in (discovery_hints or ["/"]) if str(h).strip()] or ["/"]
@@ -840,7 +852,7 @@ class AgenticInvestigator:
         self._min_call_interval_seconds = 0.0
         self._last_provider_call_at: float | None = None
         self.execution_mode = str(execution_mode or "monolithic").strip().lower()
-        if self.execution_mode not in {"ephemeral", "monolithic"}:
+        if self.execution_mode not in {"ephemeral", "monolithic", "sharded"}:
             raise ValueError(f"invalid execution_mode: {execution_mode!r}")
         self.use_bsag = bool(use_bsag)
         self.scheduler_mode = str(scheduler_mode or "ucb").strip().lower()
@@ -892,7 +904,8 @@ class AgenticInvestigator:
         self._epoch_turn_start: int = 0
         self._epoch_summary_text: str = ""
 
-    def _wrapup_reasons(self, turn: int) -> list[str]:
+    def _wrapup_reasons(self, turn: int, *, max_turns_override: int | None = None) -> list[str]:
+        eff_max_turns = max_turns_override if max_turns_override is not None else self.max_turns
         http_rem = self.http.budget.limit - self.http.budget.used
         tok_rem = self.budget.available("tokens")
         tok_lim = self.budget.limits["tokens"]
@@ -901,24 +914,47 @@ class AgenticInvestigator:
             tok_threshold = max(30_000, int(tok_lim * 0.15)) if tok_lim >= 60_000 else int(tok_lim * 0.15)
             if tok_rem <= tok_threshold:
                 wrapup_reasons.append(f"tokens={tok_rem}/{tok_lim}")
-        if self.max_turns > 5 and (self.max_turns - turn) <= 4:
-            wrapup_reasons.append(f"turns_left={max(0, self.max_turns - turn)}")
+        if eff_max_turns > 5 and (eff_max_turns - turn) <= 4:
+            wrapup_reasons.append(f"turns_left={max(0, eff_max_turns - turn)}")
         if self.http.budget.limit > 15 and http_rem <= 10:
             wrapup_reasons.append(f"http_left={http_rem}/{self.http.budget.limit}")
         return wrapup_reasons
 
-    def _sync_coverage_gate(self, turn: int) -> bool:
+    def _sync_coverage_gate(
+        self,
+        turn: int,
+        *,
+        dispatcher: ToolDispatcher | None = None,
+        max_turns_override: int | None = None,
+        allow_coverage_gate: bool = True,
+    ) -> bool:
         """Align `coverage_gate_enabled` with `[BUDGET-WRAPUP]` so `finish` is never rejected during wrapup."""
-        enabled = self.max_turns > 5 and not self._wrapup_reasons(turn)
-        self.dispatcher.coverage_gate_enabled = enabled
+        eff_disp = dispatcher if dispatcher is not None else self.dispatcher
+        eff_max_turns = max_turns_override if max_turns_override is not None else self.max_turns
+        enabled = (
+            allow_coverage_gate
+            and eff_max_turns > 5
+            and not self._wrapup_reasons(turn, max_turns_override=eff_max_turns)
+        )
+        eff_disp.coverage_gate_enabled = enabled
         return enabled
 
-    def _state_banner(self, turn: int) -> str:
+    def _state_banner(
+        self,
+        turn: int,
+        *,
+        dispatcher: ToolDispatcher | None = None,
+        max_turns_override: int | None = None,
+        shard_cluster: SubsystemCluster | None = None,
+        allow_coverage_gate: bool = True,
+    ) -> str:
+        eff_disp = dispatcher if dispatcher is not None else self.dispatcher
+        eff_max_turns = max_turns_override if max_turns_override is not None else self.max_turns
         http_rem = self.http.budget.limit - self.http.budget.used
         tok_rem = self.budget.available("tokens")
         tok_lim = self.budget.limits["tokens"]
         actor_list = [a["alias"] for a in self.http.actors.summaries()]
-        nb = self.dispatcher.notebook_state
+        nb = eff_disp.notebook_state
         nb_parts = []
         if nb.get("surface_notes"):
             nb_parts.append(f"surface={nb['surface_notes'][:300]}")
@@ -926,17 +962,17 @@ class AgenticInvestigator:
             hyps = [f"{h.get('id')}:{h.get('vuln_class')}:{h.get('status')}" for h in nb["hypotheses"][-8:]]
             nb_parts.append("hyps=" + ",".join(hyps))
         nb_line = f"\n[NOTEBOOK] {' | '.join(nb_parts)}" if nb_parts else ""
-        frontier_line = self.dispatcher.surface_tracker.format_frontier_banner(max_chars=950)
+        frontier_line = eff_disp.surface_tracker.format_frontier_banner(max_chars=950)
         write_nudge = ""
         write_allowed = self.http.allowed_methods & {"POST", "PUT", "PATCH"}
-        tracker = self.dispatcher.surface_tracker
+        tracker = eff_disp.surface_tracker
         declared_allowed = {op for op in tracker.declared_write_ops if op[0] in write_allowed}
         untested_declared = declared_allowed - tracker.tested_write_ops
         needs_write_phase = bool(untested_declared) if declared_allowed else (not tracker.tested_write_ops)
         if (
             write_allowed
             and needs_write_phase
-            and turn >= max(10, self.max_turns // 4)
+            and turn >= max(10, eff_max_turns // 4)
         ):
             pending_writes = tracker.untested_write_ops()
             if pending_writes:
@@ -950,9 +986,9 @@ class AgenticInvestigator:
                     f"are properly rejected, confirm state persistence with a follow-up GET, and call "
                     f"`record_finding` immediately if a restriction is not enforced."
                 )
-        wrapup_reasons = self._wrapup_reasons(turn)
-        if wrapup_reasons:
-            self.dispatcher.coverage_gate_enabled = False
+        wrapup_reasons = self._wrapup_reasons(turn, max_turns_override=eff_max_turns)
+        if wrapup_reasons or not allow_coverage_gate:
+            eff_disp.coverage_gate_enabled = False
         wrapup_line = (
             f"\n[BUDGET-WRAPUP] Low remaining budget ({', '.join(wrapup_reasons)}): "
             "stop broad new discovery, immediately call `record_finding` for every verified vulnerability "
@@ -961,11 +997,17 @@ class AgenticInvestigator:
             if wrapup_reasons
             else ""
         )
+        shard_line = (
+            f"\n[SHARD SCOPE] shard_id={shard_cluster.shard_id} | families={shard_cluster.families}"
+            if shard_cluster is not None
+            else ""
+        )
         return (
             f"\n[STATE] http_budget: {http_rem}/{self.http.budget.limit} left | "
-            f"llm_tokens: {tok_rem}/{tok_lim} left | turn: {turn}/{self.max_turns} | "
-            f"actors: {actor_list} | findings: {len(self.dispatcher.findings)} | "
+            f"llm_tokens: {tok_rem}/{tok_lim} left | turn: {turn}/{eff_max_turns} | "
+            f"actors: {actor_list} | findings: {len(eff_disp.findings)} | "
             f"receipts: {self.receipts.count()}"
+            f"{shard_line}"
             f"{nb_line}"
             f"{frontier_line}"
             f"{write_nudge}"
@@ -976,7 +1018,12 @@ class AgenticInvestigator:
         responses = getattr(self.transport, "provider_responses", None)
         if not responses:
             return None
-        status = responses[-1].get("upstream_http_status")
+        lock = getattr(self.transport, "provider_lock", None)
+        if lock is not None:
+            with lock:
+                status = responses[-1].get("upstream_http_status") if responses else None
+        else:
+            status = responses[-1].get("upstream_http_status")
         return status if isinstance(status, int) else None
 
     def _is_transient_provider_error(self, exc: Exception) -> bool:
@@ -1018,14 +1065,17 @@ class AgenticInvestigator:
         max_tool_chars: int = 5200,
         epoch_turn_start: int | None = None,
         epoch_summary_text: str | None = None,
+        epoch_state: dict[str, Any] | None = None,
     ) -> list[dict[str, Any]]:
         """Project an append-only, prompt-cache-stable view of the current epoch."""
         if len(messages) <= 1:
             return copy.deepcopy(messages)
 
         turn_groups = _group_turns(messages)
-        raw_start = self._epoch_turn_start if epoch_turn_start is None else epoch_turn_start
-        raw_summary = self._epoch_summary_text if epoch_summary_text is None else epoch_summary_text
+        default_start = int(epoch_state.get("turn_start", 0)) if epoch_state is not None else self._epoch_turn_start
+        default_summary = str(epoch_state.get("summary_text", "")) if epoch_state is not None else self._epoch_summary_text
+        raw_start = default_start if epoch_turn_start is None else epoch_turn_start
+        raw_summary = default_summary if epoch_summary_text is None else epoch_summary_text
         if raw_start > 0 and raw_start >= len(turn_groups):
             eff_start = 0
             eff_summary = ""
@@ -1061,6 +1111,8 @@ class AgenticInvestigator:
         *,
         omit_reasoning_effort: bool = False,
         keep_recent_turns_override: int | None = None,
+        epoch_state: dict[str, Any] | None = None,
+        model_override: str | None = None,
     ) -> dict[str, Any]:
         avail = self.budget.available("tokens")
         wire_tools_default = compact_tools(TOOL_SCHEMAS, description_limit=140, strip_annotations=False)
@@ -1086,20 +1138,25 @@ class AgenticInvestigator:
         serialized_bytes = 0
 
         turn_groups = _group_turns(messages)
+        cur_epoch_start = int(epoch_state.get("turn_start", 0)) if epoch_state is not None else self._epoch_turn_start
         epoch_applicable = (
             keep_recent_turns_override is None
-            and self.execution_mode == "monolithic"
-            and not (self._epoch_turn_start > 0 and self._epoch_turn_start >= len(turn_groups))
+            and self.execution_mode in {"monolithic", "sharded"}
+            and not (cur_epoch_start > 0 and cur_epoch_start >= len(turn_groups))
         )
         if epoch_applicable:
-            epoch_msgs = self._project_epoch_messages(messages, max_tool_chars=5200)
+            epoch_msgs = self._project_epoch_messages(
+                messages,
+                max_tool_chars=5200,
+                epoch_state=epoch_state,
+            )
             epoch_bytes = _serialized_len(epoch_msgs, wire_tools_default)
             if _fits_epoch_budget(epoch_bytes):
                 chosen_msgs = epoch_msgs
                 chosen_tools = wire_tools_default
                 serialized_bytes = epoch_bytes
-            elif len(turn_groups) - self._epoch_turn_start > 1:
-                cand_start = max(self._epoch_turn_start + 1, len(turn_groups) - 1)
+            elif len(turn_groups) - cur_epoch_start > 1:
+                cand_start = max(cur_epoch_start + 1, len(turn_groups) - 1)
                 cand_summary = _build_rolled_history_summary(
                     turn_groups[:cand_start],
                     max_chars=1800,
@@ -1109,11 +1166,16 @@ class AgenticInvestigator:
                     max_tool_chars=5200,
                     epoch_turn_start=cand_start,
                     epoch_summary_text=cand_summary,
+                    epoch_state=epoch_state,
                 )
                 cand_bytes = _serialized_len(cand_msgs, wire_tools_default)
                 if _fits_epoch_budget(cand_bytes):
-                    self._epoch_turn_start = cand_start
-                    self._epoch_summary_text = cand_summary
+                    if epoch_state is not None:
+                        epoch_state["turn_start"] = cand_start
+                        epoch_state["summary_text"] = cand_summary
+                    else:
+                        self._epoch_turn_start = cand_start
+                        self._epoch_summary_text = cand_summary
                     chosen_msgs = cand_msgs
                     chosen_tools = wire_tools_default
                     serialized_bytes = cand_bytes
@@ -1168,7 +1230,7 @@ class AgenticInvestigator:
         headroom = avail - (serialized_bytes + _FRAMING_RESERVE_TOKENS)
         max_out = min(2048, max(256, headroom)) if headroom > 0 else 2048
         body: dict[str, Any] = {
-            "model": self._active_model,
+            "model": model_override or self._active_model,
             "messages": chosen_msgs,
             "tools": chosen_tools,
             "tool_choice": "auto",
@@ -1178,17 +1240,28 @@ class AgenticInvestigator:
             body["reasoning_effort"] = self.reasoning_effort
         return body
 
-    def _complete_with_retry(self, messages: list[dict[str, Any]]) -> dict[str, Any]:
+    def _complete_with_retry(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        epoch_state: dict[str, Any] | None = None,
+        model_override: str | None = None,
+        usage_sink: dict[str, int] | None = None,
+        calls_sink: list[int] | None = None,
+    ) -> dict[str, Any]:
         attempt = 0
         http400_attempts = 0
         wire_messages = messages
         omit_reasoning_effort = False
         keep_recent_turns_override: int | None = None
         while True:
-            if self._min_call_interval_seconds > 0.0 and self._last_provider_call_at is not None:
+            with self._stats_lock:
+                min_interval = self._min_call_interval_seconds
+                last_call_at = self._last_provider_call_at
+            if min_interval > 0.0 and last_call_at is not None:
                 clock_fn = getattr(self.budget, "clock", time.monotonic)
-                elapsed = max(0.0, float(clock_fn()) - self._last_provider_call_at)
-                wait_for = self._min_call_interval_seconds - elapsed
+                elapsed = max(0.0, float(clock_fn()) - last_call_at)
+                wait_for = min_interval - elapsed
                 if wait_for > 0.0:
                     rem = float(self.budget.remaining_seconds())
                     bounded_wait = min(wait_for, max(0.0, rem - 1.0)) if rem > 1.0 else 0.0
@@ -1198,19 +1271,33 @@ class AgenticInvestigator:
                 wire_messages,
                 omit_reasoning_effort=omit_reasoning_effort,
                 keep_recent_turns_override=keep_recent_turns_override,
+                epoch_state=epoch_state,
+                model_override=model_override,
             )
             clock_fn = getattr(self.budget, "clock", time.monotonic)
-            self._last_provider_call_at = float(clock_fn())
+            with self._stats_lock:
+                self._last_provider_call_at = float(clock_fn())
             try:
+                if calls_sink is not None:
+                    calls_sink[0] += 1
                 resp = self.transport.complete(body, minimum_output_tokens=16)
                 turn_usage = account_completion_tokens(resp, body)
-                self.token_usage["prompt_tokens"] += turn_usage["prompt_tokens"]
-                self.token_usage["completion_tokens"] += turn_usage["completion_tokens"]
-                self.token_usage["total_tokens"] += turn_usage["total_tokens"]
-                if turn_usage["source"] == "provider_usage":
-                    self.token_usage["provider_reported_calls"] += 1
-                else:
-                    self.token_usage["estimated_calls"] += 1
+                with self._stats_lock:
+                    self.token_usage["prompt_tokens"] += turn_usage["prompt_tokens"]
+                    self.token_usage["completion_tokens"] += turn_usage["completion_tokens"]
+                    self.token_usage["total_tokens"] += turn_usage["total_tokens"]
+                    if turn_usage["source"] == "provider_usage":
+                        self.token_usage["provider_reported_calls"] += 1
+                    else:
+                        self.token_usage["estimated_calls"] += 1
+                if usage_sink is not None:
+                    usage_sink["prompt_tokens"] += turn_usage["prompt_tokens"]
+                    usage_sink["completion_tokens"] += turn_usage["completion_tokens"]
+                    usage_sink["total_tokens"] += turn_usage["total_tokens"]
+                    if turn_usage["source"] == "provider_usage":
+                        usage_sink["provider_reported_calls"] += 1
+                    else:
+                        usage_sink["estimated_calls"] += 1
                 return resp
             except Exception as exc:
                 if (
@@ -1230,7 +1317,8 @@ class AgenticInvestigator:
                     status = self._last_provider_status()
                     if status == 429:
                         delay = min(45.0, float(5 * (2 ** (attempt - 1))))
-                        self._min_call_interval_seconds = min(10.0, max(4.0, self._min_call_interval_seconds + 2.0))
+                        with self._stats_lock:
+                            self._min_call_interval_seconds = min(10.0, max(4.0, self._min_call_interval_seconds + 2.0))
                     else:
                         delay = min(30.0, float(2 ** attempt))
                     self._clear_transient_gates()
@@ -1454,9 +1542,11 @@ class AgenticInvestigator:
         return added
 
     def run(self, *, resume: bool = False) -> dict[str, Any]:
-        """Run (or resume) the investigator loop in either `monolithic` or `ephemeral` mode."""
+        """Run (or resume) the investigator loop in `monolithic`, `ephemeral`, or `sharded` mode."""
         if self.execution_mode == "ephemeral":
             return self._run_ephemeral(resume=resume)
+        if self.execution_mode == "sharded":
+            return self._run_sharded(resume=resume)
         return self._run_monolithic(resume=resume)
 
     def _run_ephemeral(self, *, resume: bool = False) -> dict[str, Any]:
@@ -1839,6 +1929,297 @@ class AgenticInvestigator:
         )
         return sys_prompt, user_prompt
 
+    @staticmethod
+    def _merge_surface_trackers(dst: SurfaceFrontierTracker, src: SurfaceFrontierTracker) -> None:
+        """Merge visited routes, objects, params, write ops, and actor coverage from a shard tracker."""
+        dst.exercised_actors.update(src.exercised_actors)
+        dst.visited_method_paths.update(src.visited_method_paths)
+        dst.visited_method_templates.update(src.visited_method_templates)
+        dst.html_or_form_templates.update(src.html_or_form_templates)
+        dst.declared_write_ops.update(src.declared_write_ops)
+        dst.tested_write_ops.update(src.tested_write_ops)
+        dst.discovered_write_ops.update(src.discovered_write_ops)
+        dst.discovered_routes.update(src.discovered_routes)
+        dst._pruned_404_objects.update(src._pruned_404_objects)
+
+        for alias, meta in src.actors.items():
+            if alias not in dst.actors:
+                dst.actors[alias] = dict(meta)
+
+        for dict_attr in (
+            "tested_params_by_template",
+            "actors_by_template",
+            "actors_by_path",
+            "route_2xx_actors",
+            "discovered_params",
+            "collection_listed_objects",
+            "api_prefix_routes",
+        ):
+            dst_map = getattr(dst, dict_attr)
+            src_map = getattr(src, dict_attr)
+            for key, vals in src_map.items():
+                dst_map.setdefault(key, set()).update(vals)
+
+        for tmpl, pmap in src.param_probes_by_template.items():
+            dst_pmap = dst.param_probes_by_template.setdefault(tmpl, {})
+            for pname, rec in pmap.items():
+                dst_rec = dst_pmap.setdefault(pname, {"values": set(), "has_special": False})
+                dst_rec["values"].update(rec.get("values") or ())
+                dst_rec["has_special"] = bool(dst_rec.get("has_special") or rec.get("has_special"))
+
+        for obj_path, entry in src.discovered_objects.items():
+            existing = dst.discovered_objects.get(obj_path)
+            if existing is None:
+                dst.discovered_objects[obj_path] = {
+                    "path": entry["path"],
+                    "template": entry["template"],
+                    "owner_actor": entry.get("owner_actor", ""),
+                    "seen_by": set(entry.get("seen_by") or ()),
+                    "listed_by": set(entry.get("listed_by") or ()),
+                    "tested_by": set(entry.get("tested_by") or ()),
+                    "verified_2xx": bool(entry.get("verified_2xx")),
+                }
+            else:
+                if not existing.get("owner_actor") and entry.get("owner_actor"):
+                    existing["owner_actor"] = entry["owner_actor"]
+                existing["seen_by"].update(entry.get("seen_by") or ())
+                existing.setdefault("listed_by", set()).update(entry.get("listed_by") or ())
+                existing["tested_by"].update(entry.get("tested_by") or ())
+                existing["verified_2xx"] = bool(existing.get("verified_2xx") or entry.get("verified_2xx"))
+
+    def _execute_monolithic_loop(
+        self,
+        *,
+        dispatcher: ToolDispatcher,
+        messages: list[dict[str, Any]],
+        start_turn: int,
+        max_turns: int,
+        epoch_state: dict[str, Any] | None = None,
+        model_name: str | None = None,
+        allow_coverage_gate: bool = True,
+        disable_gate_last_n_turns: int = 0,
+        checkpoint_fn: Callable[[int, str, list[dict[str, Any]]], None] | None = None,
+        handoff_scout_cfg: dict[str, Any] | None = None,
+        shard_cluster: SubsystemCluster | None = None,
+        usage_sink: dict[str, int] | None = None,
+        calls_sink: list[int] | None = None,
+    ) -> tuple[str, int, list[dict[str, Any]]]:
+        """Run a bounded ReAct monolithic loop over a caller-supplied dispatcher and message list."""
+        status = "running"
+        empty_nudges = 0
+        last_completed_turn = start_turn - 1
+        recent_local_reads: list[tuple[int, str, str, str]] = []
+        eff_model = model_name or self.model
+
+        def _enter_deep_phase(reason: str, completed_turn: int) -> None:
+            nonlocal messages, empty_nudges, recent_local_reads, eff_model
+            assert handoff_scout_cfg is not None
+            self._handoff_summary = {
+                "scout_model": self.scout_model,
+                "deep_model": self.model,
+                "handoff_reason": reason,
+                "handoff_after_turn": completed_turn,
+                "scout_calls": self.transport.calls - handoff_scout_cfg["start_calls"],
+                "scout_tokens": self.token_usage["total_tokens"] - handoff_scout_cfg["start_tokens"],
+                "scout_http": self.http.budget.used - handoff_scout_cfg["start_http"],
+                "scout_findings": len(dispatcher.findings),
+            }
+            self._handoff_phase = "deep"
+            self._active_model = self.model
+            eff_model = self.model
+            self._epoch_turn_start = 0
+            self._epoch_summary_text = ""
+            if epoch_state is not None:
+                epoch_state["turn_start"] = 0
+                epoch_state["summary_text"] = ""
+            dispatcher.finished = False
+            dispatcher.finish_rejections = 0
+            p2_sys, p2_usr = self._build_handoff_packet(reason=reason, next_turn=completed_turn + 1)
+            dispatcher.finish_summary = ""
+            messages = [
+                {"role": "system", "content": p2_sys},
+                {"role": "user", "content": p2_usr},
+            ]
+            empty_nudges = 0
+            recent_local_reads = []
+
+        try:
+            for turn in range(start_turn, max_turns + 1):
+                if handoff_scout_cfg is not None and self._handoff_phase == "scout":
+                    scout_tokens_used = self.token_usage["total_tokens"] - handoff_scout_cfg["start_tokens"]
+                    if turn > handoff_scout_cfg["turn_limit"] or scout_tokens_used >= handoff_scout_cfg["token_cap"]:
+                        _enter_deep_phase(
+                            "scout_turn_limit" if turn > handoff_scout_cfg["turn_limit"] else "scout_token_cap",
+                            turn - 1,
+                        )
+
+                if dispatcher.finished:
+                    status = "finished"
+                    break
+                if self.budget.remaining_seconds() <= 5 or self.budget.available("tokens") < 2500:
+                    status = "budget_exhausted"
+                    break
+
+                self._sync_coverage_gate(
+                    turn,
+                    dispatcher=dispatcher,
+                    max_turns_override=max_turns,
+                    allow_coverage_gate=allow_coverage_gate,
+                )
+                if handoff_scout_cfg is not None and self._handoff_phase == "scout" and turn >= handoff_scout_cfg["turn_limit"] - 1:
+                    dispatcher.coverage_gate_enabled = False
+                if disable_gate_last_n_turns > 0 and turn > max_turns - disable_gate_last_n_turns:
+                    dispatcher.coverage_gate_enabled = False
+
+                resp = self._complete_with_retry(
+                    messages,
+                    epoch_state=epoch_state,
+                    model_override=eff_model,
+                    usage_sink=usage_sink,
+                    calls_sink=calls_sink,
+                )
+                choice = (resp.get("choices") or [{}])[0]
+                msg = choice.get("message") or {}
+                tool_calls = msg.get("tool_calls") or []
+                content = msg.get("content")
+
+                assistant_entry: dict[str, Any] = {"role": "assistant"}
+                if content is not None:
+                    assistant_entry["content"] = content
+                else:
+                    assistant_entry["content"] = ""
+                if tool_calls:
+                    assistant_entry["tool_calls"] = tool_calls
+                messages.append(assistant_entry)
+
+                if tool_calls:
+                    self._sync_coverage_gate(
+                        turn,
+                        dispatcher=dispatcher,
+                        max_turns_override=max_turns,
+                        allow_coverage_gate=allow_coverage_gate,
+                    )
+                    if handoff_scout_cfg is not None and self._handoff_phase == "scout" and turn >= handoff_scout_cfg["turn_limit"] - 1:
+                        dispatcher.coverage_gate_enabled = False
+                    if disable_gate_last_n_turns > 0 and turn > max_turns - disable_gate_last_n_turns:
+                        dispatcher.coverage_gate_enabled = False
+                    empty_nudges = 0
+                    recent_local_reads = [entry for entry in recent_local_reads if turn - entry[0] <= 8]
+                    for idx, tc in enumerate(tool_calls):
+                        fn = tc.get("function") or {}
+                        name = str(fn.get("name") or "")
+                        raw_args = fn.get("arguments") or "{}"
+                        try:
+                            parsed_args = json.loads(raw_args) if isinstance(raw_args, str) else dict(raw_args)
+                        except ValueError:
+                            parsed_args = {}
+                        result_text = dispatcher.dispatch(name, parsed_args)
+                        if name in _LOCAL_READ_TOOLS and not (
+                            name == "notebook" and str(parsed_args.get("action") or "read").lower() != "read"
+                        ):
+                            canon_args = json.dumps(parsed_args, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+                            rid = str(parsed_args.get("receipt_id") or "")
+                            exact_hits = sum(
+                                1
+                                for t_prev, n_prev, a_prev, _ in recent_local_reads
+                                if n_prev == name and a_prev == canon_args and (turn - t_prev) <= 6
+                            )
+                            same_rid_hits = (
+                                sum(
+                                    1
+                                    for _, n_prev, _, r_prev in recent_local_reads
+                                    if n_prev in {"read_receipt", "extract_surface"} and r_prev == rid
+                                )
+                                if rid
+                                else 0
+                            )
+                            recent_local_reads.append((turn, name, canon_args, rid))
+                            if exact_hits >= 1 or same_rid_hits >= 2:
+                                target_ref = rid or name
+                                result_text += (
+                                    f"\n[LOOP GUARD] Repeated local inspection of `{target_ref}` detected. "
+                                    "Do NOT re-read it again; act directly on untested routes, cross-actor replays, "
+                                    "or allowed write operations in [SURFACE FRONTIER], or call `record_finding` for verified issues."
+                                )
+                        if idx == len(tool_calls) - 1:
+                            result_text = result_text + self._state_banner(
+                                turn + 1,
+                                dispatcher=dispatcher,
+                                max_turns_override=max_turns,
+                                shard_cluster=shard_cluster,
+                                allow_coverage_gate=allow_coverage_gate,
+                            )
+                            if turn >= max_turns - 2 or (self.http.budget.limit - self.http.budget.used) <= 8:
+                                result_text += "\n[URGENT] Budget or turns nearly exhausted: call `record_finding` for verified issues and `finish`."
+                        messages.append({
+                            "role": "tool",
+                            "tool_call_id": str(tc.get("id") or f"call_{turn}_{idx}"),
+                            "content": result_text,
+                        })
+                else:
+                    empty_nudges += 1
+                    if empty_nudges >= 3:
+                        if (
+                            handoff_scout_cfg is not None
+                            and self._handoff_phase == "scout"
+                            and turn < max_turns - 1
+                            and self.budget.available("tokens") >= 15_000
+                        ):
+                            last_completed_turn = turn
+                            _enter_deep_phase("scout_stopped_no_tool_calls", turn)
+                            if checkpoint_fn is not None:
+                                checkpoint_fn(turn, "in_progress", messages)
+                            continue
+                        status = "stopped_no_tool_calls"
+                        last_completed_turn = turn
+                        if checkpoint_fn is not None:
+                            checkpoint_fn(turn, status, messages)
+                        break
+                    messages.append({
+                        "role": "user",
+                        "content": (
+                            "Continue investigating using the provided tools, or call `finish` when done."
+                            + self._state_banner(
+                                turn + 1,
+                                dispatcher=dispatcher,
+                                max_turns_override=max_turns,
+                                shard_cluster=shard_cluster,
+                                allow_coverage_gate=allow_coverage_gate,
+                            )
+                        ),
+                    })
+
+                last_completed_turn = turn
+                if dispatcher.finished:
+                    if (
+                        handoff_scout_cfg is not None
+                        and self._handoff_phase == "scout"
+                        and turn < max_turns - 1
+                        and self.budget.available("tokens") >= 15_000
+                    ):
+                        _enter_deep_phase("scout_finished", turn)
+                        if checkpoint_fn is not None:
+                            checkpoint_fn(turn, "in_progress", messages)
+                        continue
+                    status = "finished"
+                    if checkpoint_fn is not None:
+                        checkpoint_fn(turn, status, messages)
+                    break
+                if checkpoint_fn is not None:
+                    checkpoint_fn(turn, "in_progress", messages)
+            else:
+                status = "max_turns_reached"
+        except BudgetError as exc:
+            status = exc.code or "budget_exhausted"
+            if checkpoint_fn is not None:
+                checkpoint_fn(last_completed_turn, status, messages)
+        except Exception as exc:
+            status = f"error:{type(exc).__name__}"
+            if checkpoint_fn is not None:
+                checkpoint_fn(last_completed_turn, status, messages)
+            raise
+        return status, last_completed_turn, messages
+
     def _run_monolithic(self, *, resume: bool = False) -> dict[str, Any]:
         """Run (or resume) the ReAct investigator loop until finish or budget/turn exhaustion."""
         start_turn = 1
@@ -1887,174 +2268,29 @@ class AgenticInvestigator:
                 {"role": "user", "content": init_prompt},
             ]
 
-        status = "running"
-        empty_nudges = 0
-        last_completed_turn = start_turn - 1
-        recent_local_reads: list[tuple[int, str, str, str]] = []
-
-        def _enter_deep_phase(reason: str, completed_turn: int) -> None:
-            nonlocal messages, empty_nudges, recent_local_reads
-            self._handoff_summary = {
-                "scout_model": self.scout_model,
-                "deep_model": self.model,
-                "handoff_reason": reason,
-                "handoff_after_turn": completed_turn,
-                "scout_calls": self.transport.calls - scout_start_calls,
-                "scout_tokens": self.token_usage["total_tokens"] - scout_start_tokens,
-                "scout_http": self.http.budget.used - scout_start_http,
-                "scout_findings": len(self.dispatcher.findings),
+        handoff_cfg = (
+            {
+                "start_tokens": scout_start_tokens,
+                "start_calls": scout_start_calls,
+                "start_http": scout_start_http,
+                "token_cap": scout_token_cap,
+                "turn_limit": scout_turn_limit,
             }
-            self._handoff_phase = "deep"
-            self._active_model = self.model
-            self._epoch_turn_start = 0
-            self._epoch_summary_text = ""
-            self.dispatcher.finished = False
-            self.dispatcher.finish_rejections = 0
-            p2_sys, p2_usr = self._build_handoff_packet(reason=reason, next_turn=completed_turn + 1)
-            self.dispatcher.finish_summary = ""
-            messages = [
-                {"role": "system", "content": p2_sys},
-                {"role": "user", "content": p2_usr},
-            ]
-            empty_nudges = 0
-            recent_local_reads = []
-
+            if handoff_enabled
+            else None
+        )
         try:
-            for turn in range(start_turn, self.max_turns + 1):
-                if self._handoff_phase == "scout":
-                    scout_tokens_used = self.token_usage["total_tokens"] - scout_start_tokens
-                    if turn > scout_turn_limit or scout_tokens_used >= scout_token_cap:
-                        _enter_deep_phase(
-                            "scout_turn_limit" if turn > scout_turn_limit else "scout_token_cap",
-                            turn - 1,
-                        )
-
-                if self.dispatcher.finished:
-                    status = "finished"
-                    break
-                if self.budget.remaining_seconds() <= 5 or self.budget.available("tokens") < 2500:
-                    status = "budget_exhausted"
-                    break
-
-                # Warn the agent when approaching turn, token, or HTTP budget limits so it records findings & finishes.
-                # Wrapup directives are emitted at creation time via `_state_banner(...)` so earlier messages remain immutable.
-                self._sync_coverage_gate(turn)
-                if self._handoff_phase == "scout" and turn >= scout_turn_limit - 1:
-                    self.dispatcher.coverage_gate_enabled = False
-
-                resp = self._complete_with_retry(messages)
-                choice = (resp.get("choices") or [{}])[0]
-                msg = choice.get("message") or {}
-                tool_calls = msg.get("tool_calls") or []
-                content = msg.get("content")
-
-                assistant_entry: dict[str, Any] = {"role": "assistant"}
-                if content is not None:
-                    assistant_entry["content"] = content
-                else:
-                    assistant_entry["content"] = ""
-                if tool_calls:
-                    assistant_entry["tool_calls"] = tool_calls
-                messages.append(assistant_entry)
-
-                if tool_calls:
-                    self._sync_coverage_gate(turn)
-                    if self._handoff_phase == "scout" and turn >= scout_turn_limit - 1:
-                        self.dispatcher.coverage_gate_enabled = False
-                    empty_nudges = 0
-                    recent_local_reads = [entry for entry in recent_local_reads if turn - entry[0] <= 8]
-                    for idx, tc in enumerate(tool_calls):
-                        fn = tc.get("function") or {}
-                        name = str(fn.get("name") or "")
-                        raw_args = fn.get("arguments") or "{}"
-                        try:
-                            parsed_args = json.loads(raw_args) if isinstance(raw_args, str) else dict(raw_args)
-                        except ValueError:
-                            parsed_args = {}
-                        result_text = self.dispatcher.dispatch(name, parsed_args)
-                        if name in _LOCAL_READ_TOOLS and not (
-                            name == "notebook" and str(parsed_args.get("action") or "read").lower() != "read"
-                        ):
-                            canon_args = json.dumps(parsed_args, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
-                            rid = str(parsed_args.get("receipt_id") or "")
-                            exact_hits = sum(
-                                1
-                                for t_prev, n_prev, a_prev, _ in recent_local_reads
-                                if n_prev == name and a_prev == canon_args and (turn - t_prev) <= 6
-                            )
-                            same_rid_hits = (
-                                sum(
-                                    1
-                                    for _, n_prev, _, r_prev in recent_local_reads
-                                    if n_prev in {"read_receipt", "extract_surface"} and r_prev == rid
-                                )
-                                if rid
-                                else 0
-                            )
-                            recent_local_reads.append((turn, name, canon_args, rid))
-                            if exact_hits >= 1 or same_rid_hits >= 2:
-                                target_ref = rid or name
-                                result_text += (
-                                    f"\n[LOOP GUARD] Repeated local inspection of `{target_ref}` detected. "
-                                    "Do NOT re-read it again; act directly on untested routes, cross-actor replays, "
-                                    "or allowed write operations in [SURFACE FRONTIER], or call `record_finding` for verified issues."
-                                )
-                        if idx == len(tool_calls) - 1:
-                            result_text = result_text + self._state_banner(turn + 1)
-                            if turn >= self.max_turns - 2 or (self.http.budget.limit - self.http.budget.used) <= 8:
-                                result_text += "\n[URGENT] Budget or turns nearly exhausted: call `record_finding` for verified issues and `finish`."
-                        messages.append({
-                            "role": "tool",
-                            "tool_call_id": str(tc.get("id") or f"call_{turn}_{idx}"),
-                            "content": result_text,
-                        })
-                else:
-                    empty_nudges += 1
-                    if empty_nudges >= 3:
-                        if (
-                            self._handoff_phase == "scout"
-                            and turn < self.max_turns - 1
-                            and self.budget.available("tokens") >= 15_000
-                        ):
-                            last_completed_turn = turn
-                            _enter_deep_phase("scout_stopped_no_tool_calls", turn)
-                            self._save_checkpoint(turn=turn, status="in_progress", messages=messages)
-                            continue
-                        status = "stopped_no_tool_calls"
-                        last_completed_turn = turn
-                        self._save_checkpoint(turn=turn, status=status, messages=messages)
-                        break
-                    messages.append({
-                        "role": "user",
-                        "content": (
-                            "Continue investigating using the provided tools, or call `finish` when done."
-                            + self._state_banner(turn + 1)
-                        ),
-                    })
-
-                last_completed_turn = turn
-                if self.dispatcher.finished:
-                    if (
-                        self._handoff_phase == "scout"
-                        and turn < self.max_turns - 1
-                        and self.budget.available("tokens") >= 15_000
-                    ):
-                        _enter_deep_phase("scout_finished", turn)
-                        self._save_checkpoint(turn=turn, status="in_progress", messages=messages)
-                        continue
-                    status = "finished"
-                    self._save_checkpoint(turn=turn, status=status, messages=messages)
-                    break
-                self._save_checkpoint(turn=turn, status="in_progress", messages=messages)
-            else:
-                status = "max_turns_reached"
-        except BudgetError as exc:
-            status = exc.code or "budget_exhausted"
-            self._save_checkpoint(turn=last_completed_turn, status=status, messages=messages)
-        except Exception as exc:
-            status = f"error:{type(exc).__name__}"
-            self._save_checkpoint(turn=last_completed_turn, status=status, messages=messages)
-            raise
+            status, _, _ = self._execute_monolithic_loop(
+                dispatcher=self.dispatcher,
+                messages=messages,
+                start_turn=start_turn,
+                max_turns=self.max_turns,
+                epoch_state=None,
+                model_name=self._active_model,
+                allow_coverage_gate=True,
+                checkpoint_fn=lambda t, st, msgs: self._save_checkpoint(turn=t, status=st, messages=msgs),
+                handoff_scout_cfg=handoff_cfg,
+            )
         finally:
             if self._handoff_summary is not None:
                 self._handoff_summary.update(
@@ -2071,6 +2307,299 @@ class AgenticInvestigator:
                 self.write_metrics()
 
         return self._result_summary(status)
+
+    def _run_sharded(self, *, resume: bool = False) -> dict[str, Any]:
+        """Run 2-stage single-model subsystem-clustered parallel monolithic execution."""
+        if resume:
+            loaded = self._load_checkpoint()
+            if loaded is not None and self.dispatcher.finished:
+                return self._result_summary("finished")
+
+        self._active_model = self.model
+        self._handoff_phase = "single"
+        boot_max_turns = min(self.max_turns, self.bootstrap_turns, max(4, self.max_turns // 3))
+        boot_epoch_state: dict[str, Any] = {"turn_start": 0, "summary_text": ""}
+        boot_usage: dict[str, int] = {
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "total_tokens": 0,
+            "provider_reported_calls": 0,
+            "estimated_calls": 0,
+        }
+        boot_calls = [0]
+
+        base_sys_prompt = build_system_prompt(
+            base_url=self.http.base_url,
+            allowed_methods=sorted(self.http.allowed_methods),
+            actor_summaries=self.http.actors.summaries(),
+            discovery_hints=self.discovery_hints,
+            http_budget=self.http.budget.limit,
+        )
+        init_prompt = (
+            "Begin the security investigation of the authorized target. "
+            "Start by discovering the surface using the initial discovery entry points, "
+            "inspecting extracted routes/forms/JS/OpenAPI schemas, executing any sign-up/login flows, "
+            "and systematically testing authentication, authorization, tenant isolation, and input validation. "
+            + self._state_banner(1, max_turns_override=boot_max_turns)
+        )
+        boot_messages: list[dict[str, Any]] = [
+            {"role": "system", "content": base_sys_prompt},
+            {"role": "user", "content": init_prompt},
+        ]
+
+        try:
+            boot_status, boot_last_turn, boot_messages = self._execute_monolithic_loop(
+                dispatcher=self.dispatcher,
+                messages=boot_messages,
+                start_turn=1,
+                max_turns=boot_max_turns,
+                epoch_state=boot_epoch_state,
+                model_name=self.model,
+                allow_coverage_gate=True,
+                disable_gate_last_n_turns=2,
+                checkpoint_fn=lambda t, st, msgs: self._save_checkpoint(turn=t, status=st, messages=msgs),
+                usage_sink=boot_usage,
+                calls_sink=boot_calls,
+            )
+            boot_findings_snap = copy.deepcopy(self.dispatcher.findings)
+
+            if (
+                boot_status == "budget_exhausted"
+                or self.budget.remaining_seconds() <= 5
+                or self.budget.available("tokens") < 2500
+                or (self.http.budget.limit - self.http.budget.used) <= 0
+            ):
+                self._sharding_summary = {
+                    "bootstrap_turns": boot_last_turn,
+                    "bootstrap_calls": boot_calls[0],
+                    "bootstrap_tokens": boot_usage["total_tokens"],
+                    "bootstrap_findings": len(boot_findings_snap),
+                    "fallback_to_monolithic": False,
+                    "shards": [],
+                }
+                final_status = boot_status if boot_status != "running" else "budget_exhausted"
+                return self._result_summary(final_status)
+
+            clusters = cluster_discovered_surface(
+                self.dispatcher.surface_tracker,
+                max_shards=self.max_shards,
+            )
+            if len(clusters) <= 1 or self.budget.available("tokens") < 40_000:
+                if boot_last_turn < self.max_turns and boot_status == "max_turns_reached":
+                    self.dispatcher.finished = False
+                    self.dispatcher.finish_rejections = 0
+                    self.dispatcher.finish_summary = ""
+                    cont_status, _, _ = self._execute_monolithic_loop(
+                        dispatcher=self.dispatcher,
+                        messages=boot_messages,
+                        start_turn=boot_last_turn + 1,
+                        max_turns=self.max_turns,
+                        epoch_state=boot_epoch_state,
+                        model_name=self.model,
+                        allow_coverage_gate=True,
+                        checkpoint_fn=lambda t, st, msgs: self._save_checkpoint(turn=t, status=st, messages=msgs),
+                    )
+                    self._sharding_summary = {
+                        "bootstrap_turns": boot_last_turn,
+                        "bootstrap_calls": boot_calls[0],
+                        "bootstrap_tokens": boot_usage["total_tokens"],
+                        "bootstrap_findings": len(boot_findings_snap),
+                        "fallback_to_monolithic": True,
+                        "fallback_reason": "single_cluster" if len(clusters) <= 1 else "low_remaining_tokens",
+                        "shards": [],
+                    }
+                    return self._result_summary(cont_status)
+
+                self._sharding_summary = {
+                    "bootstrap_turns": boot_last_turn,
+                    "bootstrap_calls": boot_calls[0],
+                    "bootstrap_tokens": boot_usage["total_tokens"],
+                    "bootstrap_findings": len(boot_findings_snap),
+                    "fallback_to_monolithic": True,
+                    "fallback_reason": "single_cluster" if len(clusters) <= 1 else "low_remaining_tokens",
+                    "shards": [],
+                }
+                return self._result_summary(boot_status)
+
+            # Stage 2: Parallel monolithic subsystem shards
+            bootstrap_surface_snap = copy.deepcopy(self.dispatcher.surface_tracker.to_dict())
+            shard_base_sys_prompt = build_system_prompt(
+                base_url=self.http.base_url,
+                allowed_methods=sorted(self.http.allowed_methods),
+                actor_summaries=self.http.actors.summaries(),
+                discovery_hints=self.discovery_hints,
+                http_budget=self.http.budget.limit,
+            )
+
+            def _run_shard_worker(cluster: SubsystemCluster) -> dict[str, Any]:
+                shard_dir = self.root_dir / "shards" / cluster.shard_id
+                shard_dir.mkdir(parents=True, exist_ok=True)
+                shard_dispatcher = ToolDispatcher(
+                    http_client=self.http,
+                    receipt_store=self.receipts,
+                    root_dir=shard_dir,
+                    bsag=None,
+                    oracle=self.oracle,
+                    telemetry=self.telemetry,
+                )
+                shard_dispatcher.surface_tracker.load_dict(copy.deepcopy(bootstrap_surface_snap))
+                shard_dispatcher.coverage_gate_enabled = False
+                shard_dispatcher.set_active_context(worker_id=cluster.shard_id, category=cluster.name)
+
+                shard_epoch_state: dict[str, Any] = {"turn_start": 0, "summary_text": ""}
+                shard_usage: dict[str, int] = {
+                    "prompt_tokens": 0,
+                    "completion_tokens": 0,
+                    "total_tokens": 0,
+                    "provider_reported_calls": 0,
+                    "estimated_calls": 0,
+                }
+                shard_calls = [0]
+                init_banner = self._state_banner(
+                    1,
+                    dispatcher=shard_dispatcher,
+                    max_turns_override=self.shard_turns,
+                    shard_cluster=cluster,
+                    allow_coverage_gate=False,
+                )
+                s_sys, s_usr = build_shard_prompts(
+                    cluster,
+                    base_system_prompt=shard_base_sys_prompt,
+                    bootstrap_findings=boot_findings_snap,
+                    receipts=self.receipts,
+                    state_banner=init_banner,
+                )
+                shard_messages: list[dict[str, Any]] = [
+                    {"role": "system", "content": s_sys},
+                    {"role": "user", "content": s_usr},
+                ]
+
+                def _shard_ckpt(t: int, st: str, _msgs: list[dict[str, Any]]) -> None:
+                    _atomic_write_json(
+                        shard_dir / "checkpoint.json",
+                        {
+                            "schema": "agentic-shard-checkpoint/1",
+                            "shard_id": cluster.shard_id,
+                            "families": cluster.families,
+                            "turn": t,
+                            "status": st,
+                            "findings": shard_dispatcher.findings,
+                        },
+                    )
+
+                try:
+                    s_status, _, _ = self._execute_monolithic_loop(
+                        dispatcher=shard_dispatcher,
+                        messages=shard_messages,
+                        start_turn=1,
+                        max_turns=self.shard_turns,
+                        epoch_state=shard_epoch_state,
+                        model_name=self.model,
+                        allow_coverage_gate=False,
+                        checkpoint_fn=_shard_ckpt,
+                        shard_cluster=cluster,
+                        usage_sink=shard_usage,
+                        calls_sink=shard_calls,
+                    )
+                except BudgetError as exc:
+                    s_status = exc.code or "budget_exhausted"
+                except Exception as exc:
+                    s_status = f"error:{type(exc).__name__}"
+
+                return {
+                    "shard_id": cluster.shard_id,
+                    "name": cluster.name,
+                    "families": list(cluster.families),
+                    "calls": shard_calls[0],
+                    "tokens": shard_usage["total_tokens"],
+                    "findings": list(shard_dispatcher.findings),
+                    "status": s_status,
+                    "surface_tracker": shard_dispatcher.surface_tracker,
+                    "finish_summary": shard_dispatcher.finish_summary,
+                    "untested_areas": list(shard_dispatcher.untested_areas),
+                }
+
+            shard_results: list[dict[str, Any]] = []
+            with concurrent.futures.ThreadPoolExecutor(max_workers=len(clusters)) as pool:
+                futures = [pool.submit(_run_shard_worker, cluster) for cluster in clusters]
+                for fut in futures:
+                    shard_results.append(fut.result())
+
+            # Merge surface trackers and findings from bootstrap + all shards.
+            merged_findings: list[dict[str, Any]] = list(boot_findings_snap)
+            shard_summaries_text: list[str] = []
+            merged_untested: list[str] = list(self.dispatcher.untested_areas)
+            for sres in shard_results:
+                self._merge_surface_trackers(self.dispatcher.surface_tracker, sres["surface_tracker"])
+                merged_findings.extend(sres["findings"])
+                if sres["finish_summary"]:
+                    shard_summaries_text.append(f"[{sres['shard_id']}] {sres['finish_summary']}")
+                for area in sres["untested_areas"]:
+                    if area not in merged_untested:
+                        merged_untested.append(area)
+
+            for row in self.http.actors.summaries():
+                self.dispatcher.surface_tracker.actors[row["alias"]] = {
+                    "alias": row["alias"],
+                    "role": str(row.get("role") or "").strip().lower(),
+                    "tenant": str(row.get("tenant") or "").strip().lower(),
+                }
+
+            actor_meta_map = {
+                row["alias"]: {
+                    "alias": row["alias"],
+                    "role": str(row.get("role") or "").lower(),
+                    "tenant": str(row.get("tenant") or "").lower(),
+                }
+                for row in self.http.actors.summaries()
+            }
+            self.dispatcher.findings = canonicalize_and_deduplicate_findings(
+                merged_findings,
+                actor_meta_map=actor_meta_map,
+                receipt_store=self.receipts,
+            )
+            self.dispatcher._save_findings()
+
+            if shard_summaries_text:
+                prefix = (self.dispatcher.finish_summary + " | ") if self.dispatcher.finish_summary else ""
+                self.dispatcher.finish_summary = prefix + " | ".join(shard_summaries_text)
+            self.dispatcher.untested_areas = merged_untested
+
+            shard_statuses = [r["status"] for r in shard_results]
+            if all(st == "finished" for st in shard_statuses):
+                overall_status = "finished"
+            elif any(st == "finished" for st in shard_statuses):
+                overall_status = "finished"
+            elif all(st == "budget_exhausted" for st in shard_statuses):
+                overall_status = "budget_exhausted"
+            else:
+                overall_status = shard_statuses[0] if shard_statuses else "finished"
+            self.dispatcher.finished = overall_status == "finished"
+
+            self._sharding_summary = {
+                "bootstrap_turns": boot_last_turn,
+                "bootstrap_calls": boot_calls[0],
+                "bootstrap_tokens": boot_usage["total_tokens"],
+                "bootstrap_findings": len(boot_findings_snap),
+                "fallback_to_monolithic": False,
+                "shards": [
+                    {
+                        "shard_id": r["shard_id"],
+                        "name": r["name"],
+                        "families": r["families"],
+                        "calls": r["calls"],
+                        "tokens": r["tokens"],
+                        "findings": len(r["findings"]),
+                        "status": r["status"],
+                    }
+                    for r in shard_results
+                ],
+            }
+            self._save_checkpoint(turn=boot_last_turn, status=overall_status, messages=[])
+            return self._result_summary(overall_status)
+        finally:
+            if self.telemetry is not None or self.bsag is not None:
+                self.write_metrics()
 
     def _result_summary(self, status: str) -> dict[str, Any]:
         out: dict[str, Any] = {
@@ -2091,6 +2620,8 @@ class AgenticInvestigator:
         }
         if self._handoff_summary is not None:
             out["handoff_summary"] = dict(self._handoff_summary)
+        if self._sharding_summary is not None:
+            out["sharding_summary"] = copy.deepcopy(self._sharding_summary)
         if self.bsag is not None:
             out["bsag_summary"] = self.bsag.metrics_snapshot()
         if self._last_metrics_paths is not None:

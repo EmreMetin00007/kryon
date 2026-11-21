@@ -87,35 +87,38 @@ class ActorSession:
     authenticated: bool = False
     dynamic: bool = False
     source_receipt_id: str = ""
+    _lock: threading.RLock = field(default_factory=threading.RLock, init=False, repr=False, compare=False)
 
     def collect_secrets(self) -> list[str]:
-        secrets: list[str] = []
-        for candidate in (self.password, self.access_token, self.refresh_token, self.csrf_token):
-            if candidate and len(candidate) >= 4:
-                secrets.append(candidate)
-        for k, v in self.base_headers.items():
-            if k.lower() in {"authorization", "cookie", "x-api-key", "x-csrf-token"} and v:
-                secrets.append(v)
-                tok = _extract_token_from_auth(v)
-                if tok:
-                    secrets.append(tok)
-        for val in self.cookies.values():
-            if val and len(val) >= 4:
-                secrets.append(val)
-        return secrets
+        with self._lock:
+            secrets: list[str] = []
+            for candidate in (self.password, self.access_token, self.refresh_token, self.csrf_token):
+                if candidate and len(candidate) >= 4:
+                    secrets.append(candidate)
+            for k, v in self.base_headers.items():
+                if k.lower() in {"authorization", "cookie", "x-api-key", "x-csrf-token"} and v:
+                    secrets.append(v)
+                    tok = _extract_token_from_auth(v)
+                    if tok:
+                        secrets.append(tok)
+            for val in self.cookies.values():
+                if val and len(val) >= 4:
+                    secrets.append(val)
+            return secrets
 
     def build_headers(self, method: str, extra_headers: dict[str, str] | None = None) -> dict[str, str]:
-        headers = dict(self.base_headers)
-        if self.access_token and not any(k.lower() == "authorization" for k in headers):
-            headers["Authorization"] = f"Bearer {self.access_token}"
-        if self.cookies and not any(k.lower() == "cookie" for k in headers):
-            headers["Cookie"] = "; ".join(f"{k}={v}" for k, v in sorted(self.cookies.items()))
-        if method.upper() in _MUTATING_METHODS and self.csrf_token:
-            headers.setdefault("X-CSRF-Token", self.csrf_token)
-        if extra_headers:
-            for k, v in extra_headers.items():
-                headers[str(k)] = str(v)
-        return headers
+        with self._lock:
+            headers = dict(self.base_headers)
+            if self.access_token and not any(k.lower() == "authorization" for k in headers):
+                headers["Authorization"] = f"Bearer {self.access_token}"
+            if self.cookies and not any(k.lower() == "cookie" for k in headers):
+                headers["Cookie"] = "; ".join(f"{k}={v}" for k, v in sorted(self.cookies.items()))
+            if method.upper() in _MUTATING_METHODS and self.csrf_token:
+                headers.setdefault("X-CSRF-Token", self.csrf_token)
+            if extra_headers:
+                for k, v in extra_headers.items():
+                    headers[str(k)] = str(v)
+            return headers
 
 
 def _extract_session_material_from_response(
@@ -243,23 +246,26 @@ class ActorManager:
 
     def get(self, alias: str) -> ActorSession:
         key = str(alias or "anon").strip() or "anon"
-        if key not in self.actors:
-            raise ValueError(f"unknown actor alias: {alias!r}; available: {sorted(self.actors)}")
-        return self.actors[key]
+        with self._lock:
+            if key not in self.actors:
+                raise ValueError(f"unknown actor alias: {alias!r}; available: {sorted(self.actors)}")
+            return self.actors[key]
 
     def summaries(self) -> list[dict[str, str]]:
         """Return public non-secret actor metadata safe to show the LLM."""
-        return [
-            {"alias": s.alias, "role": s.role, "tenant": s.tenant}
-            for s in self.actors.values()
-        ]
+        with self._lock:
+            return [
+                {"alias": s.alias, "role": s.role, "tenant": s.tenant}
+                for s in self.actors.values()
+            ]
 
     def all_secrets(self) -> list[str]:
         with self._lock:
-            secrets: list[str] = []
-            for session in self.actors.values():
-                secrets.extend(session.collect_secrets())
-            return secrets
+            sessions = list(self.actors.values())
+        secrets: list[str] = []
+        for session in sessions:
+            secrets.extend(session.collect_secrets())
+        return secrets
 
     def register_dynamic_session(
         self,
@@ -287,24 +293,25 @@ class ActorManager:
         with self._lock:
             existing = self.actors.get(clean_alias)
             if existing is not None:
-                existing.cookies.update(clean_cookies)
-                if clean_bearer:
-                    existing.access_token = clean_bearer
-                    existing.base_headers.pop("Authorization", None)
-                if clean_refresh:
-                    existing.refresh_token = clean_refresh
-                if clean_csrf:
-                    existing.csrf_token = clean_csrf
-                if clean_headers:
-                    existing.base_headers.update(clean_headers)
-                if role:
-                    existing.role = str(role).strip() or existing.role
-                if tenant:
-                    existing.tenant = str(tenant).strip()
-                if source_receipt_id:
-                    existing.source_receipt_id = str(source_receipt_id)
-                existing.authenticated = bool(existing.authenticated or is_auth)
-                existing.dynamic = True
+                with existing._lock:
+                    existing.cookies.update(clean_cookies)
+                    if clean_bearer:
+                        existing.access_token = clean_bearer
+                        existing.base_headers.pop("Authorization", None)
+                    if clean_refresh:
+                        existing.refresh_token = clean_refresh
+                    if clean_csrf:
+                        existing.csrf_token = clean_csrf
+                    if clean_headers:
+                        existing.base_headers.update(clean_headers)
+                    if role:
+                        existing.role = str(role).strip() or existing.role
+                    if tenant:
+                        existing.tenant = str(tenant).strip()
+                    if source_receipt_id:
+                        existing.source_receipt_id = str(source_receipt_id)
+                    existing.authenticated = bool(existing.authenticated or is_auth)
+                    existing.dynamic = True
                 return existing
             session = ActorSession(
                 alias=clean_alias,
@@ -322,6 +329,13 @@ class ActorManager:
             self.actors[clean_alias] = session
             return session
 
+    def set_source_receipt_id(self, alias: str, receipt_id: str) -> None:
+        with self._lock:
+            session = self.actors.get(alias)
+        if session is not None:
+            with session._lock:
+                session.source_receipt_id = str(receipt_id or "")
+
     def update_from_response(
         self,
         alias: str,
@@ -335,13 +349,14 @@ class ActorManager:
             return
         with self._lock:
             session = self.actors.get(alias)
-            if session is None:
-                return
-            cap_cookies, cap_bearer, cap_refresh, cap_csrf = _extract_session_material_from_response(
-                headers=headers,
-                cookies=cookies,
-                body_text=body_text,
-            )
+        if session is None:
+            return
+        cap_cookies, cap_bearer, cap_refresh, cap_csrf = _extract_session_material_from_response(
+            headers=headers,
+            cookies=cookies,
+            body_text=body_text,
+        )
+        with session._lock:
             for k, v in cap_cookies.items():
                 session.cookies[k] = v
             if cap_csrf:
@@ -399,13 +414,37 @@ class AgenticHTTPClient:
         self.budget = wire_budget or WireBudget(int(max_requests), uuid.uuid4().hex)
         self.timeout_s = float(timeout_s)
         self.max_response_bytes = int(max_response_bytes)
-        self._session = requests.Session()
-        self._session.trust_env = False
+        self._thread_local = threading.local()
+        self._sessions: list[requests.Session] = []
+        self._sessions_lock = threading.Lock()
         self._cache: dict[tuple[Any, ...], dict[str, Any]] = {}
         self._lock = threading.Lock()
+        self._auth_lock = threading.Lock()
+
+    def _get_session(self) -> requests.Session:
+        sess = getattr(self._thread_local, "session", None)
+        if sess is None:
+            sess = requests.Session()
+            sess.trust_env = False
+            self._thread_local.session = sess
+            with self._sessions_lock:
+                self._sessions.append(sess)
+        return sess
 
     def close(self) -> None:
-        self._session.close()
+        with self._sessions_lock:
+            sessions = list(self._sessions)
+            self._sessions.clear()
+        for sess in sessions:
+            try:
+                sess.close()
+            except Exception:
+                pass
+        if hasattr(self._thread_local, "session"):
+            try:
+                delattr(self._thread_local, "session")
+            except AttributeError:
+                pass
 
     def resolve_in_scope(self, url_or_path: str) -> tuple[str, str, str]:
         """Resolve relative path or URL and verify exact origin match."""
@@ -467,11 +506,12 @@ class AgenticHTTPClient:
         saved_session_meta: dict[str, Any] | None = None
 
         try:
-            # Clear shared session cookie jar before & after each wire call so per-actor
+            # Clear thread-local session cookie jar before & after each wire call so per-actor
             # cookies (managed strictly via ActorSession.build_headers) never leak across actors.
-            self._session.cookies.clear()
+            http_session = self._get_session()
+            http_session.cookies.clear()
             # Read raw stream directly so mismatched Content-Encoding never crashes requests.
-            resp = self._session.request(
+            resp = http_session.request(
                 method=method,
                 url=url,
                 headers=headers,
@@ -498,7 +538,7 @@ class AgenticHTTPClient:
                             ck, cv = nv.split("=", 1)
                             if ck.strip() and cv.strip() and ck.strip().lower() not in {"path", "expires", "max-age", "domain", "samesite"}:
                                 cookies[ck.strip()] = cv.strip()
-                self._session.cookies.clear()
+                http_session.cookies.clear()
                 clean_save_alias = str(save_session_as or "").strip()
                 if clean_save_alias and clean_save_alias != "anon" and 200 <= status < 400:
                     cap_cookies, cap_bearer, cap_refresh, cap_csrf = _extract_session_material_from_response(
@@ -527,7 +567,7 @@ class AgenticHTTPClient:
                         actor, headers=resp_headers, cookies=cookies, body_text=text
                     )
             finally:
-                self._session.cookies.clear()
+                http_session.cookies.clear()
                 resp.close()
         except Exception as exc:
             error = f"{type(exc).__name__}: {str(exc)[:200]}"
@@ -568,97 +608,110 @@ class AgenticHTTPClient:
             secret_values=self.actors.all_secrets(),
         )
         if saved_session_meta is not None:
-            dyn_sess = self.actors.actors.get(saved_session_meta["alias"])
-            if dyn_sess is not None:
-                dyn_sess.source_receipt_id = rec["receipt_id"]
+            self.actors.set_source_receipt_id(saved_session_meta["alias"], rec["receipt_id"])
             saved_session_meta["source_receipt_id"] = rec["receipt_id"]
             rec = dict(rec)
             rec["saved_session"] = saved_session_meta
         return rec
+
+    def _budget_remaining(self) -> int:
+        lock = getattr(self.budget, "_lock", None)
+        if lock is not None:
+            with lock:
+                return int(self.budget.limit - self.budget.used)
+        return int(self.budget.limit - self.budget.used)
 
     def authenticate_actor(self, alias: str, *, force_login: bool = False) -> bool:
         """Sign in an actor via configured login_path if not yet authenticated."""
         session = self.actors.get(alias)
         if alias == "anon":
             return True
-        if session.authenticated and not force_login:
-            return True
-        # Try refresh endpoint first if refresh_token exists and force_login was requested.
-        if force_login and session.refresh_token and self.actors.refresh_path:
-            try:
-                r_url, r_path, r_query = self.resolve_in_scope(self.actors.refresh_path)
-                r_body = json.dumps({"refresh_token": session.refresh_token}).encode("utf-8")
-                receipt = self._send_wire(
-                    actor=alias,
-                    method="POST",
-                    url=r_url,
-                    path=r_path,
-                    query=r_query,
-                    headers={"Content-Type": "application/json"},
-                    body_bytes=r_body,
-                    body_preview='{"refresh_token":"<REDACTED>"}',
-                    record_receipt=False,
-                )
-                if 200 <= receipt["status"] < 300:
-                    return True
-            except BudgetExhaustedError:
-                raise
-            except Exception:
-                pass
+        with self._auth_lock:
+            with session._lock:
+                already_auth = session.authenticated
+                refresh_tok = session.refresh_token
+                login_payload = dict(session.login_payload)
+            if already_auth and not force_login:
+                return True
+            # Try refresh endpoint first if refresh_token exists and force_login was requested.
+            if force_login and refresh_tok and self.actors.refresh_path:
+                try:
+                    r_url, r_path, r_query = self.resolve_in_scope(self.actors.refresh_path)
+                    r_body = json.dumps({"refresh_token": refresh_tok}).encode("utf-8")
+                    receipt = self._send_wire(
+                        actor=alias,
+                        method="POST",
+                        url=r_url,
+                        path=r_path,
+                        query=r_query,
+                        headers={"Content-Type": "application/json"},
+                        body_bytes=r_body,
+                        body_preview='{"refresh_token":"<REDACTED>"}',
+                        record_receipt=False,
+                    )
+                    if 200 <= receipt["status"] < 300:
+                        return True
+                except BudgetExhaustedError:
+                    raise
+                except Exception:
+                    pass
 
-        if not session.login_payload:
-            return session.authenticated
-        login_url, login_path, login_query = self.resolve_in_scope(self.actors.login_path)
-        payload_bytes = json.dumps(session.login_payload).encode("utf-8")
-        receipt = self._send_wire(
-            actor=alias,
-            method="POST",
-            url=login_url,
-            path=login_path,
-            query=login_query,
-            headers={"Content-Type": "application/json"},
-            body_bytes=payload_bytes,
-            body_preview=json.dumps({k: ("<REDACTED>" if k == "password" else v) for k, v in session.login_payload.items()}),
-            record_receipt=False,
-        )
-        if receipt["status"] in {400, 415}:
-            form_bytes = urlencode(session.login_payload).encode("utf-8")
+            if not login_payload:
+                with session._lock:
+                    return session.authenticated
+            login_url, login_path, login_query = self.resolve_in_scope(self.actors.login_path)
+            payload_bytes = json.dumps(login_payload).encode("utf-8")
             receipt = self._send_wire(
                 actor=alias,
                 method="POST",
                 url=login_url,
                 path=login_path,
                 query=login_query,
-                headers={"Content-Type": "application/x-www-form-urlencoded"},
-                body_bytes=form_bytes,
-                body_preview="<REDACTED_FORM_LOGIN>",
+                headers={"Content-Type": "application/json"},
+                body_bytes=payload_bytes,
+                body_preview=json.dumps({k: ("<REDACTED>" if k == "password" else v) for k, v in login_payload.items()}),
                 record_receipt=False,
             )
-        if 200 <= receipt["status"] < 400:
-            session.authenticated = True
-            return True
-        return False
+            if receipt["status"] in {400, 415}:
+                form_bytes = urlencode(login_payload).encode("utf-8")
+                receipt = self._send_wire(
+                    actor=alias,
+                    method="POST",
+                    url=login_url,
+                    path=login_path,
+                    query=login_query,
+                    headers={"Content-Type": "application/x-www-form-urlencoded"},
+                    body_bytes=form_bytes,
+                    body_preview="<REDACTED_FORM_LOGIN>",
+                    record_receipt=False,
+                )
+            if 200 <= receipt["status"] < 400:
+                with session._lock:
+                    session.authenticated = True
+                return True
+            return False
 
     def _refresh_csrf_from_session(self, alias: str) -> None:
         session = self.actors.get(alias)
         if alias == "anon" or not self.actors.session_check_path:
             return
-        try:
-            c_url, c_path, c_query = self.resolve_in_scope(self.actors.session_check_path)
-            headers = session.build_headers("GET")
-            self._send_wire(
-                actor=alias,
-                method="GET",
-                url=c_url,
-                path=c_path,
-                query=c_query,
-                headers=headers,
-                body_bytes=None,
-                body_preview="",
-                record_receipt=False,
-            )
-        except Exception:
-            pass
+        with self._auth_lock:
+            try:
+                c_url, c_path, c_query = self.resolve_in_scope(self.actors.session_check_path)
+                headers = session.build_headers("GET")
+                self._send_wire(
+                    actor=alias,
+                    method="GET",
+                    url=c_url,
+                    path=c_path,
+                    query=c_query,
+                    headers=headers,
+                    body_bytes=None,
+                    body_preview="",
+                    record_receipt=False,
+                )
+            except Exception:
+                pass
 
     def request(
         self,
@@ -767,7 +820,7 @@ class AgenticHTTPClient:
             )
 
         # Polite bounded single retry on HTTP 429 if budget has headroom.
-        if receipt["status"] == 429 and (self.budget.limit - self.budget.used) > 4:
+        if receipt["status"] == 429 and self._budget_remaining() > 4:
             retry_after_raw = receipt.get("response_headers", {}).get("Retry-After", "1")
             try:
                 delay_s = min(max(0.2, float(retry_after_raw)), 3.0)

@@ -11,6 +11,7 @@ import os
 from pathlib import Path
 import tempfile
 import threading
+import time
 from typing import Any
 
 from full_agent_budget import (
@@ -181,25 +182,38 @@ class MeteredProviderTransport:
         self.provider_lock = threading.Lock()
         self.transport_lock = threading.Lock()
         self.upstream = None
+        self._active_upstreams: set[Any] = set()
         self.calls = 0
         self.provider_requests = []
         self.provider_responses = []
 
     def close_upstream(self):
         with self.transport_lock:
-            upstream, self.upstream = self.upstream, None
-        if upstream is not None:
+            targets = list(self._active_upstreams)
+            if self.upstream is not None and self.upstream not in targets:
+                targets.append(self.upstream)
+            self._active_upstreams.clear()
+            self.upstream = None
+        if targets:
             # Closing a response while another thread reads it can block on
             # the IO lock. It must never delay terminating host children.
-            def close_response():
-                try:
-                    upstream.close()
-                except Exception:
-                    pass
+            import time as _time
 
-            closer = threading.Thread(target=close_response, daemon=True)
-            closer.start()
-            closer.join(timeout=0.2)
+            threads = []
+            for target in targets:
+                def close_response(obj=target):
+                    try:
+                        obj.close()
+                    except Exception:
+                        pass
+
+                closer = threading.Thread(target=close_response, daemon=True)
+                closer.start()
+                threads.append(closer)
+            deadline = _time.monotonic() + 0.2
+            for closer in threads:
+                rem = max(0.0, deadline - _time.monotonic())
+                closer.join(timeout=rem)
 
     def complete(
         self,
@@ -276,108 +290,117 @@ class MeteredProviderTransport:
                 if runtime_policy is not None:
                     dump(self.private / "runtime-policy.json", runtime_policy.snapshot())
             dump(self.private / "budget.json", self.budget.snapshot())
-            response, measured, safe_usage = None, None, None
-            status, error, encoding = None, None, None
-            failure_reason, accounting_shape, response_bytes = None, None, None
-            accounting_basis = None
             self.calls += 1
+            call_index = self.calls
             if self.budget.checkpoint is not None:
                 self.budget.checkpoint()
-            try:
-                import requests
 
-                with requests.Session() as session:
-                    session.trust_env = False
-                    with session.post(
-                        self.provider.rstrip("/") + "/chat/completions",
-                        data=provider_json(request),
-                        headers={
-                            self.api_key_header: (
-                                "Bearer " + self.api_key
-                                if self.api_key_header == "Authorization"
-                                else self.api_key
-                            ),
-                            "Content-Type": "application/json",
-                        },
-                        allow_redirects=False,
-                        timeout=min(360, self.budget.remaining_seconds()),
-                        stream=True,
-                    ) as upstream:
-                        with self.transport_lock:
-                            self.upstream = upstream
-                        self.session_gate.require_open()
-                        status = upstream.status_code
-                        header = upstream.headers.get("Content-Encoding", "identity").strip().lower()
-                        encoding = header if header in {"identity", "gzip", "deflate", "br", "zstd"} else "other"
-                        if upstream.status_code != 200:
-                            raise BudgetError(f"provider HTTP {status}; response body withheld")
-                        # requests' raw stream otherwise returns compressed wire
-                        # bytes. Bound the decoded JSON body, including gzip/br.
-                        raw = upstream.raw.read(max_body + 1, decode_content=True)
-                        response_bytes = len(raw)
-                        if len(raw) > max_body:
-                            raise BudgetError("provider response too large")
-                        response = json.loads(raw)
-                        accounting_shape = provider_usage_diagnostics(response)
-                if not isinstance(response, dict):
-                    raise BudgetError("provider response is not an object", code="response_object_invalid")
-                if response.get("error") is not None:
-                    raise BudgetError("provider returned an error", code="provider_response_error")
-                choices = response.get("choices")
-                nonempty_completion = isinstance(choices, list) and any(
-                    isinstance(row, dict)
-                    and isinstance(row.get("message"), dict)
-                    and any(
-                        row["message"].get(field)
-                        for field in (
-                            "content",
-                            "tool_calls",
-                            "function_call",
-                            "refusal",
-                            "reasoning",
-                            "reasoning_content",
-                        )
+        response, measured, safe_usage = None, None, None
+        status, error, encoding = None, None, None
+        failure_reason, accounting_shape, response_bytes = None, None, None
+        accounting_basis = None
+        local_upstream = None
+        try:
+            import requests
+
+            with requests.Session() as session:
+                session.trust_env = False
+                with session.post(
+                    self.provider.rstrip("/") + "/chat/completions",
+                    data=provider_json(request),
+                    headers={
+                        self.api_key_header: (
+                            "Bearer " + self.api_key
+                            if self.api_key_header == "Authorization"
+                            else self.api_key
+                        ),
+                        "Content-Type": "application/json",
+                    },
+                    allow_redirects=False,
+                    timeout=min(360, self.budget.remaining_seconds()),
+                    stream=True,
+                ) as upstream:
+                    local_upstream = upstream
+                    with self.transport_lock:
+                        self._active_upstreams.add(upstream)
+                        self.upstream = upstream
+                    self.session_gate.require_open()
+                    status = upstream.status_code
+                    header = upstream.headers.get("Content-Encoding", "identity").strip().lower()
+                    encoding = header if header in {"identity", "gzip", "deflate", "br", "zstd"} else "other"
+                    if upstream.status_code != 200:
+                        raise BudgetError(f"provider HTTP {status}; response body withheld")
+                    # requests' raw stream otherwise returns compressed wire
+                    # bytes. Bound the decoded JSON body, including gzip/br.
+                    raw = upstream.raw.read(max_body + 1, decode_content=True)
+                    response_bytes = len(raw)
+                    if len(raw) > max_body:
+                        raise BudgetError("provider response too large")
+                    response = json.loads(raw)
+                    accounting_shape = provider_usage_diagnostics(response)
+            if not isinstance(response, dict):
+                raise BudgetError("provider response is not an object", code="response_object_invalid")
+            if response.get("error") is not None:
+                raise BudgetError("provider returned an error", code="provider_response_error")
+            choices = response.get("choices")
+            nonempty_completion = isinstance(choices, list) and any(
+                isinstance(row, dict)
+                and isinstance(row.get("message"), dict)
+                and any(
+                    row["message"].get(field)
+                    for field in (
+                        "content",
+                        "tool_calls",
+                        "function_call",
+                        "refusal",
+                        "reasoning",
+                        "reasoning_content",
                     )
-                    for row in choices
                 )
-                usage, accounting_basis = provider_accounting_usage(
-                    response.get("usage"),
-                    provider=self.provider,
-                    model=request["model"],
-                    nonempty_completion=nonempty_completion,
-                )
-                measured = usage_tokens(usage)
-                safe_usage = {
-                    key: usage[key]
-                    for key in ("prompt_tokens", "completion_tokens", "total_tokens")
-                    if key in usage
-                }
-                for key, subset in (
-                    ("prompt_tokens_details", "cached_tokens"),
-                    ("completion_tokens_details", "reasoning_tokens"),
-                ):
-                    if isinstance(usage.get(key), dict):
-                        detail = usage[key]
-                        safe_usage[key] = {subset: detail[subset]} if detail.get(subset) is not None else {}
-                if (
-                    usage["prompt_tokens"] > metrics["prompt_upper_bound"]
-                    or usage["completion_tokens"] > metrics["admitted_output_tokens"]
-                ):
-                    measured = None
-                    raise BudgetError("provider usage exceeded admitted prompt or output bound")
-                if not isinstance(response.get("choices"), list) or not response["choices"]:
-                    raise BudgetError("provider response omitted choices")
-                return response
-            except Exception as exc:
-                # Never retain exception text: requests exceptions can contain
-                # URLs, headers or private response data. Status is sufficient.
-                error = type(exc).__name__
-                failure_reason = provider_failure_reason(exc, status)
-                self.session_gate.stop_reason = failure_reason
-                raise provider_failure(failure_reason, status, reservation_retained=measured is None) from None
-            finally:
-                with self.transport_lock:
-                    self.upstream = None
+                for row in choices
+            )
+            usage, accounting_basis = provider_accounting_usage(
+                response.get("usage"),
+                provider=self.provider,
+                model=request["model"],
+                nonempty_completion=nonempty_completion,
+            )
+            measured = usage_tokens(usage)
+            safe_usage = {
+                key: usage[key]
+                for key in ("prompt_tokens", "completion_tokens", "total_tokens")
+                if key in usage
+            }
+            for key, subset in (
+                ("prompt_tokens_details", "cached_tokens"),
+                ("completion_tokens_details", "reasoning_tokens"),
+            ):
+                if isinstance(usage.get(key), dict):
+                    detail = usage[key]
+                    safe_usage[key] = {subset: detail[subset]} if detail.get(subset) is not None else {}
+            if (
+                usage["prompt_tokens"] > metrics["prompt_upper_bound"]
+                or usage["completion_tokens"] > metrics["admitted_output_tokens"]
+            ):
+                measured = None
+                raise BudgetError("provider usage exceeded admitted prompt or output bound")
+            if not isinstance(response.get("choices"), list) or not response["choices"]:
+                raise BudgetError("provider response omitted choices")
+            return response
+        except Exception as exc:
+            # Never retain exception text: requests exceptions can contain
+            # URLs, headers or private response data. Status is sufficient.
+            error = type(exc).__name__
+            failure_reason = provider_failure_reason(exc, status)
+            self.session_gate.stop_reason = failure_reason
+            raise provider_failure(failure_reason, status, reservation_retained=measured is None) from None
+        finally:
+            with self.transport_lock:
+                if local_upstream is not None:
+                    self._active_upstreams.discard(local_upstream)
+                    if self.upstream is local_upstream:
+                        self.upstream = next(iter(self._active_upstreams), None)
+            with self.provider_lock:
                 try:
                     self.budget.settle(
                         ticket,
@@ -407,7 +430,7 @@ class MeteredProviderTransport:
                     dump(self.private / "budget.json", self.budget.snapshot())
                     self.provider_responses.append(
                         {
-                            "call": self.calls,
+                            "call": call_index,
                             "model": request["model"],
                             "upstream_http_status": status,
                             "content_encoding": encoding,
