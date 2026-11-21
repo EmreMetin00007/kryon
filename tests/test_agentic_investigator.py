@@ -628,6 +628,9 @@ def test_token_accounting_and_bounded_turn_compaction(tmp_path, mock_server):
         "prompt_tokens": 980,
         "completion_tokens": 45,
         "total_tokens": 1025,
+        "cached_prompt_tokens": 0,
+        "uncached_prompt_tokens": 980,
+        "reasoning_tokens": 0,
         "source": "provider_usage",
     }
     fallback = account_completion_tokens({"choices": [{"message": {"content": "B" * 200}}]}, req_body)

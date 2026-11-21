@@ -18,6 +18,7 @@ COMMANDS = {
     "preflight": ("full_agent_preflight", []),
     "run": ("full_agent_launcher", []),
     "agentic": ("agentic_runner", []),
+    "report": ("agentic_report", []),
     "audit": ("full_agent_holdout", ["audit"]),
     "benchmark": ("full_agent_e6_benchmark", []),
     "campaign": ("campaign_runtime", []),

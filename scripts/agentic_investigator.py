@@ -80,9 +80,53 @@ _BANNER_MARKERS = (
 CHARS_PER_TOKEN = 4
 _PROMPT_SOFT_CHAR_LIMIT = 21_000
 _PROMPT_HARD_CHAR_LIMIT = 24_000
-_EPOCH_HARD_CHAR_LIMIT = 32_000
+_EPOCH_HARD_CHAR_LIMIT = 80_000
 _FRAMING_RESERVE_TOKENS = 2048
 _LOCAL_READ_TOOLS = frozenset({"read_receipt", "extract_surface", "notebook"})
+
+
+def _new_usage_dict() -> dict[str, int]:
+    """Return a zero-initialized token/cache accounting dictionary."""
+    return {
+        "prompt_tokens": 0,
+        "completion_tokens": 0,
+        "total_tokens": 0,
+        "cached_prompt_tokens": 0,
+        "uncached_prompt_tokens": 0,
+        "reasoning_tokens": 0,
+        "provider_reported_calls": 0,
+        "estimated_calls": 0,
+    }
+
+
+def _accumulate_usage(
+    dst: dict[str, int],
+    turn_usage: dict[str, Any],
+    *,
+    count_call: bool = True,
+) -> None:
+    """Add one completion's token/cache metrics into an accumulator dict."""
+    dst["prompt_tokens"] += int(turn_usage["prompt_tokens"])
+    dst["completion_tokens"] += int(turn_usage["completion_tokens"])
+    dst["total_tokens"] += int(turn_usage["total_tokens"])
+    dst["cached_prompt_tokens"] += int(turn_usage["cached_prompt_tokens"])
+    dst["uncached_prompt_tokens"] += int(turn_usage["uncached_prompt_tokens"])
+    dst["reasoning_tokens"] += int(turn_usage["reasoning_tokens"])
+    if count_call:
+        if turn_usage.get("source") == "provider_usage":
+            dst["provider_reported_calls"] += 1
+        else:
+            dst["estimated_calls"] += 1
+
+
+def effective_tokens_from_usage(usage: dict[str, int], cache_token_weight: float) -> int:
+    """Compute cache-weighted effective tokens from a usage dictionary."""
+    prompt = int(usage.get("prompt_tokens", 0))
+    comp = int(usage.get("completion_tokens", 0))
+    cached = max(0, min(prompt, int(usage.get("cached_prompt_tokens", 0))))
+    uncached = max(0, prompt - cached)
+    w = max(0.0, min(1.0, float(cache_token_weight)))
+    return uncached + int(round(cached * w)) + comp
 
 
 def estimate_tokens(value: Any) -> int:
@@ -102,7 +146,7 @@ def account_completion_tokens(
     response: dict[str, Any] | None,
     request_body: dict[str, Any],
 ) -> dict[str, Any]:
-    """Account completion tokens: prefer provider-reported usage, else ~4 chars/token."""
+    """Account completion, prompt-cache, and reasoning tokens (provider usage or ~4 chars/token)."""
     usage = response.get("usage") if isinstance(response, dict) else None
     if isinstance(usage, dict):
         prompt = usage.get("prompt_tokens")
@@ -110,10 +154,20 @@ def account_completion_tokens(
         if type(prompt) is int and type(completion) is int and prompt >= 0 and completion >= 0:
             total_raw = usage.get("total_tokens")
             total = total_raw if (type(total_raw) is int and total_raw == prompt + completion) else (prompt + completion)
+            prompt_details = usage.get("prompt_tokens_details")
+            raw_cached = prompt_details.get("cached_tokens") if isinstance(prompt_details, dict) else None
+            cached = raw_cached if (type(raw_cached) is int and 0 <= raw_cached <= prompt) else 0
+            uncached = max(0, prompt - cached)
+            completion_details = usage.get("completion_tokens_details")
+            raw_reasoning = completion_details.get("reasoning_tokens") if isinstance(completion_details, dict) else None
+            reasoning = raw_reasoning if (type(raw_reasoning) is int and 0 <= raw_reasoning <= completion) else 0
             return {
                 "prompt_tokens": prompt,
                 "completion_tokens": completion,
                 "total_tokens": total,
+                "cached_prompt_tokens": cached,
+                "uncached_prompt_tokens": uncached,
+                "reasoning_tokens": reasoning,
                 "source": "provider_usage",
             }
     prompt_est = estimate_tokens({
@@ -125,6 +179,9 @@ def account_completion_tokens(
         "prompt_tokens": prompt_est,
         "completion_tokens": completion_est,
         "total_tokens": prompt_est + completion_est,
+        "cached_prompt_tokens": 0,
+        "uncached_prompt_tokens": prompt_est,
+        "reasoning_tokens": 0,
         "source": "char_estimate_4x",
     }
 
@@ -826,6 +883,9 @@ class AgenticInvestigator:
         bootstrap_turns: int = 12,
         shard_turns: int = 25,
         shard_token_quota: int = 0,
+        bootstrap_model: str | None = None,
+        epoch_char_limit: int = _EPOCH_HARD_CHAR_LIMIT,
+        cache_token_weight: float = 0.10,
     ):
         self.http = http_client
         self.receipts = receipt_store
@@ -839,6 +899,18 @@ class AgenticInvestigator:
         self.bootstrap_turns = max(1, int(bootstrap_turns))
         self.shard_turns = max(1, int(shard_turns))
         self.shard_token_quota = max(0, int(shard_token_quota))
+        self.bootstrap_model = str(bootstrap_model or "").strip()
+        raw_epoch_limit = int(_EPOCH_HARD_CHAR_LIMIT if epoch_char_limit is None else epoch_char_limit)
+        self.epoch_char_limit = max(
+            _PROMPT_HARD_CHAR_LIMIT,
+            _EPOCH_HARD_CHAR_LIMIT if raw_epoch_limit <= 0 else raw_epoch_limit,
+        )
+        if isinstance(cache_token_weight, bool):
+            raise ValueError("cache_token_weight must be between 0.0 and 1.0")
+        eff_weight = float(cache_token_weight)
+        if not (0.0 <= eff_weight <= 1.0):
+            raise ValueError(f"cache_token_weight must be between 0.0 and 1.0, got {cache_token_weight!r}")
+        self.cache_token_weight = eff_weight
         self._active_model = self.model
         self._handoff_phase = "single"
         self._handoff_summary: dict[str, Any] | None = None
@@ -895,16 +967,11 @@ class AgenticInvestigator:
             oracle=self.oracle,
             telemetry=self.telemetry,
         )
-        self.token_usage: dict[str, int] = {
-            "prompt_tokens": 0,
-            "completion_tokens": 0,
-            "total_tokens": 0,
-            "provider_reported_calls": 0,
-            "estimated_calls": 0,
-        }
+        self.token_usage: dict[str, int] = _new_usage_dict()
         self._last_metrics_paths: tuple[Path, Path] | None = None
         self._epoch_turn_start: int = 0
         self._epoch_summary_text: str = ""
+        self._epoch_advancements: int = 0
 
     @staticmethod
     def _close_dispatcher(dispatcher: Any) -> None:
@@ -1169,10 +1236,19 @@ class AgenticInvestigator:
         keep_recent_turns_override: int | None = None,
         epoch_state: dict[str, Any] | None = None,
         model_override: str | None = None,
+        excluded_tools: frozenset[str] | None = None,
     ) -> dict[str, Any]:
         avail = self.budget.available("tokens")
-        wire_tools_default = compact_tools(TOOL_SCHEMAS, description_limit=140, strip_annotations=False)
-        wire_tools_tight = compact_tools(TOOL_SCHEMAS, description_limit=96, strip_annotations=True)
+        schemas = (
+            [
+                s for s in TOOL_SCHEMAS
+                if str(((s.get("function") or {}).get("name")) or "") not in excluded_tools
+            ]
+            if excluded_tools
+            else TOOL_SCHEMAS
+        )
+        wire_tools_default = compact_tools(schemas, description_limit=140, strip_annotations=False)
+        wire_tools_tight = compact_tools(schemas, description_limit=96, strip_annotations=True)
 
         def _serialized_len(msgs: list[dict[str, Any]], tools_payload: list[dict[str, Any]]) -> int:
             return len(
@@ -1185,7 +1261,7 @@ class AgenticInvestigator:
 
         def _fits_epoch_budget(byte_len: int) -> bool:
             return (
-                byte_len <= _EPOCH_HARD_CHAR_LIMIT
+                byte_len <= self.epoch_char_limit
                 and byte_len + _FRAMING_RESERVE_TOKENS + 256 <= avail
             )
 
@@ -1229,9 +1305,12 @@ class AgenticInvestigator:
                     if epoch_state is not None:
                         epoch_state["turn_start"] = cand_start
                         epoch_state["summary_text"] = cand_summary
+                        epoch_state["advancements"] = int(epoch_state.get("advancements", 0)) + 1
                     else:
                         self._epoch_turn_start = cand_start
                         self._epoch_summary_text = cand_summary
+                    with self._stats_lock:
+                        self._epoch_advancements += 1
                     chosen_msgs = cand_msgs
                     chosen_tools = wire_tools_default
                     serialized_bytes = cand_bytes
@@ -1304,6 +1383,7 @@ class AgenticInvestigator:
         model_override: str | None = None,
         usage_sink: dict[str, int] | None = None,
         calls_sink: list[int] | None = None,
+        excluded_tools: frozenset[str] | None = None,
     ) -> dict[str, Any]:
         attempt = 0
         http400_attempts = 0
@@ -1329,6 +1409,7 @@ class AgenticInvestigator:
                 keep_recent_turns_override=keep_recent_turns_override,
                 epoch_state=epoch_state,
                 model_override=model_override,
+                excluded_tools=excluded_tools,
             )
             clock_fn = getattr(self.budget, "clock", time.monotonic)
             with self._stats_lock:
@@ -1339,21 +1420,9 @@ class AgenticInvestigator:
                 resp = self.transport.complete(body, minimum_output_tokens=16)
                 turn_usage = account_completion_tokens(resp, body)
                 with self._stats_lock:
-                    self.token_usage["prompt_tokens"] += turn_usage["prompt_tokens"]
-                    self.token_usage["completion_tokens"] += turn_usage["completion_tokens"]
-                    self.token_usage["total_tokens"] += turn_usage["total_tokens"]
-                    if turn_usage["source"] == "provider_usage":
-                        self.token_usage["provider_reported_calls"] += 1
-                    else:
-                        self.token_usage["estimated_calls"] += 1
+                    _accumulate_usage(self.token_usage, turn_usage, count_call=True)
                 if usage_sink is not None:
-                    usage_sink["prompt_tokens"] += turn_usage["prompt_tokens"]
-                    usage_sink["completion_tokens"] += turn_usage["completion_tokens"]
-                    usage_sink["total_tokens"] += turn_usage["total_tokens"]
-                    if turn_usage["source"] == "provider_usage":
-                        usage_sink["provider_reported_calls"] += 1
-                    else:
-                        usage_sink["estimated_calls"] += 1
+                    _accumulate_usage(usage_sink, turn_usage, count_call=True)
                 return resp
             except Exception as exc:
                 if (
@@ -1412,6 +1481,7 @@ class AgenticInvestigator:
                 "untested_areas": self.dispatcher.untested_areas,
                 "epoch_turn_start": self._epoch_turn_start,
                 "epoch_summary_text": self._epoch_summary_text,
+                "epoch_advancements": self._epoch_advancements,
             },
         )
 
@@ -1455,6 +1525,11 @@ class AgenticInvestigator:
             self._epoch_turn_start = 0
         raw_epoch_summary = data.get("epoch_summary_text", "")
         self._epoch_summary_text = raw_epoch_summary if isinstance(raw_epoch_summary, str) else ""
+        raw_epoch_adv = data.get("epoch_advancements", 0)
+        if isinstance(raw_epoch_adv, int) and not isinstance(raw_epoch_adv, bool):
+            self._epoch_advancements = max(0, raw_epoch_adv)
+        else:
+            self._epoch_advancements = 0
         return int(data.get("turn", 0)), data["messages"]
 
     def _ablation_config(self) -> dict[str, Any]:
@@ -1533,9 +1608,8 @@ class AgenticInvestigator:
         except Exception:
             return 0
         usage = account_completion_tokens(resp, body)
-        self.token_usage["prompt_tokens"] += usage["prompt_tokens"]
-        self.token_usage["completion_tokens"] += usage["completion_tokens"]
-        self.token_usage["total_tokens"] += usage["total_tokens"]
+        with self._stats_lock:
+            _accumulate_usage(self.token_usage, usage, count_call=False)
         if self.telemetry is not None:
             self.telemetry.emit(
                 "token_usage",
@@ -2061,6 +2135,7 @@ class AgenticInvestigator:
         usage_sink: dict[str, int] | None = None,
         calls_sink: list[int] | None = None,
         shard_token_quota: int | None = None,
+        excluded_tools: frozenset[str] | None = None,
     ) -> tuple[str, int, list[dict[str, Any]]]:
         """Run a bounded ReAct monolithic loop over a caller-supplied dispatcher and message list."""
         status = "running"
@@ -2073,7 +2148,7 @@ class AgenticInvestigator:
         def _shard_tokens_used() -> int:
             if usage_sink is None:
                 return 0
-            return int(usage_sink.get("prompt_tokens", 0)) + int(usage_sink.get("completion_tokens", 0))
+            return effective_tokens_from_usage(usage_sink, self.cache_token_weight)
 
         def _enter_deep_phase(reason: str, completed_turn: int) -> None:
             nonlocal messages, empty_nudges, recent_local_reads, eff_model
@@ -2155,6 +2230,7 @@ class AgenticInvestigator:
                     model_override=eff_model,
                     usage_sink=usage_sink,
                     calls_sink=calls_sink,
+                    excluded_tools=excluded_tools,
                 )
                 choice = (resp.get("choices") or [{}])[0]
                 msg = choice.get("message") or {}
@@ -2194,7 +2270,16 @@ class AgenticInvestigator:
                             parsed_args = json.loads(raw_args) if isinstance(raw_args, str) else dict(raw_args)
                         except ValueError:
                             parsed_args = {}
-                        result_text = dispatcher.dispatch(name, parsed_args)
+                        if excluded_tools and name in excluded_tools:
+                            result_text = json.dumps(
+                                {
+                                    "error": "tool_disabled_in_bootstrap_discovery",
+                                    "hint": "Focus on surface/auth discovery; Stage 2 shards handle record_finding.",
+                                },
+                                ensure_ascii=False,
+                            )
+                        else:
+                            result_text = dispatcher.dispatch(name, parsed_args)
                         if name in _LOCAL_READ_TOOLS and not (
                             name == "notebook" and str(parsed_args.get("action") or "read").lower() != "read"
                         ):
@@ -2243,7 +2328,13 @@ class AgenticInvestigator:
                                 or (self.http.budget.limit - self.http.budget.used) <= 8
                                 or shard_wrapup_urgent
                             ):
-                                result_text += "\n[URGENT] Budget or turns nearly exhausted: call `record_finding` for verified issues and `finish`."
+                                if excluded_tools and "record_finding" in excluded_tools:
+                                    result_text += (
+                                        "\n[URGENT] Bootstrap discovery turns or budget nearly exhausted: "
+                                        "call `finish` now so Stage 2 shards can begin."
+                                    )
+                                else:
+                                    result_text += "\n[URGENT] Budget or turns nearly exhausted: call `record_finding` for verified issues and `finish`."
                         messages.append({
                             "role": "tool",
                             "tool_call_id": str(tc.get("id") or f"call_{turn}_{idx}"),
@@ -2345,6 +2436,7 @@ class AgenticInvestigator:
         if messages is None:
             self._epoch_turn_start = 0
             self._epoch_summary_text = ""
+            self._epoch_advancements = 0
             sys_prompt = build_system_prompt(
                 base_url=self.http.base_url,
                 allowed_methods=sorted(self.http.allowed_methods),
@@ -2406,25 +2498,51 @@ class AgenticInvestigator:
         return self._result_summary(status)
 
     def _run_sharded(self, *, resume: bool = False) -> dict[str, Any]:
-        """Run 2-stage single-model subsystem-clustered parallel monolithic execution."""
+        """Run 2-stage subsystem-clustered parallel monolithic execution."""
         if resume:
             loaded = self._load_checkpoint()
             if loaded is not None and self.dispatcher.finished:
                 self._close_dispatcher(self.dispatcher)
                 return self._result_summary("finished")
 
-        self._active_model = self.model
+        boot_model = self.bootstrap_model or self.model
+        bootstrap_discovery_only = bool(self.bootstrap_model and self.bootstrap_model != self.model)
+        self._active_model = boot_model
         self._handoff_phase = "single"
+        self._epoch_advancements = 0
         boot_max_turns = min(self.max_turns, self.bootstrap_turns, max(4, self.max_turns // 3))
-        boot_epoch_state: dict[str, Any] = {"turn_start": 0, "summary_text": ""}
-        boot_usage: dict[str, int] = {
-            "prompt_tokens": 0,
-            "completion_tokens": 0,
-            "total_tokens": 0,
-            "provider_reported_calls": 0,
-            "estimated_calls": 0,
-        }
+        boot_epoch_state: dict[str, Any] = {"turn_start": 0, "summary_text": "", "advancements": 0}
+        boot_usage: dict[str, int] = _new_usage_dict()
         boot_calls = [0]
+
+        def _build_sharding_summary(
+            *,
+            boot_turns: int,
+            boot_findings_count: int,
+            fallback_to_monolithic: bool,
+            fallback_reason: str | None = None,
+            shards: list[dict[str, Any]] | None = None,
+        ) -> dict[str, Any]:
+            summary: dict[str, Any] = {
+                "bootstrap_model": boot_model,
+                "shard_model": self.model,
+                "cache_token_weight": round(self.cache_token_weight, 4),
+                "bootstrap_discovery_only": bootstrap_discovery_only,
+                "bootstrap_turns": boot_turns,
+                "bootstrap_calls": boot_calls[0],
+                "bootstrap_tokens": boot_usage["total_tokens"],
+                "bootstrap_effective_tokens": effective_tokens_from_usage(boot_usage, self.cache_token_weight),
+                "bootstrap_cached_tokens": boot_usage["cached_prompt_tokens"],
+                "bootstrap_uncached_tokens": boot_usage["uncached_prompt_tokens"],
+                "bootstrap_reasoning_tokens": boot_usage["reasoning_tokens"],
+                "bootstrap_epoch_advancements": int(boot_epoch_state.get("advancements", 0)),
+                "bootstrap_findings": boot_findings_count,
+                "fallback_to_monolithic": fallback_to_monolithic,
+                "shards": shards or [],
+            }
+            if fallback_reason is not None:
+                summary["fallback_reason"] = fallback_reason
+            return summary
 
         base_sys_prompt = build_system_prompt(
             base_url=self.http.base_url,
@@ -2433,13 +2551,33 @@ class AgenticInvestigator:
             discovery_hints=self.discovery_hints,
             http_budget=self.http.budget.limit,
         )
-        init_prompt = (
-            "Begin the security investigation of the authorized target. "
-            "Start by discovering the surface using the initial discovery entry points, "
-            "inspecting extracted routes/forms/JS/OpenAPI schemas, executing any sign-up/login flows, "
-            "and systematically testing authentication, authorization, tenant isolation, and input validation. "
-            + self._state_banner(1, max_turns_override=boot_max_turns)
-        )
+        if bootstrap_discovery_only:
+            init_prompt = (
+                "Stage 1 Surface & Session Discovery (discovery-only bootstrap). "
+                "Maximize surface coverage across the authorized target: crawl all initial discovery entry points, "
+                "inspect HTML/JS/OpenAPI responses with `extract_surface`, execute any sign-up/login flows to "
+                "populate live multi-actor sessions, and discover concrete object IDs, query/form parameters, and "
+                "write endpoints. Do NOT attempt vulnerability claims or call `record_finding`; "
+                "call `finish` once surface discovery is solid so Stage 2 shards can perform deep verification."
+                + self._state_banner(
+                    1,
+                    max_turns_override=boot_max_turns,
+                    allow_coverage_gate=False,
+                )
+            )
+            boot_excluded_tools: frozenset[str] | None = frozenset({"record_finding"})
+            boot_allow_coverage_gate = False
+        else:
+            init_prompt = (
+                "Begin the security investigation of the authorized target. "
+                "Start by discovering the surface using the initial discovery entry points, "
+                "inspecting extracted routes/forms/JS/OpenAPI schemas, executing any sign-up/login flows, "
+                "and systematically testing authentication, authorization, tenant isolation, and input validation. "
+                + self._state_banner(1, max_turns_override=boot_max_turns)
+            )
+            boot_excluded_tools = None
+            boot_allow_coverage_gate = True
+
         boot_messages: list[dict[str, Any]] = [
             {"role": "system", "content": base_sys_prompt},
             {"role": "user", "content": init_prompt},
@@ -2452,12 +2590,13 @@ class AgenticInvestigator:
                 start_turn=1,
                 max_turns=boot_max_turns,
                 epoch_state=boot_epoch_state,
-                model_name=self.model,
-                allow_coverage_gate=True,
-                disable_gate_last_n_turns=2,
+                model_name=boot_model,
+                allow_coverage_gate=boot_allow_coverage_gate,
+                disable_gate_last_n_turns=2 if boot_allow_coverage_gate else 0,
                 checkpoint_fn=lambda t, st, msgs: self._save_checkpoint(turn=t, status=st, messages=msgs),
                 usage_sink=boot_usage,
                 calls_sink=boot_calls,
+                excluded_tools=boot_excluded_tools,
             )
             boot_findings_snap = copy.deepcopy(self.dispatcher.findings)
 
@@ -2467,14 +2606,12 @@ class AgenticInvestigator:
                 or self.budget.available("tokens") < 2500
                 or (self.http.budget.limit - self.http.budget.used) <= 0
             ):
-                self._sharding_summary = {
-                    "bootstrap_turns": boot_last_turn,
-                    "bootstrap_calls": boot_calls[0],
-                    "bootstrap_tokens": boot_usage["total_tokens"],
-                    "bootstrap_findings": len(boot_findings_snap),
-                    "fallback_to_monolithic": False,
-                    "shards": [],
-                }
+                self._sharding_summary = _build_sharding_summary(
+                    boot_turns=boot_last_turn,
+                    boot_findings_count=len(boot_findings_snap),
+                    fallback_to_monolithic=False,
+                    shards=[],
+                )
                 final_status = boot_status if boot_status != "running" else "budget_exhausted"
                 return self._result_summary(final_status)
 
@@ -2483,43 +2620,84 @@ class AgenticInvestigator:
                 max_shards=self.max_shards,
             )
             if len(clusters) <= 1 or self.budget.available("tokens") < 40_000:
-                if boot_last_turn < self.max_turns and boot_status == "max_turns_reached":
+                fallback_reason = "single_cluster" if len(clusters) <= 1 else "low_remaining_tokens"
+                can_continue = boot_last_turn < self.max_turns and (
+                    boot_status in {"max_turns_reached", "finished", "stopped_no_tool_calls"}
+                    if bootstrap_discovery_only
+                    else boot_status == "max_turns_reached"
+                )
+                if can_continue:
                     self.dispatcher.finished = False
                     self.dispatcher.finish_rejections = 0
                     self.dispatcher.finish_summary = ""
+                    self._active_model = self.model
+                    if bootstrap_discovery_only:
+                        cont_epoch_state: dict[str, Any] = {
+                            "turn_start": 0,
+                            "summary_text": "",
+                            "advancements": 0,
+                        }
+                        cont_sys_prompt = build_system_prompt(
+                            base_url=self.http.base_url,
+                            allowed_methods=sorted(self.http.allowed_methods),
+                            actor_summaries=self.http.actors.summaries(),
+                            discovery_hints=self.discovery_hints,
+                            http_budget=self.http.budget.limit,
+                        )
+                        frontier_banner = self.dispatcher.surface_tracker.format_frontier_banner(max_chars=2400)
+                        cont_user_prompt = (
+                            "Stage 1 discovery is complete. Continue the security investigation using the "
+                            "discovered surface frontier and live actor sessions below. Systematically verify "
+                            "authentication, authorization, tenant isolation, write endpoints, and input validation, "
+                            "and call `record_finding` for every confirmed issue.\n\n"
+                            f"[LIVE ACTORS]\n{json.dumps(self.http.actors.summaries(), ensure_ascii=False)}\n"
+                            f"{frontier_banner}"
+                            + self._state_banner(
+                                boot_last_turn + 1,
+                                dispatcher=self.dispatcher,
+                                max_turns_override=self.max_turns,
+                                allow_coverage_gate=True,
+                            )
+                        )
+                        cont_messages: list[dict[str, Any]] = [
+                            {"role": "system", "content": cont_sys_prompt},
+                            {"role": "user", "content": cont_user_prompt},
+                        ]
+                    else:
+                        cont_epoch_state = boot_epoch_state
+                        cont_messages = boot_messages
+
                     cont_status, _, _ = self._execute_monolithic_loop(
                         dispatcher=self.dispatcher,
-                        messages=boot_messages,
+                        messages=cont_messages,
                         start_turn=boot_last_turn + 1,
                         max_turns=self.max_turns,
-                        epoch_state=boot_epoch_state,
+                        epoch_state=cont_epoch_state,
                         model_name=self.model,
                         allow_coverage_gate=True,
                         checkpoint_fn=lambda t, st, msgs: self._save_checkpoint(turn=t, status=st, messages=msgs),
+                        excluded_tools=None,
                     )
-                    self._sharding_summary = {
-                        "bootstrap_turns": boot_last_turn,
-                        "bootstrap_calls": boot_calls[0],
-                        "bootstrap_tokens": boot_usage["total_tokens"],
-                        "bootstrap_findings": len(boot_findings_snap),
-                        "fallback_to_monolithic": True,
-                        "fallback_reason": "single_cluster" if len(clusters) <= 1 else "low_remaining_tokens",
-                        "shards": [],
-                    }
+                    self._sharding_summary = _build_sharding_summary(
+                        boot_turns=boot_last_turn,
+                        boot_findings_count=len(boot_findings_snap),
+                        fallback_to_monolithic=True,
+                        fallback_reason=fallback_reason,
+                        shards=[],
+                    )
                     return self._result_summary(cont_status)
 
-                self._sharding_summary = {
-                    "bootstrap_turns": boot_last_turn,
-                    "bootstrap_calls": boot_calls[0],
-                    "bootstrap_tokens": boot_usage["total_tokens"],
-                    "bootstrap_findings": len(boot_findings_snap),
-                    "fallback_to_monolithic": True,
-                    "fallback_reason": "single_cluster" if len(clusters) <= 1 else "low_remaining_tokens",
-                    "shards": [],
-                }
+                self._sharding_summary = _build_sharding_summary(
+                    boot_turns=boot_last_turn,
+                    boot_findings_count=len(boot_findings_snap),
+                    fallback_to_monolithic=True,
+                    fallback_reason=fallback_reason,
+                    shards=[],
+                )
                 return self._result_summary(boot_status)
 
             # Stage 2: Parallel monolithic subsystem shards
+            self._active_model = self.model
             rem_tokens = self.budget.available("tokens")
             num_shards = len(clusters)
             eff_shard_token_quota = (
@@ -2552,14 +2730,8 @@ class AgenticInvestigator:
                     shard_dispatcher.coverage_gate_enabled = False
                     shard_dispatcher.set_active_context(worker_id=cluster.shard_id, category=cluster.name)
 
-                    shard_epoch_state: dict[str, Any] = {"turn_start": 0, "summary_text": ""}
-                    shard_usage: dict[str, int] = {
-                        "prompt_tokens": 0,
-                        "completion_tokens": 0,
-                        "total_tokens": 0,
-                        "provider_reported_calls": 0,
-                        "estimated_calls": 0,
-                    }
+                    shard_epoch_state: dict[str, Any] = {"turn_start": 0, "summary_text": "", "advancements": 0}
+                    shard_usage: dict[str, int] = _new_usage_dict()
                     shard_calls = [0]
                     init_banner = self._state_banner(
                         1,
@@ -2609,6 +2781,7 @@ class AgenticInvestigator:
                             usage_sink=shard_usage,
                             calls_sink=shard_calls,
                             shard_token_quota=eff_shard_token_quota,
+                            excluded_tools=None,
                         )
                     except BudgetError as exc:
                         s_status = self._classify_budget_error(exc, is_shard=True)
@@ -2621,6 +2794,11 @@ class AgenticInvestigator:
                         "families": list(cluster.families),
                         "calls": shard_calls[0],
                         "tokens": shard_usage["total_tokens"],
+                        "effective_tokens": effective_tokens_from_usage(shard_usage, self.cache_token_weight),
+                        "cached_tokens": shard_usage["cached_prompt_tokens"],
+                        "uncached_tokens": shard_usage["uncached_prompt_tokens"],
+                        "reasoning_tokens": shard_usage["reasoning_tokens"],
+                        "epoch_advancements": int(shard_epoch_state.get("advancements", 0)),
                         "shard_token_quota": eff_shard_token_quota,
                         "findings": list(shard_dispatcher.findings),
                         "status": s_status,
@@ -2688,26 +2866,29 @@ class AgenticInvestigator:
                 overall_status = shard_statuses[0] if shard_statuses else "finished"
             self.dispatcher.finished = overall_status == "finished"
 
-            self._sharding_summary = {
-                "bootstrap_turns": boot_last_turn,
-                "bootstrap_calls": boot_calls[0],
-                "bootstrap_tokens": boot_usage["total_tokens"],
-                "bootstrap_findings": len(boot_findings_snap),
-                "fallback_to_monolithic": False,
-                "shards": [
+            self._sharding_summary = _build_sharding_summary(
+                boot_turns=boot_last_turn,
+                boot_findings_count=len(boot_findings_snap),
+                fallback_to_monolithic=False,
+                shards=[
                     {
                         "shard_id": r["shard_id"],
                         "name": r["name"],
                         "families": r["families"],
                         "calls": r["calls"],
                         "tokens": r["tokens"],
+                        "effective_tokens": r["effective_tokens"],
+                        "cached_tokens": r["cached_tokens"],
+                        "uncached_tokens": r["uncached_tokens"],
+                        "reasoning_tokens": r["reasoning_tokens"],
+                        "epoch_advancements": r["epoch_advancements"],
                         "shard_token_quota": r["shard_token_quota"],
                         "findings": len(r["findings"]),
                         "status": r["status"],
                     }
                     for r in shard_results
                 ],
-            }
+            )
             self._save_checkpoint(turn=boot_last_turn, status=overall_status, messages=[])
             return self._result_summary(overall_status)
         finally:
@@ -2716,6 +2897,15 @@ class AgenticInvestigator:
                 self.write_metrics()
 
     def _result_summary(self, status: str) -> dict[str, Any]:
+        with self._stats_lock:
+            usage_out: dict[str, Any] = dict(self.token_usage)
+            eff_tokens = effective_tokens_from_usage(self.token_usage, self.cache_token_weight)
+            epoch_advancements = self._epoch_advancements
+        prompt_tok = int(usage_out.get("prompt_tokens", 0))
+        cached_tok = int(usage_out.get("cached_prompt_tokens", 0))
+        usage_out["cache_hit_rate"] = round(cached_tok / prompt_tok, 4) if prompt_tok > 0 else 0.0
+        usage_out["effective_tokens"] = eff_tokens
+        usage_out["cache_token_weight"] = round(self.cache_token_weight, 4)
         out: dict[str, Any] = {
             "status": status,
             "execution_mode": self.execution_mode,
@@ -2729,7 +2919,8 @@ class AgenticInvestigator:
             "http_requests_used": self.http.budget.used,
             "http_requests_limit": self.http.budget.limit,
             "llm_calls": self.transport.calls,
-            "token_usage": dict(self.token_usage),
+            "token_usage": usage_out,
+            "epoch_advancements": epoch_advancements,
             "checkpoint_path": str(self.checkpoint_path),
         }
         if self._handoff_summary is not None:

@@ -15,11 +15,16 @@ SCRIPTS = Path(__file__).resolve().parent
 if str(SCRIPTS) not in sys.path:
     sys.path.insert(0, str(SCRIPTS))
 
+import agentic_report  # noqa: E402
 import external_target_runner as ext  # noqa: E402
 import full_agent_e6_benchmark as e6  # noqa: E402
 import llm_config  # noqa: E402
 from agentic_http import ActorManager, AgenticHTTPClient  # noqa: E402
-from agentic_investigator import AgenticInvestigator  # noqa: E402
+from agentic_investigator import (  # noqa: E402
+    _EPOCH_HARD_CHAR_LIMIT,
+    _PROMPT_HARD_CHAR_LIMIT,
+    AgenticInvestigator,
+)
 from agentic_receipts import ReceiptStore  # noqa: E402
 from agentic_tools import canonicalize_and_deduplicate_findings  # noqa: E402
 from full_agent_budget import SharedBudget  # noqa: E402
@@ -95,8 +100,16 @@ def run_agentic_target(
     bootstrap_turns: int = 12,
     shard_turns: int = 25,
     shard_token_quota: int = 0,
+    bootstrap_model: str = "",
+    epoch_char_limit: int = 0,
+    cache_token_weight: float = 0.10,
 ) -> tuple[Path, dict[str, Any]]:
     """Run (or plan when execute=False) AgenticInvestigator against an owned loopback target."""
+    if isinstance(cache_token_weight, bool):
+        raise ValueError("cache_token_weight must be between 0.0 and 1.0")
+    eff_cache_weight = float(cache_token_weight)
+    if not (0.0 <= eff_cache_weight <= 1.0):
+        raise ValueError(f"cache_token_weight must be between 0.0 and 1.0, got {cache_token_weight!r}")
     bundle = ext.load_credentials_bundle(credentials_file)
     base = ext.normalize_loopback_origin(target or str(bundle.get("target_url") or ""))
     eff_run_id = str(run_id or bundle.get("run_id") or "").strip() or uuid.uuid4().hex
@@ -139,6 +152,20 @@ def run_agentic_target(
         provider["models"] = set(provider["models"]) | set(scout_provider["models"])
         models = {**models, "scout": scout_sel["worker"]}
         scout_model_id = scout_sel["worker"].split("/", 1)[1]
+    eff_bootstrap_model = str(bootstrap_model or "").strip()
+    bootstrap_model_id = ""
+    if eff_bootstrap_model:
+        boot_sel = llm_config.model_selection(provider_config, model=models["worker"], worker_model=eff_bootstrap_model)
+        boot_provider = llm_config.provider_settings(provider_config, boot_sel)
+        provider["models"] = set(provider["models"]) | set(boot_provider["models"])
+        models = {**models, "bootstrap": boot_sel["worker"]}
+        bootstrap_model_id = boot_sel["worker"].split("/", 1)[1]
+
+    raw_epoch_limit = int(epoch_char_limit)
+    eff_epoch_char_limit = max(
+        _PROMPT_HARD_CHAR_LIMIT,
+        _EPOCH_HARD_CHAR_LIMIT if raw_epoch_limit <= 0 else raw_epoch_limit,
+    )
 
     output = Path(output_dir).expanduser().resolve()
     output.mkdir(parents=True, exist_ok=True)
@@ -147,6 +174,8 @@ def run_agentic_target(
         "llm_tokens": int(token_budget),
         "seconds": int(seconds_budget),
         "max_turns": int(max_turns),
+        "epoch_char_limit": eff_epoch_char_limit,
+        "cache_token_weight": eff_cache_weight,
     }
 
     ablation_cfg = {
@@ -164,6 +193,8 @@ def run_agentic_target(
     eff_shard_token_quota = max(0, int(shard_token_quota))
     if eff_shard_token_quota > 0:
         sharding_cfg["shard_token_quota"] = eff_shard_token_quota
+    if eff_bootstrap_model:
+        sharding_cfg["bootstrap_model"] = models["bootstrap"]
 
     if not execute:
         plan_path = output / "agentic-plan.json"
@@ -214,6 +245,7 @@ def run_agentic_target(
         api_key_header=provider.get("api_key_header", "Authorization"),
         session_gate=session_gate,
         provider_options=provider.get("provider_options"),
+        cache_token_weight=eff_cache_weight,
     )
     receipt_store = ReceiptStore(output)
     actors = ActorManager(
@@ -272,6 +304,9 @@ def run_agentic_target(
             bootstrap_turns=sharding_cfg["bootstrap_turns"],
             shard_turns=sharding_cfg["shard_turns"],
             shard_token_quota=eff_shard_token_quota,
+            bootstrap_model=bootstrap_model_id or None,
+            epoch_char_limit=eff_epoch_char_limit,
+            cache_token_weight=eff_cache_weight,
         )
         run_info = investigator.run(resume=resume)
         manifest.update(run_info)
@@ -324,6 +359,16 @@ def run_agentic_target(
         dump(private_dir / "budget.json", snap)
         dump(manifest_path, manifest)
         dump(output / "launch.json", manifest)
+        try:
+            rep = agentic_report.generate_run_reports(output)
+            if rep.get("markdown_path"):
+                manifest["report_md"] = rep["markdown_path"]
+            if rep.get("sarif_path"):
+                manifest["report_sarif"] = rep["sarif_path"]
+        except Exception as report_exc:
+            manifest["report_error"] = type(report_exc).__name__
+        dump(manifest_path, manifest)
+        dump(output / "launch.json", manifest)
     return manifest_path, manifest
 
 
@@ -369,7 +414,26 @@ def main(argv: list[str] | None = None) -> int:
         default=0,
         help="Optional per-shard soft token quota for sharded mode (0 = auto-balanced from remaining tokens)",
     )
+    parser.add_argument(
+        "--bootstrap-model",
+        default="",
+        help="Optional Stage 1 discovery-only bootstrap model (same provider) for sharded mode",
+    )
+    parser.add_argument(
+        "--epoch-char-limit",
+        type=int,
+        default=0,
+        help="Optional per-epoch serialized byte limit before advancing epoch (0 = default 80000)",
+    )
+    parser.add_argument(
+        "--cache-token-weight",
+        type=float,
+        default=0.10,
+        help="Effective token weight in [0.0, 1.0] for cached prompt tokens (default: 0.10)",
+    )
     args = parser.parse_args(argv)
+    if not (0.0 <= float(args.cache_token_weight) <= 1.0):
+        parser.error("--cache-token-weight must be between 0.0 and 1.0")
 
     path, doc = run_agentic_target(
         target=args.target,
@@ -407,6 +471,9 @@ def main(argv: list[str] | None = None) -> int:
         bootstrap_turns=args.bootstrap_turns,
         shard_turns=args.shard_turns,
         shard_token_quota=args.shard_token_quota,
+        bootstrap_model=args.bootstrap_model,
+        epoch_char_limit=args.epoch_char_limit,
+        cache_token_weight=args.cache_token_weight,
     )
     print(json.dumps({
         "artifact": str(path),

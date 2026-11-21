@@ -168,9 +168,15 @@ class MeteredProviderTransport:
         api_key_header="Authorization",
         session_gate=None,
         provider_options=None,
+        cache_token_weight: float = 1.0,
     ):
         if api_key_header not in {"Authorization", "X-API-Key"}:
             raise ValueError("unsupported provider API key header")
+        if isinstance(cache_token_weight, bool):
+            raise ValueError("cache_token_weight must be between 0.0 and 1.0")
+        weight = float(cache_token_weight)
+        if not (0.0 <= weight <= 1.0):
+            raise ValueError("cache_token_weight must be between 0.0 and 1.0")
         self.budget = budget
         self.private = Path(private)
         self.provider = provider
@@ -179,13 +185,14 @@ class MeteredProviderTransport:
         self.api_key_header = api_key_header
         self.session_gate = session_gate or SessionGate()
         self.provider_options = dict(provider_options) if isinstance(provider_options, dict) and provider_options else None
+        self.cache_token_weight = weight
         self.provider_lock = threading.Lock()
         self.transport_lock = threading.Lock()
         self.upstream = None
         self._active_upstreams: set[Any] = set()
         self.calls = 0
-        self.provider_requests = []
-        self.provider_responses = []
+        self.provider_requests: list[dict[str, Any]] = []
+        self.provider_responses: list[dict[str, Any]] = []
 
     def close_upstream(self):
         with self.transport_lock:
@@ -295,7 +302,7 @@ class MeteredProviderTransport:
             if self.budget.checkpoint is not None:
                 self.budget.checkpoint()
 
-        response, measured, safe_usage = None, None, None
+        response, measured, settled, safe_usage = None, None, None, None
         status, error, encoding = None, None, None
         failure_reason, accounting_shape, response_bytes = None, None, None
         accounting_basis = None
@@ -383,7 +390,23 @@ class MeteredProviderTransport:
                 or usage["completion_tokens"] > metrics["admitted_output_tokens"]
             ):
                 measured = None
+                settled = None
                 raise BudgetError("provider usage exceeded admitted prompt or output bound")
+            if self.cache_token_weight < 1.0:
+                cached = max(
+                    0,
+                    min(
+                        usage["prompt_tokens"],
+                        int((safe_usage.get("prompt_tokens_details") or {}).get("cached_tokens") or 0),
+                    ),
+                )
+                uncached = max(0, usage["prompt_tokens"] - cached)
+                settled = min(
+                    measured,
+                    uncached + int(round(cached * self.cache_token_weight)) + usage["completion_tokens"],
+                )
+            else:
+                settled = measured
             if not isinstance(response.get("choices"), list) or not response["choices"]:
                 raise BudgetError("provider response omitted choices")
             return response
@@ -404,11 +427,13 @@ class MeteredProviderTransport:
                 try:
                     self.budget.settle(
                         ticket,
-                        measured,
+                        settled if measured is not None else None,
                         model=request["model"],
                         runtime_phase=runtime_info["phase"] if runtime_info else None,
                         task_spec_id=metrics["task_spec_id"],
                         usage=safe_usage,
+                        raw_tokens=measured,
+                        cache_token_weight=self.cache_token_weight,
                         upstream_http_status=status,
                         provider_error=error,
                         provider_failure_reason=failure_reason,

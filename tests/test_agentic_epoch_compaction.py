@@ -214,7 +214,7 @@ def test_monolithic_epoch_prefix_cache_is_byte_identical_across_turns(tmp_path: 
 
 
 def test_epoch_advancement_freezes_epoch2_prefix_and_preserves_receipt_summary(tmp_path: Path) -> None:
-    """Exceeding _EPOCH_HARD_CHAR_LIMIT advances the epoch once and keeps Epoch 2 strictly append-only."""
+    """Exceeding epoch_char_limit=32_000 advances the epoch once and keeps Epoch 2 strictly append-only."""
     store, client, budget = _make_deps(tmp_path, http_limit=40, token_limit=500_000)
     try:
         transport = _RecordingTransport([])
@@ -226,6 +226,7 @@ def test_epoch_advancement_freezes_epoch2_prefix_and_preserves_receipt_summary(t
             model="test-model",
             root_dir=tmp_path,
             max_turns=40,
+            epoch_char_limit=32_000,
         )
 
         messages: list[dict[str, Any]] = [
@@ -239,7 +240,7 @@ def test_epoch_advancement_freezes_epoch2_prefix_and_preserves_receipt_summary(t
         advanced_at_turn: int | None = None
 
         # Each turn adds ~3.2 KB so Epoch 1 grows above _PROMPT_HARD_CHAR_LIMIT (24,000) without compacting,
-        # crosses _EPOCH_HARD_CHAR_LIMIT (32,000) around turn 8, advances to len(turn_groups)-1, and Epoch 2 holds 4+ turns.
+        # crosses epoch_char_limit (32,000) around turn 8, advances to len(turn_groups)-1, and Epoch 2 holds 4+ turns.
         for turn in range(1, 14):
             rid = f"req-{turn:04d}"
             messages.append({
@@ -262,7 +263,7 @@ def test_epoch_advancement_freezes_epoch2_prefix_and_preserves_receipt_summary(t
             )
             body = inv._prepare_bounded_body(messages)
             wire_bytes = len(json.dumps({"messages": body["messages"], "tools": body["tools"]}, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
-            assert wire_bytes <= _EPOCH_HARD_CHAR_LIMIT
+            assert wire_bytes <= 32_000
 
             if inv._epoch_turn_start == 0:
                 epoch1_bodies.append(body)
@@ -578,5 +579,60 @@ def test_ephemeral_mode_and_short_message_lists_unaffected_by_epoch_state(tmp_pa
             assert inv_eph._epoch_turn_start == 3
         finally:
             client_e.close()
+    finally:
+        client.close()
+
+
+def test_default_80k_epoch_limit_retains_long_prefix_without_churn(tmp_path: Path) -> None:
+    """Default _EPOCH_HARD_CHAR_LIMIT (80,000) keeps 14 turns (~50 KB) in Epoch 1 with zero advancements."""
+    store, client, budget = _make_deps(tmp_path, http_limit=40, token_limit=500_000)
+    try:
+        assert _EPOCH_HARD_CHAR_LIMIT == 80_000
+        inv = AgenticInvestigator(
+            http_client=client,
+            receipt_store=store,
+            transport=_RecordingTransport([]),  # type: ignore[arg-type]
+            budget=budget,
+            model="test-model",
+            root_dir=tmp_path,
+            max_turns=40,
+        )
+        assert inv.epoch_char_limit == 80_000
+        messages: list[dict[str, Any]] = [
+            {"role": "system", "content": "S" * 1000},
+            {"role": "user", "content": "Investigate target.\n[STATE] http_budget: 40/40 left | turn: 1/40"},
+        ]
+        bodies: list[dict[str, Any]] = []
+        for turn in range(1, 15):
+            messages.append({
+                "role": "assistant",
+                "content": f"Turn {turn} reasoning.",
+                "tool_calls": [{
+                    "id": f"call_{turn}",
+                    "type": "function",
+                    "function": {"name": "http_request", "arguments": json.dumps({"url": f"/api/item/{turn}"})},
+                }],
+            })
+            messages.append(
+                _tool_http_msg(
+                    call_id=f"call_{turn}",
+                    receipt_id=f"req-{turn:04d}",
+                    url=f"http://127.0.0.1:18080/api/item/{turn}",
+                    body_preview="X" * 2800,
+                    banner=f"\n[STATE] http_budget: {40 - turn}/40 left | turn: {turn + 1}/40",
+                )
+            )
+            body = inv._prepare_bounded_body(messages)
+            wire_bytes = len(
+                json.dumps({"messages": body["messages"], "tools": body["tools"]}, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+            )
+            assert wire_bytes <= 80_000
+            bodies.append(body)
+
+        assert inv._epoch_turn_start == 0
+        assert inv._epoch_advancements == 0
+        for t in range(len(bodies) - 1):
+            assert bodies[t]["tools"] == bodies[t + 1]["tools"]
+            assert bodies[t]["messages"] == bodies[t + 1]["messages"][:len(bodies[t]["messages"])]
     finally:
         client.close()
