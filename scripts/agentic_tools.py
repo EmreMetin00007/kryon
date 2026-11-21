@@ -1,6 +1,7 @@
-"""The 7 general-purpose investigation tools with anti-hallucination verification."""
+"""General-purpose investigation and QA verification tools with anti-hallucination verification."""
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 import copy
 from difflib import SequenceMatcher
 import json
@@ -21,6 +22,7 @@ from agentic_http import (
     ScopeViolationError,
     is_static_asset_url,
 )
+from agentic_oob import LoopbackCallbackServer
 from agentic_oracle import (
     check_bola_false_positive,
     find_persistent_render_get_receipt,
@@ -178,34 +180,22 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "http_request",
-            "description": (
-                "Send a scope-locked HTTP request as a named actor (or 'anon'). "
-                "Successful GETs are cached unless force=true. Returns receipt_id, status, headers, and body preview."
-            ),
+            "description": "Send scope-locked HTTP request as actor (or 'anon'). GETs cached unless force=true.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "method": {"type": "string", "description": "HTTP method (GET, HEAD, POST, PUT, PATCH, DELETE)."},
-                    "url": {"type": "string", "description": "Relative path (e.g. '/api/v1/items') or same-origin URL."},
-                    "actor": {"type": "string", "description": "Actor alias from available actors, or 'anon'."},
-                    "headers": {"type": "object", "additionalProperties": {"type": "string"}, "description": "Optional extra HTTP headers."},
-                    "query": {"type": "object", "additionalProperties": {"type": "string"}, "description": "Optional query parameters to set/merge."},
-                    "json_body": {"description": "Optional JSON request body (object/array/value)."},
-                    "base_receipt_id": {
-                        "type": "string",
-                        "description": "Optional receipt_id of a previously fetched GET JSON response to preserve as the base JSON object for PUT/PATCH/POST.",
-                    },
-                    "json_merge": {
-                        "type": "object",
-                        "description": "Optional JSON object keys to deep-merge into base_receipt_id (or json_body) while preserving existing required fields.",
-                    },
-                    "form_body": {"type": "object", "additionalProperties": {"type": "string"}, "description": "Optional form-urlencoded body."},
-                    "raw_body": {"type": "string", "description": "Optional raw string body."},
-                    "force": {"type": "boolean", "description": "Bypass GET dedup cache for repeatability verification."},
-                    "save_session_as": {
-                        "type": "string",
-                        "description": "Optional alias (e.g. 'user-1') to bind returned cookies/tokens/CSRF in harness memory.",
-                    },
+                    "method": {"type": "string", "description": "HTTP method."},
+                    "url": {"type": "string", "description": "Path or same-origin URL."},
+                    "actor": {"type": "string", "description": "Actor alias or 'anon'."},
+                    "headers": {"type": "object", "additionalProperties": {"type": "string"}, "description": "Extra headers."},
+                    "query": {"type": "object", "additionalProperties": {"type": "string"}, "description": "Query params."},
+                    "json_body": {"description": "JSON body."},
+                    "base_receipt_id": {"type": "string", "description": "GET receipt_id for base JSON."},
+                    "json_merge": {"type": "object", "description": "JSON keys to deep-merge."},
+                    "form_body": {"type": "object", "additionalProperties": {"type": "string"}, "description": "Form body."},
+                    "raw_body": {"type": "string", "description": "Raw body."},
+                    "force": {"type": "boolean", "description": "Bypass GET cache."},
+                    "save_session_as": {"type": "string", "description": "Alias for captured session."},
                 },
                 "required": ["url"],
             },
@@ -215,17 +205,14 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "read_receipt",
-            "description": (
-                "Read stored response content from a previous receipt_id at 0 HTTP cost. "
-                "Supports pagination (offset/limit) and regex search for large JSON/JS/HTML payloads."
-            ),
+            "description": "Read stored receipt body at 0 HTTP cost via offset/limit or regex.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "receipt_id": {"type": "string", "description": "Receipt ID such as 'req-0001'."},
-                    "offset": {"type": "integer", "description": "Character offset to start reading from (default 0)."},
-                    "limit": {"type": "integer", "description": "Max characters to return (default 4000, max 12000)."},
-                    "regex": {"type": "string", "description": "Optional regex to search matching snippets inside the stored body."},
+                    "receipt_id": {"type": "string", "description": "Receipt ID."},
+                    "offset": {"type": "integer", "description": "Start offset (default 0)."},
+                    "limit": {"type": "integer", "description": "Max chars (default 4000)."},
+                    "regex": {"type": "string", "description": "Regex filter."},
                 },
                 "required": ["receipt_id"],
             },
@@ -235,29 +222,20 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "replay_as",
-            "description": (
-                "Replay an existing receipt_id as another actor (or with modified url/query/headers/json) "
-                "and return an automatic structural diff against the baseline receipt."
-            ),
+            "description": "Replay a receipt_id as another actor or with overrides; returns diff.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "receipt_id": {"type": "string", "description": "Baseline receipt_id to replay."},
-                    "actor": {"type": "string", "description": "Target actor alias (or 'anon'). Defaults to baseline actor."},
-                    "method": {"type": "string", "description": "Optional HTTP method override."},
-                    "url": {"type": "string", "description": "Optional URL/path override (e.g. swapped resource ID)."},
-                    "query_overrides": {"type": "object", "additionalProperties": {"type": "string"}, "description": "Query params to add/replace."},
-                    "header_overrides": {"type": "object", "additionalProperties": {"type": "string"}, "description": "Headers to add/replace."},
-                    "base_receipt_id": {
-                        "type": "string",
-                        "description": "Optional GET receipt_id whose JSON response object serves as the base body before merging json_merge/json_overrides.",
-                    },
-                    "json_merge": {
-                        "type": "object",
-                        "description": "JSON fields to deep-merge into base_receipt_id (or baseline GET response / request JSON body) preserving existing fields.",
-                    },
-                    "json_overrides": {"type": "object", "description": "JSON fields to merge into baseline JSON body (or GET response body on PUT/PATCH/POST)."},
-                    "force": {"type": "boolean", "description": "Bypass GET dedup cache."},
+                    "receipt_id": {"type": "string", "description": "Baseline receipt_id."},
+                    "actor": {"type": "string", "description": "Target actor or 'anon'."},
+                    "method": {"type": "string", "description": "Method override."},
+                    "url": {"type": "string", "description": "URL/path override."},
+                    "query_overrides": {"type": "object", "additionalProperties": {"type": "string"}, "description": "Query overrides."},
+                    "header_overrides": {"type": "object", "additionalProperties": {"type": "string"}, "description": "Header overrides."},
+                    "base_receipt_id": {"type": "string", "description": "GET receipt_id for base JSON."},
+                    "json_merge": {"type": "object", "description": "JSON keys to deep-merge."},
+                    "json_overrides": {"type": "object", "description": "JSON fields to merge."},
+                    "force": {"type": "boolean", "description": "Bypass GET cache."},
                 },
                 "required": ["receipt_id"],
             },
@@ -267,14 +245,11 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "extract_surface",
-            "description": (
-                "Parse HTML links/forms/inputs, JS routes/calls, OpenAPI specs, robots/sitemaps, "
-                "and JSON hypermedia/IDs from a stored receipt_id at 0 HTTP cost."
-            ),
+            "description": "Extract links, forms, JS routes, OpenAPI ops, and IDs from a receipt_id at 0 HTTP cost.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "receipt_id": {"type": "string", "description": "Stored receipt_id to parse locally."},
+                    "receipt_id": {"type": "string", "description": "Stored receipt_id."},
                 },
                 "required": ["receipt_id"],
             },
@@ -284,24 +259,18 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "notebook",
-            "description": (
-                "Maintain a structured investigation notebook (surface notes, hypotheses, observations) "
-                "that persists across context compaction and checkpoints. 0 HTTP cost."
-            ),
+            "description": "Maintain investigation notebook (surface_notes, hypotheses, notes). 0 HTTP cost.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "action": {
                         "type": "string",
                         "enum": ["read", "update", "add_hypothesis", "update_hypothesis", "add_note"],
-                        "description": "Notebook operation.",
+                        "description": "Notebook action.",
                     },
-                    "surface_notes": {"type": "string", "description": "Updated surface/architecture summary."},
-                    "hypothesis": {
-                        "type": "object",
-                        "description": "Hypothesis object: {id, target, vuln_class, status, notes}.",
-                    },
-                    "note": {"type": "string", "description": "Short observation note to append."},
+                    "surface_notes": {"type": "string", "description": "Surface summary."},
+                    "hypothesis": {"type": "object", "description": "{id,target,vuln_class,status,notes}."},
+                    "note": {"type": "string", "description": "Note text."},
                 },
                 "required": ["action"],
             },
@@ -310,37 +279,61 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
     {
         "type": "function",
         "function": {
-            "name": "record_finding",
-            "description": (
-                "Record a verified vulnerability finding backed by real proof_receipt_ids, "
-                "comparative control_receipt_ids, and an exact observed evidence_value."
-            ),
+            "name": "callback_listener",
+            "description": "Local loopback OOB callback URLs (create_url/poll) for SSRF/webhook checks. 0 HTTP cost.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "title": {"type": "string", "description": "Concise vulnerability title."},
+                    "action": {"type": "string", "enum": ["create_url", "poll"], "description": "create_url or poll."},
+                    "label": {"type": "string", "description": "Callback label."},
+                    "token": {"type": "string", "description": "Token (empty=all)."},
+                },
+                "required": ["action"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "concurrent_check",
+            "description": "Send 2-5 synchronized parallel requests to test idempotency and race conditions.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "url": {"type": "string", "description": "Path or same-origin URL."},
+                    "method": {"type": "string", "description": "HTTP method."},
+                    "actor": {"type": "string", "description": "Actor alias or 'anon'."},
+                    "headers": {"type": "object", "additionalProperties": {"type": "string"}, "description": "Extra headers."},
+                    "query": {"type": "object", "additionalProperties": {"type": "string"}, "description": "Query params."},
+                    "json_body": {"description": "JSON body."},
+                    "form_body": {"type": "object", "additionalProperties": {"type": "string"}, "description": "Form body."},
+                    "raw_body": {"type": "string", "description": "Raw body."},
+                    "count": {"type": "integer", "description": "Parallel count (2-5, default 3)."},
+                },
+                "required": ["url", "method", "actor"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "record_finding",
+            "description": "Record a verified finding backed by proof_receipt_ids, control_receipt_ids, and evidence_value.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "title": {"type": "string", "description": "Title."},
                     "class_type": {
                         "type": "string",
-                        "description": "Canonical OWASP vulnerability class: bola, tenant_isolation, bfla, auth_bypass, mass_assignment, reflected_xss, stored_xss, sqli_read, sqli, open_redirect, csrf, ssti, xxe, ssrf, path_traversal, info_disclosure, other.",
+                        "description": "Class: bola, tenant_isolation, bfla, auth_bypass, mass_assignment, reflected_xss, stored_xss, sqli_read, sqli, open_redirect, csrf, ssti, xxe, ssrf, path_traversal, info_disclosure, business_logic, race_condition, other.",
                     },
-                    "method": {"type": "string", "description": "HTTP method of the vulnerable request."},
-                    "url": {"type": "string", "description": "Vulnerable endpoint path or URL."},
-                    "actor_alias": {"type": "string", "description": "Actor alias that observed the proof."},
-                    "proof_receipt_ids": {
-                        "type": "array",
-                        "items": {"type": "string"},
-                        "description": "Receipt IDs demonstrating the vulnerability.",
-                    },
-                    "control_receipt_ids": {
-                        "type": "array",
-                        "items": {"type": "string"},
-                        "description": "Receipt IDs demonstrating the negative/baseline control.",
-                    },
-                    "evidence_value": {
-                        "type": "string",
-                        "description": "Exact observed canary/value/payload/redirect present in the proof receipt.",
-                    },
-                    "summary": {"type": "string", "description": "Technical explanation of proof and control."},
+                    "method": {"type": "string", "description": "HTTP method."},
+                    "url": {"type": "string", "description": "Endpoint path or URL."},
+                    "actor_alias": {"type": "string", "description": "Proof actor."},
+                    "proof_receipt_ids": {"type": "array", "items": {"type": "string"}, "description": "Proof IDs."},
+                    "control_receipt_ids": {"type": "array", "items": {"type": "string"}, "description": "Control IDs."},
+                    "evidence_value": {"type": "string", "description": "Observed evidence."},
+                    "summary": {"type": "string", "description": "Summary."},
                     "severity": {"type": "string", "enum": ["critical", "high", "medium", "low"]},
                 },
                 "required": [
@@ -361,16 +354,12 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "finish",
-            "description": "Complete the investigation and summarize findings plus any untested areas.",
+            "description": "Complete investigation and summarize findings plus untested areas.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "summary": {"type": "string", "description": "Final assessment summary."},
-                    "untested_areas": {
-                        "type": "array",
-                        "items": {"type": "string"},
-                        "description": "Endpoints or classes not tested due to budget/scope constraints.",
-                    },
+                    "summary": {"type": "string", "description": "Final summary."},
+                    "untested_areas": {"type": "array", "items": {"type": "string"}, "description": "Untested areas."},
                 },
                 "required": ["summary"],
             },
@@ -434,6 +423,10 @@ _CLASS_ALIASES = {
     "unvalidated_redirect": "open_redirect",
     "redirect": "open_redirect",
     "sql_injection": "sqli",
+    "server_side_request_forgery": "ssrf",
+    "toctou": "race_condition",
+    "race": "race_condition",
+    "concurrency": "race_condition",
 }
 _READ_SQLI_HINTS = ("order by", "order_by", "sort", "read", "differential", "boolean", "error-based", "error based", "case when")
 _ADMIN_ROLE_TOKENS = ("admin", "superadmin", "administrator", "root", "superuser", "sysadmin", "staff")
@@ -2294,7 +2287,7 @@ def _build_surface_hints(
 
 
 class ToolDispatcher:
-    """Executes the 7 general investigation tools against the harness."""
+    """Executes investigation and QA verification tools against the harness."""
 
     def __init__(
         self,
@@ -2307,6 +2300,7 @@ class ToolDispatcher:
         telemetry: Any | None = None,
         findings_path: str | Path | None = None,
         persist_findings: bool = True,
+        oob_server: LoopbackCallbackServer | None = None,
     ):
         self.http = http_client
         self.receipts = receipt_store
@@ -2314,6 +2308,9 @@ class ToolDispatcher:
         self.bsag = bsag
         self.oracle = oracle
         self.telemetry = telemetry
+        self._oob_server: LoopbackCallbackServer | None = oob_server
+        self._owns_oob_server: bool = False
+        self._oob_lock = threading.Lock()
         self.active_worker_id: str = ""
         self.active_node_id: str = ""
         self.active_category: str = ""
@@ -2426,6 +2423,28 @@ class ToolDispatcher:
         with self._findings_lock:
             _atomic_write_json(self.findings_path, self.findings)
 
+    def _get_oob_server(self, *, start: bool = False) -> LoopbackCallbackServer | None:
+        with self._oob_lock:
+            if self._oob_server is None:
+                if not start:
+                    return None
+                self._oob_server = LoopbackCallbackServer()
+                self._owns_oob_server = True
+            if start:
+                self._oob_server.start()
+            return self._oob_server
+
+    def close(self) -> None:
+        """Cleanly shut down any lazily created loopback callback server."""
+        with self._oob_lock:
+            srv = self._oob_server
+            owns = self._owns_oob_server
+            if owns:
+                self._oob_server = None
+                self._owns_oob_server = False
+        if srv is not None and owns:
+            srv.close()
+
     def dispatch(self, name: str, args: dict[str, Any]) -> str:
         handlers = {
             "http_request": self._tool_http_request,
@@ -2433,6 +2452,8 @@ class ToolDispatcher:
             "replay_as": self._tool_replay_as,
             "extract_surface": self._tool_extract_surface,
             "notebook": self._tool_notebook,
+            "callback_listener": self._tool_callback_listener,
+            "concurrent_check": self._tool_concurrent_check,
             "record_finding": self._tool_record_finding,
             "finish": self._tool_finish,
         }
@@ -2654,6 +2675,127 @@ class ToolDispatcher:
             self._save_notebook()
             return json.dumps(self.notebook_state, ensure_ascii=False)
 
+    def _tool_callback_listener(self, args: dict[str, Any]) -> str:
+        action = str(args.get("action") or "").strip().lower()
+        if action == "create_url":
+            srv = self._get_oob_server(start=True)
+            assert srv is not None
+            info = srv.create_token(label=str(args.get("label") or ""))
+            return json.dumps(info, ensure_ascii=False)
+        if action == "poll":
+            tok = str(args.get("token") or "").strip()
+            srv = self._get_oob_server(start=False)
+            if srv is None:
+                return wrap_untrusted({
+                    "token": tok,
+                    "registered": False,
+                    "hit_count": 0,
+                    "total_hits": 0,
+                    "hits": [],
+                })
+            return wrap_untrusted(srv.poll(tok))
+        raise ValueError(f"unsupported callback_listener action: {action!r}; expected 'create_url' or 'poll'")
+
+    def _tool_concurrent_check(self, args: dict[str, Any]) -> str:
+        url = str(args.get("url") or "").strip()
+        norm_method = str(args.get("method") or "GET").strip().upper()
+        actor = str(args.get("actor") or "anon").strip() or "anon"
+
+        raw_count = args.get("count", 3)
+        if isinstance(raw_count, bool):
+            raise ValueError("count must be an integer between 2 and 5")
+        try:
+            count_val = int(raw_count) if raw_count is not None else 3
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"invalid count: {raw_count!r}") from exc
+        count = max(2, min(5, count_val))
+
+        if norm_method not in self.http.allowed_methods:
+            raise MethodNotAllowedError(
+                f"HTTP method {norm_method!r} not allowed; permitted: {sorted(self.http.allowed_methods)}"
+            )
+        headers = args.get("headers") if isinstance(args.get("headers"), dict) else None
+        query = args.get("query") if isinstance(args.get("query"), dict) else None
+        json_body = args.get("json_body")
+        form_body = args.get("form_body") if isinstance(args.get("form_body"), dict) else None
+        raw_body = str(args["raw_body"]) if args.get("raw_body") is not None else None
+
+        clean_url, _, _ = self.http._merge_query(url, query)
+        session = self.http.actors.get(actor)
+        has_auth_override = any(str(k).lower() in {"authorization", "cookie"} for k in (headers or {}))
+        if actor != "anon" and not has_auth_override and not session.authenticated:
+            self.http.authenticate_actor(actor, force_login=False)
+
+        remaining = self.http._budget_remaining()
+        if remaining < count:
+            raise BudgetExhaustedError(
+                f"concurrent_check requires {count} HTTP requests, only {remaining} remaining in budget"
+            )
+
+        barrier = threading.Barrier(count, timeout=10.0)
+
+        def _worker() -> dict[str, Any]:
+            try:
+                barrier.wait()
+            except threading.BrokenBarrierError:
+                pass
+            return self.http.request(
+                method=norm_method,
+                url=url,
+                actor=actor,
+                headers=headers,
+                query=query,
+                json_body=json_body,
+                form_body=form_body,
+                raw_body=raw_body,
+                force=True,
+            )
+
+        with ThreadPoolExecutor(max_workers=count) as pool:
+            futures = [pool.submit(_worker) for _ in range(count)]
+            receipts = [fut.result() for fut in futures]
+
+        for rec in receipts:
+            self._ingest_receipt_hooks(rec)
+
+        status_counts: dict[str, int] = {}
+        receipt_ids: list[str] = []
+        distinct_hashes: list[str] = []
+        seen_hashes: set[str] = set()
+        results: list[dict[str, Any]] = []
+        for rec in receipts:
+            rid = str(rec.get("receipt_id") or "")
+            st_key = str(int(rec.get("status") or 0))
+            status_counts[st_key] = status_counts.get(st_key, 0) + 1
+            if rid:
+                receipt_ids.append(rid)
+            sha = str(rec.get("response_sha256") or "")
+            if sha and sha not in seen_hashes:
+                seen_hashes.add(sha)
+                distinct_hashes.append(sha)
+            preview_body = str(rec.get("body") or "")[:300]
+            item: dict[str, Any] = {
+                "receipt_id": rid,
+                "status": int(rec.get("status") or 0),
+                "elapsed_ms": rec.get("elapsed_ms"),
+                "response_sha256": sha[:16],
+                "body_preview": preview_body if preview_body else "<empty>",
+            }
+            if rec.get("error"):
+                item["error"] = rec["error"]
+            results.append(item)
+
+        return wrap_untrusted({
+            "count": len(receipts),
+            "method": norm_method,
+            "url": clean_url,
+            "actor": actor,
+            "status_counts": status_counts,
+            "receipt_ids": receipt_ids,
+            "distinct_body_hashes": distinct_hashes,
+            "results": results,
+        })
+
     def _receipt_contains_evidence(self, receipt: dict[str, Any], evidence: str) -> tuple[bool, str]:
         needle = evidence.strip()
         lower_needle = needle.lower()
@@ -2668,6 +2810,57 @@ class ToolDispatcher:
         if lower_needle in headers_text.lower():
             return True, headers_text[:MAX_PROOF_EXCERPT_CHARS]
         return False, ""
+
+    def _collect_oob_ssrf_context(
+        self,
+        proof_receipts: list[dict[str, Any]],
+        evidence_value: str,
+    ) -> tuple[str, list[str], list[dict[str, Any]]]:
+        """Inspect proof receipts and evidence for callback_listener tokens/hits."""
+        oob_srv = self._oob_server
+        ev = str(evidence_value or "").strip()
+        cb_pat = re.compile(r"/cb/([A-Za-z0-9_-]{6,})")
+        cb_refs: list[str] = list(cb_pat.findall(ev))
+        for rec in proof_receipts:
+            req_blob = "\n".join([
+                str(rec.get("url") or ""),
+                str(rec.get("query") or ""),
+                str(rec.get("request_body") or ""),
+                json.dumps(rec.get("request_headers") or {}, ensure_ascii=False),
+            ])
+            cb_refs.extend(cb_pat.findall(req_blob))
+
+        if oob_srv is None:
+            if cb_refs:
+                return "missing_server", list(dict.fromkeys(cb_refs)), []
+            return "none", [], []
+
+        reg_tokens = oob_srv.registered_tokens()
+        matched_tokens: list[str] = []
+        for tok in reg_tokens:
+            if not tok:
+                continue
+            if tok in ev or any(
+                tok in str(r.get("url") or "")
+                or tok in str(r.get("query") or "")
+                or tok in str(r.get("request_body") or "")
+                or tok in json.dumps(r.get("request_headers") or {}, ensure_ascii=False)
+                for r in proof_receipts
+            ):
+                matched_tokens.append(tok)
+
+        if not matched_tokens and cb_refs:
+            return "zero_hits", list(dict.fromkeys(cb_refs)), []
+        if not matched_tokens:
+            return "none", [], []
+
+        matching_hits: list[dict[str, Any]] = []
+        for tok in matched_tokens:
+            polled = oob_srv.poll(tok)
+            matching_hits.extend(polled.get("hits") or [])
+        if not matching_hits:
+            return "zero_hits", matched_tokens, []
+        return "verified_hits", matched_tokens, matching_hits
 
     def _find_followup_persistent_get(
         self,
@@ -2984,6 +3177,22 @@ class ToolDispatcher:
         original_evidence_value = evidence_value
         excerpt = ""
         found_in_proof = False
+        matching_oob_hits: list[dict[str, Any]] = []
+        oob_matched_tokens: list[str] = []
+
+        if canonical_class == "ssrf":
+            oob_status, oob_matched_tokens, matching_oob_hits = self._collect_oob_ssrf_context(
+                compatible_proofs or proof_receipts,
+                evidence_value,
+            )
+            if oob_status in {"missing_server", "zero_hits"}:
+                return json.dumps({
+                    "rejected": True,
+                    "reason": (
+                        "SSRF callback claim rejected: callback_listener poll recorded 0 hits "
+                        f"for submitted token(s) {oob_matched_tokens}"
+                    ),
+                })
 
         if not evidence_value or evidence_value.lower() in _TRIVIAL_EVIDENCE or len(evidence_value) < 3:
             if len(proof_receipts) > 1 and compatible_proofs:
@@ -3011,7 +3220,25 @@ class ToolDispatcher:
                 return json.dumps({"rejected": True, "reason": "evidence_value must be a real observed value, not a status/placeholder"})
 
         if not found_in_proof:
-            if canonical_class == "stored_xss":
+            if canonical_class == "ssrf" and matching_oob_hits:
+                ev_low = evidence_value.lower()
+                oob_hit_match = any(
+                    tok == evidence_value
+                    or tok in evidence_value
+                    or ev_low in json.dumps(h, ensure_ascii=False).lower()
+                    for tok in oob_matched_tokens
+                    for h in matching_oob_hits
+                )
+                if oob_hit_match:
+                    found_in_proof = True
+                    hit0 = matching_oob_hits[0]
+                    hit_summary = (
+                        f"OOB callback hit: {hit0.get('method')} {hit0.get('path')} "
+                        f"from {hit0.get('remote_addr')} body={hit0.get('body_preview', '')[:300]}"
+                    )
+                    base_ex = build_receipt_excerpt(primary, evidence_value, max_chars=MAX_PROOF_EXCERPT_CHARS // 2)
+                    excerpt = f"{base_ex}\n{hit_summary}"[:MAX_PROOF_EXCERPT_CHARS]
+            if not found_in_proof and canonical_class == "stored_xss":
                 get_candidates: list[dict[str, Any]] = []
                 seen_get_rids: set[str] = set()
                 for r in [primary, *compatible_proofs]:
@@ -3069,7 +3296,12 @@ class ToolDispatcher:
 
         # Multi-receipt specificity promotion: upgrade generic/low-specificity evidence when another
         # class-eligible proof receipt exposes a strictly higher-specificity unique secret (not in controls).
-        if len(proof_receipts) > 1 and compatible_proofs and canonical_class not in {"open_redirect", "reflected_xss", "stored_xss"}:
+        if (
+            len(proof_receipts) > 1
+            and compatible_proofs
+            and canonical_class not in {"open_redirect", "reflected_xss", "stored_xss", "race_condition"}
+            and not matching_oob_hits
+        ):
             eligible_proofs = _filter_class_eligible_proofs(
                 canonical_class,
                 compatible_proofs,
@@ -3182,6 +3414,30 @@ class ToolDispatcher:
         elif canonical_class == "mass_assignment":
             if not any(c.get("response_sha256") != primary.get("response_sha256") or c["method"] != primary["method"] or c["actor"] == effective_actor for c in control_receipts):
                 return json.dumps({"rejected": True, "reason": "mass_assignment requires baseline control receipt"})
+
+        elif canonical_class in {"race_condition", "business_logic"}:
+            if canonical_class == "race_condition":
+                distinct_success_rids = {
+                    str(r.get("receipt_id") or "")
+                    for r in compatible_proofs
+                    if r.get("receipt_id") and 200 <= int(r.get("status") or 0) < 400
+                }
+                if len(distinct_success_rids) < 2:
+                    return json.dumps({
+                        "rejected": True,
+                        "reason": "race_condition requires at least 2 distinct 2xx/3xx proof receipts (e.g. from concurrent_check)",
+                    })
+            if not any(
+                c.get("status") != primary.get("status")
+                or c.get("response_sha256") != primary.get("response_sha256")
+                or str(c.get("method") or "").upper() != str(primary.get("method") or "").upper()
+                or c.get("actor") != effective_actor
+                for c in control_receipts
+            ):
+                return json.dumps({
+                    "rejected": True,
+                    "reason": f"{canonical_class} requires a differential sequential or state control receipt",
+                })
 
         # Collect all valid proofs among proof_receipts (across actors) on the same route_template.
         valid_proof_records: list[tuple[dict[str, Any], str]] = [(primary, excerpt)]
@@ -3375,6 +3631,8 @@ class ToolDispatcher:
                 actor_meta_map=actor_meta,
                 surface_tracker=self.surface_tracker,
                 inferred_owner=inferred_bola_owner,
+                oob_server=self._oob_server,
+                oob_hits=matching_oob_hits,
             )
             if self.bsag is not None and hyp_id:
                 self.bsag.apply_oracle_verdict(
@@ -3416,6 +3674,14 @@ class ToolDispatcher:
             max_proof_chars=MAX_PROOF_EXCERPT_CHARS,
             max_control_chars=MAX_CONTROL_EXCERPT_CHARS,
         )
+        if matching_oob_hits:
+            hit0 = matching_oob_hits[0]
+            oob_note = (
+                f"---[oob_callback:token={hit0.get('token')} hits={len(matching_oob_hits)}]---\n"
+                f"{hit0.get('method')} {hit0.get('path')} query={hit0.get('query') or ''} "
+                f"remote={hit0.get('remote_addr')} body={hit0.get('body_preview') or ''}"
+            )
+            best_evidence = f"{best_evidence}\n{oob_note}" if best_evidence else oob_note
         resolved_url, clean_path, _ = self.http.resolve_in_scope(best_primary["url"] or raw_url)
         with self._findings_lock:
             merged_resp = self._try_merge_existing_finding_locked(

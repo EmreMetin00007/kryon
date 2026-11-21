@@ -94,6 +94,7 @@ def run_agentic_target(
     max_shards: int = 3,
     bootstrap_turns: int = 12,
     shard_turns: int = 25,
+    shard_token_quota: int = 0,
 ) -> tuple[Path, dict[str, Any]]:
     """Run (or plan when execute=False) AgenticInvestigator against an owned loopback target."""
     bundle = ext.load_credentials_bundle(credentials_file)
@@ -155,11 +156,14 @@ def run_agentic_target(
         "intervention": str(intervention or "lazy").strip().lower(),
         "execution_mode": str(execution_mode or "ephemeral").strip().lower(),
     }
-    sharding_cfg = {
+    sharding_cfg: dict[str, Any] = {
         "max_shards": max(1, int(max_shards)),
         "bootstrap_turns": max(1, int(bootstrap_turns)),
         "shard_turns": max(1, int(shard_turns)),
     }
+    eff_shard_token_quota = max(0, int(shard_token_quota))
+    if eff_shard_token_quota > 0:
+        sharding_cfg["shard_token_quota"] = eff_shard_token_quota
 
     if not execute:
         plan_path = output / "agentic-plan.json"
@@ -267,6 +271,7 @@ def run_agentic_target(
             max_shards=sharding_cfg["max_shards"],
             bootstrap_turns=sharding_cfg["bootstrap_turns"],
             shard_turns=sharding_cfg["shard_turns"],
+            shard_token_quota=eff_shard_token_quota,
         )
         run_info = investigator.run(resume=resume)
         manifest.update(run_info)
@@ -358,6 +363,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--max-shards", type=int, default=3, help="Max subsystem shards for sharded mode")
     parser.add_argument("--bootstrap-turns", type=int, default=12, help="Stage 1 bootstrap turns for sharded mode")
     parser.add_argument("--shard-turns", type=int, default=25, help="Stage 2 per-shard turn budget for sharded mode")
+    parser.add_argument(
+        "--shard-token-quota",
+        type=int,
+        default=0,
+        help="Optional per-shard soft token quota for sharded mode (0 = auto-balanced from remaining tokens)",
+    )
     args = parser.parse_args(argv)
 
     path, doc = run_agentic_target(
@@ -395,6 +406,7 @@ def main(argv: list[str] | None = None) -> int:
         max_shards=args.max_shards,
         bootstrap_turns=args.bootstrap_turns,
         shard_turns=args.shard_turns,
+        shard_token_quota=args.shard_token_quota,
     )
     print(json.dumps({
         "artifact": str(path),

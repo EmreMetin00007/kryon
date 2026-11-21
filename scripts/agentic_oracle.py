@@ -82,8 +82,10 @@ _INPUT_DIFF_CLASSES = frozenset({
     "ssti",
     "path_traversal",
     "csrf",
+    "ssrf",
 })
 _ACCESS_CLASSES = frozenset({"auth_bypass", "bfla", "bola", "tenant_isolation"})
+_CONCURRENCY_CLASSES = frozenset({"race_condition", "business_logic"})
 _MUTATING_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
 _WRITE_METHODS = frozenset({"POST", "PUT", "PATCH"})
 _PERSISTENT_CLASSES = frozenset({"stored_xss", "mass_assignment", "ssti"})
@@ -576,6 +578,7 @@ class DifferentialOracle:
         receipt_store: ReceiptStore,
         mode: str = "differential",
         timeout_s: float = 15.0,
+        oob_server: Any | None = None,
     ):
         norm_mode = str(mode or "differential").strip().lower()
         if norm_mode not in VALID_VERIFICATION_GATES:
@@ -584,6 +587,7 @@ class DifferentialOracle:
         self.receipts = receipt_store
         self.mode = norm_mode
         self.timeout_s = float(timeout_s)
+        self.oob_server = oob_server
 
     def _has_budget(self, needed: int = 1) -> bool:
         return (self.http.budget.limit - self.http.budget.used) >= needed
@@ -687,6 +691,8 @@ class DifferentialOracle:
         actor_meta_map: dict[str, dict[str, str]] | None = None,
         surface_tracker: Any | None = None,
         inferred_owner: str = "",
+        oob_server: Any | None = None,
+        oob_hits: Sequence[dict[str, Any]] | None = None,
     ) -> OracleVerdict:
         """Run verification gate before promoting a CLAIMED hypothesis to VERIFIED."""
         if self.mode == "llm_self_judge":
@@ -700,6 +706,38 @@ class DifferentialOracle:
 
         stages: dict[str, Any] = {}
         ev = str(evidence_value or "").strip()
+        active_oob = oob_server if oob_server is not None else self.oob_server
+        effective_oob_hits: list[dict[str, Any]] = [dict(h) for h in (oob_hits or []) if isinstance(h, dict)]
+        oob_tokens_submitted: list[str] = []
+        if canonical_class == "ssrf" and active_oob is not None and hasattr(active_oob, "registered_tokens"):
+            try:
+                reg_tokens = list(active_oob.registered_tokens())
+            except Exception:
+                reg_tokens = []
+            for tok in reg_tokens:
+                if not tok:
+                    continue
+                if any(
+                    tok in str(r.get("url") or "")
+                    or tok in str(r.get("query") or "")
+                    or tok in str(r.get("request_body") or "")
+                    or tok in json.dumps(r.get("request_headers") or {}, ensure_ascii=False)
+                    for r in proof_receipts
+                ):
+                    oob_tokens_submitted.append(tok)
+                    if not effective_oob_hits and hasattr(active_oob, "poll"):
+                        polled = active_oob.poll(tok)
+                        effective_oob_hits.extend(polled.get("hits") or [])
+            if oob_tokens_submitted and not effective_oob_hits:
+                stages["stage1_control"] = "failed_oob_zero_hits"
+                return OracleVerdict(
+                    verified=False,
+                    verdict="REFUTED",
+                    reason="SSRF callback claim rejected: callback_listener recorded 0 hits for submitted token(s).",
+                    mode=self.mode,
+                    stages=stages,
+                )
+        is_oob_ssrf = canonical_class == "ssrf" and bool(effective_oob_hits)
         render_proof: dict[str, Any] | None = None
         if canonical_class == "stored_xss":
             if str(primary_proof.get("method") or "").upper() == "GET" and 200 <= int(primary_proof.get("status") or 0) < 300:
@@ -768,7 +806,7 @@ class DifferentialOracle:
         # --- Stage 1: Falsification / Control Baseline Check ---
         ctrl_probe_rid = ""
         eff_controls = list(control_receipts)
-        if not eff_controls and self._has_budget(2):
+        if not eff_controls and not is_oob_ssrf and canonical_class not in _CONCURRENCY_CLASSES and self._has_budget(2):
             try:
                 if canonical_class in _INPUT_DIFF_CLASSES:
                     ctrl_url = self._benign_control_url(str(diff_target.get("url") or "/"))
@@ -825,7 +863,7 @@ class DifferentialOracle:
                 pass
 
         # Check benign control equivalence and stored_xss baseline absence for input/mutation classes
-        if canonical_class in _INPUT_DIFF_CLASSES:
+        if canonical_class in _INPUT_DIFF_CLASSES and not is_oob_ssrf:
             if canonical_class == "stored_xss" and ev:
                 p_count = str(diff_target.get("body") or "").lower().count(ev.lower())
                 for ctrl in diff_controls:
@@ -860,6 +898,47 @@ class DifferentialOracle:
                         stages=stages,
                         control_probe_receipt_id=ctrl_probe_rid,
                     )
+        elif canonical_class in _CONCURRENCY_CLASSES:
+            success_rids = {
+                str(r.get("receipt_id") or "")
+                for r in proof_receipts
+                if r.get("receipt_id") and 200 <= int(r.get("status") or 0) < 400
+            }
+            if canonical_class == "race_condition" and len(success_rids) < 2:
+                stages["stage1_control"] = "failed_missing_concurrent_proofs"
+                return OracleVerdict(
+                    verified=False,
+                    verdict="REFUTED",
+                    reason="race_condition requires at least 2 distinct 2xx/3xx concurrent proof receipts.",
+                    mode=self.mode,
+                    stages=stages,
+                )
+            if not eff_controls:
+                stages["stage1_control"] = "failed_missing_control"
+                return OracleVerdict(
+                    verified=False,
+                    verdict="REFUTED",
+                    reason=f"{canonical_class} requires at least one sequential or baseline control receipt.",
+                    mode=self.mode,
+                    stages=stages,
+                )
+            p_method = str(diff_target.get("method") or "").upper()
+            if all(
+                int(c.get("status") or 0) == p_status
+                and mask_dynamic_fields(str(c.get("body") or ""), preserve_values=(ev,)) == p_masked
+                and str(c.get("method") or "").upper() == p_method
+                and str(c.get("actor") or "") == p_actor
+                for c in eff_controls
+            ):
+                stages["stage1_control"] = "deception_identical_control"
+                return OracleVerdict(
+                    verified=False,
+                    verdict="DECEPTION_DETECTED",
+                    reason=f"{canonical_class} control receipt is identical to primary proof.",
+                    deception_detected=True,
+                    mode=self.mode,
+                    stages=stages,
+                )
         elif canonical_class in _ACCESS_CLASSES:
             # Check if a negative control (e.g. different path returning 403/404, or anon returning 401/403)
             # accidentally returned the exact same masked body + evidence_value for an unrelated/denied check.
@@ -886,10 +965,10 @@ class DifferentialOracle:
                             stages=stages,
                             control_probe_receipt_id=ctrl_probe_rid,
                         )
-        stages["stage1_control"] = "passed"
+        stages["stage1_control"] = "passed_oob_callback" if is_oob_ssrf else "passed"
 
         # --- Stage 2: Dynamic-Field-Masked Structural & Access-Boundary Diff ---
-        if canonical_class in _INPUT_DIFF_CLASSES:
+        if canonical_class in _INPUT_DIFF_CLASSES and not is_oob_ssrf:
             has_masked_diff = False
             for ctrl in diff_controls:
                 c_masked = mask_dynamic_fields(str(ctrl.get("body") or ""), preserve_values=(ev,))
@@ -908,6 +987,25 @@ class DifferentialOracle:
                     mode=self.mode,
                     stages=stages,
                     control_probe_receipt_id=ctrl_probe_rid,
+                )
+        elif canonical_class in _CONCURRENCY_CLASSES:
+            p_method = str(diff_target.get("method") or "").upper()
+            has_diff = any(
+                int(c.get("status") or 0) != p_status
+                or mask_dynamic_fields(str(c.get("body") or ""), preserve_values=(ev,)) != p_masked
+                or str(c.get("method") or "").upper() != p_method
+                or str(c.get("actor") or "") != p_actor
+                for c in eff_controls
+            )
+            if not has_diff:
+                stages["stage2_diff"] = "failed_masked_equivalence"
+                return OracleVerdict(
+                    verified=False,
+                    verdict="REFUTED",
+                    reason=f"{canonical_class} proof and control receipts show no differential behavior.",
+                    deception_detected=True,
+                    mode=self.mode,
+                    stages=stages,
                 )
         elif canonical_class in _ACCESS_CLASSES:
             meta_map = actor_meta_map or {}
@@ -943,9 +1041,33 @@ class DifferentialOracle:
                         stages=stages,
                         control_probe_receipt_id=ctrl_probe_rid,
                     )
-        stages["stage2_diff"] = "passed"
+        stages["stage2_diff"] = "passed_oob_callback" if is_oob_ssrf else "passed"
 
         # --- Stage 3: Clean-Session Replay in fresh isolated requests.Session() ---
+        if canonical_class == "race_condition" or (
+            canonical_class == "business_logic"
+            and (str(primary_proof.get("method") or "").upper() in _MUTATING_METHODS or len(proof_receipts) >= 2)
+        ):
+            stages["stage3_clean_replay"] = "skipped_non_idempotent_concurrency"
+            return OracleVerdict(
+                verified=True,
+                verdict="VERIFIED",
+                reason="Verified across concurrency proof receipts and sequential/state control without re-triggering mutating bursts.",
+                mode=self.mode,
+                stages=stages,
+                control_probe_receipt_id=ctrl_probe_rid,
+            )
+
+        if is_oob_ssrf and str(primary_proof.get("method") or "").upper() in _MUTATING_METHODS:
+            stages["stage3_clean_replay"] = "passed_oob_verified"
+            return OracleVerdict(
+                verified=True,
+                verdict="VERIFIED",
+                reason="Verified by recorded out-of-band loopback callback hit(s) matching submitted token.",
+                mode=self.mode,
+                stages=stages,
+                control_probe_receipt_id=ctrl_probe_rid,
+            )
         if not self._has_budget(1):
             stages["stage3_clean_replay"] = "skipped_budget"
             return OracleVerdict(
@@ -1112,19 +1234,26 @@ class DifferentialOracle:
                 )
         else:
             if ev and not _receipt_contains_evidence(replay_rec, ev):
-                stages["stage3_clean_replay"] = "failed_missing_evidence"
-                return OracleVerdict(
-                    verified=False,
-                    verdict="REFUTED",
-                    reason="Clean-session replay did not reproduce the claimed evidence_value.",
-                    mode=self.mode,
-                    stages=stages,
-                    clean_replay_receipt_id=replay_rec["receipt_id"],
-                    control_probe_receipt_id=ctrl_probe_rid,
+                ev_in_oob = is_oob_ssrf and any(
+                    ev.lower() in json.dumps(h, ensure_ascii=False).lower()
+                    for h in effective_oob_hits
                 )
+                if not ev_in_oob:
+                    stages["stage3_clean_replay"] = "failed_missing_evidence"
+                    return OracleVerdict(
+                        verified=False,
+                        verdict="REFUTED",
+                        reason="Clean-session replay did not reproduce the claimed evidence_value.",
+                        mode=self.mode,
+                        stages=stages,
+                        clean_replay_receipt_id=replay_rec["receipt_id"],
+                        control_probe_receipt_id=ctrl_probe_rid,
+                    )
 
         stages["stage3_clean_replay"] = (
-            "passed_stateful_persistence" if replayed_via_stateful_fallback else "passed"
+            "passed_oob_verified"
+            if is_oob_ssrf
+            else ("passed_stateful_persistence" if replayed_via_stateful_fallback else "passed")
         )
         return OracleVerdict(
             verified=True,

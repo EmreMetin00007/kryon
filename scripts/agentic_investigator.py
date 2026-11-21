@@ -825,6 +825,7 @@ class AgenticInvestigator:
         max_shards: int = 3,
         bootstrap_turns: int = 12,
         shard_turns: int = 25,
+        shard_token_quota: int = 0,
     ):
         self.http = http_client
         self.receipts = receipt_store
@@ -837,6 +838,7 @@ class AgenticInvestigator:
         self.max_shards = max(1, int(max_shards))
         self.bootstrap_turns = max(1, int(bootstrap_turns))
         self.shard_turns = max(1, int(shard_turns))
+        self.shard_token_quota = max(0, int(shard_token_quota))
         self._active_model = self.model
         self._handoff_phase = "single"
         self._handoff_summary: dict[str, Any] | None = None
@@ -904,7 +906,33 @@ class AgenticInvestigator:
         self._epoch_turn_start: int = 0
         self._epoch_summary_text: str = ""
 
-    def _wrapup_reasons(self, turn: int, *, max_turns_override: int | None = None) -> list[str]:
+    @staticmethod
+    def _close_dispatcher(dispatcher: Any) -> None:
+        close_fn = getattr(dispatcher, "close", None)
+        if callable(close_fn):
+            close_fn()
+
+    @staticmethod
+    def _classify_budget_error(exc: BudgetError, *, is_shard: bool = False) -> str:
+        if is_shard:
+            msg = str(exc).lower()
+            if (
+                "budget exhausted" in msg
+                or "insufficient tokens" in msg
+                or "token_admission_exhausted" in msg
+                or (exc.code == "provider_budget_error" and "token" in msg)
+            ):
+                return "budget_exhausted"
+        return exc.code or "budget_exhausted"
+
+    def _wrapup_reasons(
+        self,
+        turn: int,
+        *,
+        max_turns_override: int | None = None,
+        shard_token_quota: int | None = None,
+        shard_tokens_used: int | None = None,
+    ) -> list[str]:
         eff_max_turns = max_turns_override if max_turns_override is not None else self.max_turns
         http_rem = self.http.budget.limit - self.http.budget.used
         tok_rem = self.budget.available("tokens")
@@ -914,7 +942,16 @@ class AgenticInvestigator:
             tok_threshold = max(30_000, int(tok_lim * 0.15)) if tok_lim >= 60_000 else int(tok_lim * 0.15)
             if tok_rem <= tok_threshold:
                 wrapup_reasons.append(f"tokens={tok_rem}/{tok_lim}")
+        if (
+            shard_token_quota is not None
+            and shard_token_quota > 0
+            and shard_tokens_used is not None
+            and shard_tokens_used >= int(shard_token_quota * 0.80)
+        ):
+            wrapup_reasons.append(f"shard_tokens={shard_tokens_used}/{shard_token_quota}")
         if eff_max_turns > 5 and (eff_max_turns - turn) <= 4:
+            wrapup_reasons.append(f"turns_left={max(0, eff_max_turns - turn)}")
+        elif shard_token_quota is not None and eff_max_turns > 3 and (eff_max_turns - turn) <= 3:
             wrapup_reasons.append(f"turns_left={max(0, eff_max_turns - turn)}")
         if self.http.budget.limit > 15 and http_rem <= 10:
             wrapup_reasons.append(f"http_left={http_rem}/{self.http.budget.limit}")
@@ -927,6 +964,8 @@ class AgenticInvestigator:
         dispatcher: ToolDispatcher | None = None,
         max_turns_override: int | None = None,
         allow_coverage_gate: bool = True,
+        shard_token_quota: int | None = None,
+        shard_tokens_used: int | None = None,
     ) -> bool:
         """Align `coverage_gate_enabled` with `[BUDGET-WRAPUP]` so `finish` is never rejected during wrapup."""
         eff_disp = dispatcher if dispatcher is not None else self.dispatcher
@@ -934,7 +973,12 @@ class AgenticInvestigator:
         enabled = (
             allow_coverage_gate
             and eff_max_turns > 5
-            and not self._wrapup_reasons(turn, max_turns_override=eff_max_turns)
+            and not self._wrapup_reasons(
+                turn,
+                max_turns_override=eff_max_turns,
+                shard_token_quota=shard_token_quota,
+                shard_tokens_used=shard_tokens_used,
+            )
         )
         eff_disp.coverage_gate_enabled = enabled
         return enabled
@@ -947,6 +991,8 @@ class AgenticInvestigator:
         max_turns_override: int | None = None,
         shard_cluster: SubsystemCluster | None = None,
         allow_coverage_gate: bool = True,
+        shard_token_quota: int | None = None,
+        shard_tokens_used: int | None = None,
     ) -> str:
         eff_disp = dispatcher if dispatcher is not None else self.dispatcher
         eff_max_turns = max_turns_override if max_turns_override is not None else self.max_turns
@@ -986,7 +1032,12 @@ class AgenticInvestigator:
                     f"are properly rejected, confirm state persistence with a follow-up GET, and call "
                     f"`record_finding` immediately if a restriction is not enforced."
                 )
-        wrapup_reasons = self._wrapup_reasons(turn, max_turns_override=eff_max_turns)
+        wrapup_reasons = self._wrapup_reasons(
+            turn,
+            max_turns_override=eff_max_turns,
+            shard_token_quota=shard_token_quota,
+            shard_tokens_used=shard_tokens_used,
+        )
         if wrapup_reasons or not allow_coverage_gate:
             eff_disp.coverage_gate_enabled = False
         wrapup_line = (
@@ -997,8 +1048,13 @@ class AgenticInvestigator:
             if wrapup_reasons
             else ""
         )
+        shard_tok_part = (
+            f" | shard_tokens={shard_tokens_used}/{shard_token_quota}"
+            if shard_token_quota is not None and shard_token_quota > 0 and shard_tokens_used is not None
+            else ""
+        )
         shard_line = (
-            f"\n[SHARD SCOPE] shard_id={shard_cluster.shard_id} | families={shard_cluster.families}"
+            f"\n[SHARD SCOPE] shard_id={shard_cluster.shard_id} | families={shard_cluster.families}{shard_tok_part}"
             if shard_cluster is not None
             else ""
         )
@@ -1821,6 +1877,7 @@ class AgenticInvestigator:
             self._save_checkpoint(turn=total_turns, status=status, messages=[])
             raise
         finally:
+            self._close_dispatcher(self.dispatcher)
             if self.telemetry is not None or self.bsag is not None:
                 self.write_metrics()
 
@@ -2003,6 +2060,7 @@ class AgenticInvestigator:
         shard_cluster: SubsystemCluster | None = None,
         usage_sink: dict[str, int] | None = None,
         calls_sink: list[int] | None = None,
+        shard_token_quota: int | None = None,
     ) -> tuple[str, int, list[dict[str, Any]]]:
         """Run a bounded ReAct monolithic loop over a caller-supplied dispatcher and message list."""
         status = "running"
@@ -2010,6 +2068,12 @@ class AgenticInvestigator:
         last_completed_turn = start_turn - 1
         recent_local_reads: list[tuple[int, str, str, str]] = []
         eff_model = model_name or self.model
+        is_shard = shard_cluster is not None or shard_token_quota is not None
+
+        def _shard_tokens_used() -> int:
+            if usage_sink is None:
+                return 0
+            return int(usage_sink.get("prompt_tokens", 0)) + int(usage_sink.get("completion_tokens", 0))
 
         def _enter_deep_phase(reason: str, completed_turn: int) -> None:
             nonlocal messages, empty_nudges, recent_local_reads, eff_model
@@ -2056,8 +2120,20 @@ class AgenticInvestigator:
                 if dispatcher.finished:
                     status = "finished"
                     break
-                if self.budget.remaining_seconds() <= 5 or self.budget.available("tokens") < 2500:
+                cur_shard_tokens = _shard_tokens_used()
+                min_global_tokens = 3500 if is_shard else 2500
+                if (
+                    self.budget.remaining_seconds() <= 5
+                    or self.budget.available("tokens") < min_global_tokens
+                    or (
+                        shard_token_quota is not None
+                        and shard_token_quota > 0
+                        and cur_shard_tokens >= shard_token_quota
+                    )
+                ):
                     status = "budget_exhausted"
+                    if checkpoint_fn is not None:
+                        checkpoint_fn(last_completed_turn, status, messages)
                     break
 
                 self._sync_coverage_gate(
@@ -2065,6 +2141,8 @@ class AgenticInvestigator:
                     dispatcher=dispatcher,
                     max_turns_override=max_turns,
                     allow_coverage_gate=allow_coverage_gate,
+                    shard_token_quota=shard_token_quota,
+                    shard_tokens_used=cur_shard_tokens,
                 )
                 if handoff_scout_cfg is not None and self._handoff_phase == "scout" and turn >= handoff_scout_cfg["turn_limit"] - 1:
                     dispatcher.coverage_gate_enabled = False
@@ -2093,11 +2171,14 @@ class AgenticInvestigator:
                 messages.append(assistant_entry)
 
                 if tool_calls:
+                    cur_shard_tokens = _shard_tokens_used()
                     self._sync_coverage_gate(
                         turn,
                         dispatcher=dispatcher,
                         max_turns_override=max_turns,
                         allow_coverage_gate=allow_coverage_gate,
+                        shard_token_quota=shard_token_quota,
+                        shard_tokens_used=cur_shard_tokens,
                     )
                     if handoff_scout_cfg is not None and self._handoff_phase == "scout" and turn >= handoff_scout_cfg["turn_limit"] - 1:
                         dispatcher.coverage_gate_enabled = False
@@ -2142,14 +2223,26 @@ class AgenticInvestigator:
                                     "or allowed write operations in [SURFACE FRONTIER], or call `record_finding` for verified issues."
                                 )
                         if idx == len(tool_calls) - 1:
+                            cur_shard_tokens = _shard_tokens_used()
                             result_text = result_text + self._state_banner(
                                 turn + 1,
                                 dispatcher=dispatcher,
                                 max_turns_override=max_turns,
                                 shard_cluster=shard_cluster,
                                 allow_coverage_gate=allow_coverage_gate,
+                                shard_token_quota=shard_token_quota,
+                                shard_tokens_used=cur_shard_tokens,
                             )
-                            if turn >= max_turns - 2 or (self.http.budget.limit - self.http.budget.used) <= 8:
+                            shard_wrapup_urgent = (
+                                shard_token_quota is not None
+                                and shard_token_quota > 0
+                                and cur_shard_tokens >= int(shard_token_quota * 0.80)
+                            )
+                            if (
+                                turn >= max_turns - 2
+                                or (self.http.budget.limit - self.http.budget.used) <= 8
+                                or shard_wrapup_urgent
+                            ):
                                 result_text += "\n[URGENT] Budget or turns nearly exhausted: call `record_finding` for verified issues and `finish`."
                         messages.append({
                             "role": "tool",
@@ -2185,6 +2278,8 @@ class AgenticInvestigator:
                                 max_turns_override=max_turns,
                                 shard_cluster=shard_cluster,
                                 allow_coverage_gate=allow_coverage_gate,
+                                shard_token_quota=shard_token_quota,
+                                shard_tokens_used=_shard_tokens_used(),
                             )
                         ),
                     })
@@ -2210,7 +2305,7 @@ class AgenticInvestigator:
             else:
                 status = "max_turns_reached"
         except BudgetError as exc:
-            status = exc.code or "budget_exhausted"
+            status = self._classify_budget_error(exc, is_shard=is_shard)
             if checkpoint_fn is not None:
                 checkpoint_fn(last_completed_turn, status, messages)
         except Exception as exc:
@@ -2229,6 +2324,7 @@ class AgenticInvestigator:
             if loaded is not None:
                 last_turn, loaded_msgs = loaded
                 if self.dispatcher.finished:
+                    self._close_dispatcher(self.dispatcher)
                     return self._result_summary("finished")
                 start_turn = last_turn + 1
                 messages = loaded_msgs
@@ -2292,6 +2388,7 @@ class AgenticInvestigator:
                 handoff_scout_cfg=handoff_cfg,
             )
         finally:
+            self._close_dispatcher(self.dispatcher)
             if self._handoff_summary is not None:
                 self._handoff_summary.update(
                     deep_calls=max(0, self.transport.calls - scout_start_calls - self._handoff_summary["scout_calls"]),
@@ -2313,6 +2410,7 @@ class AgenticInvestigator:
         if resume:
             loaded = self._load_checkpoint()
             if loaded is not None and self.dispatcher.finished:
+                self._close_dispatcher(self.dispatcher)
                 return self._result_summary("finished")
 
         self._active_model = self.model
@@ -2422,6 +2520,13 @@ class AgenticInvestigator:
                 return self._result_summary(boot_status)
 
             # Stage 2: Parallel monolithic subsystem shards
+            rem_tokens = self.budget.available("tokens")
+            num_shards = len(clusters)
+            eff_shard_token_quota = (
+                self.shard_token_quota
+                if self.shard_token_quota > 0
+                else max(25_000, int((rem_tokens * 0.90) / num_shards))
+            )
             bootstrap_surface_snap = copy.deepcopy(self.dispatcher.surface_tracker.to_dict())
             shard_base_sys_prompt = build_system_prompt(
                 base_url=self.http.base_url,
@@ -2442,82 +2547,89 @@ class AgenticInvestigator:
                     oracle=self.oracle,
                     telemetry=self.telemetry,
                 )
-                shard_dispatcher.surface_tracker.load_dict(copy.deepcopy(bootstrap_surface_snap))
-                shard_dispatcher.coverage_gate_enabled = False
-                shard_dispatcher.set_active_context(worker_id=cluster.shard_id, category=cluster.name)
-
-                shard_epoch_state: dict[str, Any] = {"turn_start": 0, "summary_text": ""}
-                shard_usage: dict[str, int] = {
-                    "prompt_tokens": 0,
-                    "completion_tokens": 0,
-                    "total_tokens": 0,
-                    "provider_reported_calls": 0,
-                    "estimated_calls": 0,
-                }
-                shard_calls = [0]
-                init_banner = self._state_banner(
-                    1,
-                    dispatcher=shard_dispatcher,
-                    max_turns_override=self.shard_turns,
-                    shard_cluster=cluster,
-                    allow_coverage_gate=False,
-                )
-                s_sys, s_usr = build_shard_prompts(
-                    cluster,
-                    base_system_prompt=shard_base_sys_prompt,
-                    bootstrap_findings=boot_findings_snap,
-                    receipts=self.receipts,
-                    state_banner=init_banner,
-                )
-                shard_messages: list[dict[str, Any]] = [
-                    {"role": "system", "content": s_sys},
-                    {"role": "user", "content": s_usr},
-                ]
-
-                def _shard_ckpt(t: int, st: str, _msgs: list[dict[str, Any]]) -> None:
-                    _atomic_write_json(
-                        shard_dir / "checkpoint.json",
-                        {
-                            "schema": "agentic-shard-checkpoint/1",
-                            "shard_id": cluster.shard_id,
-                            "families": cluster.families,
-                            "turn": t,
-                            "status": st,
-                            "findings": shard_dispatcher.findings,
-                        },
-                    )
-
                 try:
-                    s_status, _, _ = self._execute_monolithic_loop(
-                        dispatcher=shard_dispatcher,
-                        messages=shard_messages,
-                        start_turn=1,
-                        max_turns=self.shard_turns,
-                        epoch_state=shard_epoch_state,
-                        model_name=self.model,
-                        allow_coverage_gate=False,
-                        checkpoint_fn=_shard_ckpt,
-                        shard_cluster=cluster,
-                        usage_sink=shard_usage,
-                        calls_sink=shard_calls,
-                    )
-                except BudgetError as exc:
-                    s_status = exc.code or "budget_exhausted"
-                except Exception as exc:
-                    s_status = f"error:{type(exc).__name__}"
+                    shard_dispatcher.surface_tracker.load_dict(copy.deepcopy(bootstrap_surface_snap))
+                    shard_dispatcher.coverage_gate_enabled = False
+                    shard_dispatcher.set_active_context(worker_id=cluster.shard_id, category=cluster.name)
 
-                return {
-                    "shard_id": cluster.shard_id,
-                    "name": cluster.name,
-                    "families": list(cluster.families),
-                    "calls": shard_calls[0],
-                    "tokens": shard_usage["total_tokens"],
-                    "findings": list(shard_dispatcher.findings),
-                    "status": s_status,
-                    "surface_tracker": shard_dispatcher.surface_tracker,
-                    "finish_summary": shard_dispatcher.finish_summary,
-                    "untested_areas": list(shard_dispatcher.untested_areas),
-                }
+                    shard_epoch_state: dict[str, Any] = {"turn_start": 0, "summary_text": ""}
+                    shard_usage: dict[str, int] = {
+                        "prompt_tokens": 0,
+                        "completion_tokens": 0,
+                        "total_tokens": 0,
+                        "provider_reported_calls": 0,
+                        "estimated_calls": 0,
+                    }
+                    shard_calls = [0]
+                    init_banner = self._state_banner(
+                        1,
+                        dispatcher=shard_dispatcher,
+                        max_turns_override=self.shard_turns,
+                        shard_cluster=cluster,
+                        allow_coverage_gate=False,
+                        shard_token_quota=eff_shard_token_quota,
+                        shard_tokens_used=0,
+                    )
+                    s_sys, s_usr = build_shard_prompts(
+                        cluster,
+                        base_system_prompt=shard_base_sys_prompt,
+                        bootstrap_findings=boot_findings_snap,
+                        receipts=self.receipts,
+                        state_banner=init_banner,
+                    )
+                    shard_messages: list[dict[str, Any]] = [
+                        {"role": "system", "content": s_sys},
+                        {"role": "user", "content": s_usr},
+                    ]
+
+                    def _shard_ckpt(t: int, st: str, _msgs: list[dict[str, Any]]) -> None:
+                        _atomic_write_json(
+                            shard_dir / "checkpoint.json",
+                            {
+                                "schema": "agentic-shard-checkpoint/1",
+                                "shard_id": cluster.shard_id,
+                                "families": cluster.families,
+                                "turn": t,
+                                "status": st,
+                                "findings": shard_dispatcher.findings,
+                            },
+                        )
+
+                    try:
+                        s_status, _, _ = self._execute_monolithic_loop(
+                            dispatcher=shard_dispatcher,
+                            messages=shard_messages,
+                            start_turn=1,
+                            max_turns=self.shard_turns,
+                            epoch_state=shard_epoch_state,
+                            model_name=self.model,
+                            allow_coverage_gate=False,
+                            checkpoint_fn=_shard_ckpt,
+                            shard_cluster=cluster,
+                            usage_sink=shard_usage,
+                            calls_sink=shard_calls,
+                            shard_token_quota=eff_shard_token_quota,
+                        )
+                    except BudgetError as exc:
+                        s_status = self._classify_budget_error(exc, is_shard=True)
+                    except Exception as exc:
+                        s_status = f"error:{type(exc).__name__}"
+
+                    return {
+                        "shard_id": cluster.shard_id,
+                        "name": cluster.name,
+                        "families": list(cluster.families),
+                        "calls": shard_calls[0],
+                        "tokens": shard_usage["total_tokens"],
+                        "shard_token_quota": eff_shard_token_quota,
+                        "findings": list(shard_dispatcher.findings),
+                        "status": s_status,
+                        "surface_tracker": shard_dispatcher.surface_tracker,
+                        "finish_summary": shard_dispatcher.finish_summary,
+                        "untested_areas": list(shard_dispatcher.untested_areas),
+                    }
+                finally:
+                    self._close_dispatcher(shard_dispatcher)
 
             shard_results: list[dict[str, Any]] = []
             with concurrent.futures.ThreadPoolExecutor(max_workers=len(clusters)) as pool:
@@ -2589,6 +2701,7 @@ class AgenticInvestigator:
                         "families": r["families"],
                         "calls": r["calls"],
                         "tokens": r["tokens"],
+                        "shard_token_quota": r["shard_token_quota"],
                         "findings": len(r["findings"]),
                         "status": r["status"],
                     }
@@ -2598,6 +2711,7 @@ class AgenticInvestigator:
             self._save_checkpoint(turn=boot_last_turn, status=overall_status, messages=[])
             return self._result_summary(overall_status)
         finally:
+            self._close_dispatcher(self.dispatcher)
             if self.telemetry is not None or self.bsag is not None:
                 self.write_metrics()
 
