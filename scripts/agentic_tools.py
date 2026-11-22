@@ -146,6 +146,31 @@ _PERSISTENT_VULN_CLASSES = frozenset({"stored_xss", "mass_assignment", "ssti"})
 _OOB_CALLBACK_CLASSES = frozenset({"ssrf", "xxe", "ssti", "command_injection"})
 _MUTATING_WRITE_METHODS = frozenset({"POST", "PUT", "PATCH"})
 
+RECORD_FINDING_CLASS_ENUM: list[str] = [
+    "auth_bypass",
+    "bfla",
+    "bola",
+    "tenant_isolation",
+    "mass_assignment",
+    "reflected_xss",
+    "stored_xss",
+    "sqli",
+    "sqli_read",
+    "open_redirect",
+    "ssrf",
+    "xxe",
+    "ssti",
+    "path_traversal",
+    "file_upload",
+    "cors_misconfiguration",
+    "csrf",
+    "jwt_weakness",
+    "command_injection",
+    "race_condition",
+    "business_logic",
+    "other",
+]
+
 TOOL_SCHEMAS: list[dict[str, Any]] = [
     {
         "type": "function",
@@ -331,7 +356,8 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                     "title": {"type": "string"},
                     "class_type": {
                         "type": "string",
-                        "description": "bola,bfla,auth_bypass,tenant_isolation,mass_assignment,reflected_xss,stored_xss,sqli,open_redirect,ssrf,xxe,cors_misconfiguration,other",
+                        "enum": RECORD_FINDING_CLASS_ENUM,
+                        "description": "Canonical finding class (avoid 'other' when a specific class fits).",
                     },
                     "method": {"type": "string"},
                     "url": {"type": "string"},
@@ -409,6 +435,20 @@ def _deep_merge_json(base: dict[str, Any], patch: dict[str, Any]) -> dict[str, A
         else:
             merged[key] = copy.deepcopy(value)
     return merged
+
+
+def _is_multipart_receipt(receipt: dict[str, Any]) -> bool:
+    """Return True if a receipt represents a multipart/form-data upload."""
+    req_body = str(receipt.get("request_body") or "")
+    if req_body.startswith("multipart/form-data "):
+        return True
+    req_headers = receipt.get("request_headers")
+    if isinstance(req_headers, dict):
+        for k, v in req_headers.items():
+            if str(k).strip().lower() == "content-type":
+                if str(v or "").strip().lower().startswith("multipart/form-data"):
+                    return True
+    return False
 
 
 class ToolDispatcher:
@@ -772,21 +812,10 @@ class ToolDispatcher:
     def _tool_replay_as(self, args: dict[str, Any]) -> str:
         baseline = self.receipts.get(str(args.get("receipt_id") or ""))
         target_actor = str(args.get("actor") or baseline["actor"])
-        method = str(args.get("method") or baseline["method"]).upper()
+        method = str(args.get("method") or baseline["method"]).strip().upper()
         url = str(args.get("url") or baseline["url"])
-
-        # Preserve safe non-auth request headers when replaying.
-        req_headers: dict[str, str] = {}
-        for k, v in (baseline.get("request_headers") or {}).items():
-            if k.lower() not in _SKIP_REPLAY_HEADERS and "<REDACTED" not in str(v):
-                req_headers[k] = str(v)
-        if isinstance(args.get("header_overrides"), dict):
-            for k, v in args["header_overrides"].items():
-                key_str = str(k)
-                key_low = key_str.lower()
-                for existing_key in [ek for ek in req_headers if ek.lower() == key_low and ek != key_str]:
-                    req_headers.pop(existing_key, None)
-                req_headers[key_str] = str(v)
+        base_body_str = str(baseline.get("request_body") or "")
+        baseline_is_multipart = _is_multipart_receipt(baseline)
 
         query_overrides = args.get("query_overrides") if isinstance(args.get("query_overrides"), dict) else None
         json_overrides = args.get("json_overrides") if isinstance(args.get("json_overrides"), dict) else None
@@ -802,15 +831,39 @@ class ToolDispatcher:
             patch_obj = json_overrides
 
         base_receipt_id = str(args.get("base_receipt_id") or "").strip()
+        has_body_replacement = bool(base_receipt_id) or (patch_obj is not None)
+        if baseline_is_multipart and method in _MUTATING_WRITE_METHODS and not has_body_replacement:
+            raise ValueError(
+                f"receipt {baseline.get('receipt_id', '')} is a multipart/form-data upload whose stored "
+                "request_body is a redacted non-binary summary and cannot be replayed directly via "
+                "replay_as; send the upload via http_request with the files=[...] parameter instead."
+            )
+
+        # Preserve safe non-auth request headers when replaying.
+        req_headers: dict[str, str] = {}
+        for k, v in (baseline.get("request_headers") or {}).items():
+            kl = str(k).strip().lower()
+            if kl in _SKIP_REPLAY_HEADERS or "<REDACTED" in str(v):
+                continue
+            if baseline_is_multipart and kl == "content-type":
+                continue
+            req_headers[k] = str(v)
+        if isinstance(args.get("header_overrides"), dict):
+            for k, v in args["header_overrides"].items():
+                key_str = str(k)
+                key_low = key_str.lower()
+                for existing_key in [ek for ek in req_headers if ek.lower() == key_low and ek != key_str]:
+                    req_headers.pop(existing_key, None)
+                req_headers[key_str] = str(v)
+
         json_body = None
         raw_body = None
-        base_body_str = baseline.get("request_body") or ""
         if base_receipt_id:
             base_obj = self._load_receipt_json_object(base_receipt_id)
             json_body = _deep_merge_json(base_obj, patch_obj) if patch_obj is not None else base_obj
         elif patch_obj is not None:
             parsed: Any = None
-            if base_body_str:
+            if base_body_str and not baseline_is_multipart:
                 try:
                     parsed = json.loads(base_body_str)
                 except ValueError:
@@ -827,7 +880,7 @@ class ToolDispatcher:
                 json_body = _deep_merge_json(parsed, patch_obj)
             else:
                 json_body = copy.deepcopy(patch_obj)
-        elif base_body_str:
+        elif base_body_str and not baseline_is_multipart:
             try:
                 json_body = json.loads(base_body_str)
             except ValueError:

@@ -118,6 +118,8 @@ _KV_SECRET_RE = re.compile(
     r"(?i)\b(api_key|apikey|access_token|refresh_token|client_secret|private_key|password|passwd|secret|token|sid)=([^\s&;\"'`,]+)"
 )
 _SAFE_SHELL_VALUE_RE = re.compile(r"^[A-Za-z0-9_./:@+=,<>\- ]+$")
+_CONTROL_CHARS_RE = re.compile(r"[\x00-\x1f\x7f]+")
+_MULTIPART_SUMMARY_PREFIX = "multipart/form-data "
 
 _SUCCESSFUL_STATUSES = frozenset({
     "finished",
@@ -553,6 +555,73 @@ def _format_curl_header_arg(name: str, value: str) -> str:
     return f"-H {shlex.quote(combined)}"
 
 
+def _is_multipart_receipt(req_body: str, headers: dict[str, str]) -> bool:
+    """Return True when a receipt represents a multipart/form-data upload."""
+    if req_body.startswith(_MULTIPART_SUMMARY_PREFIX):
+        return True
+    for k, v in headers.items():
+        if str(k).strip().lower() == "content-type":
+            if str(v or "").strip().lower().startswith("multipart/form-data"):
+                return True
+    return False
+
+
+def _sanitize_curl_multipart_token(raw: Any, secret_values: Sequence[str]) -> str:
+    """Sanitize a multipart field name, filename, or content-type for safe single-line curl -F output."""
+    cleaned = _sanitize_text(str(raw or ""), secret_values)
+    cleaned = _CONTROL_CHARS_RE.sub("", cleaned)
+    return cleaned.strip()
+
+
+def _build_multipart_curl_args(req_body: str, secret_values: Sequence[str]) -> list[str]:
+    """Build deterministic `curl -F` arguments from a multipart/form-data receipt summary."""
+    fallback = ["-F", "'file=@upload.bin'"]
+    if not req_body.startswith(_MULTIPART_SUMMARY_PREFIX):
+        return fallback
+    payload_raw = req_body[len(_MULTIPART_SUMMARY_PREFIX) :].strip()
+    if not payload_raw:
+        return fallback
+    try:
+        parsed = json.loads(payload_raw)
+    except ValueError:
+        return fallback
+    if not isinstance(parsed, dict):
+        return fallback
+
+    args: list[str] = []
+    raw_fields = parsed.get("fields")
+    if isinstance(raw_fields, list):
+        for raw_name in raw_fields:
+            if not isinstance(raw_name, str):
+                continue
+            name = _sanitize_curl_multipart_token(raw_name, secret_values)
+            if not name:
+                continue
+            args.extend(["-F", shlex.quote(f"{name}=<value>")])
+
+    raw_files = parsed.get("files")
+    if isinstance(raw_files, list):
+        for item in raw_files:
+            if not isinstance(item, dict):
+                continue
+            raw_field = item.get("field")
+            field = _sanitize_curl_multipart_token(raw_field, secret_values) if raw_field is not None else ""
+            if not field:
+                field = "file"
+            raw_filename = item.get("filename")
+            filename = (
+                _sanitize_curl_multipart_token(raw_filename, secret_values) if raw_filename is not None else ""
+            )
+            if not filename:
+                filename = "upload.bin"
+            raw_ct = item.get("content_type")
+            content_type = _sanitize_curl_multipart_token(raw_ct, secret_values) if raw_ct is not None else ""
+            spec = f"{field}=@{filename};type={content_type}" if content_type else f"{field}=@{filename}"
+            args.extend(["-F", shlex.quote(spec)])
+
+    return args if args else fallback
+
+
 def _build_curl_reproduction(
     finding: dict[str, Any],
     proof_receipt: dict[str, Any] | None,
@@ -573,10 +642,14 @@ def _build_curl_reproduction(
 
         parts: list[str] = ["curl", "-sS", "-i", "-X", method, shlex.quote(safe_url)]
         safe_headers = _sanitize_header_dict(proof_receipt.get("request_headers"), secret_values)
+        req_body = str(proof_receipt.get("request_body") or "")
+        is_multipart = _is_multipart_receipt(req_body, safe_headers)
         for k in sorted(safe_headers.keys(), key=lambda x: str(x).lower()):
             name = str(k).strip()
             nl = name.lower()
             if not name or nl in _CURL_SKIP_HEADERS:
+                continue
+            if is_multipart and nl == "content-type":
                 continue
             if nl in {"authorization", "proxy-authorization"}:
                 parts.append(_format_curl_header_arg(name, "<REDACTED_AUTH_HEADER>"))
@@ -589,8 +662,9 @@ def _build_curl_reproduction(
                 if safe_val:
                     parts.append(_format_curl_header_arg(name, safe_val))
 
-        req_body = str(proof_receipt.get("request_body") or "")
-        if req_body:
+        if is_multipart:
+            parts.extend(_build_multipart_curl_args(req_body, secret_values))
+        elif req_body:
             safe_body = _sanitize_text(req_body, secret_values)
             if len(safe_body) > 2000:
                 safe_body = safe_body[:2000] + "...<truncated>"

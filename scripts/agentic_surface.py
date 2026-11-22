@@ -6,6 +6,7 @@ write operations, and actor coverage from every HTTP receipt at 0 extra HTTP cos
 from __future__ import annotations
 
 import json
+import math
 from pathlib import Path
 import re
 import sys
@@ -241,6 +242,477 @@ _FRONTEND_SOURCE_DIR_PREFIXES = (
     "/components/ui/",
     "/src/components/",
 )
+_MAX_BODY_TEMPLATES = 40
+_MAX_BODY_TEMPLATE_CHARS = 600
+_MAX_BODY_TEMPLATE_STR_LEN = 64
+_MAX_BODY_TEMPLATE_LIST_LEN = 4
+_MAX_BODY_TEMPLATE_DICT_KEYS = 16
+_MAX_BODY_TEMPLATE_DEPTH = 4
+_MAX_SCHEMA_HINTS_PER_TEMPLATE = 24
+_MAX_SCHEMA_HINT_TEMPLATES = 60
+_MAX_PARAMS_PER_TEMPLATE = 32
+_MAX_PATH_PARAMS_PER_ROUTE = 6
+
+_SECRET_KEY_SUBSTRINGS = (
+    "password",
+    "passwd",
+    "secret",
+    "token",
+    "apikey",
+    "api_key",
+    "credential",
+    "private_key",
+    "privatekey",
+    "access_key",
+    "accesskey",
+    "passphrase",
+    "cookie",
+    "jwt",
+    "bearer",
+)
+_SECRET_KEY_EXACT_TOKENS = frozenset({
+    "pwd",
+    "auth",
+    "authorization",
+    "csrf",
+    "xsrf",
+    "session_id",
+    "sessionid",
+    "sid",
+    "otp",
+    "pin",
+})
+_CAMEL_BOUNDARY_RE = re.compile(r"([a-z0-9])([A-Z])")
+_TOKEN_SPLIT_RE = re.compile(r"[^a-z0-9]+")
+
+_VALIDATION_FIELD_SEG_RE = re.compile(r"^[A-Za-z0-9_$-]{1,48}$")
+_VALIDATION_TYPE_RE = re.compile(r"^[A-Za-z0-9_.-]{1,48}$")
+_VALIDATION_ROOT_SCOPES = frozenset({"body", "query", "path", "header", "cookie"})
+_NON_TYPE_LABELS = frozenset({"field", "error", "validation_error", "invalid"})
+
+_PATH_KV_KEY_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_-]{0,31}$")
+_URL_SCHEME_VAL_RE = re.compile(r"^[A-Za-z][A-Za-z0-9+.-]{0,15}:$")
+_PATH_TEMPLATE_PARAM_RE = re.compile(r"^\{([A-Za-z][A-Za-z0-9_.-]{0,31})(?::([A-Za-z0-9_-]{1,16}))?\}$")
+_PLAIN_PATH_VAL_RE = re.compile(
+    r"^(?:[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)?|https?://[A-Za-z0-9._:/-]+)$"
+)
+_PATH_INPUT_PARAM_TOKENS = frozenset({
+    "file",
+    "filename",
+    "filepath",
+    "path",
+    "pathname",
+    "dir",
+    "directory",
+    "folder",
+    "url",
+    "uri",
+    "href",
+    "redirect",
+    "dest",
+    "destination",
+    "target",
+    "goto",
+    "callback",
+    "proxy",
+    "forward",
+    "upstream",
+    "template",
+    "tpl",
+    "include",
+    "src",
+    "source",
+    "next",
+    "return",
+    "location",
+})
+_PATH_INPUT_PARENT_SEGMENTS = frozenset({
+    "download",
+    "downloads",
+    "fetch",
+    "proxy",
+    "redirect",
+    "redir",
+    "forward",
+    "goto",
+    "render",
+    "template",
+    "templates",
+    "include",
+    "serve",
+    "readfile",
+    "getfile",
+    "sendfile",
+    "file",
+    "fetch-url",
+    "fetch_url",
+})
+
+
+def _is_secret_key(key: str) -> bool:
+    """Return True if a JSON key name looks like a credential, token, or secret."""
+    snake = _CAMEL_BOUNDARY_RE.sub(r"\1_\2", str(key or "")).strip().lower()
+    if not snake:
+        return False
+    norm = snake.replace("-", "_")
+    if any(sub in norm for sub in _SECRET_KEY_SUBSTRINGS):
+        return True
+    tokens = [tok for tok in _TOKEN_SPLIT_RE.split(norm) if tok]
+    if norm in _SECRET_KEY_EXACT_TOKENS or any(tok in _SECRET_KEY_EXACT_TOKENS for tok in tokens):
+        return True
+    return False
+
+
+def _sanitize_json_template(
+    obj: Any,
+    *,
+    depth: int = 0,
+    max_str_len: int = _MAX_BODY_TEMPLATE_STR_LEN,
+    max_list_len: int = _MAX_BODY_TEMPLATE_LIST_LEN,
+    max_dict_keys: int = _MAX_BODY_TEMPLATE_DICT_KEYS,
+) -> Any:
+    """Compact and secret-redact a JSON structure for safe schema-template reuse."""
+    if isinstance(obj, dict):
+        if depth >= _MAX_BODY_TEMPLATE_DEPTH:
+            return {}
+        out: dict[str, Any] = {}
+        for k, v in list(obj.items())[:max_dict_keys]:
+            k_str = str(k)[:64]
+            if not k_str:
+                continue
+            if _is_secret_key(k_str):
+                out[k_str] = "<redacted>"
+            else:
+                out[k_str] = _sanitize_json_template(
+                    v,
+                    depth=depth + 1,
+                    max_str_len=max_str_len,
+                    max_list_len=max_list_len,
+                    max_dict_keys=max_dict_keys,
+                )
+        return out
+    if isinstance(obj, list):
+        if depth >= _MAX_BODY_TEMPLATE_DEPTH:
+            return []
+        return [
+            _sanitize_json_template(
+                item,
+                depth=depth + 1,
+                max_str_len=max_str_len,
+                max_list_len=max_list_len,
+                max_dict_keys=max_dict_keys,
+            )
+            for item in obj[:max_list_len]
+        ]
+    if isinstance(obj, str):
+        low = obj.lower()
+        if "<redacted" in low or (low.strip().startswith("bearer ") and len(obj.strip()) > 12):
+            return "<redacted>"
+        if len(obj) > max_str_len:
+            if max_str_len <= 3:
+                return obj[:max_str_len]
+            return obj[: max_str_len - 3] + "..."
+        return obj
+    if isinstance(obj, bool) or obj is None or isinstance(obj, int):
+        return obj
+    if isinstance(obj, float):
+        return obj if math.isfinite(obj) else 0.0
+    text = str(obj)
+    return text[:max_str_len]
+
+
+def _serialized_json_len(doc: Any) -> int:
+    return len(json.dumps(doc, ensure_ascii=False, separators=(",", ":")))
+
+
+def _fit_body_template_budget(
+    doc: dict[str, Any],
+    *,
+    max_chars: int = _MAX_BODY_TEMPLATE_CHARS,
+) -> dict[str, Any]:
+    """Ensure a sanitized JSON template dict serializes compactly within `max_chars`."""
+    if _serialized_json_len(doc) <= max_chars:
+        return doc
+    for str_len, list_len in ((24, 2), (12, 1), (8, 1)):
+        shrunk = _sanitize_json_template(
+            doc,
+            max_str_len=str_len,
+            max_list_len=list_len,
+            max_dict_keys=_MAX_BODY_TEMPLATE_DICT_KEYS,
+        )
+        if isinstance(shrunk, dict) and _serialized_json_len(shrunk) <= max_chars:
+            return shrunk
+        if isinstance(shrunk, dict):
+            doc = shrunk
+
+    kept: dict[str, Any] = {}
+    for k, v in doc.items():
+        candidate = dict(kept)
+        candidate[k] = v
+        if _serialized_json_len(candidate) <= max_chars:
+            kept = candidate
+            continue
+        fallback_val: Any = [] if isinstance(v, list) else ({} if isinstance(v, dict) else "...")
+        candidate[k] = fallback_val
+        if _serialized_json_len(candidate) <= max_chars:
+            kept = candidate
+    return kept
+
+
+def _normalize_validation_path(
+    raw_path: Any,
+    *,
+    location: str = "",
+    method: str = "POST",
+) -> tuple[str, str] | None:
+    """Normalize a validation error field path into `(dotted_path, leaf_param)`."""
+    parts: list[str]
+    if isinstance(raw_path, (list, tuple)):
+        parts = [str(p).strip() for p in raw_path if str(p).strip() != ""]
+    elif isinstance(raw_path, str):
+        text = raw_path.strip()
+        if not text:
+            return None
+        if "/" in text:
+            parts = [seg.strip() for seg in text.strip("/").split("/") if seg.strip()]
+        else:
+            parts = [seg.strip() for seg in text.split(".") if seg.strip()]
+    else:
+        return None
+
+    if not parts:
+        return None
+    parts = parts[:8]
+    if any(not _VALIDATION_FIELD_SEG_RE.fullmatch(seg) for seg in parts):
+        return None
+
+    loc_low = str(location or "").strip().lower()
+    if loc_low in _VALIDATION_ROOT_SCOPES and parts[0].lower() not in _VALIDATION_ROOT_SCOPES:
+        parts = [loc_low, *parts]
+    elif parts[0].lower() not in _VALIDATION_ROOT_SCOPES and method in {"POST", "PUT", "PATCH"}:
+        parts = ["body", *parts]
+
+    formatted_path = ".".join(parts)
+    leaf = ""
+    for seg in reversed(parts):
+        if not seg.isdigit() and seg.lower() not in _VALIDATION_ROOT_SCOPES and not seg.startswith("$"):
+            leaf = seg
+            break
+    return formatted_path, leaf
+
+
+def _extract_validation_schema_hints(
+    parsed: Any,
+    *,
+    method: str = "POST",
+) -> tuple[list[str], list[str]]:
+    """Extract compact validation field hints (`body.data:list_type`) and leaf param names from 400/422 JSON."""
+    hints: list[str] = []
+    leaves: list[str] = []
+    seen_hints: set[str] = set()
+    seen_leaves: set[str] = set()
+
+    def _add(fpath: str, leaf: str, err_type: str = "") -> None:
+        clean_type = str(err_type or "").strip()
+        if clean_type.lower() in _NON_TYPE_LABELS or not _VALIDATION_TYPE_RE.fullmatch(clean_type):
+            clean_type = ""
+        hint = f"{fpath}:{clean_type}" if clean_type else fpath
+        if hint not in seen_hints and len(hints) < _MAX_SCHEMA_HINTS_PER_TEMPLATE:
+            seen_hints.add(hint)
+            hints.append(hint)
+        if leaf and leaf not in seen_leaves and len(leaves) < _MAX_SCHEMA_HINTS_PER_TEMPLATE:
+            seen_leaves.add(leaf)
+            leaves.append(leaf)
+
+    def _extract_item(item: dict[str, Any]) -> None:
+        location = str(item.get("location") or item.get("in") or "").strip().lower()
+        raw_path: Any = None
+        for key in ("loc", "path", "field", "param", "property", "missing_field", "instancePath", "dataPath", "name", "key"):
+            cand = item.get(key)
+            if cand is not None and cand != "" and cand != []:
+                raw_path = cand
+                break
+        # Support AJV-style `{instancePath: "/items/0", params: {missingProperty: "name"}}`
+        params_obj = item.get("params")
+        if isinstance(params_obj, dict):
+            missing_prop = params_obj.get("missingProperty")
+            if isinstance(missing_prop, str) and missing_prop.strip():
+                if isinstance(raw_path, str) and raw_path.strip():
+                    raw_path = f"{raw_path.rstrip('/')}/{missing_prop.strip()}"
+                elif raw_path is None:
+                    raw_path = missing_prop.strip()
+
+        norm = _normalize_validation_path(raw_path, location=location, method=method)
+        if norm is None:
+            return
+        fpath, leaf = norm
+
+        err_type = ""
+        for tkey in ("expected", "expected_type", "expectedType", "type", "code"):
+            raw_t = item.get(tkey)
+            if isinstance(raw_t, str) and raw_t.strip():
+                cand_t = raw_t.strip()
+                if cand_t.lower() not in _NON_TYPE_LABELS and _VALIDATION_TYPE_RE.fullmatch(cand_t):
+                    err_type = cand_t
+                    break
+        _add(fpath, leaf, err_type)
+
+    if isinstance(parsed, list):
+        for elem in parsed[:30]:
+            if isinstance(elem, dict) and any(
+                k in elem for k in ("loc", "path", "field", "param", "instancePath", "dataPath")
+            ):
+                _extract_item(elem)
+        return hints, leaves
+
+    if not isinstance(parsed, dict):
+        return hints, leaves
+
+    matched_container = False
+    for key in ("detail", "errors", "issues", "violations", "validation_errors", "validationErrors"):
+        val = parsed.get(key)
+        if isinstance(val, list):
+            matched_container = True
+            for elem in val[:30]:
+                if isinstance(elem, dict):
+                    _extract_item(elem)
+                elif isinstance(elem, str) and _VALIDATION_FIELD_SEG_RE.fullmatch(elem.strip()):
+                    norm = _normalize_validation_path(elem.strip(), method=method)
+                    if norm is not None:
+                        _add(norm[0], norm[1])
+        elif isinstance(val, dict):
+            matched_container = True
+            if any(k in val for k in ("loc", "path", "field", "param", "instancePath")):
+                _extract_item(val)
+            else:
+                for fk in list(val.keys())[:24]:
+                    fk_s = str(fk or "").strip()
+                    if fk_s.lower() in {"message", "error", "code", "status", "detail"}:
+                        continue
+                    norm = _normalize_validation_path(fk_s, method=method)
+                    if norm is not None:
+                        _add(norm[0], norm[1])
+
+    for key in ("fieldErrors", "field_errors", "fields"):
+        val = parsed.get(key)
+        if isinstance(val, dict):
+            matched_container = True
+            for fk in list(val.keys())[:24]:
+                norm = _normalize_validation_path(str(fk or "").strip(), method=method)
+                if norm is not None:
+                    _add(norm[0], norm[1])
+        elif isinstance(val, list):
+            matched_container = True
+            for elem in val[:24]:
+                if isinstance(elem, dict):
+                    _extract_item(elem)
+                elif isinstance(elem, str):
+                    norm = _normalize_validation_path(elem.strip(), method=method)
+                    if norm is not None:
+                        _add(norm[0], norm[1])
+
+    for key in ("missing", "missing_fields", "missingFields", "required", "required_fields", "requiredFields"):
+        val = parsed.get(key)
+        if isinstance(val, list):
+            matched_container = True
+            for elem in val[:24]:
+                if isinstance(elem, str) and elem.strip():
+                    norm = _normalize_validation_path(elem.strip(), method=method)
+                    if norm is not None:
+                        _add(norm[0], norm[1])
+        elif isinstance(val, str) and _VALIDATION_FIELD_SEG_RE.fullmatch(val.strip()):
+            matched_container = True
+            norm = _normalize_validation_path(val.strip(), method=method)
+            if norm is not None:
+                _add(norm[0], norm[1])
+
+    if not matched_container and any(k in parsed for k in ("loc", "path", "field", "param", "missing_field")):
+        _extract_item(parsed)
+
+    return hints, leaves
+
+
+def _split_path_kv_segment(seg: str) -> tuple[str, str] | None:
+    """Return `(key_lower, value)` if `seg` is a valid path-embedded `key=value` segment."""
+    if "=" not in seg or seg.endswith("=="):
+        return None
+    key, _, val = seg.partition("=")
+    if not key or not _PATH_KV_KEY_RE.fullmatch(key):
+        return None
+    if val.startswith("="):
+        return None
+    if not val and not (key.islower() and 2 <= len(key) <= 20):
+        return None
+    return key.lower(), val
+
+
+def _extract_path_embedded_param_pairs(path: str) -> list[tuple[str, str]]:
+    """Extract `(marker, observed_value)` for path-embedded `key=value` and file/url/redirect `{param}` segments."""
+    raw = str(path or "").strip()
+    if not raw or is_malformed_url_path(raw):
+        return []
+    norm_p = normalize_path(raw)
+    raw_segs = [seg for seg in norm_p.split("/") if seg]
+    if not raw_segs:
+        return []
+
+    out: list[tuple[str, str]] = []
+    seen: set[str] = set()
+
+    for idx, seg in enumerate(raw_segs):
+        if len(out) >= _MAX_PATH_PARAMS_PER_ROUTE:
+            break
+        kv = _split_path_kv_segment(seg)
+        if kv is not None:
+            key_low, val = kv
+            marker = f"path:{key_low}="
+            raw_key = seg.partition("=")[0]
+            consumes_tail = (
+                (_URL_SCHEME_VAL_RE.fullmatch(val) is not None)
+                or (key_low in _PATH_INPUT_PARAM_TOKENS and val in {"", ".", ".."})
+            )
+            full_val = val
+            if consumes_tail and idx + 1 < len(raw_segs):
+                prefix_segs = "/" + "/".join(raw_segs[:idx]) if idx > 0 else ""
+                needle = f"{prefix_segs}/{raw_key}="
+                pos = norm_p.find(needle)
+                if pos != -1:
+                    full_val = norm_p[pos + len(needle) :]
+                else:
+                    full_val = "/".join([val, *raw_segs[idx + 1 :]])
+            if marker not in seen:
+                seen.add(marker)
+                out.append((marker, full_val[:64]))
+            if consumes_tail:
+                break
+            continue
+
+        tmpl_match = _PATH_TEMPLATE_PARAM_RE.fullmatch(seg)
+        if tmpl_match is not None:
+            param_name = tmpl_match.group(1)
+            converter = (tmpl_match.group(2) or "").lower()
+            param_low = param_name.lower()
+            param_tokens = [tok for tok in _TOKEN_SPLIT_RE.split(param_low) if tok]
+            prev_seg = raw_segs[idx - 1].lower() if idx > 0 else ""
+            matches_param = (
+                converter == "path"
+                or param_low in _PATH_INPUT_PARAM_TOKENS
+                or any(tok in _PATH_INPUT_PARAM_TOKENS for tok in param_tokens)
+            )
+            is_generic_id = param_low == "id" or param_low.endswith(("_id", "-id"))
+            matches_parent = (prev_seg in _PATH_INPUT_PARENT_SEGMENTS) and not is_generic_id
+            if matches_param or matches_parent:
+                marker = f"path:{param_low}"
+                if marker not in seen:
+                    seen.add(marker)
+                    out.append((marker, ""))
+
+    return out
+
+
+def _extract_path_embedded_params(path: str) -> list[str]:
+    """Extract `path:...` input-parameter markers from path-embedded `key=value` or `{param}` segments."""
+    return [marker for marker, _ in _extract_path_embedded_param_pairs(path)]
 
 
 def is_malformed_url_path(url_or_path: str) -> bool:
@@ -346,6 +818,7 @@ def _extract_ui_resource_info(path: str) -> tuple[str, bool, str] | None:
     if (
         resource in _NON_RESOURCE_UI_SEGMENTS
         or resource.startswith((".", "_"))
+        or "=" in resource
         or is_id_segment(resource)
         or resource.endswith(_NON_RESOURCE_FILE_EXTS)
     ):
@@ -382,15 +855,22 @@ def normalize_path(url_or_path: str) -> str:
 
 
 def route_template_of(url_or_path: str) -> str:
-    """Normalize concrete resource ID path segments into `{id}` route templates."""
+    """Normalize concrete resource ID and `key=value` path segments into route templates."""
     path = normalize_path(url_or_path)
     if path == "/":
         return "/"
+    raw_segs = [seg for seg in path.split("/") if seg]
     segments: list[str] = []
-    for seg in path.split("/"):
-        if not seg:
-            continue
-        if is_id_segment(seg):
+    for seg in raw_segs:
+        kv = _split_path_kv_segment(seg)
+        if kv is not None:
+            key_low, val = kv
+            segments.append(f"{key_low}={{val}}")
+            if _URL_SCHEME_VAL_RE.fullmatch(val) or (
+                key_low in _PATH_INPUT_PARAM_TOKENS and val in {"", ".", ".."}
+            ):
+                break
+        elif is_id_segment(seg):
             segments.append("{id}")
         else:
             segments.append(seg.lower())
@@ -404,6 +884,8 @@ def _is_auth_utility_path(path: str) -> bool:
 
 class SurfaceFrontierTracker:
     """Passively tracks discovered routes, per-actor objects, write ops, and untested frontier items."""
+
+    _extract_path_embedded_params = staticmethod(_extract_path_embedded_params)
 
     def __init__(
         self,
@@ -458,6 +940,57 @@ class SurfaceFrontierTracker:
         # Observed API prefixes and non-API UI resource families for UI <-> API parity
         self.api_prefix_routes: dict[str, set[str]] = {}
         self.ui_resource_families: dict[str, dict[str, Any]] = {}
+        # Observed working write-body JSON templates and 400/422 validation schema hints
+        # key: (METHOD, route_template) -> compacted/redacted JSON object dict
+        self.discovered_body_templates: dict[tuple[str, str], dict[str, Any]] = {}
+        # key: route_template -> set of validation field hints (e.g. "body.data:list_type")
+        self.discovered_schema_hints: dict[str, set[str]] = {}
+
+    def _add_discovered_params(self, tmpl: str, names: Sequence[str]) -> None:
+        """Add parameter names to `discovered_params[tmpl]` within per-template bounds."""
+        if not names:
+            return
+        bucket = self.discovered_params.setdefault(tmpl, set())
+        for raw_name in names:
+            pname = str(raw_name or "").strip()
+            if not pname or pname in bucket:
+                continue
+            if len(bucket) >= _MAX_PARAMS_PER_TEMPLATE:
+                break
+            bucket.add(pname)
+
+    def _record_body_template(self, method: str, tmpl: str, parsed_req: dict[str, Any]) -> None:
+        """Record a sanitized, size-bounded observed working JSON body template."""
+        if not parsed_req:
+            return
+        key = (method, tmpl)
+        sanitized = _sanitize_json_template(parsed_req)
+        if not isinstance(sanitized, dict) or not sanitized:
+            return
+        fitted = _fit_body_template_budget(sanitized, max_chars=_MAX_BODY_TEMPLATE_CHARS)
+        if not fitted:
+            return
+        existing = self.discovered_body_templates.get(key)
+        if existing is None:
+            if len(self.discovered_body_templates) >= _MAX_BODY_TEMPLATES:
+                return
+            self.discovered_body_templates[key] = fitted
+        elif len(fitted) > len(existing):
+            self.discovered_body_templates[key] = fitted
+
+    def _ingest_validation_hints(self, tmpl: str, parsed: Any, *, method: str) -> None:
+        """Record 400/422 validation schema hints and leaf parameter names for `tmpl`."""
+        hints, leaves = _extract_validation_schema_hints(parsed, method=method)
+        if hints:
+            existing = self.discovered_schema_hints.get(tmpl)
+            if existing is not None or len(self.discovered_schema_hints) < _MAX_SCHEMA_HINT_TEMPLATES:
+                bucket = self.discovered_schema_hints.setdefault(tmpl, set())
+                for h in hints:
+                    if len(bucket) >= _MAX_SCHEMA_HINTS_PER_TEMPLATE:
+                        break
+                    bucket.add(h)
+        if leaves:
+            self._add_discovered_params(tmpl, leaves)
 
     def _record_param_probes(self, tmpl: str, pairs: Sequence[tuple[str, str]]) -> None:
         """Record observed parameter names, distinct values (bounded), and special-char probe depth."""
@@ -471,7 +1004,10 @@ class SurfaceFrontierTracker:
             rec = p_map.setdefault(pname, {"values": set(), "has_special": False})
             if len(rec["values"]) < _MAX_PARAM_VALUES_TRACKED:
                 rec["values"].add(val)
-            if val and not _PLAIN_ALNUM_VAL_RE.fullmatch(val):
+            if pname.startswith("path:"):
+                if val and (".." in val or not _PLAIN_PATH_VAL_RE.fullmatch(val)):
+                    rec["has_special"] = True
+            elif val and not _PLAIN_ALNUM_VAL_RE.fullmatch(val):
                 rec["has_special"] = True
 
     def _is_param_probed_enough(self, tmpl: str, pname: str) -> bool:
@@ -486,7 +1022,11 @@ class SurfaceFrontierTracker:
             return True
         if len(rec.get("values") or set()) >= 2:
             return True
-        needs_depth = (tmpl in self.html_or_form_templates) or (p_low in _PROBE_PRIORITY_PARAM_NAMES)
+        needs_depth = (
+            p_low.startswith("path:")
+            or (tmpl in self.html_or_form_templates)
+            or (p_low in _PROBE_PRIORITY_PARAM_NAMES)
+        )
         return not needs_depth
 
     def was_object_listed_for_actor(self, url_or_path: str, actor: str) -> bool:
@@ -637,7 +1177,7 @@ class SurfaceFrontierTracker:
         parsed = urlsplit(resolved)
         if (parsed.scheme, parsed.netloc) != self._origin:
             return None
-        if is_static_asset_url(parsed.path) or is_non_endpoint_source_path(resolved):
+        if (is_static_asset_url(parsed.path) and not _extract_path_embedded_params(parsed.path)) or is_non_endpoint_source_path(resolved):
             return None
         norm_p = normalize_path(parsed.path)
         return norm_p, parsed.query
@@ -669,7 +1209,10 @@ class SurfaceFrontierTracker:
             if pname and pname not in q_names:
                 q_names.append(pname)
         if q_names:
-            self.discovered_params.setdefault(tmpl, set()).update(q_names)
+            self._add_discovered_params(tmpl, q_names)
+        path_params = _extract_path_embedded_params(norm_p)
+        if path_params:
+            self._add_discovered_params(tmpl, path_params)
         if is_form:
             self.html_or_form_templates.add(tmpl)
 
@@ -839,6 +1382,23 @@ class SurfaceFrontierTracker:
         self.actors_by_path.setdefault(norm_p, set()).add(actor)
         self.actors_by_template.setdefault(tmpl, set()).add(actor)
 
+        raw_norm_p = normalize_path(str(receipt.get("path") or raw_url))
+        raw_path_pairs = _extract_path_embedded_param_pairs(raw_norm_p)
+        path_param_pairs = _extract_path_embedded_param_pairs(norm_p)
+        if raw_path_pairs and not path_param_pairs:
+            raw_tmpl = route_template_of(raw_norm_p)
+            if status != 404:
+                self._add_discovered_params(raw_tmpl, [k for k, _ in raw_path_pairs])
+            concrete_raw_pairs = [(k, v) for k, v in raw_path_pairs if v or k.endswith("=")]
+            if concrete_raw_pairs:
+                self._record_param_probes(raw_tmpl, concrete_raw_pairs)
+        elif path_param_pairs:
+            if status != 404:
+                self._add_discovered_params(tmpl, [k for k, _ in path_param_pairs])
+            concrete_path_pairs = [(k, v) for k, v in path_param_pairs if v or k.endswith("=")]
+            if concrete_path_pairs:
+                self._record_param_probes(tmpl, concrete_path_pairs)
+
         parsed_url = urlsplit(url)
         query_str = str(receipt.get("query") or parsed_url.query or "")
         q_pairs = [(k.strip(), v) for k, v in parse_qsl(query_str, keep_blank_values=True) if k.strip()]
@@ -860,9 +1420,31 @@ class SurfaceFrontierTracker:
 
         if method in {"POST", "PUT", "PATCH", "DELETE"}:
             req_body = str(receipt.get("request_body") or "")
-            body_pairs = [(k.strip(), v) for k, v in parse_qsl(req_body, keep_blank_values=True) if k.strip()]
-            if body_pairs:
-                self._record_param_probes(tmpl, body_pairs)
+            stripped_req = req_body.strip()
+            is_multipart_summary = stripped_req.lower().startswith("multipart/form-data ")
+            parsed_req_obj: dict[str, Any] | None = None
+            if stripped_req and not is_multipart_summary and stripped_req.startswith("{"):
+                try:
+                    cand_req = json.loads(stripped_req)
+                except ValueError:
+                    cand_req = None
+                if isinstance(cand_req, dict):
+                    parsed_req_obj = cand_req
+
+            if parsed_req_obj is not None:
+                json_probe_pairs = [
+                    (str(k).strip(), "<redacted>" if _is_secret_key(str(k)) else str(v)[:64])
+                    for k, v in list(parsed_req_obj.items())[:_MAX_BODY_TEMPLATE_DICT_KEYS]
+                    if str(k).strip()
+                ]
+                if json_probe_pairs:
+                    self._record_param_probes(tmpl, json_probe_pairs)
+                if method in {"POST", "PUT", "PATCH"} and 200 <= status < 400 and parsed_req_obj:
+                    self._record_body_template(method, tmpl, parsed_req_obj)
+            elif stripped_req and not is_multipart_summary and not stripped_req.startswith(("{", "[")):
+                body_pairs = [(k.strip(), v) for k, v in parse_qsl(req_body, keep_blank_values=True) if k.strip()]
+                if body_pairs:
+                    self._record_param_probes(tmpl, body_pairs)
             if not _is_auth_utility_path(norm_p):
                 self.tested_write_ops.add((method, tmpl))
 
@@ -922,6 +1504,8 @@ class SurfaceFrontierTracker:
             except ValueError:
                 parsed = None
             if isinstance(parsed, (dict, list)):
+                if status in {400, 422}:
+                    self._ingest_validation_hints(tmpl, parsed, method=method)
                 if isinstance(parsed, dict) and "paths" in parsed and ("openapi" in parsed or "swagger" in parsed):
                     self._ingest_openapi_spec(parsed)
                 hypermedia, _ = extract_json_hypermedia(parsed, url, origin_url=self.base_url)
@@ -1154,20 +1738,32 @@ class SurfaceFrontierTracker:
             if (method, norm_p) not in self.visited_method_paths and (method, tmpl) not in self.visited_method_templates:
                 if (method, tmpl) not in seen_templates_in_out:
                     seen_templates_in_out.add((method, tmpl))
-                    out.append(f"{method} {display}")
+                    path_p = sorted(
+                        k for k in (self.discovered_params.get(tmpl) or ()) if str(k).startswith("path:")
+                    )
+                    suffix = f" [{','.join(path_p[:2])}]" if path_p else ""
+                    out.append(f"{method} {display}{suffix}")
             else:
-                # Check if discovered query/form parameters on this route template remain completely untested
+                # Check if discovered query/form/path parameters on this route template remain completely untested
                 disc_p = self.discovered_params.get(tmpl) or set()
                 tested_p = self.tested_params_by_template.get(tmpl) or set()
                 untested_p = sorted(disc_p - tested_p)
                 if untested_p and (method, tmpl) not in seen_templates_in_out:
                     seen_templates_in_out.add((method, tmpl))
-                    param_hint = "&".join(f"{k}=" for k in untested_p[:4])
-                    out.append(f"{method} {norm_p}?{param_hint}")
+                    query_untested = [k for k in untested_p if not str(k).startswith("path:")]
+                    path_untested = [k for k in untested_p if str(k).startswith("path:")]
+                    if query_untested and path_untested:
+                        param_hint = "&".join(f"{k}=" for k in query_untested[:4])
+                        out.append(f"{method} {norm_p}?{param_hint} [{','.join(path_untested[:2])}]")
+                    elif query_untested:
+                        param_hint = "&".join(f"{k}=" for k in query_untested[:4])
+                        out.append(f"{method} {norm_p}?{param_hint}")
+                    else:
+                        out.append(f"{method} {norm_p} [{','.join(path_untested[:2])}]")
         return out
 
     def unprobed_params(self) -> list[str]:
-        """Return discovered query params on visited routes that only received a single plain alphanumeric value."""
+        """Return discovered query/path params on visited routes that only received a single benign value."""
         out: list[str] = []
         visited_tmpls = {tmpl for _, tmpl in self.visited_method_templates}
         sample_path_by_tmpl: dict[str, str] = {}
@@ -1189,7 +1785,12 @@ class SurfaceFrontierTracker:
                 continue
             sample_path = sample_path_by_tmpl.get(tmpl, tmpl)
             for pname in shallow[:2]:
-                out.append(f"GET {sample_path}?{pname}= (1 benign value seen; probe special-char/differential value)")
+                if str(pname).startswith("path:"):
+                    out.append(
+                        f"GET {sample_path} [{pname}] (1 benign value seen; probe traversal/URL/injection value)"
+                    )
+                else:
+                    out.append(f"GET {sample_path}?{pname}= (1 benign value seen; probe special-char/differential value)")
                 if len(out) >= 8:
                     return out
         return out
@@ -1489,6 +2090,34 @@ class SurfaceFrontierTracker:
             or frontier["api_parity_untested"]
         )
 
+    def _format_compact_schema_hints(self, *, max_routes: int = 2, max_hints: int = 3) -> str:
+        """Render compact 400/422 validation schema hints for banner inclusion."""
+        if not self.discovered_schema_hints:
+            return ""
+        items: list[str] = []
+        for tmpl, hset in sorted(self.discovered_schema_hints.items()):
+            clean = sorted(str(h) for h in hset if str(h))[:max_hints]
+            if not clean:
+                continue
+            items.append(f"{tmpl}({','.join(clean)})")
+            if len(items) >= max_routes:
+                break
+        return f"schema_hints: [{'; '.join(items)}]" if items else ""
+
+    def _format_compact_body_templates(self, *, max_templates: int = 2) -> str:
+        """Render compact observed working write-body key summaries for banner inclusion."""
+        if not self.discovered_body_templates:
+            return ""
+        items: list[str] = []
+        for (method, tmpl), doc in sorted(self.discovered_body_templates.items()):
+            if not isinstance(doc, dict) or not doc:
+                continue
+            keys = ",".join(str(k) for k in list(doc.keys())[:6])
+            items.append(f"{method} {tmpl}{{{keys}}}")
+            if len(items) >= max_templates:
+                break
+        return f"body_templates: [{'; '.join(items)}]" if items else ""
+
     def format_frontier_banner(self, *, max_chars: int = 1000) -> str:
         """Render a compact (~1 KB) `[SURFACE FRONTIER]` block for turn state injection."""
         if max_chars <= 0:
@@ -1498,6 +2127,13 @@ class SurfaceFrontierTracker:
         all_params = self.unprobed_params()
         all_objs = self.untested_cross_actor_objects()
         all_writes = self.untested_write_ops()
+
+        def _append_compact_intel(base_text: str) -> str:
+            result = base_text
+            for extra in (self._format_compact_schema_hints(), self._format_compact_body_templates()):
+                if extra and len(result) + 3 + len(extra) <= max_chars:
+                    result = f"{result} | {extra}"
+            return result[:max_chars]
 
         if not any(
             (
@@ -1509,7 +2145,8 @@ class SurfaceFrontierTracker:
                 frontier["untested_actors"],
             )
         ):
-            return "\n[SURFACE FRONTIER] All discovered routes, objects, and allowed write ops covered."[:max_chars]
+            base_done = "\n[SURFACE FRONTIER] All discovered routes, objects, and allowed write ops covered."
+            return _append_compact_intel(base_done)
 
         def _build(r_cap: int, q_cap: int, o_cap: int, p_cap: int, w_cap: int, a_cap: int) -> str:
             parts: list[str] = []
@@ -1536,7 +2173,7 @@ class SurfaceFrontierTracker:
         for caps in ((6, 3, 4, 3, 6, 5), (3, 2, 2, 3, 3, 3), (2, 1, 1, 3, 1, 2), (1, 1, 1, 2, 1, 1)):
             candidate = _build(*caps)
             if len(candidate) <= max_chars:
-                return candidate
+                return _append_compact_intel(candidate)
         return _build(1, 1, 1, 2, 1, 1)[:max_chars]
 
     def to_dict(self) -> dict[str, Any]:
@@ -1591,6 +2228,12 @@ class SurfaceFrontierTracker:
                     "collection_403": bool(v.get("collection_403")),
                 }
                 for k, v in sorted(self.ui_resource_families.items())
+            },
+            "discovered_body_templates": [
+                [k[0], k[1], v] for k, v in sorted(self.discovered_body_templates.items())
+            ],
+            "discovered_schema_hints": {
+                k: sorted(v) for k, v in sorted(self.discovered_schema_hints.items()) if v
             },
         }
 
@@ -1692,6 +2335,24 @@ class SurfaceFrontierTracker:
                 if info is not None and info[2]:
                     self._observe_parity_path(norm_p, discovered=True)
         self._sync_ui_api_concrete_siblings()
+        self.discovered_body_templates = {}
+        for row in (data.get("discovered_body_templates") or []):
+            if isinstance(row, list) and len(row) == 3 and isinstance(row[2], dict):
+                m_up = str(row[0] or "").strip().upper()
+                tmpl_key = str(row[1] or "").strip()
+                if m_up and tmpl_key and len(self.discovered_body_templates) < _MAX_BODY_TEMPLATES:
+                    sanitized = _sanitize_json_template(row[2])
+                    if isinstance(sanitized, dict) and sanitized:
+                        fitted = _fit_body_template_budget(sanitized, max_chars=_MAX_BODY_TEMPLATE_CHARS)
+                        if fitted:
+                            self.discovered_body_templates[(m_up, tmpl_key)] = fitted
+        self.discovered_schema_hints = {}
+        for tmpl_key, raw_hints in (data.get("discovered_schema_hints") or {}).items():
+            if not isinstance(raw_hints, list):
+                continue
+            cleaned = {str(h).strip() for h in raw_hints if str(h).strip()}
+            if cleaned and len(self.discovered_schema_hints) < _MAX_SCHEMA_HINT_TEMPLATES:
+                self.discovered_schema_hints[str(tmpl_key)] = set(sorted(cleaned)[:_MAX_SCHEMA_HINTS_PER_TEMPLATE])
 
     @classmethod
     def from_dict(

@@ -1,12 +1,14 @@
 """General-purpose subsystem clustering and prompt builders for sharded execution."""
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+import json
 import re
 from typing import Any, Sequence
 from urllib.parse import urlsplit
 
 from agentic_surface import (
+    _split_path_kv_segment,
     is_malformed_url_path,
     is_non_endpoint_source_path,
     route_template_of,
@@ -31,6 +33,8 @@ class SubsystemCluster:
     write_ops: list[str]
     objects: list[str]
     params: dict[str, list[str]]
+    body_templates: dict[str, Any] = field(default_factory=dict)
+    schema_hints: dict[str, list[str]] = field(default_factory=dict)
 
 
 def extract_resource_family(path: str) -> str:
@@ -55,6 +59,9 @@ def extract_resource_family(path: str) -> str:
     first = segments[0]
     if first.startswith("{") and first.endswith("}"):
         return "root"
+    kv = _split_path_kv_segment(first)
+    if kv is not None:
+        return kv[0]
     if len(segments) == 1 and "." in first:
         return "root"
     if not any(ch.isalnum() for ch in first):
@@ -76,6 +83,8 @@ def cluster_discovered_surface(
     family_writes: dict[str, set[str]] = {}
     family_objects: dict[str, set[str]] = {}
     family_params: dict[str, dict[str, set[str]]] = {}
+    family_body_templates: dict[str, dict[str, Any]] = {}
+    family_schema_hints: dict[str, dict[str, set[str]]] = {}
 
     def _add_route(raw_path: str) -> str | None:
         raw = str(raw_path or "")
@@ -126,6 +135,25 @@ def cluster_discovered_surface(
         if cleaned:
             family_params.setdefault(fam, {}).setdefault(tmpl, set()).update(cleaned)
 
+    for raw_key, tmpl_doc in (getattr(surface_tracker, "discovered_body_templates", {}) or {}).items():
+        if not isinstance(raw_key, tuple) or len(raw_key) != 2 or not isinstance(tmpl_doc, dict) or not tmpl_doc:
+            continue
+        method = str(raw_key[0] or "POST").strip().upper()
+        tmpl = _add_route(str(raw_key[1] or ""))
+        if tmpl is None:
+            continue
+        fam = extract_resource_family(tmpl)
+        family_body_templates.setdefault(fam, {})[f"{method} {tmpl}"] = tmpl_doc
+
+    for raw_tmpl, hint_set in (getattr(surface_tracker, "discovered_schema_hints", {}) or {}).items():
+        tmpl = _add_route(str(raw_tmpl))
+        if tmpl is None:
+            continue
+        fam = extract_resource_family(tmpl)
+        cleaned_hints = {str(h).strip() for h in (hint_set or ()) if str(h).strip()}
+        if cleaned_hints:
+            family_schema_hints.setdefault(fam, {}).setdefault(tmpl, set()).update(cleaned_hints)
+
     all_families = sorted(family_routes)
     all_routes = sorted({r for rs in family_routes.values() for r in rs})
     all_writes = sorted({w for ws in family_writes.values() for w in ws})
@@ -135,6 +163,15 @@ def cluster_discovered_surface(
         for tmpl, pset in pmap.items():
             if pset:
                 all_params[tmpl] = sorted(set(all_params.get(tmpl, [])) | pset)
+    all_body_templates: dict[str, Any] = {}
+    for btmap in family_body_templates.values():
+        for op_key, tmpl_doc in btmap.items():
+            all_body_templates[op_key] = tmpl_doc
+    all_schema_hints: dict[str, list[str]] = {}
+    for shmap in family_schema_hints.values():
+        for tmpl, hset in shmap.items():
+            if hset:
+                all_schema_hints[tmpl] = sorted(set(all_schema_hints.get(tmpl, [])) | hset)
 
     if eff_max <= 1 or len(all_routes) < eff_min_routes or len(all_families) <= 1:
         single_name = all_families[0] if len(all_families) == 1 else "all"
@@ -147,6 +184,8 @@ def cluster_discovered_surface(
                 write_ops=all_writes,
                 objects=all_objects,
                 params=dict(sorted(all_params.items())),
+                body_templates=dict(sorted(all_body_templates.items())),
+                schema_hints=dict(sorted(all_schema_hints.items())),
             )
         ]
 
@@ -195,10 +234,17 @@ def cluster_discovered_surface(
         c_writes = sorted({w for fam in fams for w in family_writes.get(fam, ())})
         c_objects = sorted({o for fam in fams for o in family_objects.get(fam, ())})
         c_params: dict[str, list[str]] = {}
+        c_body_templates: dict[str, Any] = {}
+        c_schema_hints: dict[str, list[str]] = {}
         for fam in fams:
             for tmpl, pset in family_params.get(fam, {}).items():
                 if pset:
                     c_params[tmpl] = sorted(pset)
+            for op_key, tmpl_doc in family_body_templates.get(fam, {}).items():
+                c_body_templates[op_key] = tmpl_doc
+            for tmpl, hset in family_schema_hints.get(fam, {}).items():
+                if hset:
+                    c_schema_hints[tmpl] = sorted(set(c_schema_hints.get(tmpl, [])) | hset)
         c_name = "+".join(fams[:3]) + (f"+{len(fams) - 3}" if len(fams) > 3 else "")
         clusters.append(
             SubsystemCluster(
@@ -209,6 +255,8 @@ def cluster_discovered_surface(
                 write_ops=c_writes,
                 objects=c_objects,
                 params=dict(sorted(c_params.items())),
+                body_templates=dict(sorted(c_body_templates.items())),
+                schema_hints=dict(sorted(c_schema_hints.items())),
             )
         )
     return clusters
@@ -239,6 +287,11 @@ def build_shard_prompts(
         f"  - {tmpl}: {', '.join(pnames[:10])}"
         for tmpl, pnames in sorted(cluster.params.items())[:20]
     ]
+    has_path_params = any(
+        str(p).startswith("path:")
+        for pnames in cluster.params.values()
+        for p in pnames
+    )
     scope_sections = [
         f"SUBSYSTEM SHARD SCOPE ({cluster.shard_id}: {cluster.name}):",
         f"- Assigned resource families: {', '.join(cluster.families) or '(all)'}",
@@ -251,7 +304,50 @@ def build_shard_prompts(
     if cluster.objects:
         scope_sections.append("- Assigned concrete objects:\n  " + "\n  ".join(cluster.objects[:30]))
     if params_lines:
-        scope_sections.append("- Assigned parameters:\n" + "\n".join(params_lines))
+        params_header = "- Assigned parameters"
+        if has_path_params:
+            params_header += (
+                " (treat `path:...` entries as path-embedded inputs — test path traversal, "
+                "URL/redirect handling, and injection by substituting the path segment/value)"
+            )
+        scope_sections.append(params_header + ":\n" + "\n".join(params_lines))
+    if cluster.body_templates:
+        bt_lines: list[str] = []
+        bt_chars = 0
+        for op_key, tmpl_doc in sorted(cluster.body_templates.items())[:10]:
+            try:
+                compact = json.dumps(tmpl_doc, ensure_ascii=False, separators=(",", ":"))
+            except (TypeError, ValueError):
+                continue
+            if len(compact) > 240:
+                compact = compact[:237] + "..."
+            line = f"  - {op_key}: {compact}"
+            if bt_lines and bt_chars + len(line) > 1800:
+                break
+            bt_lines.append(line)
+            bt_chars += len(line)
+        if bt_lines:
+            scope_sections.append(
+                "- Observed working JSON body templates (mutate leaf values rather than inventing schemas):\n"
+                + "\n".join(bt_lines)
+            )
+    if cluster.schema_hints:
+        sh_lines: list[str] = []
+        sh_chars = 0
+        for tmpl, hints in sorted(cluster.schema_hints.items())[:15]:
+            clean_hints = [str(h).strip() for h in (hints or []) if str(h).strip()][:8]
+            if not clean_hints:
+                continue
+            line = f"  - {tmpl}: {', '.join(clean_hints)}"
+            if sh_lines and sh_chars + len(line) > 1200:
+                break
+            sh_lines.append(line)
+            sh_chars += len(line)
+        if sh_lines:
+            scope_sections.append(
+                "- Validation schema hints (from 400/422):\n"
+                + "\n".join(sh_lines)
+            )
     scope_sections.append(f"- Already-verified bootstrap findings (DO NOT DUPLICATE):\n{findings_block}")
     scope_sections.append(
         "- Call `record_finding` immediately as each vulnerability is confirmed, and call `finish` when your assigned subsystem slice is complete."

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import datetime
 import json
 import re
 from typing import Any, Sequence
@@ -62,6 +63,13 @@ _EPHEMERAL_JSON_KEYS = frozenset({
     "exp",
     "jti",
 })
+_EPHEMERAL_REPLAY_JSON_KEYS = _EPHEMERAL_JSON_KEYS | frozenset({
+    "event_id",
+    "job_id",
+    "task_id",
+    "run_id",
+    "execution_id",
+})
 _ISO_TS_RE = re.compile(
     r"\b\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?\b"
 )
@@ -69,6 +77,8 @@ _UUID_RE = re.compile(
     r"\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b",
     re.IGNORECASE,
 )
+_HEX_EPHEMERAL_RE = re.compile(r"[0-9a-fA-F]{16,64}")
+_HEX_MASK_RE = re.compile(r"\b[0-9a-fA-F]{24,64}\b")
 _NON_REPLAY_REQ_HEADERS = frozenset({
     "authorization",
     "cookie",
@@ -102,6 +112,33 @@ _WRITE_METHODS = frozenset({"POST", "PUT", "PATCH"})
 _PERSISTENT_CLASSES = frozenset({"stored_xss", "mass_assignment", "ssti"})
 _API_PREFIX_SEGMENTS = frozenset({"api", "v1", "v2", "v3", "v4"})
 _API_VERSION_SEG_RE = re.compile(r"^v\d+$", re.I)
+_TRIVIAL_CORRELATION_TOKENS = frozenset({
+    "0",
+    "1",
+    "true",
+    "false",
+    "null",
+    "none",
+    "yes",
+    "no",
+    "on",
+    "off",
+    "ok",
+    "all",
+    "get",
+    "post",
+    "put",
+    "patch",
+    "delete",
+    "json",
+    "html",
+    "text",
+    "utf-8",
+    "asc",
+    "desc",
+    "en",
+    "us",
+})
 
 
 def _extract_owner_and_tenant_from_receipt(
@@ -580,6 +617,183 @@ def _select_mutating_get_proof(
     return candidates[0]
 
 
+def _parse_receipt_timestamp(ts: str) -> datetime | None:
+    raw = str(ts or "").strip()
+    if not raw:
+        return None
+    try:
+        return datetime.fromisoformat(raw)
+    except ValueError:
+        return None
+
+
+def _is_strictly_earlier_receipt(candidate: dict[str, Any], target: dict[str, Any]) -> bool:
+    """Return True if `candidate` was recorded strictly before `target` by seq ID or timestamp."""
+    c_seq = _receipt_seq_num(candidate)
+    t_seq = _receipt_seq_num(target)
+    if c_seq > 0 and t_seq > 0:
+        return c_seq < t_seq
+    c_ts_str = str(candidate.get("timestamp") or "").strip()
+    t_ts_str = str(target.get("timestamp") or "").strip()
+    if c_ts_str and t_ts_str:
+        c_dt = _parse_receipt_timestamp(c_ts_str)
+        t_dt = _parse_receipt_timestamp(t_ts_str)
+        if c_dt is not None and t_dt is not None and (c_dt.tzinfo is None) == (t_dt.tzinfo is None):
+            return c_dt < t_dt
+        return c_ts_str < t_ts_str
+    return False
+
+
+def _add_correlation_token(tokens: set[str], value: Any) -> None:
+    if isinstance(value, bool) or value is None:
+        return
+    if not isinstance(value, (str, int)):
+        return
+    s = str(value).strip()
+    if 2 <= len(s) <= 128 and s.lower() not in _TRIVIAL_CORRELATION_TOKENS:
+        tokens.add(s.lower())
+
+
+def _extract_body_correlation_tokens(raw_text: str, tokens: set[str]) -> None:
+    text = str(raw_text or "").strip()
+    if not text:
+        return
+    if text.startswith(("{", "[")):
+        try:
+            parsed = json.loads(text)
+        except ValueError:
+            parsed = None
+        if parsed is not None:
+            stack: list[Any] = [parsed]
+            visited = 0
+            while stack and visited < 120:
+                cur = stack.pop()
+                visited += 1
+                if isinstance(cur, dict):
+                    for v in cur.values():
+                        stack.append(v)
+                elif isinstance(cur, list):
+                    for item in cur[:50]:
+                        stack.append(item)
+                else:
+                    _add_correlation_token(tokens, cur)
+            return
+    if "=" in text and not text.startswith("<") and "\n" not in text[:256]:
+        for _, v in parse_qsl(text, keep_blank_values=False):
+            _add_correlation_token(tokens, v)
+
+
+def _extract_receipt_correlation_tokens(
+    receipt: dict[str, Any],
+    *,
+    include_response: bool = False,
+) -> set[str]:
+    """Extract non-trivial query, ID path segment, and body correlation tokens from a receipt."""
+    tokens: set[str] = set()
+    url = str(receipt.get("url") or receipt.get("path") or "")
+    parsed = urlsplit(url)
+    query_str = parsed.query or str(receipt.get("query") or "")
+    if query_str:
+        for _, v in parse_qsl(query_str, keep_blank_values=False):
+            _add_correlation_token(tokens, v)
+    for seg in parsed.path.split("/"):
+        if seg and is_id_segment(seg):
+            _add_correlation_token(tokens, seg)
+    _extract_body_correlation_tokens(str(receipt.get("request_body") or ""), tokens)
+    if include_response:
+        redir = str(receipt.get("redirect_location") or "").strip()
+        if redir:
+            r_parsed = urlsplit(redir)
+            if r_parsed.query:
+                for _, v in parse_qsl(r_parsed.query, keep_blank_values=False):
+                    _add_correlation_token(tokens, v)
+            for seg in r_parsed.path.split("/"):
+                if seg and is_id_segment(seg):
+                    _add_correlation_token(tokens, seg)
+        _extract_body_correlation_tokens(str(receipt.get("body") or ""), tokens)
+    return tokens
+
+
+def _find_prior_setup_write_receipt(
+    replay_target: dict[str, Any],
+    proof_receipts: Sequence[dict[str, Any]],
+    receipt_store: ReceiptStore | None = None,
+) -> dict[str, Any] | None:
+    """Return the best strictly-earlier non-multipart write receipt in `proof_receipts` for a GET target.
+
+    Strictly bounded to receipts explicitly provided in `proof_receipts` so two-step clean
+    replay never guesses unrelated mutating writes across the wider receipt store.
+    """
+    if str(replay_target.get("method") or "").upper() != "GET":
+        return None
+
+    t_rid = str(replay_target.get("receipt_id") or "").strip()
+    target_url = str(replay_target.get("url") or replay_target.get("path") or "")
+    target_tokens = _extract_receipt_correlation_tokens(replay_target, include_response=False)
+
+    candidates: list[tuple[int, int, int, str, dict[str, Any]]] = []
+    seen_keys: set[str] = set()
+    for raw_rec in proof_receipts:
+        if not isinstance(raw_rec, dict):
+            continue
+        rec = raw_rec
+        r_rid = str(rec.get("receipt_id") or "").strip()
+        if not rec.get("method") and r_rid and receipt_store is not None:
+            try:
+                rec = receipt_store.get(r_rid)
+            except (KeyError, ValueError):
+                continue
+        if rec is replay_target or (t_rid and r_rid and r_rid == t_rid):
+            continue
+        dedup_key = r_rid or f"obj:{id(rec)}"
+        if dedup_key in seen_keys:
+            continue
+        seen_keys.add(dedup_key)
+
+        if str(rec.get("method") or "").upper() not in _WRITE_METHODS:
+            continue
+        status = int(rec.get("status") or 0)
+        if not (200 <= status < 400):
+            continue
+        if _is_multipart_receipt(rec):
+            continue
+        if not _is_strictly_earlier_receipt(rec, replay_target):
+            continue
+
+        cand_tokens = _extract_receipt_correlation_tokens(rec, include_response=True)
+        shares_token = bool(target_tokens and (target_tokens & cand_tokens))
+        if not shares_token and target_tokens:
+            cand_haystack = "\n".join(
+                part
+                for part in (
+                    str(rec.get("url") or ""),
+                    str(rec.get("request_body") or ""),
+                    str(rec.get("body") or ""),
+                    str(rec.get("redirect_location") or ""),
+                )
+                if part
+            ).lower()
+            if cand_haystack:
+                shares_token = any(
+                    len(tok) >= 4
+                    and re.search(rf"(?<![a-z0-9_-]){re.escape(tok)}(?![a-z0-9_-])", cand_haystack)
+                    for tok in target_tokens
+                )
+        same_path_family = is_persistent_read_path_related(rec, target_url)
+        candidates.append((
+            1 if shares_token else 0,
+            1 if same_path_family else 0,
+            _receipt_seq_num(rec),
+            str(rec.get("timestamp") or ""),
+            rec,
+        ))
+
+    if not candidates:
+        return None
+    candidates.sort(key=lambda item: (item[0], item[1], item[2], item[3]), reverse=True)
+    return candidates[0][4]
+
+
 def mask_dynamic_fields(text: str, *, preserve_values: Sequence[str] = ()) -> str:
     """Mask ephemeral timestamps, nonces, and request/trace UUIDs before structural comparison."""
     raw = str(text or "")
@@ -629,6 +843,132 @@ def mask_dynamic_fields(text: str, *, preserve_values: Sequence[str] = ()) -> st
     for token, orig in placeholders.items():
         working = working.replace(token, orig)
     return working
+
+
+def _try_parse_json_body(text: str) -> Any | None:
+    stripped = text.lstrip()
+    if not stripped.startswith(("{", "[")):
+        return None
+    try:
+        return json.loads(text)
+    except ValueError:
+        return None
+
+
+def _collect_ephemeral_json_values(
+    obj: Any,
+    path: tuple[str, ...] = (),
+) -> dict[tuple[str, ...], list[str]]:
+    found: dict[tuple[str, ...], list[str]] = {}
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            kl = str(k).lower()
+            child_path = (*path, kl)
+            if (
+                kl in _EPHEMERAL_REPLAY_JSON_KEYS
+                and isinstance(v, (str, int, float))
+                and not isinstance(v, bool)
+            ):
+                val_str = str(v).strip()
+                if val_str:
+                    found.setdefault(child_path, []).append(val_str)
+            if isinstance(v, (dict, list)):
+                for sub_path, vals in _collect_ephemeral_json_values(v, child_path).items():
+                    found.setdefault(sub_path, []).extend(vals)
+    elif isinstance(obj, list):
+        for item in obj[:100]:
+            if isinstance(item, (dict, list)):
+                for sub_path, vals in _collect_ephemeral_json_values(item, (*path, "[]")).items():
+                    found.setdefault(sub_path, []).extend(vals)
+    return found
+
+
+def _mask_for_ephemeral_replay_comparison(text: str, parsed_json: Any | None = None) -> str:
+    """Mask UUIDs, timestamps, ephemeral JSON keys, and 24-64 char hex IDs for replay comparison."""
+    raw = str(text or "")
+    if not raw:
+        return ""
+    parsed = parsed_json if parsed_json is not None else _try_parse_json_body(raw)
+    if parsed is not None:
+        def _scrub(obj: Any) -> Any:
+            if isinstance(obj, dict):
+                out: dict[str, Any] = {}
+                for k, v in sorted(obj.items(), key=lambda kv: str(kv[0])):
+                    lk = str(k).lower()
+                    if lk in _EPHEMERAL_REPLAY_JSON_KEYS:
+                        out[str(k)] = "<MASKED>"
+                    else:
+                        out[str(k)] = _scrub(v)
+                return out
+            if isinstance(obj, list):
+                return [_scrub(x) for x in obj]
+            if isinstance(obj, str):
+                s = _ISO_TS_RE.sub("<TS>", obj)
+                s = _UUID_RE.sub("<UUID>", s)
+                s = _HEX_MASK_RE.sub("<HEX>", s)
+                return s
+            return obj
+
+        return json.dumps(_scrub(parsed), ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+
+    working = _ISO_TS_RE.sub("<TS>", raw)
+    working = _UUID_RE.sub("<UUID>", working)
+    working = _HEX_MASK_RE.sub("<HEX>", working)
+    return re.sub(r"\s+", " ", working).strip()
+
+
+def _detect_ephemeral_evidence_mismatch(
+    evidence_value: str,
+    replay_target: dict[str, Any],
+    replay_rec: dict[str, Any],
+) -> bool:
+    """Return True if Stage 3 replay reproduced the same masked response while only an ephemeral ID rotated."""
+    ev = str(evidence_value or "").strip()
+    if not ev:
+        return False
+
+    t_status = int(replay_target.get("status") or 0)
+    r_status = int(replay_rec.get("status") or 0)
+    if not (200 <= t_status < 300 and 200 <= r_status < 300):
+        return False
+
+    t_body = str(replay_target.get("body") or "").strip()
+    r_body = str(replay_rec.get("body") or "").strip()
+    if not t_body or not r_body:
+        return False
+
+    ev_low = ev.lower()
+    if ev_low in r_body.lower():
+        return False
+
+    t_json = _try_parse_json_body(t_body)
+    r_json = _try_parse_json_body(r_body)
+
+    rotated_ephemeral_key = False
+    if t_json is not None and r_json is not None:
+        t_eph = _collect_ephemeral_json_values(t_json)
+        r_eph = _collect_ephemeral_json_values(r_json)
+        for key_path, t_vals in t_eph.items():
+            if any(v.lower() == ev_low for v in t_vals):
+                r_vals = r_eph.get(key_path) or []
+                if r_vals and all(rv.lower() != ev_low for rv in r_vals):
+                    rotated_ephemeral_key = True
+                    break
+
+    is_ephemeral_token = bool(
+        _UUID_RE.fullmatch(ev)
+        or _HEX_EPHEMERAL_RE.fullmatch(ev)
+        or rotated_ephemeral_key
+    )
+    if not is_ephemeral_token:
+        return False
+
+    if not rotated_ephemeral_key and ev_low not in t_body.lower():
+        return False
+
+    t_masked = _mask_for_ephemeral_replay_comparison(t_body, parsed_json=t_json)
+    r_masked = _mask_for_ephemeral_replay_comparison(r_body, parsed_json=r_json)
+    return bool(t_masked) and t_masked == r_masked
 
 
 @dataclass
@@ -1206,6 +1546,8 @@ class DifferentialOracle:
             )
 
         replayed_via_stateful_fallback = False
+        replayed_via_two_step = False
+        two_step_setup_rid = ""
 
         try:
             replay_rec = self._run_clean_session_request(
@@ -1432,6 +1774,72 @@ class DifferentialOracle:
                     control_probe_receipt_id=ctrl_probe_rid,
                 )
 
+        ev_in_oob = bool(
+            ev
+            and is_oob_verified
+            and any(
+                ev.lower() in json.dumps(h, ensure_ascii=False).lower()
+                for h in effective_oob_hits
+            )
+        )
+
+        # Two-step clean replay fallback: for one-shot / stateful GET workflows whose
+        # item/event was drained on the first read (e.g. POST /queue/join -> GET /queue/data,
+        # POST /tokens -> GET /tokens/consume), replay the strictly-earlier non-multipart
+        # setup write from proof_receipts followed immediately by the GET in fresh sessions.
+        single_step_get_missing_state = (
+            str(replay_target.get("method") or "").upper() == "GET"
+            and canonical_class not in {"open_redirect", "cors_misconfiguration"}
+            and 200 <= t_status < 300
+            and (
+                r_status in {404, 410}
+                or (
+                    200 <= r_status < 300
+                    and bool(ev)
+                    and not ev_in_oob
+                    and (
+                        (canonical_class == "stored_xss" and not receipt_body_contains_verbatim(replay_rec, ev))
+                        or (canonical_class != "stored_xss" and not _receipt_contains_evidence(replay_rec, ev))
+                    )
+                )
+            )
+        )
+        if single_step_get_missing_state and self._has_budget(2):
+            setup_rec = _find_prior_setup_write_receipt(
+                replay_target,
+                proof_receipts,
+                self.receipts,
+            )
+            if setup_rec is not None:
+                setup_method = str(setup_rec.get("method") or "").upper()
+                if setup_method in self.http.allowed_methods:
+                    try:
+                        setup_replay_rec = self._run_clean_session_request(
+                            actor=str(setup_rec.get("actor") or "anon"),
+                            method=setup_method,
+                            url=str(setup_rec.get("url") or "/"),
+                            headers=setup_rec.get("request_headers") or {},
+                            raw_body=str(setup_rec.get("request_body") or ""),
+                        )
+                    except (BudgetExhaustedError, ValueError):
+                        setup_replay_rec = None
+                    if setup_replay_rec is not None and 200 <= int(setup_replay_rec.get("status") or 0) < 400:
+                        try:
+                            step2_replay_rec = self._run_clean_session_request(
+                                actor=str(replay_target.get("actor") or "anon"),
+                                method="GET",
+                                url=str(replay_target.get("url") or "/"),
+                                headers=replay_target.get("request_headers") or {},
+                                raw_body=str(replay_target.get("request_body") or ""),
+                            )
+                        except (BudgetExhaustedError, ValueError):
+                            step2_replay_rec = None
+                        if step2_replay_rec is not None:
+                            replay_rec = step2_replay_rec
+                            r_status = int(step2_replay_rec.get("status") or 0)
+                            replayed_via_two_step = True
+                            two_step_setup_rid = str(setup_replay_rec.get("receipt_id") or "")
+
         if not (200 <= r_status < 400) or (r_status // 100) != (t_status // 100):
             stages["stage3_clean_replay"] = f"failed_status_{r_status}"
             return OracleVerdict(
@@ -1507,11 +1915,22 @@ class DifferentialOracle:
                 )
         else:
             if ev and not _receipt_contains_evidence(replay_rec, ev):
-                ev_in_oob = is_oob_verified and any(
-                    ev.lower() in json.dumps(h, ensure_ascii=False).lower()
-                    for h in effective_oob_hits
-                )
                 if not ev_in_oob:
+                    if _detect_ephemeral_evidence_mismatch(ev, replay_target, replay_rec):
+                        return OracleVerdict(
+                            verified=False,
+                            verdict="REFUTED",
+                            reason=(
+                                "Clean-session replay reproduced the same response structure, "
+                                "but evidence_value appears to be a per-request dynamic/ephemeral ID "
+                                "(UUID/event_id/request_id) that changes on every request; re-submit "
+                                "with a static or structural evidence_value from the response body instead."
+                            ),
+                            mode=self.mode,
+                            stages={**stages, "stage3_clean_replay": "failed_ephemeral_evidence"},
+                            clean_replay_receipt_id=replay_rec["receipt_id"],
+                            control_probe_receipt_id=ctrl_probe_rid,
+                        )
                     stages["stage3_clean_replay"] = "failed_missing_evidence"
                     return OracleVerdict(
                         verified=False,
@@ -1523,15 +1942,24 @@ class DifferentialOracle:
                         control_probe_receipt_id=ctrl_probe_rid,
                     )
 
-        stages["stage3_clean_replay"] = (
-            "passed_oob_verified"
-            if is_oob_verified
-            else ("passed_stateful_persistence" if replayed_via_stateful_fallback else "passed")
-        )
+        if replayed_via_two_step:
+            stages["stage3_clean_replay"] = "passed_two_step_replay"
+            if two_step_setup_rid:
+                stages["stage3_setup_replay_receipt_id"] = two_step_setup_rid
+        elif is_oob_verified:
+            stages["stage3_clean_replay"] = "passed_oob_verified"
+        elif replayed_via_stateful_fallback:
+            stages["stage3_clean_replay"] = "passed_stateful_persistence"
+        else:
+            stages["stage3_clean_replay"] = "passed"
         return OracleVerdict(
             verified=True,
             verdict="VERIFIED",
-            reason="Verified across control baseline, masked structural diff, and isolated clean-session replay.",
+            reason=(
+                "Verified across control baseline, masked structural diff, and two-step clean-session replay."
+                if replayed_via_two_step
+                else "Verified across control baseline, masked structural diff, and isolated clean-session replay."
+            ),
             mode=self.mode,
             stages=stages,
             clean_replay_receipt_id=replay_rec["receipt_id"],
