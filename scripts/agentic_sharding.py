@@ -10,7 +10,6 @@ from urllib.parse import urlsplit
 from agentic_surface import (
     _split_path_kv_segment,
     is_id_segment,
-    is_malformed_url_path,
     is_non_endpoint_source_path,
     route_template_of,
 )
@@ -52,7 +51,7 @@ def extract_resource_family(path: str) -> str:
     and punctuation-only segments map to `"root"`.
     """
     raw = str(path or "")
-    if is_malformed_url_path(raw):
+    if is_non_endpoint_source_path(raw):
         return "root"
     raw_path = urlsplit(raw.strip()).path or "/"
     segments = [seg for seg in raw_path.split("/") if seg]
@@ -65,6 +64,8 @@ def extract_resource_family(path: str) -> str:
         return "root"
     first = segments[0]
     if first.startswith("{") and first.endswith("}"):
+        return "root"
+    if first.startswith("$"):
         return "root"
     kv = _split_path_kv_segment(first)
     if kv is not None:
@@ -79,7 +80,7 @@ def extract_resource_family(path: str) -> str:
 def _extract_subfamily_after(path: str, umbrella: str) -> str | None:
     """Return the normalized non-ID sub-family immediately following stripped prefix + `umbrella`."""
     raw = str(path or "")
-    if is_malformed_url_path(raw):
+    if is_non_endpoint_source_path(raw):
         return None
     raw_path = urlsplit(raw.strip()).path or "/"
     segments = [seg for seg in raw_path.split("/") if seg]

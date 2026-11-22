@@ -545,18 +545,72 @@ _SPA_REACT_LINK_RE = re.compile(
     re.I,
 )
 _SPA_COLON_PARAM_RE = re.compile(r":([A-Za-z_][A-Za-z0-9_]*)")
+_SPA_BRACKET_PARAM_RE = re.compile(r"\[{1,2}(?:\.\.\.)?([A-Za-z_][A-Za-z0-9_]*)(?:=[^\]/]+)?\]{1,2}")
+_SPA_SEGMENT_BRACKET_PARAM_RE = re.compile(r"^\[{1,2}(?:\.\.\.)?([A-Za-z_][A-Za-z0-9_]*)(?:=[^\]/]+)?\]{1,2}$")
+_SPA_VIRTUAL_GROUP_RE = re.compile(r"^\([A-Za-z0-9_-]+\)$")
 _STATIC_SPA_EXT_RE = re.compile(r"\.(?:png|jpe?g|gif|css|ico|svg|woff2?|ttf|map|js|mjs)(?:\?|$)", re.I)
+_NON_ENDPOINT_SOURCE_EXTS = (
+    ".d.ts",
+    ".ts",
+    ".tsx",
+    ".jsx",
+    ".mjs",
+    ".cjs",
+    ".vue",
+    ".svelte",
+    ".scss",
+    ".sass",
+    ".less",
+    ".styl",
+    ".map",
+    ".wasm",
+    ".avif",
+    ".webmanifest",
+)
+_BUNDLER_PATH_MARKERS = (
+    "/node_modules/",
+    "/@vite/",
+    "/@fs/",
+    "/@id/",
+    "/__vite",
+    "/@react-refresh",
+    "/_app/immutable/",
+    "/_app/version.json",
+    "/_next/static/",
+    "/_next/data/",
+)
+_BUNDLER_EXACT_PATHS = frozenset({
+    "/node_modules",
+    "/@vite",
+    "/@fs",
+    "/@id",
+    "/@react-refresh",
+    "/_app/immutable",
+    "/_app/version.json",
+    "/_next/static",
+    "/_next/data",
+})
+_FRONTEND_SOURCE_DIR_PREFIXES = (
+    "/components/ui/",
+    "/src/components/",
+)
+_JSON_SCHEMA_POINTER_RE = re.compile(
+    r"(?:^|/)\$(?:defs|schema|ref|id|anchor|dynamicref|dynamicanchor|vocabulary|comment|_[A-Za-z0-9_-]*)(?:/|$)",
+    re.IGNORECASE,
+)
+_LEADING_TEMPLATE_VAR_RE = re.compile(r"^(?:\$\{[^}]+\}|\{[A-Za-z_$][A-Za-z0-9_$]*\})(.*)$")
+_BARE_TEMPLATE_VAR_RE = re.compile(r"^(?:\$\{[^}]+\}|\{[A-Za-z_$][A-Za-z0-9_$]*\})$")
 _JS_LINE_COMMENT_RE = re.compile(r"(?:^|[\s;{}(),])//([^\n\r]*)")
 _JS_BLOCK_COMMENT_RE = re.compile(r"/\*([\s\S]*?)\*/")
 _JS_COMMENT_SLASH_PATH_RE = re.compile(
     r"""(?:^|[\s(\["'=,:;])(/[A-Za-z0-9._~-]+(?:/[A-Za-z0-9._~-]+)*(?:\?[A-Za-z0-9._~:/?#\[\]@!$&'*+,;=%-]+)?)"""
 )
 _JS_VAR_ASSIGN_RE = re.compile(
-    r"""(?:^|[;\n\r{},])\s*(?:(?:var|let|const)\s+)?([A-Za-z_$][\w$]*)\s*=\s*(['"`])([^'"`\n\r\\]{0,512})\2""",
+    r"""(?:^|[;\n\r{},])\s*(?:export\s+)?(?:(?:var|let|const)\s+)?([A-Za-z_$][\w$]*)\s*=\s*(['"`])([^'"`\n\r\\]{0,512})\2""",
     re.M,
 )
 _JS_CONCAT_ASSIGN_RE = re.compile(
-    r"""(?:^|[;\n\r{},])\s*(?:(?:var|let|const)\s+)?([A-Za-z_$][\w$]*)\s*=\s*([^;\n\r{}()]+?\+[^;\n\r{}()]+)""",
+    r"""(?:^|[;\n\r{},])\s*(?:export\s+)?(?:(?:var|let|const)\s+)?([A-Za-z_$][\w$]*)\s*=(?!=)\s*([^;\n\r{}()]{1,512}?\+[^;\n\r{}()]{1,512})""",
     re.M,
 )
 _JS_CONCAT_EXPR_RE = re.compile(
@@ -648,6 +702,102 @@ def _top_level_keys(span: str) -> list[str]:
     return keys
 
 
+def is_non_endpoint_noise_path(url_or_path: str) -> bool:
+    """Return True for frontend source modules, bundler chunk internals, and JSON Schema pointer paths.
+
+    Preserves `.js` bundle URLs (e.g. `/assets/app.js`) and valid endpoints while filtering
+    SvelteKit/Next.js build internals (`/_app/immutable/`, `/_app/version.json`,
+    `/_next/static/`, `/_next/data/`) and dollar-prefixed schema refs (`/$defs/...`, `/$schema`).
+    """
+    raw = str(url_or_path or "").strip()
+    if not raw:
+        return False
+    try:
+        parsed = urlsplit(raw)
+    except ValueError:
+        return True
+    path = (parsed.path or "").strip()
+    if (not path or path == "/") and parsed.fragment.startswith("/"):
+        path = parsed.fragment.strip()
+    if not path or path == "/":
+        return False
+    norm_path = path.lower()
+    while norm_path.startswith("./"):
+        norm_path = norm_path[2:]
+    if norm_path and not norm_path.startswith("/"):
+        norm_path = "/" + norm_path
+    trimmed = norm_path.rstrip("/")
+    if not trimmed:
+        return False
+    if trimmed.endswith(_NON_ENDPOINT_SOURCE_EXTS):
+        return True
+    if trimmed in _BUNDLER_EXACT_PATHS or any(marker in norm_path for marker in _BUNDLER_PATH_MARKERS):
+        return True
+    if norm_path.startswith(_FRONTEND_SOURCE_DIR_PREFIXES):
+        return True
+    if _JSON_SCHEMA_POINTER_RE.search(trimmed):
+        return True
+    return False
+
+
+def _is_js_url_prefix_value(value: str) -> bool:
+    """Return True if a constant JS string value looks like a safe URL or path prefix."""
+    val = (value or "").strip()
+    if not val or len(val) > 256:
+        return False
+    if any(ch.isspace() or ord(ch) < 32 or ch in ("\\", '"', "'", "`") for ch in val):
+        return False
+    if "${" in val or val.startswith("//"):
+        return False
+    low = val.lower()
+    if low.startswith(("http://", "https://")):
+        return bool(urlparse(val).netloc)
+    return val.startswith(("/", "./", "../"))
+
+
+def _resolve_js_call_raw_url(raw_url: str, symtab: dict[str, str]) -> str | None:
+    """Resolve same-file URL/path prefix constants and strip unresolved leading base placeholders."""
+    candidate = (raw_url or "").strip()
+    if not candidate:
+        return None
+
+    if "${" in candidate and symtab:
+        parts: list[str] = []
+        pos = 0
+        for match in _TEMPLATE_EXPR_RE.finditer(candidate):
+            lit_before = candidate[pos:match.start()]
+            parts.append(lit_before)
+            ident = match.group(1).strip()
+            preceded_by_slash = candidate[:match.start()].endswith("/")
+            val = symtab.get(ident, "") if _IDENTIFIER_RE.fullmatch(ident) else ""
+            if not preceded_by_slash and _is_js_url_prefix_value(val):
+                spliced_so_far = "".join(parts)
+                if spliced_so_far.endswith("/") and val.startswith("/"):
+                    val = val.lstrip("/")
+                if val.endswith("/") and candidate[match.end():].startswith("/"):
+                    val = val[:-1]
+                parts.append(val)
+            else:
+                parts.append(match.group(0))
+            pos = match.end()
+        parts.append(candidate[pos:])
+        candidate = "".join(parts)
+
+    if _BARE_TEMPLATE_VAR_RE.fullmatch(candidate):
+        return None
+    leading_m = _LEADING_TEMPLATE_VAR_RE.match(candidate)
+    if leading_m:
+        remainder = leading_m.group(1).strip()
+        if not remainder or remainder.startswith("#"):
+            return None
+        if remainder.startswith(("/", "//")):
+            return remainder
+        if remainder.startswith("?"):
+            return "/" + remainder
+        return "/" + remainder.lstrip("./")
+    return candidate
+
+
 def _template_url(raw: str) -> tuple[str, list[str]]:
     names = []
 
@@ -685,6 +835,16 @@ def extract_js_calls(text: str, base: str, allow_subdomains: bool = False,
     değişkenleri parametre sayılır. Değerlendirme yok; sınırlı regex taraması.
     """
     source = text or ""
+    symtab = _collect_js_string_symtab(source)
+    parsed_base = urlparse(base or "")
+    if (
+        parsed_base.scheme in ("http", "https")
+        and parsed_base.netloc
+        and parsed_base.path.lower().endswith((".js", ".mjs"))
+    ):
+        call_base = f"{parsed_base.scheme}://{parsed_base.netloc}/"
+    else:
+        call_base = base
     calls = []  # (raw_url, method, body_keys, is_graphql_hint)
 
     def option_slice(start: int) -> str:
@@ -755,14 +915,20 @@ def extract_js_calls(text: str, base: str, allow_subdomains: bool = False,
 
     records, seen = [], set()
     for raw_url, method, keys, opts in calls:
-        templated, template_names = _template_url(raw_url)
-        url = normalize_url(templated, base=base)
+        resolved_raw = _resolve_js_call_raw_url(raw_url, symtab)
+        if not resolved_raw:
+            continue
+        templated, template_names = _template_url(resolved_raw)
+        url = normalize_url(templated, base=call_base)
         if not url or not same_host(url, base, allow_subdomains=allow_subdomains):
             continue
-        if url.endswith((".png", ".jpg", ".jpeg", ".gif", ".css", ".ico",
-                         ".svg", ".woff", ".woff2", ".js")):
+        parsed_url = urlparse(url)
+        if parsed_url.path.lower().endswith((".png", ".jpg", ".jpeg", ".gif", ".css", ".ico",
+                                             ".svg", ".woff", ".woff2", ".js")):
             continue
-        is_graphql = "graphql" in urlparse(url).path.lower()
+        if is_non_endpoint_noise_path(url):
+            continue
+        is_graphql = "graphql" in parsed_url.path.lower()
         is_form_encoded = method != "GET" and bool(_FORM_URLENCODED_RE.search(opts))
         params = params_from_url(url)
         present = {param["name"] for param in params}
@@ -859,6 +1025,38 @@ def _join_spa_basename(basename: str, raw_path: str) -> str:
     return basename + "/" + path.lstrip("/")
 
 
+def _normalize_spa_route_path(
+    raw_path: str,
+    *,
+    normalize_colon: bool = True,
+    drop_empty_root: bool = False,
+) -> str:
+    """Normalize `:param`/`[param]` syntax and strip virtual router group segments like `(app)`."""
+    cleaned = str(raw_path or "").strip()
+    if not cleaned:
+        return ""
+    if cleaned.startswith("#/"):
+        cleaned = cleaned[1:]
+    if not cleaned.startswith("/"):
+        return ""
+    path_part, sep, query_part = cleaned.partition("?")
+    if "*" in path_part:
+        return ""
+    if normalize_colon:
+        path_part = _SPA_COLON_PARAM_RE.sub(r"{\1}", path_part)
+    bracket_re = _SPA_BRACKET_PARAM_RE if normalize_colon else _SPA_SEGMENT_BRACKET_PARAM_RE
+    raw_segs = [seg for seg in path_part.split("/") if seg]
+    norm_segs = [
+        bracket_re.sub(r"{\1}", seg)
+        for seg in raw_segs
+        if not _SPA_VIRTUAL_GROUP_RE.fullmatch(seg)
+    ]
+    if drop_empty_root and not norm_segs and not query_part:
+        return ""
+    norm_path = "/" + "/".join(norm_segs)
+    return f"{norm_path}{sep}{query_part}" if sep else norm_path
+
+
 def extract_spa_routes(
     text: str,
     base: str,
@@ -882,12 +1080,10 @@ def extract_spa_routes(
     def _emit_route(raw_path: str, source_tag: str) -> None:
         if limit is not None and len(records) >= limit:
             return
-        cleaned = _SPA_COLON_PARAM_RE.sub(r"{\1}", str(raw_path or "").strip())
-        if not cleaned or "*" in cleaned or _STATIC_SPA_EXT_RE.search(cleaned):
+        cleaned = _normalize_spa_route_path(raw_path)
+        if not cleaned or _STATIC_SPA_EXT_RE.search(cleaned):
             return
-        if cleaned.startswith("#/"):
-            cleaned = cleaned[1:]
-        if not cleaned.startswith("/"):
+        if is_non_endpoint_noise_path(cleaned):
             return
         url = normalize_url(cleaned, base=base)
         if not url or not same_host(url, base, allow_subdomains=allow_subdomains):
@@ -964,6 +1160,73 @@ def _looks_js_url_or_path(val: str) -> bool:
     return bool(re.fullmatch(r"[A-Za-z0-9._~-]+\.[A-Za-z][A-Za-z0-9]{1,5}(?:\?[^\s]*)?", val))
 
 
+def _eval_js_template_literal(raw_tmpl: str, symtab: dict[str, str]) -> str | None:
+    """Resolve a simple template literal if every `${ident}` binding exists in `symtab`."""
+    if "${" not in raw_tmpl:
+        return raw_tmpl
+    parts: list[str] = []
+    last = 0
+    for match in _TEMPLATE_EXPR_RE.finditer(raw_tmpl):
+        parts.append(raw_tmpl[last:match.start()])
+        ident = match.group(1).strip()
+        if not _IDENTIFIER_RE.fullmatch(ident) or ident not in symtab:
+            return None
+        val = symtab[ident]
+        if "${" in val:
+            return None
+        parts.append(val)
+        last = match.end()
+    parts.append(raw_tmpl[last:])
+    return "".join(parts)
+
+
+def _collect_js_string_symtab(
+    source: str,
+    *,
+    max_chars: int = 262_144,
+    max_entries: int = 2048,
+) -> dict[str, str]:
+    """Collect bounded same-file constant JS string, concat, and simple template bindings."""
+    js_slice = (source or "")[:max_chars]
+    symtab: dict[str, str] = {}
+    pending_templates: list[tuple[str, str]] = []
+
+    for vm in _JS_VAR_ASSIGN_RE.finditer(js_slice):
+        var_name, quote, raw_val = vm.group(1), vm.group(2), vm.group(3)
+        if quote == "`" and "${" in raw_val:
+            if len(pending_templates) < max_entries:
+                pending_templates.append((var_name, raw_val))
+            continue
+        if var_name not in symtab and len(symtab) >= max_entries:
+            if not _is_js_url_prefix_value(raw_val) or len(symtab) >= max_entries + 256:
+                continue
+        symtab[var_name] = raw_val
+
+    for _ in range(2):
+        changed = False
+        for am in _JS_CONCAT_ASSIGN_RE.finditer(js_slice):
+            var_name = am.group(1)
+            if var_name not in symtab and len(symtab) >= max_entries + 256:
+                continue
+            resolved = _eval_js_concat(am.group(2), symtab)
+            if resolved is not None and "${" not in resolved:
+                if symtab.get(var_name) != resolved:
+                    symtab[var_name] = resolved
+                    changed = True
+        for var_name, raw_tmpl in pending_templates:
+            if var_name not in symtab and len(symtab) >= max_entries + 256:
+                continue
+            resolved = _eval_js_template_literal(raw_tmpl, symtab)
+            if resolved is not None:
+                if symtab.get(var_name) != resolved:
+                    symtab[var_name] = resolved
+                    changed = True
+        if not changed:
+            break
+
+    return symtab
+
+
 def extract_js(text: str, base: str, allow_subdomains: bool = False, limit: int | None = 80) -> list[dict]:
     if limit is not None and limit <= 0:
         return []
@@ -975,12 +1238,18 @@ def extract_js(text: str, base: str, allow_subdomains: bool = False, limit: int 
         cand = (candidate or "").strip()
         if not cand or "${" in cand:
             return False
+        if cand.startswith("/") and not cand.startswith("//"):
+            cand = _normalize_spa_route_path(cand, normalize_colon=False, drop_empty_root=True)
+            if not cand:
+                return False
         if cand.lower().endswith(_JS_STATIC_EXTS):
             return False
         url = normalize_url(cand, base=base)
         if not url or not same_host(url, base, allow_subdomains=allow_subdomains):
             return False
         if urlparse(url).path.lower().endswith(_JS_STATIC_EXTS):
+            return False
+        if is_non_endpoint_noise_path(url):
             return False
         if url in seen:
             return False
@@ -1007,30 +1276,8 @@ def extract_js(text: str, base: str, allow_subdomains: bool = False, limit: int 
                 if _emit_js(m.group(1).rstrip(".,;:!?]")):
                     return records
 
-    js_slice = source[:65536]
-    symtab: dict[str, str] = {}
-    for vm in _JS_VAR_ASSIGN_RE.finditer(js_slice):
-        symtab[vm.group(1)] = vm.group(3)
-        if len(symtab) >= 512:
-            break
-
-    if symtab:
-        for _ in range(2):
-            changed = False
-            for am in _JS_CONCAT_ASSIGN_RE.finditer(js_slice):
-                if len(symtab) >= 512:
-                    break
-                resolved = _eval_js_concat(am.group(2), symtab)
-                if resolved is not None:
-                    var_name = am.group(1)
-                    if symtab.get(var_name) != resolved:
-                        symtab[var_name] = resolved
-                        changed = True
-                    if _looks_js_url_or_path(resolved) and _emit_js(resolved):
-                        return records
-            if not changed:
-                break
-
+    symtab = _collect_js_string_symtab(source)
+    js_slice = source[:262_144]
     for em in _JS_CONCAT_EXPR_RE.finditer(js_slice):
         resolved = _eval_js_concat(em.group(1), symtab)
         if resolved is not None and _looks_js_url_or_path(resolved):

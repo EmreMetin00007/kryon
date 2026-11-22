@@ -6,6 +6,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 from pathlib import Path
 import threading
+from types import SimpleNamespace
 from typing import Any, Callable, Iterator
 from urllib.parse import urlsplit
 
@@ -14,10 +15,13 @@ import pytest
 import agentic_stage0_crawl
 from agentic_stage0_crawl import (
     HAS_PLAYWRIGHT,
+    _Stage0Budget,
     _Stage0Collector,
     _compute_dom_state_hash,
     _extract_openapi_templates,
     _finalize_routes,
+    _is_browser_script_asset,
+    _is_stage0_noise_path,
     _parse_multipart_schema,
     _select_crawl_actors,
     run_stage0_crawl,
@@ -327,6 +331,90 @@ def test_openapi_template_synthesis_resolves_refs() -> None:
     assert tmpl["name"] == "sample"
     assert tmpl["priority"] == 2
     assert tmpl["secret_key"] == "<redacted>"
+
+
+def test_browser_script_asset_and_stage0_noise_path_guards(tmp_path: Path) -> None:
+    assert _is_browser_script_asset(
+        "http://127.0.0.1:18080/_app/immutable/chunks/chunk-01.js",
+        "/_app/immutable/chunks/chunk-01.js",
+        SimpleNamespace(resource_type="script"),
+    ) is True
+    assert _is_browser_script_asset(
+        "http://127.0.0.1:18080/_app/immutable/entry/app.mjs?v=123",
+        "/_app/immutable/entry/app.mjs",
+        SimpleNamespace(resource_type="script"),
+    ) is True
+    assert _is_browser_script_asset(
+        "http://127.0.0.1:18080/_next/static/chunks/main-abc",
+        "/_next/static/chunks/main-abc",
+        SimpleNamespace(resource_type="script"),
+    ) is True
+    assert _is_browser_script_asset(
+        "http://127.0.0.1:18080/assets/app.js",
+        "/assets/app.js",
+        None,
+    ) is True
+
+    # Never exempt API routes, path-embedded params, documents, or parameterized fetch() calls.
+    assert _is_browser_script_asset(
+        "http://127.0.0.1:18080/api/v1/plugin.js",
+        "/api/v1/plugin.js",
+        SimpleNamespace(resource_type="script"),
+    ) is False
+    assert _is_browser_script_asset(
+        "http://127.0.0.1:18080/files/file=app.js",
+        "/files/file=app.js",
+        SimpleNamespace(resource_type="script"),
+    ) is False
+    assert _is_browser_script_asset(
+        "http://127.0.0.1:18080/download.js?file=secret",
+        "/download.js",
+        SimpleNamespace(resource_type="fetch"),
+    ) is False
+    assert _is_browser_script_asset(
+        "http://127.0.0.1:18080/assets/app.js",
+        "/assets/app.js",
+        SimpleNamespace(resource_type="document"),
+    ) is False
+
+    # Stage 0 route noise guards ignore virtual route groups, /$defs/*, and immutable chunks.
+    assert _is_stage0_noise_path("/(app)/workspace") is True
+    assert _is_stage0_noise_path("/routes/(group)/settings") is True
+    assert _is_stage0_noise_path("/$defs/ChatSchema") is True
+    assert _is_stage0_noise_path("/_app/immutable/chunks/chunk-01.js") is True
+    assert _is_stage0_noise_path("/_next/static/chunks/main.js") is True
+    assert _is_stage0_noise_path("/api/v1/chats") is False
+    assert _is_stage0_noise_path("/assets/app.js") is False
+
+    http = _make_client(tmp_path, base_url="http://127.0.0.1:18080/")
+    collector = _Stage0Collector(http)
+    assert collector.record_route(method="GET", raw_url="/(app)/workspace") is False
+    assert collector.record_route(method="GET", raw_url="/$defs/ChatSchema") is False
+    assert collector.record_route(method="GET", raw_url="/_app/immutable/chunks/chunk-01.js") is False
+    assert collector.record_route(method="GET", raw_url="/api/v1/chats") is True
+
+
+def test_stage0_budget_reserve_enforces_browser_cap_and_keeps_layer4_quota(tmp_path: Path) -> None:
+    http = _make_client(tmp_path, max_requests=40)
+    budget = _Stage0Budget(http, cap=12, reserve=3)
+
+    assert budget.remaining() == 9
+    assert budget.remaining(include_reserve=True) == 12
+
+    for _ in range(9):
+        assert budget.try_consume() is True
+
+    assert budget.can_spend() is False
+    assert budget.try_consume() is False
+    assert budget.global_exhausted is False
+    assert http.budget.used == 9
+
+    assert budget.can_spend(include_reserve=True) is True
+    assert budget.remaining(include_reserve=True) == 3
+    for _ in range(3):
+        assert budget.try_consume(include_reserve=True) is True
+    assert budget.can_spend(include_reserve=True) is False
+    assert http.budget.used == 12
 
 
 # ---------------------------------------------------------------------------
@@ -828,4 +916,193 @@ def test_stage0_shadow_dom_and_session_drop_recovery(tmp_path: Path) -> None:
         assert "/api/expire-session" in hit_paths
         assert "/api/after-drop" not in hit_paths
         assert reauth_calls == [("bob", True)]
+
+
+@pytest.mark.skipif(not HAS_PLAYWRIGHT, reason="Playwright Chromium not available")
+def test_stage0_sveltekit_immutable_chunks_preserve_budget_and_discover_openapi(tmp_path: Path) -> None:
+    chunk_paths = [
+        "/_app/immutable/entry/start.js",
+        "/_app/immutable/entry/app.js",
+        *(f"/_app/immutable/chunks/chunk-{i:02d}.js" for i in range(1, 31)),
+        "/_app/immutable/nodes/0.js",
+        "/_app/immutable/nodes/2.js",
+    ]
+    openapi_doc = {
+        "openapi": "3.0.3",
+        "info": {"title": "SvelteKit SPA API", "version": "1.0"},
+        "paths": {
+            "/api/v1/completions": {
+                "post": {
+                    "requestBody": {
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "type": "object",
+                                    "properties": {
+                                        "model": {"type": "string"},
+                                        "prompt": {"type": "string"},
+                                    },
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            "/api/v1/prompts": {"get": {"responses": {"200": {"description": "ok"}}}},
+        },
+    }
+
+    def router(method: str, raw_path: str, _hdrs: dict[str, str], _body: bytes) -> tuple[int, str, str, dict[str, str]]:
+        path = urlsplit(raw_path).path
+        if path == "/":
+            script_tags = "\n  ".join(
+                f'<script type="module" src="{cp}"></script>' for cp in chunk_paths
+            )
+            html = f"""<!doctype html>
+<html>
+<head>
+  <title>OpenWebUI Style SPA</title>
+  {script_tags}
+</head>
+<body>
+  <h1>Chat Workspace</h1>
+  <nav>
+    <a href="/workspace">Workspace</a>
+    <a href="/settings">Settings</a>
+  </nav>
+  <div role="tablist">
+    <button role="tab" id="tab-chat" aria-selected="true">Chat</button>
+    <button role="tab" id="tab-models" aria-selected="false" onclick="fetch('/api/v1/tags')">Models</button>
+  </div>
+</body>
+</html>"""
+            return 200, "text/html; charset=utf-8", html, {}
+        if path == "/workspace":
+            return 200, "text/html; charset=utf-8", "<html><body><h1>Workspace</h1></body></html>", {}
+        if path == "/settings":
+            return 200, "text/html; charset=utf-8", "<html><body><h1>Settings</h1></body></html>", {}
+        if path == "/_app/immutable/nodes/2.js":
+            js = """
+export async function loadChats() {
+  const virtualRoute = "/(app)/workspace";
+  const jsonPtr = "/$defs/ChatSchema";
+  return fetch('/api/v1/chats');
+}
+"""
+            return 200, "application/javascript", js, {}
+        if path in chunk_paths:
+            return 200, "application/javascript", f"export const chunkId = {path!r};\n", {}
+        if path == "/api/v1/tags":
+            return 200, "application/json", json.dumps({"models": []}), {}
+        if path == "/openapi.json":
+            return 200, "application/json", json.dumps(openapi_doc), {}
+        return 404, "application/json", json.dumps({"error": "not found"}), {}
+
+    with _start_test_server(router) as (base_url, _port, log):
+        http = _make_client(tmp_path, base_url=base_url, allowed_methods=("GET", "HEAD", "POST"), max_requests=100)
+        res = run_stage0_crawl(
+            http,
+            allow_forms=False,
+            max_pages=10,
+            max_actions=10,
+            wait_ms=250,
+            max_passive_probes=10,
+        )
+
+        assert res["status"] == "ok"
+        assert res["stats"]["js_chunks_parsed"] >= 30
+        assert res["stats"]["pages_visited"] >= 2
+        assert res["stats"]["ui_actions_taken"] >= 1
+        assert res["stats"]["passive_probes_sent"] >= 1
+        assert res["stats"]["network_requests_captured"] < 15
+
+        chunk_hits = [r for r in log if "/_app/immutable/" in urlsplit(r["path"]).path]
+        assert len(chunk_hits) >= 34
+
+        # At least 65% of the HTTP campaign budget must remain untouched for Stage 1+2.
+        assert (http.budget.limit - http.budget.used) >= 65
+
+        all_routes = {(r["method"], r["url"]) for r in [*res["links"], *res["forms"]]}
+        assert ("GET", "/workspace") in all_routes
+        assert ("GET", "/settings") in all_routes
+        assert ("GET", "/api/v1/tags") in all_routes
+        assert ("GET", "/api/v1/chats") in all_routes
+        assert ("POST", "/api/v1/completions") in all_routes
+        assert ("GET", "/api/v1/prompts") in all_routes
+        assert "POST /api/v1/completions" in res["body_templates"]
+
+        # Virtual SvelteKit route groups, JSON Schema $defs, and immutable chunks must not pollute links.
+        link_urls = {r["url"] for r in [*res["links"], *res["forms"]]}
+        assert "/(app)/workspace" not in link_urls
+        assert "/$defs/ChatSchema" not in link_urls
+        assert not any("/_app/immutable/" in u for u in link_urls)
+
+
+@pytest.mark.skipif(not HAS_PLAYWRIGHT, reason="Playwright Chromium not available")
+def test_stage0_layer4_passive_reserve_probes_openapi_when_browser_slice_exhausted(tmp_path: Path) -> None:
+    page_names = [
+        "alpha", "bravo", "charlie", "delta", "echo",
+        "foxtrot", "golf", "hotel", "india", "juliet",
+        "kilo", "lima", "mike", "november", "oscar",
+        "papa", "quebec", "romeo", "sierra", "tango",
+    ]
+    chunk_paths = [f"/_app/immutable/chunks/chunk-{name}.js" for name in page_names[:6]]
+    openapi_doc = {
+        "openapi": "3.0.3",
+        "info": {"title": "Reserved Probe API", "version": "1.0"},
+        "paths": {
+            "/api/reserved-probe-op": {
+                "post": {
+                    "requestBody": {
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "type": "object",
+                                    "properties": {"query": {"type": "string"}},
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        },
+    }
+
+    def router(_method: str, raw_path: str, _hdrs: dict[str, str], _body: bytes) -> tuple[int, str, str, dict[str, str]]:
+        path = urlsplit(raw_path).path
+        if path == "/":
+            links_html = "\n  ".join(f'<a href="/{name}">{name}</a>' for name in page_names)
+            scripts_html = "\n  ".join(f'<script type="module" src="{cp}"></script>' for cp in chunk_paths)
+            return 200, "text/html; charset=utf-8", f"<html><head>{scripts_html}</head><body><h1>Root</h1>{links_html}</body></html>", {}
+        if path.lstrip("/") in page_names:
+            name = path.lstrip("/")
+            return 200, "text/html; charset=utf-8", f"<html><body><h1>Page {name}</h1></body></html>", {}
+        if path in chunk_paths:
+            return 200, "application/javascript", f"export const name = {path!r};\n", {}
+        if path == "/openapi.json":
+            return 200, "application/json", json.dumps(openapi_doc), {}
+        return 404, "application/json", json.dumps({"error": "not found"}), {}
+
+    with _start_test_server(router) as (base_url, _port, log):
+        # max_requests=36 -> stage0_cap=12, passive_reserve=2, browser slice=10.
+        http = _make_client(tmp_path, base_url=base_url, allowed_methods=("GET", "HEAD", "POST"), max_requests=36)
+        res = run_stage0_crawl(
+            http,
+            allow_forms=False,
+            max_pages=20,
+            max_actions=4,
+            wait_ms=50,
+            max_passive_probes=6,
+        )
+
+        assert res["status"] == "ok"
+        assert res["stats"]["pages_visited"] == 10
+        assert res["stats"]["js_chunks_parsed"] >= 6
+        assert res["stats"]["passive_probes_sent"] >= 1
+        assert http.budget.used <= 12
+
+        all_routes = {(r["method"], r["url"]) for r in [*res["links"], *res["forms"]]}
+        assert ("POST", "/api/reserved-probe-op") in all_routes
+        assert "POST /api/reserved-probe-op" in res["body_templates"]
+        assert any(urlsplit(r["path"]).path == "/openapi.json" for r in log)
 

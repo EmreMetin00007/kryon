@@ -20,6 +20,10 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 from kryon_core.surface.extract import (  # noqa: E402
+    _BUNDLER_EXACT_PATHS as _BUNDLER_EXACT_PATHS,
+    _BUNDLER_PATH_MARKERS as _BUNDLER_PATH_MARKERS,
+    _FRONTEND_SOURCE_DIR_PREFIXES as _FRONTEND_SOURCE_DIR_PREFIXES,
+    _NON_ENDPOINT_SOURCE_EXTS as _NON_ENDPOINT_SOURCE_EXTS,
     extract_html,
     extract_inline_scripts,
     extract_js,
@@ -29,6 +33,7 @@ from kryon_core.surface.extract import (  # noqa: E402
     extract_sitemap,
     extract_spa_routes,
     find_spec_urls,
+    is_non_endpoint_noise_path,
 )
 from kryon_core.surface.openapi import LocalSchema  # noqa: E402
 
@@ -202,46 +207,7 @@ _NON_RESOURCE_FILE_EXTS = (
     ".eot",
     ".webp",
 )
-# Frontend source-module, style-preprocessor, and bundler artifact extensions
-# that are not HTTP application endpoints. `.js` is intentionally excluded so
-# app bundle URLs (e.g. `/assets/app.js`) remain discoverable for surface extraction.
-_NON_ENDPOINT_SOURCE_EXTS = (
-    ".d.ts",
-    ".ts",
-    ".tsx",
-    ".jsx",
-    ".mjs",
-    ".cjs",
-    ".vue",
-    ".svelte",
-    ".scss",
-    ".sass",
-    ".less",
-    ".styl",
-    ".map",
-    ".wasm",
-    ".avif",
-    ".webmanifest",
-)
-_BUNDLER_PATH_MARKERS = (
-    "/node_modules/",
-    "/@vite/",
-    "/@fs/",
-    "/@id/",
-    "/__vite",
-    "/@react-refresh",
-)
-_BUNDLER_EXACT_PATHS = frozenset({
-    "/node_modules",
-    "/@vite",
-    "/@fs",
-    "/@id",
-    "/@react-refresh",
-})
-_FRONTEND_SOURCE_DIR_PREFIXES = (
-    "/components/ui/",
-    "/src/components/",
-)
+# Body template and validation schema limits
 _MAX_BODY_TEMPLATES = 40
 _MAX_BODY_TEMPLATE_CHARS = 600
 _MAX_BODY_TEMPLATE_STR_LEN = 64
@@ -760,37 +726,14 @@ def is_malformed_url_path(url_or_path: str) -> bool:
 
 
 def is_non_endpoint_source_path(url_or_path: str) -> bool:
-    """Return True for frontend source/bundler artifact URLs or malformed path fragments.
+    """Return True for frontend source/bundler artifact URLs, schema pointers, or malformed path fragments.
 
     Preserves `.js` bundle URLs (e.g. `/assets/app.js`), legitimate API/OpenAPI/GraphQL
     routes, and valid `{id}` route templates.
     """
     if is_malformed_url_path(url_or_path):
         return True
-    raw = str(url_or_path or "").strip()
-    if not raw:
-        return False
-    try:
-        path = (urlsplit(raw).path or "").strip()
-    except ValueError:
-        return True
-    if not path or path == "/":
-        return False
-    norm_path = path.lower()
-    while norm_path.startswith("./"):
-        norm_path = norm_path[2:]
-    if norm_path and not norm_path.startswith("/"):
-        norm_path = "/" + norm_path
-    trimmed = norm_path.rstrip("/")
-    if not trimmed:
-        return False
-    if trimmed.endswith(_NON_ENDPOINT_SOURCE_EXTS):
-        return True
-    if trimmed in _BUNDLER_EXACT_PATHS or any(marker in norm_path for marker in _BUNDLER_PATH_MARKERS):
-        return True
-    if norm_path.startswith(_FRONTEND_SOURCE_DIR_PREFIXES):
-        return True
-    return False
+    return is_non_endpoint_noise_path(url_or_path)
 
 
 def _extract_api_prefix(path: str) -> str:
@@ -829,7 +772,7 @@ def _extract_ui_resource_info(path: str) -> tuple[str, bool, str] | None:
     resource = segs[0].lower()
     if (
         resource in _NON_RESOURCE_UI_SEGMENTS
-        or resource.startswith((".", "_"))
+        or resource.startswith((".", "_", "$"))
         or "=" in resource
         or is_id_segment(resource)
         or resource.endswith(_NON_RESOURCE_FILE_EXTS)

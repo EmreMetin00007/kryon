@@ -204,12 +204,12 @@ _HIGH_SIGNAL_PARAM_NAMES = frozenset({
 })
 
 _STANDARD_MANIFEST_PROBES: tuple[str, ...] = (
-    "/robots.txt",
-    "/sitemap.xml",
     "/openapi.json",
     "/swagger.json",
     "/v3/api-docs",
     "/api-docs",
+    "/robots.txt",
+    "/sitemap.xml",
     "/info",
 )
 _BENIGN_TECH_PROBES: dict[str, tuple[str, ...]] = {
@@ -223,8 +223,25 @@ _BENIGN_TECH_PROBES: dict[str, tuple[str, ...]] = {
     "go": ("/api", "/metrics"),
 }
 
-_MAX_JS_CHUNKS = 12
+_MAX_JS_CHUNKS = 64
 _MAX_JS_CHUNK_BYTES = 256 * 1024
+_MAX_STAGE0_SCRIPT_ASSETS = 160
+_SCRIPT_ASSET_EXTS = (".js", ".mjs", ".cjs", ".wasm")
+_SCRIPT_BUNDLE_PATH_MARKERS = (
+    "/_app/immutable/",
+    "/_next/static/",
+    "/@vite/",
+    "/@fs/",
+    "/@id/",
+    "/node_modules/",
+    "/static/js/",
+    "/assets/js/",
+)
+_STAGE0_BUNDLER_NOISE_MARKERS = (
+    "/_app/immutable/",
+    "/_next/static/",
+)
+_ROUTE_GROUP_SEG_RE = re.compile(r"^\([^/()]+\)$")
 _MAX_HTML_DOCS = 24
 _MAX_HTML_BYTES = 256 * 1024
 _MAX_PARAMS_PER_ROUTE = 32
@@ -479,24 +496,27 @@ class _RouteRecord:
 class _Stage0Budget:
     """Thread-safe Stage 0 budget slice backed by ``AgenticHTTPClient.budget``."""
 
-    def __init__(self, http_client: AgenticHTTPClient, cap: int) -> None:
+    def __init__(self, http_client: AgenticHTTPClient, cap: int, *, reserve: int = 0) -> None:
         self._http = http_client
         self.cap = max(0, int(cap))
+        self.reserve = max(0, min(self.cap, int(reserve)))
         self.charged = 0
         self.global_exhausted = False
         self._lock = threading.Lock()
 
-    def remaining(self) -> int:
+    def remaining(self, *, include_reserve: bool = False) -> int:
         with self._lock:
-            slice_left = max(0, self.cap - self.charged)
+            effective_cap = self.cap if include_reserve else max(0, self.cap - self.reserve)
+            slice_left = max(0, effective_cap - self.charged)
         return min(slice_left, _budget_remaining(self._http))
 
-    def can_spend(self) -> bool:
-        return self.remaining() > 0
+    def can_spend(self, *, include_reserve: bool = False) -> bool:
+        return self.remaining(include_reserve=include_reserve) > 0
 
-    def try_consume(self) -> bool:
+    def try_consume(self, *, include_reserve: bool = False) -> bool:
         with self._lock:
-            if self.charged >= self.cap:
+            effective_cap = self.cap if include_reserve else max(0, self.cap - self.reserve)
+            if self.charged >= effective_cap:
                 return False
             allowed, _reason = self._http.budget.consume()
             if not allowed:
@@ -582,6 +602,50 @@ def _is_heavy_media_url(url: str) -> bool:
     if _extract_path_embedded_params(path):
         return False
     return any(path.endswith(ext) for ext in _HEAVY_MEDIA_EXTS)
+
+
+def _is_browser_script_asset(req_url: str, req_path: str = "", req: Any = None) -> bool:
+    """Return True for read-only static JS/WASM bundle fetches exempt from Stage 0 HTTP budget."""
+    raw_url = str(req_url or "").strip()
+    if not raw_url:
+        return False
+    parsed = urlsplit(raw_url)
+    path = str(req_path or parsed.path or "").strip()
+    if not path or _extract_path_embedded_params(path):
+        return False
+    low_path = path.lower()
+    if _API_PATH_RE.search(low_path):
+        return False
+
+    res_type = str(getattr(req, "resource_type", "") or "").strip().lower()
+    if res_type == "document":
+        return False
+
+    has_script_ext = low_path.endswith(_SCRIPT_ASSET_EXTS)
+    has_bundle_path = (
+        any(marker in low_path for marker in _SCRIPT_BUNDLE_PATH_MARKERS)
+        or is_non_endpoint_source_path(low_path)
+    )
+    if res_type == "script":
+        return bool(has_script_ext or has_bundle_path)
+    if has_bundle_path and has_script_ext:
+        return True
+    if has_script_ext and (not res_type or res_type == "other" or not parsed.query):
+        return True
+    return False
+
+
+def _is_stage0_noise_path(norm_p: str) -> bool:
+    """Return True for framework virtual route groups like ``/(app)/...``, ``/$defs/...``, or bundler chunks."""
+    low = str(norm_p or "").strip().lower()
+    if not low:
+        return False
+    if any(marker in low for marker in _STAGE0_BUNDLER_NOISE_MARKERS):
+        return True
+    segments = [seg for seg in low.split("/") if seg]
+    if any(seg == "$defs" for seg in segments):
+        return True
+    return any(_ROUTE_GROUP_SEG_RE.fullmatch(seg) for seg in segments)
 
 
 def _sanitize_param_name(raw: Any) -> str:
@@ -1315,6 +1379,8 @@ class _Stage0Collector:
         self.server_headers: list[str] = []
         self.powered_by_headers: list[str] = []
         self.body_snippets: list[str] = []
+        self.script_assets_seen: set[str] = set()
+        self.script_assets_requests = 0
         self._seen_order = 0
         self._lock = threading.Lock()
 
@@ -1327,6 +1393,21 @@ class _Stage0Collector:
         self.network_requests_captured = 0
         self.js_chunks_parsed = 0
         self.passive_probes_sent = 0
+
+    def try_reserve_script_asset(self, clean_url: str) -> bool:
+        """Allow up to ``_MAX_STAGE0_SCRIPT_ASSETS`` unique browser script assets per crawl."""
+        key = str(clean_url or "").strip()
+        if not key:
+            return False
+        with self._lock:
+            if self.script_assets_requests >= _MAX_STAGE0_SCRIPT_ASSETS * 3:
+                return False
+            if key not in self.script_assets_seen:
+                if len(self.script_assets_seen) >= _MAX_STAGE0_SCRIPT_ASSETS:
+                    return False
+                self.script_assets_seen.add(key)
+            self.script_assets_requests += 1
+            return True
 
     def record_ws_endpoint(self, raw_ws_url: str) -> bool:
         """Validate and record a same-origin WebSocket URL; reject off-origin or excluded."""
@@ -1384,7 +1465,11 @@ class _Stage0Collector:
             return False
 
         path_params = _extract_path_embedded_params(norm_p)
-        if (is_static_asset_url(norm_p) and not path_params) or is_non_endpoint_source_path(norm_p):
+        if (
+            (is_static_asset_url(norm_p) and not path_params)
+            or is_non_endpoint_source_path(norm_p)
+            or _is_stage0_noise_path(norm_p)
+        ):
             return False
 
         merged_params: list[str] = []
@@ -1891,6 +1976,31 @@ def _crawl_actor_playwright(
         if hasattr(context, "route_web_socket"):
             context.route_web_socket("**/*", _on_ws_route)
 
+        def _continue_route(route: Any, req: Any, *, include_extra_headers: bool) -> None:
+            if include_extra_headers and extra_headers:
+                try:
+                    raw_hdrs = dict(req.all_headers() or {})
+                except Exception:
+                    raw_hdrs = dict(getattr(req, "headers", None) or {})
+                merged = {
+                    str(k): str(v)
+                    for k, v in raw_hdrs.items()
+                    if k and not str(k).startswith(":")
+                }
+                existing_lower = {k.lower() for k in merged}
+                for hk, hv in extra_headers.items():
+                    if hk.lower() not in existing_lower:
+                        merged[hk] = hv
+                try:
+                    route.continue_(headers=merged)
+                except Exception:
+                    pass
+                return
+            try:
+                route.continue_()
+            except Exception:
+                pass
+
         def _on_route(route: Any) -> None:
             req = route.request
             req_method = str(getattr(req, "method", "GET") or "GET").strip().upper()
@@ -1937,10 +2047,17 @@ def _crawl_actor_playwright(
                     except Exception:
                         pass
                     return
-                try:
-                    route.continue_()
-                except Exception:
-                    pass
+                _continue_route(route, req, include_extra_headers=False)
+                return
+
+            if req_method in {"GET", "HEAD"} and _is_browser_script_asset(req_url, req_path, req):
+                if not collector.try_reserve_script_asset(_clean):
+                    try:
+                        route.abort("blockedbyclient")
+                    except Exception:
+                        pass
+                    return
+                _continue_route(route, req, include_extra_headers=True)
                 return
 
             if not stage0_budget.try_consume():
@@ -1950,29 +2067,7 @@ def _crawl_actor_playwright(
                     pass
                 return
 
-            if extra_headers:
-                try:
-                    raw_hdrs = dict(req.all_headers() or {})
-                except Exception:
-                    raw_hdrs = dict(getattr(req, "headers", None) or {})
-                merged = {
-                    str(k): str(v)
-                    for k, v in raw_hdrs.items()
-                    if k and not str(k).startswith(":")
-                }
-                existing_lower = {k.lower() for k in merged}
-                for hk, hv in extra_headers.items():
-                    if hk.lower() not in existing_lower:
-                        merged[hk] = hv
-                try:
-                    route.continue_(headers=merged)
-                except Exception:
-                    pass
-            else:
-                try:
-                    route.continue_()
-                except Exception:
-                    pass
+            _continue_route(route, req, include_extra_headers=True)
 
         context.route("**/*", _on_route)
         page = context.new_page()
@@ -1987,6 +2082,8 @@ def _crawl_actor_playwright(
             if is_static_asset_url(req_path) and not _extract_path_embedded_params(req_path):
                 return
             if is_non_endpoint_source_path(req_path):
+                return
+            if req_method in {"GET", "HEAD"} and _is_browser_script_asset(req_url, req_path, req):
                 return
 
             try:
@@ -2052,18 +2149,24 @@ def _crawl_actor_playwright(
                 ):
                     session_dropped = True
 
-            collector.record_route(
-                method=req_method,
-                raw_url=resp_url,
-                status=status,
+            is_script_asset = req_method in {"GET", "HEAD"} and _is_browser_script_asset(
+                resp_url,
+                resp_path,
+                req_obj,
             )
+            if not is_script_asset:
+                collector.record_route(
+                    method=req_method,
+                    raw_url=resp_url,
+                    status=status,
+                )
 
             if status < 200 or status >= 300:
                 return
             is_js = (
                 "javascript" in ctype
                 or "ecmascript" in ctype
-                or resp_path.lower().endswith((".js", ".mjs"))
+                or resp_path.lower().endswith((".js", ".mjs", ".cjs"))
             )
             is_html = "html" in ctype
             if not is_js and not is_html:
@@ -2119,7 +2222,12 @@ def _crawl_actor_playwright(
                 norm_p = normalize_path(path_u or "/")
             except ValueError:
                 return
-            if is_static_asset_url(norm_p) or is_non_endpoint_source_path(norm_p) or norm_p.lower().endswith((".js", ".mjs")):
+            if (
+                is_static_asset_url(norm_p)
+                or is_non_endpoint_source_path(norm_p)
+                or _is_stage0_noise_path(norm_p)
+                or norm_p.lower().endswith(_SCRIPT_ASSET_EXTS)
+            ):
                 return
             if actor != "anon" and _DESTRUCTIVE_RE.search(norm_p):
                 return
@@ -2480,7 +2588,7 @@ def _run_layer4_passive_fusion(
 
     probe_candidates: list[str] = []
     seen_probes: set[str] = set()
-    for raw_p in [*_STANDARD_MANIFEST_PROBES, *collector.discovered_spec_urls, *tech_probes]:
+    for raw_p in [*collector.discovered_spec_urls, *_STANDARD_MANIFEST_PROBES, *tech_probes]:
         try:
             _u, clean_p, _q = _check_http_scope(http_client, raw_p, allow_fragment=False)
             norm_p = normalize_path(clean_p)
@@ -2497,7 +2605,7 @@ def _run_layer4_passive_fusion(
     for probe_path in probe_candidates:
         if collector.passive_probes_sent >= max_passive_probes:
             break
-        if not stage0_budget.can_spend():
+        if not stage0_budget.can_spend(include_reserve=True):
             break
         before_used = int(http_client.budget.used)
         try:
@@ -2705,12 +2813,19 @@ def run_stage0_crawl(
 
     stage0_cap = min(
         remaining,
-        min(
-            max(12, remaining // 2),
-            max(24, eff_max_pages * 5 + eff_max_actions * 2 + eff_max_probes),
+        max(
+            12,
+            min(
+                remaining // 3,
+                eff_max_pages * 3 + eff_max_actions + eff_max_probes,
+                64,
+            ),
         ),
     )
-    stage0_budget = _Stage0Budget(http_client, cap=stage0_cap)
+    passive_reserve = 0
+    if eff_max_probes > 0 and "GET" in http_client.allowed_methods and stage0_cap > 1:
+        passive_reserve = min(eff_max_probes, max(1, stage0_cap // 5), 8, stage0_cap - 1)
+    stage0_budget = _Stage0Budget(http_client, cap=stage0_cap, reserve=passive_reserve)
 
     selected_actors = _select_crawl_actors(http_client, actors)
     raw_starts = list(start_paths) if start_paths else ["/"]
