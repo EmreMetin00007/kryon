@@ -242,8 +242,10 @@ _STAGE0_BUNDLER_NOISE_MARKERS = (
     "/_next/static/",
 )
 _ROUTE_GROUP_SEG_RE = re.compile(r"^\([^/()]+\)$")
-_MAX_HTML_DOCS = 24
+_MAX_HTML_DOCS = 64
 _MAX_HTML_BYTES = 256 * 1024
+_MAX_CSS_DOCS = 24
+_MAX_CSS_BYTES = 128 * 1024
 _MAX_PARAMS_PER_ROUTE = 32
 _MAX_ROUTES_RETURNED = 200
 _MAX_DISCOVERY_HINTS = 12
@@ -311,6 +313,9 @@ _COLLECT_DOM_STATE_JS = r"""() => {
       if (isVisible(el) && href && visibleLinks.length < 80) {
         visibleLinks.push(String(href).slice(0, 120));
       }
+    }
+    for (const el of root.querySelectorAll('frame[src], iframe[src]')) {
+      pushHref(el.getAttribute('src'));
     }
     for (const el of root.querySelectorAll('[data-href], [data-route], [data-hash]')) {
       for (const attr of ['data-href', 'data-route', 'data-hash']) {
@@ -462,6 +467,7 @@ _COLLECT_DOM_STATE_JS = r"""() => {
   };
   return {
     url: String(window.location.href || ''),
+    base_uri: String(document.baseURI || window.location.href || ''),
     pathname: String(window.location.pathname || '/'),
     hash: String(window.location.hash || ''),
     title: String(document.title || '').slice(0, 120),
@@ -1374,6 +1380,7 @@ class _Stage0Collector:
         self.ws_endpoints: dict[tuple[str, str], dict[str, str]] = {}
         self.captured_html: dict[str, dict[str, Any]] = {}
         self.captured_js: dict[str, dict[str, Any]] = {}
+        self.captured_css: dict[str, dict[str, Any]] = {}
         self.discovered_spec_urls: list[str] = []
         self.fetched_2xx_paths: set[str] = set()
         self.server_headers: list[str] = []
@@ -1566,6 +1573,7 @@ class _Stage0Collector:
         body: str,
         headers: dict[str, str],
         is_js: bool,
+        is_css: bool = False,
     ) -> None:
         if not body:
             return
@@ -1576,7 +1584,7 @@ class _Stage0Collector:
                 self.server_headers.append(srv)
             if xpb and xpb not in self.powered_by_headers and len(self.powered_by_headers) < 8:
                 self.powered_by_headers.append(xpb)
-            if not is_js and len(self.body_snippets) < 4:
+            if not is_js and not is_css and len(self.body_snippets) < 4:
                 self.body_snippets.append(body[:8192])
 
             parsed = urlsplit(url)
@@ -1585,23 +1593,21 @@ class _Stage0Collector:
             except ValueError:
                 norm_p = parsed.path or "/"
 
-            if is_js:
-                if norm_p not in self.captured_js and len(self.captured_js) < _MAX_JS_CHUNKS:
-                    self.captured_js[norm_p] = {
-                        "url": url,
-                        "content_type": content_type,
-                        "body": body,
-                        "headers": dict(headers),
-                    }
+            entry = {
+                "url": url,
+                "content_type": content_type,
+                "body": body,
+                "headers": dict(headers),
+            }
+            if is_css:
+                store, store_key, cap = self.captured_css, norm_p, _MAX_CSS_DOCS
+            elif is_js:
+                store, store_key, cap = self.captured_js, norm_p, _MAX_JS_CHUNKS
             else:
                 doc_key = f"{norm_p}?{parsed.query}" if parsed.query else norm_p
-                if doc_key not in self.captured_html and len(self.captured_html) < _MAX_HTML_DOCS:
-                    self.captured_html[doc_key] = {
-                        "url": url,
-                        "content_type": content_type,
-                        "body": body,
-                        "headers": dict(headers),
-                    }
+                store, store_key, cap = self.captured_html, doc_key, _MAX_HTML_DOCS
+            if store_key not in store and len(store) < cap:
+                store[store_key] = entry
 
     def ingest_surface_summary(self, summary: dict[str, Any], *, source_url: str) -> None:
         """Ingest routes extracted by ``agentic_preview._extract_surface_summary``."""
@@ -2163,15 +2169,17 @@ def _crawl_actor_playwright(
 
             if status < 200 or status >= 300:
                 return
+            low_resp_path = resp_path.lower()
             is_js = (
                 "javascript" in ctype
                 or "ecmascript" in ctype
-                or resp_path.lower().endswith((".js", ".mjs", ".cjs"))
+                or low_resp_path.endswith((".js", ".mjs", ".cjs"))
             )
+            is_css = ("css" in ctype) or low_resp_path.endswith(".css")
             is_html = "html" in ctype
-            if not is_js and not is_html:
+            if not is_js and not is_css and not is_html:
                 return
-            max_bytes = _MAX_JS_CHUNK_BYTES if is_js else _MAX_HTML_BYTES
+            max_bytes = _MAX_JS_CHUNK_BYTES if is_js else (_MAX_CSS_BYTES if is_css else _MAX_HTML_BYTES)
             try:
                 raw_body = resp.body()
             except Exception:
@@ -2185,6 +2193,7 @@ def _crawl_actor_playwright(
                 body=text_body,
                 headers=resp_headers,
                 is_js=is_js,
+                is_css=is_css,
             )
 
         def _on_websocket(ws: Any) -> None:
@@ -2244,16 +2253,29 @@ def _crawl_actor_playwright(
         for start_u in start_urls:
             _enqueue_url(start_u, http_client.base_url)
 
+        def _dom_link_base(dom_data: dict[str, Any], current_page_url: str) -> str:
+            raw_base_uri = str(dom_data.get("base_uri") or "").strip()
+            if not raw_base_uri:
+                return current_page_url
+            try:
+                clean_b, _bp, _bq = _check_http_scope(http_client, raw_base_uri, allow_fragment=False)
+                return clean_b
+            except ScopeViolationError:
+                return current_page_url
+
         def _ingest_dom_discovery(dom_data: dict[str, Any], current_page_url: str) -> None:
+            link_base = _dom_link_base(dom_data, current_page_url)
             for link_raw in dom_data.get("links") or ():
-                collector.record_route(method="GET", raw_url=str(link_raw), current_url=current_page_url)
-                _enqueue_url(str(link_raw), current_page_url)
+                collector.record_route(method="GET", raw_url=str(link_raw), current_url=link_base)
+                _enqueue_url(str(link_raw), link_base)
             for h_raw in dom_data.get("hash_routes") or ():
                 _enqueue_url(str(h_raw), current_page_url)
             for form_item in dom_data.get("forms") or ():
                 if not isinstance(form_item, dict):
                     continue
-                f_action = str(form_item.get("action") or "") or current_page_url
+                raw_action = str(form_item.get("action") or "").strip()
+                f_action = raw_action or current_page_url
+                f_base = link_base if raw_action else current_page_url
                 f_method = str(form_item.get("method") or "GET").upper()
                 f_fields = [
                     str(fld.get("name") or "")
@@ -2263,7 +2285,7 @@ def _crawl_actor_playwright(
                 collector.record_route(
                     method=f_method,
                     raw_url=f_action,
-                    current_url=current_page_url,
+                    current_url=f_base,
                     params=f_fields,
                     is_form=True,
                 )
@@ -2307,12 +2329,13 @@ def _crawl_actor_playwright(
                     form_submitting_flag[0] = False
 
             # 2. Visible <form> elements
+            link_base = _dom_link_base(dom_data, current_page_url)
             forms_list = [f for f in (dom_data.get("forms") or ()) if isinstance(f, dict) and f.get("visible")]
             for form_item in forms_list:
                 if session_dropped or not stage0_budget.can_spend():
                     break
-                raw_action = str(form_item.get("action") or "").strip() or current_page_url
-                resolved_action = urljoin(current_page_url, raw_action)
+                raw_action = str(form_item.get("action") or "").strip()
+                resolved_action = urljoin(link_base, raw_action) if raw_action else current_page_url
                 try:
                     _a_url, a_path, _a_q = _check_http_scope(http_client, resolved_action, allow_fragment=False)
                     norm_action_path = normalize_path(a_path or "/")
@@ -2537,40 +2560,30 @@ def _run_layer4_passive_fusion(
     primary_actor: str,
     max_passive_probes: int,
 ) -> None:
-    """Fuse captured HTML + JS chunks via ``_extract_surface_summary`` and run bounded manifest probes."""
+    """Fuse captured HTML, JS chunks, and CSS via ``_extract_surface_summary`` and run bounded manifest probes."""
     idx = 0
-    for doc in list(collector.captured_html.values()):
-        idx += 1
-        fake_rec = {
-            "receipt_id": f"stage0-html-{idx}",
-            "url": doc["url"],
-            "content_type": doc["content_type"],
-            "body": doc["body"],
-            "response_headers": doc["headers"],
-            "redirect_location": "",
-        }
-        try:
-            summary = _extract_surface_summary(fake_rec, http_client.base_url)
-            collector.ingest_surface_summary(summary, source_url=doc["url"])
-        except Exception:
-            continue
-
-    for js_doc in list(collector.captured_js.values())[:_MAX_JS_CHUNKS]:
-        idx += 1
-        collector.js_chunks_parsed += 1
-        fake_rec = {
-            "receipt_id": f"stage0-js-{idx}",
-            "url": js_doc["url"],
-            "content_type": js_doc["content_type"] or "application/javascript",
-            "body": js_doc["body"],
-            "response_headers": js_doc["headers"],
-            "redirect_location": "",
-        }
-        try:
-            summary = _extract_surface_summary(fake_rec, http_client.base_url)
-            collector.ingest_surface_summary(summary, source_url=js_doc["url"])
-        except Exception:
-            continue
+    for docs, prefix, default_ctype, is_js_batch in (
+        (list(collector.captured_html.values()), "html", "text/html", False),
+        (list(collector.captured_js.values())[:_MAX_JS_CHUNKS], "js", "application/javascript", True),
+        (list(collector.captured_css.values())[:_MAX_CSS_DOCS], "css", "text/css", False),
+    ):
+        for doc in docs:
+            idx += 1
+            if is_js_batch:
+                collector.js_chunks_parsed += 1
+            fake_rec = {
+                "receipt_id": f"stage0-{prefix}-{idx}",
+                "url": doc["url"],
+                "content_type": doc["content_type"] or default_ctype,
+                "body": doc["body"],
+                "response_headers": doc["headers"],
+                "redirect_location": "",
+            }
+            try:
+                summary = _extract_surface_summary(fake_rec, http_client.base_url)
+                collector.ingest_surface_summary(summary, source_url=doc["url"])
+            except Exception:
+                continue
 
     if max_passive_probes <= 0 or "GET" not in http_client.allowed_methods:
         return

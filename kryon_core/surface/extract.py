@@ -100,8 +100,9 @@ _META_URL_KEY_HINTS = (
 )
 _TEXT_ABS_URL_RE = re.compile(r"""https?://[^\s<>"'`()]+""", re.I)
 _TEXT_REL_DOT_RE = re.compile(r"""(?:^|[\s(\["'=,:;])(\.{1,2}/[^\s<>"'`(),;]+)""")
+_TEXT_DOT_PREFIX_RE = re.compile(r"^(?:\.\.?/)+")
 _TEXT_REL_FILE_RE = re.compile(
-    r"""(?:^|[\s(\["'=,:;])(/?[A-Za-z0-9_-]+(?:/[A-Za-z0-9._~-]+)+\."""
+    r"""(?:^|[\s(\["'=,:;])((?:[A-Za-z0-9_-]+(?:/[A-Za-z0-9._~-]+)+|/(?!/)[A-Za-z0-9._~-]+(?:/[A-Za-z0-9._~-]+)*)\."""
     r"""(?:html?|xhtml|shtml|php\d?|phtml|aspx?|ashx|asmx|jspx?|do|action|cgi|pl|py|rb|"""
     r"""json|xml|txt|md|csv|ya?ml|js|mjs|ts|css|svg|pdf|zip|tar|gz|bak|old|orig|conf|"""
     r"""cfg|ini|log|sql|env|map|wasm|swf|jar|woff2?|ttf|eot|png|jpe?g|gif|webp|ico|bmp|"""
@@ -270,6 +271,22 @@ def _decode_svg_data_uri(uri: str) -> str:
     return unquote(payload)
 
 
+def _extract_hash_route_from_attr(raw_value: str) -> str:
+    """Return the route segment embedded after ``#!`` or ``#/`` in an HTML link attribute."""
+    val = (raw_value or "").strip()
+    if "#!" in val:
+        route = val.partition("#!")[2].strip()
+    elif "#/" in val:
+        route = "/" + val.partition("#/")[2].strip()
+    else:
+        return ""
+    if not route or route == "/" or any(ch.isspace() or ord(ch) < 32 for ch in route):
+        return ""
+    if any(ch in route for ch in ('"', "'", "<", ">", "{", "}")):
+        return ""
+    return route
+
+
 def _extract_html_impl(
     html: str,
     base: str,
@@ -318,9 +335,25 @@ def _extract_html_impl(
         for m in _TEXT_ABS_URL_RE.finditer(segment):
             _emit_html(m.group(0).rstrip(".,;:!?]"))
         for m in _TEXT_REL_DOT_RE.finditer(segment):
-            _emit_html(m.group(1).rstrip(".,;:!?]"))
+            rel_text = m.group(1).rstrip(".,;:!?]")
+            _emit_html(rel_text)
+            stripped = _TEXT_DOT_PREFIX_RE.sub("", rel_text)
+            if stripped and "/" in stripped and not stripped.startswith("/"):
+                _emit_html("/" + stripped)
         for m in _TEXT_REL_FILE_RE.finditer(segment):
             _emit_html(m.group(1).rstrip(".,;:!?]"))
+
+    def _emit_hash_route(route_part: str) -> None:
+        if not route_part:
+            return
+        if not route_part.startswith("/"):
+            _emit_html(route_part)
+            return
+        if base_match:
+            base_prefix = urlsplit(effective_base).path.rstrip("/")
+            _emit_html(_join_spa_basename(base_prefix, route_part))
+            return
+        _emit_html(route_part)
 
     def _scan_fragment(fragment: str, frag_depth: int) -> None:
         tags = _iter_html_tags(fragment)
@@ -375,6 +408,9 @@ def _extract_html_impl(
                                 _scan_fragment(svg_text, frag_depth + 1)
                     else:
                         _emit_html(val)
+                        frag_route = _extract_hash_route_from_attr(val)
+                        if frag_route:
+                            _emit_hash_route(frag_route)
 
             if tag == "param" and param_value and _looks_url_like(param_value):
                 _emit_html(param_value)

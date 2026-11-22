@@ -377,3 +377,42 @@ def test_crawl_site_discovers_shadow_dom_interactive_headers_and_css(tmp_path: P
     finally:
         server.shutdown()
         server.server_close()
+
+
+def test_extract_html_covers_base_href_ng_href_frame_and_inline_strings() -> None:
+    from kryon_core.surface.extract import extract_html
+
+    # 1. AngularJS ng-href with #! resolved against <base href>
+    ng_html = (
+        '<!doctype html><html><head><base href="/app/angular/"></head><body>'
+        "<a ng-href=\"{{'index.html#!users/profile.found'}}\">Users</a>"
+        '<a href="index.html#!/admin/audit">Audit</a>'
+        '<a href="#/reports/daily">Daily</a>'
+        "</body></html>"
+    )
+    ng_paths = {urlsplit(rec["url"]).path for rec in extract_html(ng_html, "http://127.0.0.1:8080/app/angular/")}
+    assert "/app/angular/users/profile.found" in ng_paths
+    assert "/app/angular/admin/audit" in ng_paths
+    assert "/app/angular/reports/daily" in ng_paths
+
+    # 2. Frameset <frame src> and <base href> path-relative links
+    frame_html = (
+        '<!doctype html><head><base href="http://127.0.0.1:8080/test/"></head>'
+        '<h1>Frame</h1><frameset><frame src="/frames/inner.found"></frameset>'
+        '<a href="relative/path.found">Rel</a>'
+    )
+    frame_paths = {urlsplit(rec["url"]).path for rec in extract_html(frame_html, "http://127.0.0.1:8080/pages/frame/")}
+    assert "/frames/inner.found" in frame_paths
+    assert "/test/relative/path.found" in frame_paths
+
+    # 3. Inline prose strings: ./, ../, and single-segment rooted known extension
+    prose_html = (
+        "<p>See ./nested/item.found, ../sibling/export.found, and /public-report.pdf "
+        "plus https://evil.example/off-origin.pdf (mime application/pdf).</p>"
+    )
+    prose_paths = {urlsplit(rec["url"]).path for rec in extract_html(prose_html, "http://127.0.0.1:8080/docs/page/")}
+    assert "/nested/item.found" in prose_paths
+    assert "/sibling/export.found" in prose_paths
+    assert "/public-report.pdf" in prose_paths
+    assert "/off-origin.pdf" not in prose_paths
+

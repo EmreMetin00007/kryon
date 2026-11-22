@@ -1106,3 +1106,82 @@ def test_stage0_layer4_passive_reserve_probes_openapi_when_browser_slice_exhaust
         assert "POST /api/reserved-probe-op" in res["body_templates"]
         assert any(urlsplit(r["path"]).path == "/openapi.json" for r in log)
 
+
+@pytest.mark.skipif(not HAS_PLAYWRIGHT, reason="Playwright Chromium not available")
+def test_stage0_captures_external_css_base_href_frame_and_inline_links(tmp_path: Path) -> None:
+    def router(_method: str, raw_path: str, _hdrs: dict[str, str], _body: bytes) -> tuple[int, str, str, dict[str, str]]:
+        path = urlsplit(raw_path).path
+        if path == "/":
+            return (
+                200,
+                "text/html; charset=utf-8",
+                (
+                    "<!doctype html><html><head><link rel='stylesheet' href='/styles/site.css'></head><body>"
+                    "<a href='/pages/base-test/'>Base</a>"
+                    "<a href='/pages/frame-test/'>Frame</a>"
+                    "<a href='/pages/prose-test/'>Prose</a>"
+                    "<a href='/app/angular/'>Angular</a>"
+                    "</body></html>"
+                ),
+                {},
+            )
+        if path == "/styles/site.css":
+            return (
+                200,
+                "text/css",
+                "@font-face { font-family: leak; src: url('/css-discovered/font-leak.found'); }",
+                {},
+            )
+        if path == "/pages/base-test/":
+            return (
+                200,
+                "text/html; charset=utf-8",
+                (
+                    "<!doctype html><head><base href='/resolved-base/'></head>"
+                    "<body><a href='sub/target.found'>rel</a></body>"
+                ),
+                {},
+            )
+        if path == "/pages/frame-test/":
+            return (
+                200,
+                "text/html; charset=utf-8",
+                "<!doctype html><h1>Frames</h1><frameset><frame src='/frames/inner.found'></frameset>",
+                {},
+            )
+        if path == "/pages/prose-test/":
+            return (
+                200,
+                "text/html; charset=utf-8",
+                "<!doctype html><p>Inline: ./prose/dot.found and ../prose/dotdot.found and /root-item.pdf</p>",
+                {},
+            )
+        if path == "/app/angular/":
+            return (
+                200,
+                "text/html; charset=utf-8",
+                (
+                    "<!doctype html><head><base href='/app/angular/'></head>"
+                    "<body><a ng-href=\"{{'index.html#!view/secret.found'}}\">NG</a></body>"
+                ),
+                {},
+            )
+        if path.endswith(".found") or path == "/root-item.pdf":
+            return 200, "text/html; charset=utf-8", "ok", {}
+        return 404, "text/plain", "missing", {}
+
+    with _start_test_server(router) as (base_url, _port, _log):
+        http = _make_client(tmp_path, base_url=base_url, allowed_methods=("GET", "HEAD"), max_requests=100)
+        res = run_stage0_crawl(http, allow_forms=False, max_pages=16, max_actions=4, wait_ms=50, max_passive_probes=0)
+        assert res["status"] == "ok"
+        route_paths = {r["url"] for r in [*res["links"], *res["forms"]]}
+        assert "/css-discovered/font-leak.found" in route_paths
+        assert "/resolved-base/sub/target.found" in route_paths
+        assert "/frames/inner.found" in route_paths
+        assert "/prose/dot.found" in route_paths
+        assert "/prose/dotdot.found" in route_paths
+        assert "/root-item.pdf" in route_paths
+        assert "/app/angular/view/secret.found" in route_paths
+        assert "/styles/site.css" not in route_paths
+
+
