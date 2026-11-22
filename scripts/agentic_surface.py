@@ -15,11 +15,10 @@ from urllib.parse import parse_qsl, urljoin, urlsplit
 from agentic_http import is_static_asset_url, normalize_origin
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
-_SURFACE_CORE_PARENT = _REPO_ROOT / "mcp-servers" / "mcp-memory-server"
-if str(_SURFACE_CORE_PARENT) not in sys.path:
-    sys.path.insert(0, str(_SURFACE_CORE_PARENT))
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
 
-from cco_surface_core.extract import (  # noqa: E402
+from kryon_core.surface.extract import (  # noqa: E402
     extract_html,
     extract_inline_scripts,
     extract_js,
@@ -30,7 +29,7 @@ from cco_surface_core.extract import (  # noqa: E402
     extract_spa_routes,
     find_spec_urls,
 )
-from cco_surface_core.openapi import LocalSchema  # noqa: E402
+from kryon_core.surface.openapi import LocalSchema  # noqa: E402
 
 _UUID_SEG_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.I)
 _HEX_ID_SEG_RE = re.compile(r"^[0-9a-f]{16,}$", re.I)

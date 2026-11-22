@@ -22,11 +22,10 @@ from agentic_surface import (
 )
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
-_SURFACE_CORE_PARENT = _REPO_ROOT / "mcp-servers" / "mcp-memory-server"
-if str(_SURFACE_CORE_PARENT) not in sys.path:
-    sys.path.insert(0, str(_SURFACE_CORE_PARENT))
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
 
-from cco_surface_core.extract import (  # noqa: E402
+from kryon_core.surface.extract import (  # noqa: E402
     extract_html,
     extract_inline_scripts,
     extract_js,
@@ -37,7 +36,7 @@ from cco_surface_core.extract import (  # noqa: E402
     extract_spa_routes,
     find_spec_urls,
 )
-from cco_surface_core.openapi import LocalSchema  # noqa: E402
+from kryon_core.surface.openapi import LocalSchema  # noqa: E402
 
 NODE_ENDPOINT = "ENDPOINT"
 NODE_AUTH_CONTEXT = "AUTH_CONTEXT"

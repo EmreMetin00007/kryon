@@ -16,9 +16,8 @@ from typing import Any, Iterator
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 _SCRIPTS_DIR = _REPO_ROOT / "scripts"
-_MEMORY_DIR = _REPO_ROOT / "mcp-servers" / "mcp-memory-server"
-_VALIDATOR_DIR = _REPO_ROOT / "mcp-servers" / "mcp-validator"
-_OTP_DIR = _REPO_ROOT / "mcp-servers" / "mcp-otp"
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
 
 _INDEX_FILENAME = "agentic_vault_index.json"
 _LOCK_FILENAME = ".agentic_vault_index.lock"
@@ -32,25 +31,23 @@ def _ensure_sys_path(directory: Path) -> None:
 
 
 def _load_credential_vault_cls() -> Any:
-    _ensure_sys_path(_MEMORY_DIR)
-    from credential_vault import CredentialVault  # type: ignore[import-not-found]
+    _ensure_sys_path(_REPO_ROOT)
+    from kryon_core.vault.credential_vault import CredentialVault
 
     return CredentialVault
 
 
 def _load_oob_verifier() -> Any:
+    _ensure_sys_path(_REPO_ROOT)
     _ensure_sys_path(_SCRIPTS_DIR)
-    _ensure_sys_path(_VALIDATOR_DIR)
-    from cco_validator_core.oob_collector import (  # type: ignore[import-not-found]
-        verify_collector_event,
-    )
+    from kryon_core.validator.oob_collector import verify_collector_event
 
     return verify_collector_event
 
 
 def _load_otp_core() -> Any:
-    _ensure_sys_path(_OTP_DIR)
-    import otp_core  # type: ignore[import-not-found]
+    _ensure_sys_path(_REPO_ROOT)
+    from kryon_core.vault import otp_core
 
     return otp_core
 
@@ -198,7 +195,7 @@ def verify_external_oob_event(
 
 
 def fetch_latest_otp(**kwargs: Any) -> dict[str, Any]:
-    """Lazily invoke mcp-otp's otp_core.fetch_latest_otp and return strictly bounded fields."""
+    """Lazily invoke kryon_core.vault.otp_core.fetch_latest_otp and return strictly bounded fields."""
     otp_mod = _load_otp_core()
     raw = otp_mod.fetch_latest_otp(**kwargs)
     if not isinstance(raw, dict) or not raw.get("code"):

@@ -179,7 +179,8 @@ def run_audit(root: str | Path, include_runtime: bool = False, max_file_bytes: i
                 findings.append(finding)
     summary = {"high": 0, "medium": 0, "low": 0, "total": len(findings)}
     for finding in findings:
-        summary[finding["severity"]] = summary.get(finding["severity"], 0) + 1
+        severity = str(finding["severity"])
+        summary[severity] = summary.get(severity, 0) + 1
     return {
         "root": str(root),
         "summary": summary,

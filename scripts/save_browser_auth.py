@@ -24,8 +24,10 @@ import sys
 import time
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "mcp-servers" / "mcp-otp"))
-from otp_core import OtpError, fetch_latest_otp  # noqa: E402
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+from kryon_core.vault.otp_core import OtpError, fetch_latest_otp  # noqa: E402
 
 AUTH_DIR = Path(os.environ.get("CCO_AUTH_DIR", "~/.cco/auth")).expanduser()
 PROXY = os.environ.get("CCO_PROXY", "http://127.0.0.1:8080").strip()

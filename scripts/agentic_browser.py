@@ -1,7 +1,7 @@
 """Read-only, same-origin scope-locked headless Playwright integration for the agentic engine.
 
 Provides two bounded capabilities:
-1. ``run_browser_crawl``: SPA/Shadow-DOM surface discovery backed by ``cco_surface_core.crawl``
+1. ``run_browser_crawl``: SPA/Shadow-DOM surface discovery backed by ``kryon_core.surface.crawl``
    with strict same-origin filtering, WireBudget accounting, host-side actor auth injection,
    and automatic ingestion into ``SurfaceFrontierTracker``.
 2. ``inspect_rendered_page``: Isolated read-only Chromium QA inspector for a single rendered
@@ -28,14 +28,11 @@ from agentic_http import (
 from agentic_surface import SurfaceFrontierTracker
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
-_SURFACE_CORE_PARENT = _REPO_ROOT / "mcp-servers" / "mcp-memory-server"
-_BROWSER_CORE_PARENT = _REPO_ROOT / "mcp-servers" / "mcp-browser"
-for _parent in (_SURFACE_CORE_PARENT, _BROWSER_CORE_PARENT):
-    if str(_parent) not in sys.path:
-        sys.path.insert(0, str(_parent))
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
 
 try:
-    from cco_surface_core.crawl import (  # noqa: E402
+    from kryon_core.surface.crawl import (  # noqa: E402
         CHROMIUM_ARGS as _CRAWL_CHROMIUM_ARGS,
         HAS_PLAYWRIGHT as _CRAWL_HAS_PLAYWRIGHT,
         crawl_site as _default_crawl_site,
@@ -48,7 +45,7 @@ except Exception:  # pragma: no cover - optional dependency fallback
     _crawl_run_playwright_sync = None  # type: ignore[assignment]
 
 try:
-    from cco_browser_core.hooks import (  # type: ignore[import-not-found]  # noqa: E402
+    from kryon_core.browser.hooks import (  # noqa: E402
         build_runtime_hook_script as _build_runtime_hook_script,
         normalize_runtime_events as _normalize_runtime_events,
     )
@@ -446,7 +443,7 @@ def _extract_safe_field_names(raw_fields: Any) -> list[str]:
 
 
 def _build_crawl_wire_gate(http: AgenticHTTPClient) -> Callable[[str, str, dict[str, Any]], tuple[bool, str]]:
-    """Build a read-only same-origin wire gate for ``cco_surface_core.crawl.crawl_site``."""
+    """Build a read-only same-origin wire gate for ``kryon_core.surface.crawl.crawl_site``."""
 
     def _gate(method: str, req_url: str, _req_headers: dict[str, Any]) -> tuple[bool, str]:
         norm_method = str(method or "").strip().upper()

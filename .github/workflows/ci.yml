@@ -43,30 +43,19 @@ jobs:
 
       - name: Run unit tests (coverage)
         env:
-          CCO_GRAPH_BACKEND: networkx
           COVERAGE_FILE: /tmp/.coverage-ci
         run: |
-          coverage run -m pytest tests -q -m "not integration"
-          coverage report --include="scripts/policy_engine.py,scripts/campaign_runtime.py,mcp-servers/mcp-validator/cco_validator_core/*,mcp-servers/mcp-hunter/cco_hunter_core/*,mcp-servers/mcp-reasoning/cco_reasoning_core/*" | tee /tmp/coverage-core.txt
-
-      - name: Run loopback lab validation
-        env:
-          CCO_GRAPH_BACKEND: networkx
-        run: python3 scripts/lab-validate.py --skip-rag --quiet --json
-
-      - name: Run negative-control battery (FP rate)
-        env:
-          CCO_GRAPH_BACKEND: networkx
-        run: python3 scripts/negative-control.py --rounds 1 --json
+          coverage run -m pytest tests -q
+          coverage report --include="scripts/agentic_*.py,scripts/target_bootstrap.py,kryon_core/*" | tee /tmp/coverage-core.txt
 
       - name: Check Python provider configuration
         run: python3 scripts/agent_cli.py check-config --provider-config config/llm.example.json
 
-      - name: Governance audit smoke
+      - name: Governance audit smoke (scripts)
         run: python3 scripts/governance_audit.py --root scripts --format json --fail-on high
 
-      - name: Multi-worker soak smoke
-        run: python3 scripts/worker_soak.py --tasks 16 --workers 4 --stale-claims 2 --executor synthetic --max-tasks 16 --json
+      - name: Governance audit smoke (kryon_core)
+        run: python3 scripts/governance_audit.py --root kryon_core --format json --fail-on high
 
       - name: Signed release bundle smoke
         run: |

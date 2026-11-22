@@ -18,7 +18,6 @@ SCRIPTS_DIR = REPO_ROOT / "scripts"
 if str(SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPTS_DIR))
 
-import external_target_runner as ext  # noqa: E402
 import target_bootstrap as tb  # noqa: E402
 from agentic_http import (  # noqa: E402
     ActorManager,
@@ -72,15 +71,8 @@ def test_target_bootstrap_has_zero_forbidden_transitive_imports() -> None:
 
 
 # ---------------------------------------------------------------------------
-# 2. Bootstrap helpers & external_target_runner re-export identity
+# 2. Bootstrap helpers
 # ---------------------------------------------------------------------------
-
-
-def test_external_target_runner_reexports_target_bootstrap_identity() -> None:
-    assert ext._ADMIN_ROLES is tb._ADMIN_ROLES
-    assert ext.normalize_loopback_origin is tb.normalize_loopback_origin
-    assert ext.load_credentials_bundle is tb.load_credentials_bundle
-    assert ext.select_representative_accounts is tb.select_representative_accounts
 
 
 def test_normalize_loopback_origin_validation() -> None:

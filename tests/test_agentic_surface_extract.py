@@ -13,8 +13,7 @@ import pytest
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SCRIPTS_DIR = REPO_ROOT / "scripts"
-SURFACE_CORE_DIR = REPO_ROOT / "mcp-servers" / "mcp-memory-server"
-for _p in (str(SCRIPTS_DIR), str(SURFACE_CORE_DIR)):
+for _p in (str(REPO_ROOT), str(SCRIPTS_DIR)):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
@@ -211,7 +210,7 @@ def test_tool_dispatcher_extract_surface_and_hints_for_headers_and_css(tmp_path:
 
 
 def test_crawl_site_discovers_shadow_dom_interactive_headers_and_css(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    from cco_surface_core.crawl import HAS_PLAYWRIGHT, crawl_site
+    from kryon_core.surface.crawl import HAS_PLAYWRIGHT, crawl_site
 
     if not HAS_PLAYWRIGHT:
         pytest.skip("playwright not installed")
@@ -305,23 +304,26 @@ def test_crawl_site_discovers_shadow_dom_interactive_headers_and_css(tmp_path: P
     thread.start()
     url = f"http://127.0.0.1:{server.server_address[1]}/"
 
-    scope_file = tmp_path / "scope.json"
-    scope_file.write_text(json.dumps({"in_scope": [{"asset": url}], "allow_loopback": True}))
-    policy_file = tmp_path / "policy.json"
-    policy_file.write_text(json.dumps({"allow_loopback": True}))
-    monkeypatch.setenv("CCO_HOME", str(tmp_path / "home"))
-    monkeypatch.setenv("CCO_SCOPE_FILE", str(scope_file))
-    monkeypatch.setenv("CCO_PROGRAM_POLICY_FILE", str(policy_file))
-    from policy_engine import PolicyEngine
+    base_netloc = urlsplit(url).netloc
 
-    PolicyEngine(
-        cco_home=str(tmp_path / "home"),
-        scope_file=str(scope_file),
-        program_policy_file=str(policy_file),
-    ).grant_approval("kali-tools_crawl_web_surface", "127.0.0.1", ttl_seconds=600, reason="shadow crawl test")
+    def _readonly_same_origin_gate(method: str, req_url: str, _req_headers: dict[str, Any]) -> tuple[bool, str]:
+        if str(method or "").upper() not in {"GET", "HEAD", "OPTIONS"}:
+            return False, "read_only_method_blocked"
+        if urlsplit(req_url).netloc != base_netloc:
+            return False, "scope_violation"
+        return True, "allowed"
+
+    setattr(_readonly_same_origin_gate, "accounts_campaign_requests", True)
 
     try:
-        out = crawl_site(url, max_pages=10, wait_ms=60, timeout_ms=10000, max_actions=8)
+        out = crawl_site(
+            url,
+            max_pages=10,
+            wait_ms=60,
+            timeout_ms=10000,
+            max_actions=8,
+            wire_gate=_readonly_same_origin_gate,
+        )
         assert out.get("ok") is True, out.get("error")
 
         link_paths = {urlsplit(u).path for u in (out.get("links") or [])}
@@ -361,7 +363,14 @@ def test_crawl_site_discovers_shadow_dom_interactive_headers_and_css(tmp_path: P
         )
 
         # Respect max_actions=0 bound: safe button is NOT clicked when action budget is 0
-        out_zero = crawl_site(url, max_pages=2, wait_ms=40, timeout_ms=10000, max_actions=0)
+        out_zero = crawl_site(
+            url,
+            max_pages=2,
+            wait_ms=40,
+            timeout_ms=10000,
+            max_actions=0,
+            wire_gate=_readonly_same_origin_gate,
+        )
         assert out_zero.get("ok") is True
         zero_xhr = {(item.get("method"), urlsplit(item["url"]).path) for item in (out_zero.get("xhr") or [])}
         assert ("POST", "/api/shadow-hit") not in zero_xhr

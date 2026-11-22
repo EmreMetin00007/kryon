@@ -12,10 +12,8 @@ from urllib.parse import urljoin, urlsplit
 from agentic_http import is_static_asset_url
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
-_SURFACE_CORE_PARENT = _REPO_ROOT / "mcp-servers" / "mcp-memory-server"
-_KALI_TOOLS_PARENT = _REPO_ROOT / "mcp-servers" / "mcp-kali-tools"
-if str(_SURFACE_CORE_PARENT) not in sys.path:
-    sys.path.insert(0, str(_SURFACE_CORE_PARENT))
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
 
 _CLIENT_LOGIC_LOADED = False
 _BUILD_CLIENT_LOGIC_MAP: Callable[..., dict[str, Any]] | None = None
@@ -24,25 +22,22 @@ _SIGNING_HEADER_RE = re.compile(r"(?:sign|signature|hmac|digest)", re.I)
 
 
 def _load_build_client_logic_map() -> Callable[..., dict[str, Any]] | None:
-    """Lazily import cco_js_core.client_logic.build_client_logic_map if available."""
+    """Lazily import kryon_core.js.client_logic.build_client_logic_map if available."""
     global _CLIENT_LOGIC_LOADED, _BUILD_CLIENT_LOGIC_MAP
     if _CLIENT_LOGIC_LOADED:
         return _BUILD_CLIENT_LOGIC_MAP
     _CLIENT_LOGIC_LOADED = True
     try:
-        kali_path = str(_KALI_TOOLS_PARENT)
-        if _KALI_TOOLS_PARENT.is_dir() and kali_path not in sys.path:
-            sys.path.insert(0, kali_path)
-        from cco_js_core.client_logic import (  # type: ignore[import-not-found]
-            build_client_logic_map,
-        )
+        if str(_REPO_ROOT) not in sys.path:
+            sys.path.insert(0, str(_REPO_ROOT))
+        from kryon_core.js.client_logic import build_client_logic_map
 
         _BUILD_CLIENT_LOGIC_MAP = build_client_logic_map
     except Exception:
         _BUILD_CLIENT_LOGIC_MAP = None
     return _BUILD_CLIENT_LOGIC_MAP
 
-from cco_surface_core.extract import (  # noqa: E402
+from kryon_core.surface.extract import (  # noqa: E402
     extract_css,
     extract_html,
     extract_http_headers,
@@ -55,7 +50,7 @@ from cco_surface_core.extract import (  # noqa: E402
     extract_spa_routes,
     find_spec_urls,
 )
-from cco_surface_core.openapi import LocalSchema  # noqa: E402
+from kryon_core.surface.openapi import LocalSchema  # noqa: E402
 
 _ID_VALUE_RE = re.compile(
     r"\b(?:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|[a-z]+-[a-z0-9_-]{3,24}|\d{1,10})\b",
@@ -647,7 +642,7 @@ def _extract_js_client_logic(
     body: str,
     url: str,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, Any]]:
-    """Run passive cco_js_core Client Logic Map on JS source without exposing secret values."""
+    """Run passive kryon_core.js Client Logic Map on JS source without exposing secret values."""
     if not body or not body.strip():
         return [], [], {}
     build_fn = _load_build_client_logic_map()

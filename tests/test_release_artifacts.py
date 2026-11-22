@@ -127,13 +127,15 @@ def test_release_staging_excludes_repository_engagement_data(tmp_path):
     mod._stage_release_source(staging)
 
     names = {path.relative_to(staging).as_posix() for path in staging.rglob("*") if path.is_file()}
-    assert "scripts/campaign_worker.py" in names
-    assert "config/tool-capabilities.json" in names
-    assert "mcp-servers/mcp-kali-tools/server.py" in names
-    assert "mcp-servers/mcp-rag-engine/requirements.txt" in names
-    assert "mcp-servers/mcp-rag-engine/cco_rag_core/storage.py" in names
+    assert "scripts/agentic_runner.py" in names
+    assert "kryon_core/surface/extract.py" in names
+    assert "config/llm.example.json" in names
+    assert "config/bounty-program-policy.json" in names
     assert "requirements.lock" in names
-    assert not any(name.startswith(("hepsiburada-bb/", "memory/", ".codex/", ".git/")) for name in names)
+    assert not any(
+        name.startswith(("mcp-servers/", "hepsiburada-bb/", "memory/", ".codex/", ".git/"))
+        for name in names
+    )
 
 
 def test_release_verification_rejects_unsigned_nested_files(tmp_path):

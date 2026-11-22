@@ -18,7 +18,7 @@ def test_new_runtime_artifacts_fail_layout(tmp_path, name):
 
 
 def test_product_directories_and_build_output_are_allowed(tmp_path):
-    for name in ["scripts", "tests", "docs", "config", "mcp-servers", "build"]:
+    for name in ["scripts", "tests", "docs", "config", "kryon_core", "build"]:
         (tmp_path / name).mkdir()
     assert violations(tmp_path) == []
 

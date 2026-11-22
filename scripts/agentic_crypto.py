@@ -16,7 +16,8 @@ from typing import Any, Callable
 from urllib.parse import unquote
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
-_VALIDATOR_DIR = _REPO_ROOT / "mcp-servers" / "mcp-validator"
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
 
 _MAX_CLAIM_STR_LEN = 120
 _HEX_RE = re.compile(r"^[0-9a-fA-F]+$")
@@ -65,16 +66,15 @@ _DESER_MOD: Any = None
 
 
 def _load_validator_helpers() -> tuple[Any, Any]:
-    """Lazily import passive analyzers from cco_validator_core with fallback."""
+    """Lazily import passive analyzers from kryon_core.validator with fallback."""
     global _VALIDATOR_LOADED, _CRYPTO_TOKEN_MOD, _DESER_MOD
     if _VALIDATOR_LOADED:
         return _CRYPTO_TOKEN_MOD, _DESER_MOD
     _VALIDATOR_LOADED = True
     try:
-        validator_path = str(_VALIDATOR_DIR)
-        if _VALIDATOR_DIR.is_dir() and validator_path not in sys.path:
-            sys.path.insert(0, validator_path)
-        from cco_validator_core import crypto_token, deser  # type: ignore[import-not-found]
+        if str(_REPO_ROOT) not in sys.path:
+            sys.path.insert(0, str(_REPO_ROOT))
+        from kryon_core.validator import crypto_token, deser
 
         _CRYPTO_TOKEN_MOD = crypto_token
         _DESER_MOD = deser

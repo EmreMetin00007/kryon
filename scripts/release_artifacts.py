@@ -349,18 +349,8 @@ def _stage_release_source(staging: Path) -> None:
         if source.is_symlink() or not source.is_file():
             raise ValueError(f"release source file missing: {name}")
         shutil.copy2(source, staging / name)
-    config_files = {
-        "llm.example.json", "profiles.json", "mcp-servers.json",
-        "bounty-program-policy.json", "tool-capabilities.json",
-        "executor-contract.example.json", "mcp-core-tools.json",
-        "program-profiles/ctf.json", "program-profiles/lab.json",
-        "program-profiles/strict-bounty.json", "program-profiles/strict-bounty-anduril.json",
-        "program-profiles/strict-bounty-coupang.json", "program-profiles/strict-bounty-expedia.json",
-        "program-profiles/strict-bounty-clear.json", "program-profiles/strict-bounty-livenation.json",
-        "program-profiles/strict-bounty-rapyd.json", "program-profiles/vdp-nebius.json",
-    }
-    lab_files = {"lab/Dockerfile", "lab/docker-compose.yml", "lab/README.md"}
-    for relative in (Path("scripts"), Path("config"), Path("mcp-servers")):
+    config_files = {"llm.example.json", "bounty-program-policy.json"}
+    for relative in (Path("scripts"), Path("kryon_core"), Path("config")):
         source_root = REPO_ROOT / relative
         if source_root.is_symlink() or not source_root.is_dir():
             raise ValueError(f"release source directory missing: {relative}")
@@ -370,12 +360,11 @@ def _stage_release_source(staging: Path) -> None:
                 raise ValueError(f"release source symlink is forbidden: {source.relative_to(REPO_ROOT)}")
             if not source.is_file() or "__pycache__" in source.parts:
                 continue
-            if (relative == Path("scripts") and source.suffix not in {".py", ".sh", ".json"}
-                    and source.relative_to(source_root).as_posix() not in lab_files):
+            if relative == Path("scripts") and source.suffix not in {".py", ".sh"}:
+                continue
+            if relative == Path("kryon_core") and source.suffix != ".py":
                 continue
             if relative == Path("config") and source.relative_to(source_root).as_posix() not in config_files:
-                continue
-            if relative == Path("mcp-servers") and source.suffix not in {".py", ".txt"}:
                 continue
             destination = destination_root / source.relative_to(source_root)
             destination.parent.mkdir(parents=True, exist_ok=True)
@@ -387,10 +376,10 @@ def audit_release_archives(artifacts: list[Path]) -> dict:
     source_archive = next(path for path in artifacts if path.name.endswith(".tar.gz"))
     project, version, _direct = _project_metadata()
     distribution = project.replace("-", "_")
-    with zipfile.ZipFile(wheel) as archive:
-        wheel_names = archive.namelist()
-    with tarfile.open(source_archive, "r:gz") as archive:
-        source_names = archive.getnames()
+    with zipfile.ZipFile(wheel) as wheel_archive:
+        wheel_names = wheel_archive.namelist()
+    with tarfile.open(source_archive, "r:gz") as tar_archive:
+        source_names = tar_archive.getnames()
 
     def safe_parts(name: str) -> tuple[str, ...]:
         normalized = name.replace("\\", "/")
@@ -401,7 +390,7 @@ def audit_release_archives(artifacts: list[Path]) -> dict:
 
     wheel_roots = {
         "scripts",
-        "cco_rag_core",
+        "kryon_core",
         f"{distribution}-{version}.dist-info",
         f"{distribution}-{version}.data",
     }
@@ -411,7 +400,7 @@ def audit_release_archives(artifacts: list[Path]) -> dict:
             raise ValueError(f"wheel contains a non-allowlisted path: {name}")
     allowed_source_roots = {
         "LICENSE", "README.md", "pyproject.toml", "requirements.lock", "MANIFEST.in",
-        "PKG-INFO", "setup.cfg", "scripts", "config", "mcp-servers", "hackagent.egg-info",
+        "PKG-INFO", "setup.cfg", "scripts", "kryon_core", "config", "hackagent.egg-info",
     }
     for name in source_names:
         parts = safe_parts(name)
@@ -433,7 +422,8 @@ def _normalize_source_archive(path: Path, epoch: int) -> None:
     members: list[tuple[tarfile.TarInfo, bytes | None]] = []
     with tarfile.open(path, "r:gz") as source:
         for member in source.getmembers():
-            payload = source.extractfile(member).read() if member.isfile() else None
+            extracted = source.extractfile(member) if member.isfile() else None
+            payload = extracted.read() if extracted is not None else None
             members.append((member, payload))
     temporary = path.with_name(path.name + ".tmp")
     with temporary.open("wb") as raw_output:

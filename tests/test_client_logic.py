@@ -4,9 +4,10 @@ import os
 import sys
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-sys.path.insert(0, os.path.join(REPO_ROOT, "mcp-servers", "mcp-kali-tools"))
+if REPO_ROOT not in sys.path:
+    sys.path.insert(0, REPO_ROOT)
 
-from cco_js_core.client_logic import build_client_logic_map
+from kryon_core.js.client_logic import build_client_logic_map
 
 
 SOURCE = r"""
@@ -191,10 +192,10 @@ def _assert_bounded_safe_diagnostics(meta_or_out, forbidden=()):
 
 
 def test_missing_node_emits_coverage_gap_not_tested(monkeypatch):
-    import cco_js_core.parsers as parsers
+    import kryon_core.js.parsers as parsers
 
     monkeypatch.setattr(parsers.shutil, "which", lambda name: None)
-    from cco_js_core.parsers import parse_javascript
+    from kryon_core.js.parsers import parse_javascript
 
     result, meta = parse_javascript("fetch('/api/v2/x')", parser="auto")
     assert meta["used"] == "static"
@@ -212,7 +213,7 @@ def test_missing_node_emits_coverage_gap_not_tested(monkeypatch):
 
 
 def test_missing_babel_despite_node_emits_gap_without_echoing_stderr(monkeypatch):
-    import cco_js_core.parsers as parsers
+    import kryon_core.js.parsers as parsers
 
     secret = "SECRET_CANARY_BABEL_STDERR_9f3"
     monkeypatch.setattr(parsers.shutil, "which", lambda name: "/usr/bin/node")
@@ -225,7 +226,7 @@ def test_missing_babel_despite_node_emits_gap_without_echoing_stderr(monkeypatch
             stderr=f"Error: Cannot find module '@babel/parser' {secret}",
         ),
     )
-    from cco_js_core.parsers import parse_javascript
+    from kryon_core.js.parsers import parse_javascript
 
     result, meta = parse_javascript("fetch('/api/v2/x')", parser="babel")
     assert meta["used"] == "static"
@@ -245,7 +246,7 @@ def test_missing_babel_despite_node_emits_gap_without_echoing_stderr(monkeypatch
 def test_babel_execution_failure_emits_gap(monkeypatch):
     import subprocess as _sp
 
-    import cco_js_core.parsers as parsers
+    import kryon_core.js.parsers as parsers
 
     monkeypatch.setattr(parsers.shutil, "which", lambda name: "/usr/bin/node")
 
@@ -253,7 +254,7 @@ def test_babel_execution_failure_emits_gap(monkeypatch):
         raise _sp.TimeoutExpired(cmd="node", timeout=8)
 
     monkeypatch.setattr(parsers.subprocess, "run", _timeout)
-    from cco_js_core.parsers import parse_javascript
+    from kryon_core.js.parsers import parse_javascript
 
     result, meta = parse_javascript("fetch('/api/v2/x')", parser="auto")
     assert meta["used"] == "static"
@@ -273,7 +274,7 @@ def test_babel_execution_failure_emits_gap(monkeypatch):
 
 
 def test_babel_parse_failure_does_not_echo_source_secret(monkeypatch):
-    import cco_js_core.parsers as parsers
+    import kryon_core.js.parsers as parsers
 
     secret = "SECRET_SOURCE_SNIPPET_7a1"
     monkeypatch.setattr(parsers.shutil, "which", lambda name: "/usr/bin/node")
@@ -286,7 +287,7 @@ def test_babel_parse_failure_does_not_echo_source_secret(monkeypatch):
             stderr=f"SyntaxError: Unexpected token, expected \",\" {secret} fetch('/api/secret')",
         ),
     )
-    from cco_js_core.parsers import parse_javascript
+    from kryon_core.js.parsers import parse_javascript
 
     result, meta = parse_javascript(f"fetch('/api/x'); {secret}", parser="babel")
     assert meta["used"] == "static"
@@ -299,10 +300,10 @@ def test_babel_parse_failure_does_not_echo_source_secret(monkeypatch):
 
 
 def test_babel_invalid_and_nonobject_json_do_not_crash(monkeypatch):
-    import cco_js_core.parsers as parsers
+    import kryon_core.js.parsers as parsers
 
     monkeypatch.setattr(parsers.shutil, "which", lambda name: "/usr/bin/node")
-    from cco_js_core.parsers import parse_javascript
+    from kryon_core.js.parsers import parse_javascript
 
     for payload in ("not-json", "[]", '"hello"', "123", "null", "true"):
         monkeypatch.setattr(
@@ -319,7 +320,7 @@ def test_babel_invalid_and_nonobject_json_do_not_crash(monkeypatch):
 
 
 def test_babel_nonobject_fields_do_not_crash(monkeypatch):
-    import cco_js_core.parsers as parsers
+    import kryon_core.js.parsers as parsers
 
     monkeypatch.setattr(parsers.shutil, "which", lambda name: "/usr/bin/node")
     monkeypatch.setattr(
@@ -331,7 +332,7 @@ def test_babel_nonobject_fields_do_not_crash(monkeypatch):
             stderr="",
         ),
     )
-    from cco_js_core.parsers import parse_javascript
+    from kryon_core.js.parsers import parse_javascript
 
     result, meta = parse_javascript("fetch('/api/v2/x')", parser="babel")
     # malformed shape must be treated as parser failure, not crash
@@ -342,7 +343,7 @@ def test_babel_nonobject_fields_do_not_crash(monkeypatch):
 
 
 def test_deliberate_static_mode_emits_diagnostic_and_gap():
-    from cco_js_core.parsers import get_parser, parse_javascript
+    from kryon_core.js.parsers import get_parser, parse_javascript
 
     result, meta = parse_javascript(SOURCE, parser="static")
     assert meta["requested"] == "static"
@@ -361,7 +362,7 @@ def test_deliberate_static_mode_emits_diagnostic_and_gap():
 
 
 def test_source_truncation_emits_gap():
-    from cco_js_core.parsers import MAX_SOURCE, parse_javascript
+    from kryon_core.js.parsers import MAX_SOURCE, parse_javascript
 
     filler = "// filler line for truncation coverage\n" * 100
     # Build source just over MAX_SOURCE without a single huge token line.
@@ -383,7 +384,7 @@ def test_source_truncation_emits_gap():
 
 
 def test_build_map_propagates_gap_and_never_claims_complete_coverage(monkeypatch):
-    import cco_js_core.parsers as parsers
+    import kryon_core.js.parsers as parsers
 
     monkeypatch.setattr(parsers.shutil, "which", lambda name: None)
     out = build_client_logic_map(SOURCE, parser="auto")
@@ -448,7 +449,7 @@ def test_babel_success_does_not_claim_full_security_coverage():
 
 
 def test_parser_candidates_use_explicit_env_not_repo_local(monkeypatch, tmp_path):
-    import cco_js_core.parsers as parsers
+    import kryon_core.js.parsers as parsers
 
     monkeypatch.delenv("CCO_JS_PARSER_PATH", raising=False)
     monkeypatch.delenv("NODE_PATH", raising=False)

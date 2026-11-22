@@ -20,59 +20,30 @@ benchmark = ["tiktoken>=0.12,<0.13"]
 
 [project.scripts]
 cco-agent = "scripts.agent_cli:main"
-cco-operator = "scripts.operator_cli:main"
-cco-campaign = "scripts.campaign_runtime:main"
-cco-worker = "scripts.campaign_worker:main"
-cco-worker-soak = "scripts.worker_soak:main"
 cco-governance = "scripts.governance_audit:main"
-cco-policy = "scripts.policy_gate_cli:main"
 cco-release-check = "scripts.release_check:main"
 cco-release-artifacts = "scripts.release_artifacts:main"
-cco-rag-bootstrap = "scripts.rag_bootstrap:main"
-cco-finding-migration = "scripts.finding_migration:main"
-cco-engagement = "scripts.engagement_workspace:main"
 
 [tool.setuptools]
-packages = ["scripts", "cco_rag_core"]
+packages = [
+  "scripts",
+  "kryon_core",
+  "kryon_core.surface",
+  "kryon_core.browser",
+  "kryon_core.js",
+  "kryon_core.waf",
+  "kryon_core.validator",
+  "kryon_core.vault",
+]
 include-package-data = false
 
-[tool.setuptools.package-dir]
-cco_rag_core = "mcp-servers/mcp-rag-engine/cco_rag_core"
-
 [tool.setuptools.package-data]
-scripts = ["*.sh", "lab/*.py", "xbow_bench_fixtures/**/*.json"]
+scripts = ["*.sh"]
 
 [tool.setuptools.data-files]
-"share/hackagent" = ["pyproject.toml", "requirements.lock", "config/tool-capabilities.json", "config/executor-contract.example.json"]
+"share/hackagent" = ["pyproject.toml", "requirements.lock"]
 "share/hackagent/scripts" = ["scripts/*.py"]
-"share/hackagent/scripts/lab" = ["scripts/lab/*.py", "scripts/lab/Dockerfile", "scripts/lab/docker-compose.yml", "scripts/lab/README.md"]
-"share/hackagent/config" = ["config/llm.example.json", "config/profiles.json", "config/mcp-servers.json", "config/bounty-program-policy.json", "config/executor-contract.example.json", "config/mcp-core-tools.json", "config/tool-capabilities.json"]
-"share/hackagent/config/program-profiles" = ["config/program-profiles/ctf.json", "config/program-profiles/lab.json", "config/program-profiles/strict-bounty.json", "config/program-profiles/strict-bounty-anduril.json", "config/program-profiles/strict-bounty-clear.json", "config/program-profiles/strict-bounty-coupang.json", "config/program-profiles/strict-bounty-expedia.json", "config/program-profiles/strict-bounty-livenation.json", "config/program-profiles/strict-bounty-rapyd.json", "config/program-profiles/vdp-nebius.json"]
-"share/hackagent/mcp-servers/mcp-ad-tools" = ["mcp-servers/mcp-ad-tools/server.py"]
-"share/hackagent/mcp-servers/mcp-agent-browse" = ["mcp-servers/mcp-agent-browse/server.py"]
-"share/hackagent/mcp-servers/mcp-browser" = ["mcp-servers/mcp-browser/server.py"]
-"share/hackagent/mcp-servers/mcp-browser/cco_browser_core" = ["mcp-servers/mcp-browser/cco_browser_core/*.py"]
-"share/hackagent/mcp-servers/mcp-container-tools" = ["mcp-servers/mcp-container-tools/server.py"]
-"share/hackagent/mcp-servers/mcp-ctf-platform" = ["mcp-servers/mcp-ctf-platform/server.py"]
-"share/hackagent/mcp-servers/mcp-hunter" = ["mcp-servers/mcp-hunter/server.py"]
-"share/hackagent/mcp-servers/mcp-hunter/cco_hunter_core" = ["mcp-servers/mcp-hunter/cco_hunter_core/*.py"]
-"share/hackagent/mcp-servers/mcp-kali-tools" = ["mcp-servers/mcp-kali-tools/server.py"]
-"share/hackagent/mcp-servers/mcp-kali-tools/cco_js_core" = ["mcp-servers/mcp-kali-tools/cco_js_core/*.py"]
-"share/hackagent/mcp-servers/mcp-kali-tools/cco_postex_core" = ["mcp-servers/mcp-kali-tools/cco_postex_core/*.py"]
-"share/hackagent/mcp-servers/mcp-llm-security" = ["mcp-servers/mcp-llm-security/server.py"]
-"share/hackagent/mcp-servers/mcp-memory-server" = ["mcp-servers/mcp-memory-server/*.py"]
-"share/hackagent/mcp-servers/mcp-memory-server/cco_surface_core" = ["mcp-servers/mcp-memory-server/cco_surface_core/*.py"]
-"share/hackagent/mcp-servers/mcp-osint-tools" = ["mcp-servers/mcp-osint-tools/server.py"]
-"share/hackagent/mcp-servers/mcp-otp" = ["mcp-servers/mcp-otp/*.py"]
-"share/hackagent/mcp-servers/mcp-rag-engine" = ["mcp-servers/mcp-rag-engine/server.py", "mcp-servers/mcp-rag-engine/requirements.txt"]
-"share/hackagent/mcp-servers/mcp-rag-engine/cco_rag_core" = ["mcp-servers/mcp-rag-engine/cco_rag_core/*.py"]
-"share/hackagent/mcp-servers/mcp-reasoning" = ["mcp-servers/mcp-reasoning/server.py"]
-"share/hackagent/mcp-servers/mcp-reasoning/cco_reasoning_core" = ["mcp-servers/mcp-reasoning/cco_reasoning_core/*.py"]
-"share/hackagent/mcp-servers/mcp-telemetry" = ["mcp-servers/mcp-telemetry/server.py"]
-"share/hackagent/mcp-servers/mcp-telemetry/cco_telemetry_core" = ["mcp-servers/mcp-telemetry/cco_telemetry_core/*.py"]
-"share/hackagent/mcp-servers/mcp-validator" = ["mcp-servers/mcp-validator/server.py"]
-"share/hackagent/mcp-servers/mcp-validator/cco_validator_core" = ["mcp-servers/mcp-validator/cco_validator_core/*.py"]
-"share/hackagent/mcp-servers/mcp-web-advanced" = ["mcp-servers/mcp-web-advanced/server.py"]
+"share/hackagent/config" = ["config/llm.example.json", "config/bounty-program-policy.json"]
 
 [tool.ruff]
 target-version = "py312"
@@ -95,16 +66,15 @@ select = [
 
 [tool.mypy]
 python_version = "3.12"
-mypy_path = ["scripts", "mcp-servers/mcp-hunter", "mcp-servers/mcp-validator", "mcp-servers/mcp-memory-server"]
+mypy_path = ["scripts", "."]
 check_untyped_defs = true
 warn_unused_ignores = false
-# The CI core gate checks its explicit entrypoints. MCP runtime imports are
-# tested separately and can be loaded as both package and standalone modules.
 follow_imports = "skip"
 files = [
   "scripts/agent_cli.py",
   "scripts/agentic_auth_import.py",
   "scripts/agentic_browser.py",
+  "scripts/agentic_bsag.py",
   "scripts/agentic_context.py",
   "scripts/agentic_crypto.py",
   "scripts/agentic_evidence.py",
@@ -116,50 +86,29 @@ files = [
   "scripts/agentic_receipts.py",
   "scripts/agentic_report.py",
   "scripts/agentic_runner.py",
+  "scripts/agentic_scheduler.py",
   "scripts/agentic_seed.py",
   "scripts/agentic_sharding.py",
   "scripts/agentic_surface.py",
+  "scripts/agentic_telemetry.py",
   "scripts/agentic_tools.py",
   "scripts/agentic_vault.py",
   "scripts/agentic_waf.py",
-  "scripts/attempt_ledger.py",
-  "scripts/authz_matrix.py",
-  "scripts/chain_transport.py",
   "scripts/check_repo_layout.py",
-  "scripts/egress_policy.py",
-  "scripts/egress_watchdog.py",
   "scripts/evidence_trust.py",
-  "scripts/full_agent_broker.py",
   "scripts/full_agent_budget.py",
-  "scripts/full_agent_e6_benchmark.py",
-  "scripts/full_agent_executor.py",
-  "scripts/full_agent_history.py",
-  "scripts/full_agent_launcher.py",
-  "scripts/full_agent_preflight.py",
   "scripts/full_agent_provider.py",
-  "scripts/full_agent_python_broker.py",
-  "scripts/full_agent_python_solver.py",
-  "scripts/full_agent_runtime_policy.py",
-  "scripts/full_agent_summary_feedback.py",
-  "scripts/full_agent_tasks.py",
+  "scripts/governance_audit.py",
   "scripts/llm_config.py",
-  "scripts/orchestration_spec.py",
-  "scripts/policy_engine.py",
-  "scripts/policy_gate_cli.py",
   "scripts/provider_auth.py",
-  "scripts/python_workflow_binding.py",
-  "scripts/python_candidate_runtime.py",
-  "scripts/python_identity_discovery.py",
-  "scripts/python_scheduler.py",
+  "scripts/release_artifacts.py",
   "scripts/release_check.py",
   "scripts/runtime_paths.py",
-  "scripts/session_store.py",
-  "scripts/signed_completion.py",
+  "scripts/save_browser_auth.py",
   "scripts/target_bootstrap.py",
-  "scripts/task_spec.py",
-  "scripts/tool_counts.py",
+  "scripts/tech_routes.py",
   "scripts/wire_budget.py",
-  "scripts/workflow_checkpoint.py",
+  "kryon_core",
 ]
 
 [[tool.mypy.overrides]]
@@ -168,7 +117,7 @@ ignore_missing_imports = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-pythonpath = ["scripts"]
+pythonpath = [".", "scripts"]
 addopts = "-q"
 
 [tool.cco]
@@ -177,10 +126,9 @@ quality_gate = [
   "python3 -m ruff check .",
   "python3 -m mypy",
   "python3 -m pytest tests -q",
-  "python3 scripts/worker_soak.py --tasks 16 --workers 4 --stale-claims 2 --executor synthetic --max-tasks 16 --json",
   "python3 scripts/release_artifacts.py check-lock",
-  "python3 scripts/lab-validate.py --skip-rag --quiet --json",
   "python3 scripts/agent_cli.py check-config --provider-config config/llm.example.json",
   "python3 scripts/governance_audit.py --root scripts --format json --fail-on high",
+  "python3 scripts/governance_audit.py --root kryon_core --format json --fail-on high",
   "python3 scripts/check_repo_layout.py",
 ]

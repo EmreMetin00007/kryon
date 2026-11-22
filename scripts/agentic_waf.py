@@ -11,7 +11,8 @@ import sys
 from typing import Any, Callable
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
-_REASONING_DIR = _REPO_ROOT / "mcp-servers" / "mcp-reasoning"
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
 
 _EVALUATED_STATUSES = frozenset({403, 406, 429, 503})
 
@@ -67,19 +68,15 @@ def _load_waf_profiles() -> tuple[
     Callable[..., dict[str, Any]] | None,
     Callable[..., tuple[str, int, list[str]]] | None,
 ]:
-    """Lazily import passive classifiers from cco_reasoning_core.waf_profiles."""
+    """Lazily import passive classifiers from kryon_core.waf.waf_profiles."""
     global _WAF_PROFILES_LOADED, _CLASSIFY_HTTP, _FINGERPRINT_CHANNELS
     if _WAF_PROFILES_LOADED:
         return _CLASSIFY_HTTP, _FINGERPRINT_CHANNELS
     _WAF_PROFILES_LOADED = True
     try:
-        reasoning_path = str(_REASONING_DIR)
-        if _REASONING_DIR.is_dir() and reasoning_path not in sys.path:
-            sys.path.insert(0, reasoning_path)
-        from cco_reasoning_core.waf_profiles import (  # type: ignore[import-not-found]
-            classify_http,
-            fingerprint_channels,
-        )
+        if str(_REPO_ROOT) not in sys.path:
+            sys.path.insert(0, str(_REPO_ROOT))
+        from kryon_core.waf.waf_profiles import classify_http, fingerprint_channels
 
         _CLASSIFY_HTTP = classify_http
         _FINGERPRINT_CHANNELS = fingerprint_channels

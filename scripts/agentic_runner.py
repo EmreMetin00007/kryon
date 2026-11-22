@@ -12,8 +12,10 @@ from typing import Any, Sequence
 import uuid
 
 SCRIPTS = Path(__file__).resolve().parent
-if str(SCRIPTS) not in sys.path:
-    sys.path.insert(0, str(SCRIPTS))
+_REPO_ROOT = SCRIPTS.parent
+for _p in (str(_REPO_ROOT), str(SCRIPTS)):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
 
 import agentic_auth_import  # noqa: E402
 import agentic_report  # noqa: E402

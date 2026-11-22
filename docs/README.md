@@ -1,28 +1,18 @@
-# Dokümantasyon dizini
+# Dokümantasyon Dizini
 
-Başlangıç noktası [English README](../README.md) · [Türkçe README](../README.tr.md). Bu dizin güncel
-**`cco-agent agentic` (Sharded ReAct)** mimarisini, operasyon/güvenlik rehberlerini ve
-eski Python Engine / P5–P9 sözleşme belgelerini içerir.
+Başlangıç noktası: [English README](../README.md) · [Türkçe README](../README.tr.md)
 
-## Güncel rehberler
+Bu dizin, tek mimarili **`cco-agent agentic` (Sharded ReAct Motoru + `kryon_core`)** çalışma zamanına ait güncel belgeleri ve yapılandırma referanslarını toplar.
 
-| Konu | Belge |
-| --- | --- |
-| Güncel `agentic` Mimarisi (`cco-agent agentic` / Sharded ReAct Motoru) | [Mimari](architecture.md) |
-| Operasyon, güvenlik ve kampanyalar | [Operasyon](operations.md) |
-| Tekrarlanabilir lab ve doğrulama sonuçları | [Benchmark ve Doğrulama Kartı](benchmark-scorecard.md) |
-| MCP araç kataloğu (eski Python Engine / `mcp-servers/*`) | [MCP referansı](mcp-reference.md) |
-| Eski Python Engine durumu ve eksikler (E1–E9) | [PYTHON_ENGINE_GAPS.md](PYTHON_ENGINE_GAPS.md) |
+## Güncel Belgeler ve Yapılandırma Referansları
 
-## P5–P9 yetenek ve sözleşme belgeleri (eski Python Engine)
+| Konu | Belge / Dosya |
+| :--- | :--- |
+| Sistem Mimarisi, Modül Haritası ve Veri Sınırları | [docs/architecture.md](architecture.md) |
+| Proje Özeti ve Hızlı Başlangıç (EN) | [README.md](../README.md) |
+| Proje Özeti ve Hızlı Başlangıç (TR) | [README.tr.md](../README.tr.md) |
+| Ajan Çalışma Kuralları, Kapsam ve Kanıt İlkeleri | [AGENTS.md](../AGENTS.md) |
+| LLM Sağlayıcı Yapılandırma Şeması (`cco-llm/1`) | [config/llm.example.json](../config/llm.example.json) |
+| Program Politikası Şablonu | [config/bounty-program-policy.json](../config/bounty-program-policy.json) |
 
-| Aşama | Belge |
-| --- | --- |
-| P5: Observation-level hypothesis queue | [p5-hypothesis-queue.md](p5-hypothesis-queue.md) |
-| P6: Observation-bound web experiments | [p6-web-experiments.md](p6-web-experiments.md) |
-| P7: Observation-bound business logic | [p7-business-logic.md](p7-business-logic.md) |
-| P8: Evidence-bound chaining | [p8-chaining.md](p8-chaining.md) |
-| P9: Agent integration ve operatör sözleşmeleri | [p9-agent-integration.md](p9-agent-integration.md) |
-
-`CLAUDE.md`, `AGENTS.md` ve `.claude/skills/` (`skills` symlink'i ile) güncel
-çalışma sınırları ve metodoloji kataloğu olarak korunur.
+> **Arşiv notu:** Emekliye ayrılan v1 Python Engine (`PythonSolver`, `Brain`, `CampaignRuntime`), 16 MCP sunucusu, P5–P9 belgeleri ve `skills/` kataloğu kalıcı olarak `git tag legacy-v1-archive` etiketinde korunmaktadır.
