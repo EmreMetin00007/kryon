@@ -15,7 +15,9 @@ SCRIPTS = Path(__file__).resolve().parent
 if str(SCRIPTS) not in sys.path:
     sys.path.insert(0, str(SCRIPTS))
 
+import agentic_auth_import  # noqa: E402
 import agentic_report  # noqa: E402
+import agentic_seed  # noqa: E402
 import agentic_vault  # noqa: E402
 import llm_config  # noqa: E402
 import target_bootstrap  # noqa: E402
@@ -109,6 +111,9 @@ def run_agentic_target(
     max_degradation_streak: int = 5,
     vault_home: Path | None = None,
     vault_key_name: str = "",
+    storage_states: Sequence[str] | None = None,
+    seed_surface_files: Sequence[Path] | None = None,
+    tech_hints: Sequence[str] | None = None,
 ) -> tuple[Path, dict[str, Any]]:
     """Run (or plan when execute=False) AgenticInvestigator against an authorized target."""
     if isinstance(cache_token_weight, bool):
@@ -116,10 +121,16 @@ def run_agentic_target(
     eff_cache_weight = float(cache_token_weight)
     if not (0.0 <= eff_cache_weight <= 1.0):
         raise ValueError(f"cache_token_weight must be between 0.0 and 1.0, got {cache_token_weight!r}")
+    vault_storage_payload: dict[str, Any] | None = None
     if credentials_file is not None:
         bundle = target_bootstrap.load_credentials_bundle(credentials_file)
     elif vault_home is not None and str(vault_key_name or "").strip():
-        bundle = agentic_vault.load_vault_credentials(vault_home, str(vault_key_name).strip())
+        loaded_vault = agentic_vault.load_vault_credentials(vault_home, str(vault_key_name).strip())
+        if loaded_vault.get("schema") == "agentic-vault-storage-state/1":
+            vault_storage_payload = loaded_vault
+            bundle = {"target_url": loaded_vault.get("target_url") or ""}
+        else:
+            bundle = loaded_vault
     else:
         bundle = {}
     base, scope_meta = target_bootstrap.resolve_target_origin(
@@ -143,11 +154,47 @@ def run_agentic_target(
         for item in (discovery_hints if discovery_hints else (bundle.get("discovery") or []))
         if isinstance(item, str) and str(item).strip()
     ] or ["/"]
+    seed_data: dict[str, Any] | None = None
+    if seed_surface_files:
+        seed_data = agentic_seed.load_seed_surface_files(
+            seed_surface_files,
+            base_url=base,
+            excluded_paths=eff_excluded_paths,
+        )
+        for hint in seed_data.get("discovery_hints") or []:
+            if hint not in eff_discovery_hints:
+                eff_discovery_hints.append(hint)
+    if tech_hints:
+        eff_discovery_hints = agentic_seed.enrich_tech_discovery_hints(
+            tech_hints,
+            existing_hints=eff_discovery_hints,
+        )
     accounts = target_bootstrap.select_representative_accounts(
         bundle.get("test_accounts") or [],
         max_members=max_member_accounts,
         max_admins=max_admin_accounts,
     )
+    if vault_storage_payload is not None:
+        accounts.append(
+            agentic_auth_import.load_storage_state_actor(
+                vault_storage_payload.get("storage_state") or {},
+                base_url=base,
+                alias=str(vault_storage_payload.get("alias") or "browser-user"),
+                role=str(vault_storage_payload.get("role") or "member"),
+                tenant=str(vault_storage_payload.get("tenant") or ""),
+            )
+        )
+    for raw_spec in storage_states or ():
+        s_alias, s_role, s_tenant, s_path = agentic_auth_import.parse_storage_state_spec(str(raw_spec))
+        accounts.append(
+            agentic_auth_import.load_storage_state_actor(
+                s_path,
+                base_url=base,
+                alias=s_alias,
+                role=s_role,
+                tenant=s_tenant,
+            )
+        )
 
     auth = authorize_provider(
         provider_config,
@@ -230,6 +277,7 @@ def run_agentic_target(
             "provider_host": auth["provider_host"],
             "allowed_methods": eff_methods,
             "discovery_hints": eff_discovery_hints,
+            "seed_surface": dict(seed_data.get("stats") or {}) if seed_data is not None else None,
             "ablation": ablation_cfg,
             "sharding": sharding_cfg,
             "selected_accounts": [
@@ -302,6 +350,7 @@ def run_agentic_target(
         "provider_kind": auth["provider_kind"],
         "allowed_methods": eff_methods,
         "discovery_hints": eff_discovery_hints,
+        "seed_surface": dict(seed_data.get("stats") or {}) if seed_data is not None else None,
         "ablation": ablation_cfg,
         "sharding": sharding_cfg,
         "limits": limits,
@@ -338,6 +387,7 @@ def run_agentic_target(
             bootstrap_model=bootstrap_model_id or None,
             epoch_char_limit=eff_epoch_char_limit,
             cache_token_weight=eff_cache_weight,
+            seed_surface=seed_data,
         )
         run_info = investigator.run(resume=resume)
         manifest.update(run_info)
@@ -490,6 +540,28 @@ def main(argv: list[str] | None = None) -> int:
         default="",
         help="Credential bundle key name inside --vault-home",
     )
+    parser.add_argument(
+        "--storage-state",
+        action="append",
+        dest="storage_states",
+        default=None,
+        help="Playwright storage_state.json spec (alias=/path or alias:role:tenant=/path); repeatable",
+    )
+    parser.add_argument(
+        "--seed-surface",
+        action="append",
+        dest="seed_surface_files",
+        type=Path,
+        default=None,
+        help="Offline discovery seed file (HAR/mitm_scope/ZAP/ffuf/nuclei/URL list); repeatable",
+    )
+    parser.add_argument(
+        "--tech-hint",
+        action="append",
+        dest="tech_hints",
+        default=None,
+        help="Optional technology stack hint (e.g. nextjs, django, spring) to enrich initial discovery paths",
+    )
     args = parser.parse_args(argv)
     if not (0.0 <= float(args.cache_token_weight) <= 1.0):
         parser.error("--cache-token-weight must be between 0.0 and 1.0")
@@ -538,6 +610,9 @@ def main(argv: list[str] | None = None) -> int:
         max_degradation_streak=args.max_degradation_streak,
         vault_home=args.vault_home,
         vault_key_name=args.vault_key_name,
+        storage_states=args.storage_states,
+        seed_surface_files=args.seed_surface_files,
+        tech_hints=args.tech_hints,
     )
     print(json.dumps({
         "artifact": str(path),

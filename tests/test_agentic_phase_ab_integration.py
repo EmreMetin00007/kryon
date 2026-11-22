@@ -300,3 +300,145 @@ def test_runner_plan_supports_scope_file_and_vault_credentials(tmp_path: Path) -
     assert plan["scope"]["excluded_paths_count"] == 2
     assert plan["selected_accounts"][0]["alias"] == "member1"
     assert "synthetic-secret-value" not in plan_path.read_text(encoding="utf-8")
+
+
+def test_storage_state_actor_live_http_redaction_and_runner_seed_integration(tmp_path: Path) -> None:
+    import agentic_auth_import
+    import agentic_seed
+
+    seen_headers: dict[str, str] = {}
+
+    class _AuthEchoHandler(BaseHTTPRequestHandler):
+        def log_message(self, *_args: Any) -> None:
+            return
+
+        def do_POST(self) -> None:
+            seen_headers.clear()
+            for k, v in self.headers.items():
+                seen_headers[k.lower()] = v
+            body = b'{"ok":true,"item":"protected"}'
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), _AuthEchoHandler)
+    t = threading.Thread(target=srv.serve_forever, daemon=True)
+    t.start()
+    try:
+        base = f"http://127.0.0.1:{srv.server_port}/"
+        state_file = tmp_path / "sso-state.json"
+        state_file.write_text(
+            json.dumps(
+                {
+                    "cookies": [
+                        {
+                            "name": "session_id",
+                            "value": "sess-secret-cookie-999",
+                            "domain": "127.0.0.1",
+                            "path": "/",
+                            "secure": True,
+                            "expires": -1,
+                        },
+                        {
+                            "name": "csrftoken",
+                            "value": "csrf-secret-value-888",
+                            "domain": "127.0.0.1",
+                            "path": "/",
+                            "expires": -1,
+                        },
+                    ],
+                    "origins": [
+                        {
+                            "origin": base.rstrip("/"),
+                            "localStorage": [
+                                {"name": "access_token", "value": "jwt-secret-bearer-777"},
+                            ],
+                        }
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+        actor_desc = agentic_auth_import.load_storage_state_actor(
+            state_file,
+            base_url=base,
+            alias="sso-member",
+            role="member",
+            tenant="acme",
+        )
+        store = ReceiptStore(tmp_path / "run_live")
+        actors = ActorManager([actor_desc])
+        client = AgenticHTTPClient(
+            base_url=base,
+            receipt_store=store,
+            actors=actors,
+            allowed_methods=["GET", "POST"],
+            max_requests=10,
+        )
+        rec = client.request(method="POST", url="/api/v1/orders", actor="sso-member", json_body={"qty": 1})
+        assert rec["status"] == 200
+        assert "session_id=sess-secret-cookie-999" in seen_headers.get("cookie", "")
+        assert seen_headers.get("authorization") == "Bearer jwt-secret-bearer-777"
+        assert seen_headers.get("x-csrf-token") == "csrf-secret-value-888"
+
+        # Receipt persisted on disk must redact all imported secrets!
+        receipt_raw = (tmp_path / "run_live" / "receipts" / f"{rec['receipt_id']}.json").read_text(encoding="utf-8")
+        assert "sess-secret-cookie-999" not in receipt_raw
+        assert "jwt-secret-bearer-777" not in receipt_raw
+        assert "csrf-secret-value-888" not in receipt_raw
+
+        # Seed surface pre-populates investigator surface_tracker at 0 HTTP/LLM cost
+        seed_file = tmp_path / "mitm-routes.json"
+        seed_file.write_text(
+            json.dumps(
+                {
+                    f"127.0.0.1:{srv.server_port}": {
+                        "GET /api/v1/reports?team=alpha": {"count": 2},
+                        "POST /api/v1/exports": {"count": 1},
+                    },
+                    "evil.example": {"GET /off-scope": {"count": 1}},
+                }
+            ),
+            encoding="utf-8",
+        )
+        seed_data = agentic_seed.load_seed_surface_files([seed_file], base_url=base)
+        budget = SharedBudget(http=10, tokens=50_000, seconds=60)
+        inv = AgenticInvestigator(
+            http_client=client,
+            receipt_store=store,
+            transport=object(),  # type: ignore[arg-type]
+            budget=budget,
+            model="test-model",
+            root_dir=tmp_path / "run_live",
+            seed_surface=seed_data,
+        )
+        assert inv.seeded_surface_count == 2
+        assert client.budget.used == 1  # No extra HTTP calls from seeding!
+        unvisited = inv.dispatcher.surface_tracker.unvisited_routes()
+        assert any("/api/v1/reports" in r for r in unvisited)
+        assert any("/api/v1/exports" in r for r in unvisited)
+        assert not any("off-scope" in r for r in unvisited)
+        client.close()
+
+        # Runner plan-only integration with --storage-state, --seed-surface, and --tech-hint
+        plan_path, plan = agentic_runner.run_agentic_target(
+            target=base,
+            provider_config=REPO_ROOT / "config" / "llm.example.json",
+            output_dir=tmp_path / "plan_seed",
+            storage_states=[f"sso-member:member:acme={state_file}"],
+            seed_surface_files=[seed_file],
+            tech_hints=["nextjs"],
+            execute=False,
+        )
+        plan_text = plan_path.read_text(encoding="utf-8")
+        assert plan["seed_surface"]["routes_accepted"] == 2
+        assert plan["seed_surface"]["routes_dropped_scope"] == 1
+        assert "/api/v1/reports" in plan["discovery_hints"]
+        assert any(a["alias"] == "sso-member" and a["tenant"] == "acme" for a in plan["selected_accounts"])
+        assert "sess-secret-cookie-999" not in plan_text
+        assert "jwt-secret-bearer-777" not in plan_text
+    finally:
+        srv.shutdown()
+        srv.server_close()

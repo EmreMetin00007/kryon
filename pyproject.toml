@@ -103,6 +103,7 @@ warn_unused_ignores = false
 follow_imports = "skip"
 files = [
   "scripts/agent_cli.py",
+  "scripts/agentic_auth_import.py",
   "scripts/agentic_browser.py",
   "scripts/agentic_context.py",
   "scripts/agentic_crypto.py",
@@ -115,6 +116,7 @@ files = [
   "scripts/agentic_receipts.py",
   "scripts/agentic_report.py",
   "scripts/agentic_runner.py",
+  "scripts/agentic_seed.py",
   "scripts/agentic_sharding.py",
   "scripts/agentic_surface.py",
   "scripts/agentic_tools.py",

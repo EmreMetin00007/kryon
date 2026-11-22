@@ -225,6 +225,8 @@ class ActorManager:
             if not access_token and "Authorization" in base_headers:
                 access_token = _extract_token_from_auth(base_headers["Authorization"])
             cookies: dict[str, str] = {}
+            if isinstance(raw.get("cookies"), dict):
+                cookies.update({str(k): str(v) for k, v in raw["cookies"].items() if k and v is not None})
             if isinstance(raw.get("cookie"), str) and raw["cookie"].strip():
                 base_headers.setdefault("Cookie", raw["cookie"].strip())
             password = str(raw.get("password") or "")

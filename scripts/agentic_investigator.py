@@ -67,6 +67,7 @@ from agentic_context import (
 from agentic_http import AgenticHTTPClient, ServiceDegradationError
 from agentic_oracle import DifferentialOracle
 from agentic_receipts import ReceiptStore
+from agentic_seed import apply_seed_surface
 from agentic_scheduler import (
     AntiBiasUCBScheduler,
     ArmSelection,
@@ -115,6 +116,7 @@ class AgenticInvestigator:
         bootstrap_model: str | None = None,
         epoch_char_limit: int = _EPOCH_HARD_CHAR_LIMIT,
         cache_token_weight: float = 0.10,
+        seed_surface: dict[str, Any] | None = None,
     ):
         self.http = http_client
         self.receipts = receipt_store
@@ -195,6 +197,11 @@ class AgenticInvestigator:
             bsag=self.bsag,
             oracle=self.oracle,
             telemetry=self.telemetry,
+        )
+        self.seeded_surface_count: int = (
+            apply_seed_surface(self.dispatcher.surface_tracker, seed_surface)
+            if isinstance(seed_surface, dict)
+            else 0
         )
         self.token_usage: dict[str, int] = _new_usage_dict()
         self._last_metrics_paths: tuple[Path, Path] | None = None
