@@ -143,6 +143,7 @@ _SKIP_REPLAY_HEADERS = frozenset({
     "host",
 })
 _PERSISTENT_VULN_CLASSES = frozenset({"stored_xss", "mass_assignment", "ssti"})
+_OOB_CALLBACK_CLASSES = frozenset({"ssrf", "xxe", "ssti", "command_injection"})
 _MUTATING_WRITE_METHODS = frozenset({"POST", "PUT", "PATCH"})
 
 TOOL_SCHEMAS: list[dict[str, Any]] = [
@@ -150,12 +151,12 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "http_request",
-            "description": "Send scope-locked HTTP request as actor (or 'anon'). GETs cached unless force=true.",
+            "description": "Send scope-locked HTTP or WS (ws://, wss://) request as actor ('anon'). GETs cached unless force=true.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "method": {"type": "string", "description": "HTTP method (defaults GET; POST if body)."},
-                    "url": {"type": "string"},
+                    "url": {"type": "string", "description": "In-scope path/URL (http(s):// or ws(s)://)."},
                     "actor": {"type": "string"},
                     "headers": {"type": "object", "additionalProperties": {"type": "string"}},
                     "query": {"type": "object", "additionalProperties": {"type": "string"}},
@@ -164,6 +165,12 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                     "json_merge": {"type": "object"},
                     "form_body": {"type": "object", "additionalProperties": {"type": "string"}},
                     "raw_body": {"type": "string"},
+                    "files": {
+                        "type": "array",
+                        "description": "Multipart files: [{field,filename,content|content_base64,content_type}].",
+                        "items": {"type": "object"},
+                    },
+                    "follow_redirects": {"type": "boolean"},
                     "force": {"type": "boolean"},
                     "save_session_as": {"type": "string", "description": "Captured session alias."},
                 },
@@ -247,7 +254,7 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "callback_listener",
-            "description": "Local loopback OOB callback URLs (create_url/poll) for SSRF/webhook checks. 0 HTTP cost.",
+            "description": "Local OOB callback URLs (create_url/poll) for SSRF/XXE/SSTI/webhook checks. 0 HTTP cost.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -324,7 +331,7 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                     "title": {"type": "string"},
                     "class_type": {
                         "type": "string",
-                        "description": "bola, tenant_isolation, bfla, auth_bypass, mass_assignment, reflected_xss, stored_xss, sqli_read, sqli, open_redirect, csrf, ssti, xxe, ssrf, path_traversal, info_disclosure, business_logic, race_condition, other",
+                        "description": "bola,bfla,auth_bypass,tenant_isolation,mass_assignment,reflected_xss,stored_xss,sqli,open_redirect,ssrf,xxe,cors_misconfiguration,other",
                     },
                     "method": {"type": "string"},
                     "url": {"type": "string"},
@@ -561,7 +568,13 @@ class ToolDispatcher:
             if self._oob_server is None:
                 if not start:
                     return None
-                self._oob_server = LoopbackCallbackServer()
+                if (
+                    str(os.environ.get("CCO_OOB_BIND_HOST") or "").strip()
+                    or str(os.environ.get("CCO_OOB_ADVERTISE_HOST") or "").strip()
+                ):
+                    self._oob_server = LoopbackCallbackServer.from_env()
+                else:
+                    self._oob_server = LoopbackCallbackServer()
                 self._owns_oob_server = True
             if start:
                 self._oob_server.start()
@@ -646,6 +659,18 @@ class ToolDispatcher:
             if isinstance(parsed_form, dict):
                 form_body = parsed_form
         raw_body = args.get("raw_body")
+        raw_files = args.get("files")
+        if isinstance(raw_files, str) and raw_files.lstrip().startswith("["):
+            try:
+                raw_files = json.loads(raw_files)
+            except ValueError:
+                pass
+        files: list[dict[str, Any]] | None = None
+        if raw_files is not None:
+            if not isinstance(raw_files, list) or not all(isinstance(item, dict) for item in raw_files):
+                raise ValueError("files must be a list of file objects")
+            if raw_files:
+                files = raw_files
         base_receipt_id = str(args.get("base_receipt_id") or "").strip()
         json_merge = args.get("json_merge") if isinstance(args.get("json_merge"), dict) else (
             args.get("mutate_json") if isinstance(args.get("mutate_json"), dict) else None
@@ -668,6 +693,7 @@ class ToolDispatcher:
             json_body is not None
             or form_body is not None
             or raw_body is not None
+            or files is not None
             or bool(base_receipt_id)
             or (json_merge is not None)
         )
@@ -678,18 +704,23 @@ class ToolDispatcher:
         else:
             eff_method = "GET"
 
-        receipt = self.http.request(
-            method=eff_method,
-            url=str(args.get("url") or ""),
-            actor=str(args.get("actor") or "anon"),
-            headers=args.get("headers"),
-            query=args.get("query"),
-            json_body=json_body,
-            form_body=form_body,
-            raw_body=raw_body,
-            force=bool(args.get("force", False)),
-            save_session_as=str(args.get("save_session_as") or ""),
-        )
+        follow_redirects = bool(args.get("follow_redirects", False))
+        request_kwargs: dict[str, Any] = {
+            "method": eff_method,
+            "url": str(args.get("url") or ""),
+            "actor": str(args.get("actor") or "anon"),
+            "headers": args.get("headers"),
+            "query": args.get("query"),
+            "json_body": json_body,
+            "form_body": form_body,
+            "raw_body": raw_body,
+            "files": files,
+            "force": bool(args.get("force", False)),
+            "save_session_as": str(args.get("save_session_as") or ""),
+        }
+        if follow_redirects:
+            request_kwargs["follow_redirects"] = True
+        receipt = self.http.request(**request_kwargs)
         self._ingest_receipt_hooks(receipt)
         preview = _format_receipt_preview(receipt)
         if eff_method == "GET" and has_payload:
@@ -751,7 +782,11 @@ class ToolDispatcher:
                 req_headers[k] = str(v)
         if isinstance(args.get("header_overrides"), dict):
             for k, v in args["header_overrides"].items():
-                req_headers[str(k)] = str(v)
+                key_str = str(k)
+                key_low = key_str.lower()
+                for existing_key in [ek for ek in req_headers if ek.lower() == key_low and ek != key_str]:
+                    req_headers.pop(existing_key, None)
+                req_headers[key_str] = str(v)
 
         query_overrides = args.get("query_overrides") if isinstance(args.get("query_overrides"), dict) else None
         json_overrides = args.get("json_overrides") if isinstance(args.get("json_overrides"), dict) else None
@@ -1020,17 +1055,74 @@ class ToolDispatcher:
             "results": results,
         })
 
+    @staticmethod
+    def _format_response_headers(receipt: dict[str, Any]) -> str:
+        raw_headers = receipt.get("response_headers") or {}
+        if not isinstance(raw_headers, dict) or not raw_headers:
+            return ""
+        return "\n".join(f"{k}: {v}" for k, v in raw_headers.items())
+
+    @staticmethod
+    def _is_genuine_anon_proof(
+        receipt: dict[str, Any],
+        actor_meta: dict[str, dict[str, str]],
+    ) -> bool:
+        if _is_genuine_anon_2xx(receipt, actor_meta):
+            return True
+        if (
+            str(receipt.get("actor") or "").strip() == "anon"
+            and str(receipt.get("method") or "").upper() == "DELETE"
+            and int(receipt.get("status") or 0) == 204
+        ):
+            resp_headers = {
+                str(k).lower(): str(v).strip()
+                for k, v in (receipt.get("response_headers") or {}).items()
+            }
+            known_non_anon = {a for a in actor_meta if a and a != "anon"}
+            for hname in _ACTOR_IDENTITY_HEADERS:
+                hval = resp_headers.get(hname, "")
+                if hval and hval != "anon" and (hval in known_non_anon or not known_non_anon):
+                    return False
+            return True
+        return False
+
+    @staticmethod
+    def _delete_204_evidence_supported(
+        primary: dict[str, Any],
+        control_receipts: list[dict[str, Any]],
+        evidence_value: str,
+    ) -> bool:
+        ev_low = str(evidence_value or "").strip().lower()
+        if not ev_low:
+            return False
+        if not any(int(c.get("status") or 0) != 204 for c in control_receipts):
+            return False
+        p_path = _norm_path(str(primary.get("url") or primary.get("path") or ""))
+        status_desc = f"http 204 no content delete {p_path} deleted"
+        if ev_low in status_desc or ev_low in p_path or ev_low in str(primary.get("url") or "").lower():
+            return True
+        for ctrl in control_receipts:
+            c_body = str(ctrl.get("body") or "").lower()
+            c_hdrs = json.dumps(ctrl.get("response_headers") or {}, ensure_ascii=False).lower()
+            if ev_low in c_body or ev_low in c_hdrs:
+                return True
+        return False
+
     def _receipt_contains_evidence(self, receipt: dict[str, Any], evidence: str) -> tuple[bool, str]:
         needle = evidence.strip()
         lower_needle = needle.lower()
         body = receipt.get("body") or ""
         loc = receipt.get("redirect_location") or ""
-        headers_text = json.dumps(receipt.get("response_headers") or {}, ensure_ascii=False)
+        raw_headers = receipt.get("response_headers") or {}
+        headers_lines = self._format_response_headers(receipt)
+        headers_text = json.dumps(raw_headers, ensure_ascii=False)
 
         if needle in body or lower_needle in body.lower():
             return True, build_receipt_excerpt(receipt, needle, max_chars=MAX_PROOF_EXCERPT_CHARS)
         if needle in loc or lower_needle in loc.lower():
             return True, build_receipt_excerpt(receipt, needle, max_chars=MAX_PROOF_EXCERPT_CHARS)
+        if headers_lines and lower_needle in headers_lines.lower():
+            return True, headers_lines[:MAX_PROOF_EXCERPT_CHARS]
         if lower_needle in headers_text.lower():
             return True, headers_text[:MAX_PROOF_EXCERPT_CHARS]
         return False, ""
@@ -1393,7 +1485,7 @@ class ToolDispatcher:
                     return False
                 if r_method != method and not (canonical_class == "mass_assignment" and r_method == "GET"):
                     return False
-            if canonical_class == "auth_bypass" and not _is_genuine_anon_2xx(r, actor_meta):
+            if canonical_class == "auth_bypass" and not self._is_genuine_anon_proof(r, actor_meta):
                 return False
             return True
 
@@ -1404,21 +1496,44 @@ class ToolDispatcher:
         matching_oob_hits: list[dict[str, Any]] = []
         oob_matched_tokens: list[str] = []
 
-        if canonical_class == "ssrf":
+        if canonical_class in _OOB_CALLBACK_CLASSES:
             oob_status, oob_matched_tokens, matching_oob_hits = self._collect_oob_ssrf_context(
                 compatible_proofs or proof_receipts,
                 evidence_value,
             )
             if oob_status in {"missing_server", "zero_hits"}:
+                class_label = "SSRF" if canonical_class == "ssrf" else canonical_class.upper()
                 return json.dumps({
                     "rejected": True,
                     "reason": (
-                        "SSRF callback claim rejected: callback_listener poll recorded 0 hits "
+                        f"{class_label} callback claim rejected: callback_listener poll recorded 0 hits "
                         f"for submitted token(s) {oob_matched_tokens}"
                     ),
                 })
 
-        if not evidence_value or evidence_value.lower() in _TRIVIAL_EVIDENCE or len(evidence_value) < 3:
+        is_empty_delete_204 = (
+            str(primary.get("method") or "").upper() == "DELETE"
+            and int(primary.get("status") or 0) == 204
+            and not str(primary.get("body") or "").strip()
+        )
+        is_cors_wildcard = (
+            canonical_class == "cors_misconfiguration"
+            and evidence_value == "*"
+            and any(
+                str(k).strip().lower() == "access-control-allow-origin" and str(v).strip() == "*"
+                for r in (compatible_proofs or [primary])
+                for k, v in (r.get("response_headers") or {}).items()
+            )
+        )
+        allow_delete_204_ev = is_empty_delete_204 and self._delete_204_evidence_supported(
+            primary,
+            control_receipts,
+            evidence_value,
+        )
+
+        if not is_cors_wildcard and not allow_delete_204_ev and (
+            not evidence_value or evidence_value.lower() in _TRIVIAL_EVIDENCE or len(evidence_value) < 3
+        ):
             if len(proof_receipts) > 1 and compatible_proofs:
                 eligible_init = _filter_class_eligible_proofs(
                     canonical_class,
@@ -1444,7 +1559,18 @@ class ToolDispatcher:
                 return json.dumps({"rejected": True, "reason": "evidence_value must be a real observed value, not a status/placeholder"})
 
         if not found_in_proof:
-            if canonical_class == "ssrf" and matching_oob_hits:
+            if is_cors_wildcard:
+                for r in [*matching_proofs, *compatible_proofs]:
+                    raw_hdrs = r.get("response_headers") or {}
+                    if any(
+                        str(k).strip().lower() == "access-control-allow-origin" and str(v).strip() == "*"
+                        for k, v in raw_hdrs.items()
+                    ):
+                        found_in_proof = True
+                        primary = r
+                        excerpt = self._format_response_headers(r)[:MAX_PROOF_EXCERPT_CHARS]
+                        break
+            if not found_in_proof and canonical_class in _OOB_CALLBACK_CLASSES and matching_oob_hits:
                 ev_low = evidence_value.lower()
                 oob_hit_match = any(
                     tok == evidence_value
@@ -1495,7 +1621,7 @@ class ToolDispatcher:
                             "in HTML GET render receipt(s)"
                         ),
                     })
-            else:
+            elif not found_in_proof:
                 # Verify evidence_value appears verbatim in matching_proofs first, then any compatible proof receipt.
                 for r in matching_proofs:
                     ok, ex = self._receipt_contains_evidence(r, evidence_value)
@@ -1512,6 +1638,11 @@ class ToolDispatcher:
                             excerpt = ex
                             primary = r
                             break
+                if not found_in_proof and allow_delete_204_ev:
+                    found_in_proof = True
+                    hdr_lines = self._format_response_headers(primary)
+                    status_line = f"HTTP 204 No Content (DELETE {primary.get('url') or primary.get('path') or ''})"
+                    excerpt = f"{status_line}\n{hdr_lines}"[:MAX_PROOF_EXCERPT_CHARS] if hdr_lines else status_line
         if not found_in_proof:
             return json.dumps({
                 "rejected": True,
@@ -1523,8 +1654,9 @@ class ToolDispatcher:
         if (
             len(proof_receipts) > 1
             and compatible_proofs
-            and canonical_class not in {"open_redirect", "reflected_xss", "stored_xss", "race_condition"}
+            and canonical_class not in {"open_redirect", "reflected_xss", "stored_xss", "race_condition", "cors_misconfiguration"}
             and not matching_oob_hits
+            and not is_empty_delete_204
         ):
             eligible_proofs = _filter_class_eligible_proofs(
                 canonical_class,
@@ -1610,7 +1742,7 @@ class ToolDispatcher:
                     "rejected": True,
                     "reason": f"auth_bypass requires a substantive 2xx response from 'anon' (got status {primary.get('status')})",
                 })
-            if not _is_genuine_anon_2xx(primary, actor_meta):
+            if not self._is_genuine_anon_proof(primary, actor_meta):
                 return json.dumps({
                     "rejected": True,
                     "reason": "auth_bypass rejected: public HTML landing/login page, empty body, or non-anon actor identity header present",
@@ -1898,6 +2030,25 @@ class ToolDispatcher:
             max_proof_chars=MAX_PROOF_EXCERPT_CHARS,
             max_control_chars=MAX_CONTROL_EXCERPT_CHARS,
         )
+        hdr_lines = self._format_response_headers(best_primary)
+        if hdr_lines and (
+            canonical_class == "cors_misconfiguration"
+            or (
+                evidence_value
+                and evidence_value.lower() not in (best_evidence or "").lower()
+                and evidence_value.lower() in hdr_lines.lower()
+            )
+        ):
+            hdr_note = f"---[response_headers]---\n{hdr_lines[:1024]}"
+            best_evidence = f"{hdr_note}\n{best_evidence}" if best_evidence else hdr_note
+        if (
+            str(best_primary.get("method") or "").upper() == "DELETE"
+            and int(best_primary.get("status") or 0) == 204
+            and not str(best_primary.get("body") or "").strip()
+            and "204" not in (best_evidence or "")
+        ):
+            del_status_line = f"HTTP 204 No Content (DELETE {best_primary.get('url') or best_primary.get('path') or ''})"
+            best_evidence = f"{del_status_line}\n{best_evidence}" if best_evidence else del_status_line
         if matching_oob_hits:
             hit0 = matching_oob_hits[0]
             oob_note = (

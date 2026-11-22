@@ -10,6 +10,12 @@ from typing import Any, Callable
 from urllib.parse import urljoin, urlsplit
 
 from agentic_http import is_static_asset_url
+from agentic_surface import is_non_endpoint_source_path
+
+
+def _is_skipped_surface_url(url: str) -> bool:
+    """Return True for static media/style assets, frontend source modules, or malformed paths."""
+    return is_static_asset_url(url) or is_non_endpoint_source_path(url)
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(_REPO_ROOT) not in sys.path:
@@ -623,7 +629,7 @@ def _extract_postman_operations(
                     parsed_u = urlsplit(raw_url)
                     if parsed_u.scheme in {"http", "https"} and parsed_u.netloc and parsed_u.netloc == base_netloc:
                         resolved = raw_url
-                if resolved and not is_static_asset_url(resolved):
+                if resolved and not _is_skipped_surface_url(resolved):
                     same_origin_links.append({
                         "method": method,
                         "url": resolved,
@@ -697,7 +703,7 @@ def _extract_js_client_logic(
             if _SIGNING_HEADER_RE.search(h):
                 _add_unique(signing_indicators, h, 20)
 
-        if path and (method, path) not in seen_ep_keys and len(compact_endpoints) < 40:
+        if path and not _is_skipped_surface_url(path) and (method, path) not in seen_ep_keys and len(compact_endpoints) < 40:
             seen_ep_keys.add((method, path))
             compact_endpoints.append({
                 "method": method,
@@ -709,9 +715,9 @@ def _extract_js_client_logic(
                 "runtime_required": runtime_required,
             })
 
-        if path.startswith(("/", "http://", "https://")):
+        if path.startswith(("/", "http://", "https://")) and not _is_skipped_surface_url(path):
             resolved = urljoin(url, path)
-            if not is_static_asset_url(resolved):
+            if not _is_skipped_surface_url(resolved):
                 all_params = list(dict.fromkeys([*q_params, *b_fields]))[:15]
                 merged_calls.append({
                     "method": method,
@@ -811,7 +817,7 @@ def _extract_surface_summary(receipt: dict[str, Any], base_url: str) -> dict[str
         hdr_input = {"Location": redir_loc}
     if hdr_input:
         for rec in extract_http_headers(hdr_input, url):
-            if not is_static_asset_url(rec.get("url", "")):
+            if not _is_skipped_surface_url(rec.get("url", "")):
                 links.append(rec)
 
     stripped = body.lstrip()
@@ -830,21 +836,28 @@ def _extract_surface_summary(receipt: dict[str, Any], base_url: str) -> dict[str
                     links.extend(postman_links)
             hypermedia, _ = extract_json_hypermedia(parsed, url, origin_url=base)
             for item in hypermedia:
-                if not is_static_asset_url(item.get("url", "")):
+                if not _is_skipped_surface_url(item.get("url", "")):
                     links.append(item)
             candidate_ids = _extract_candidate_ids(parsed)
-            spec_urls = find_spec_urls(body, url)
+            spec_urls = [u for u in find_spec_urls(body, url) if not _is_skipped_surface_url(u)]
 
     if "html" in ctype or "<html" in body[:512].lower() or "<form" in body.lower() or "href=" in body.lower():
         for rec in extract_html(body, url):
             if rec.get("sources") == ["form"]:
-                forms.append(rec)
-            elif not is_static_asset_url(rec.get("url", "")):
+                if not is_non_endpoint_source_path(rec.get("url", "")):
+                    forms.append(rec)
+            elif not _is_skipped_surface_url(rec.get("url", "")):
                 links.append(rec)
         for script in extract_inline_scripts(body):
-            js_calls.extend(extract_js_calls(script, url, limit=40))
-            spa_routes.extend(extract_spa_routes(script, url, limit=40))
-            spec_urls.extend(find_spec_urls(script, url))
+            js_calls.extend(
+                c for c in extract_js_calls(script, url, limit=40)
+                if not _is_skipped_surface_url(c.get("url", ""))
+            )
+            spa_routes.extend(
+                r for r in extract_spa_routes(script, url, limit=40)
+                if not _is_skipped_surface_url(r.get("url", ""))
+            )
+            spec_urls.extend(u for u in find_spec_urls(script, url) if not _is_skipped_surface_url(u))
         # Also capture concrete UUID/resource IDs appearing inside HTML links/attributes.
         seen_html_ids = {(c["field"], c["value"]) for c in candidate_ids}
         for link_item in links:
@@ -855,12 +868,25 @@ def _extract_surface_summary(receipt: dict[str, Any], base_url: str) -> dict[str
                         candidate_ids.append({"field": "path_id", "value": seg})
 
     if "javascript" in ctype or "ecmascript" in ctype or urlsplit(url).path.lower().endswith((".js", ".mjs")):
-        js_calls.extend(extract_js_calls(body, url, limit=80))
-        for rec in extract_js(body, url, limit=60):
-            if not is_static_asset_url(rec.get("url", "")):
+        js_calls.extend(
+            c for c in extract_js_calls(body, url, limit=80)
+            if not _is_skipped_surface_url(c.get("url", ""))
+        )
+        kept_js_links = 0
+        for rec in extract_js(body, url, limit=240):
+            if not _is_skipped_surface_url(rec.get("url", "")):
                 links.append(rec)
-        spa_routes.extend(extract_spa_routes(body, url, limit=60))
-        spec_urls.extend(find_spec_urls(body, url))
+                kept_js_links += 1
+                if kept_js_links >= 60:
+                    break
+        kept_spa_routes = 0
+        for rec in extract_spa_routes(body, url, limit=160):
+            if not _is_skipped_surface_url(rec.get("url", "")):
+                spa_routes.append(rec)
+                kept_spa_routes += 1
+                if kept_spa_routes >= 60:
+                    break
+        spec_urls.extend(u for u in find_spec_urls(body, url) if not _is_skipped_surface_url(u))
         cl_calls, cl_links, client_logic = _extract_js_client_logic(body, url)
         seen_js_call_keys = {
             (str(c.get("method") or "GET").upper(), str(c.get("url") or ""))
@@ -875,13 +901,13 @@ def _extract_surface_summary(receipt: dict[str, Any], base_url: str) -> dict[str
 
     if "css" in ctype or urlsplit(url).path.lower().endswith(".css"):
         for rec in extract_css(body, url, limit=120):
-            if not is_static_asset_url(rec.get("url", "")):
+            if not _is_skipped_surface_url(rec.get("url", "")):
                 links.append(rec)
 
     if urlsplit(url).path.lower().endswith("/robots.txt"):
-        links.extend(extract_robots(body, url))
+        links.extend(r for r in extract_robots(body, url) if not _is_skipped_surface_url(r.get("url", "")))
     if "xml" in ctype or "<urlset" in body[:512].lower() or "<sitemapindex" in body[:512].lower():
-        links.extend(extract_sitemap(body, url))
+        links.extend(r for r in extract_sitemap(body, url) if not _is_skipped_surface_url(r.get("url", "")))
 
     # Deduplicate and compact links/forms so high-signal routes, forms, and IDs appear first without verbose boilerplate.
     base_netloc = urlsplit(base).netloc
@@ -906,7 +932,12 @@ def _extract_surface_summary(receipt: dict[str, Any], base_url: str) -> dict[str
     dedup_links: list[dict[str, Any]] = []
     seen_links: set[tuple[str, str]] = set()
     for item in links:
+        raw_item_url = str(item.get("url") or "")
+        if _is_skipped_surface_url(raw_item_url):
+            continue
         comp = _compact_surface_item(item)
+        if _is_skipped_surface_url(comp["url"]):
+            continue
         key = (comp["method"], comp["url"])
         if key not in seen_links:
             seen_links.add(key)
@@ -986,8 +1017,10 @@ def _build_surface_hints(
     def _add_api(raw_u: str) -> None:
         if len(api_endpoints) >= 8:
             return
+        if _is_skipped_surface_url(raw_u):
+            return
         path, _, same_origin = _short_same_origin(raw_u)
-        if not same_origin or not path or path == "/" or is_static_asset_url(path):
+        if not same_origin or not path or path == "/" or _is_skipped_surface_url(path):
             return
         if path not in api_path_set:
             api_path_set.add(path)
@@ -1022,7 +1055,7 @@ def _build_surface_hints(
             break
         raw_u = str(item.get("url") or "")
         path, short, same_origin = _short_same_origin(raw_u)
-        if not same_origin or is_static_asset_url(raw_u):
+        if not same_origin or _is_skipped_surface_url(raw_u) or _is_skipped_surface_url(path):
             continue
         if path == "/" and "?" not in short:
             continue

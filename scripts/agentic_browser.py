@@ -14,6 +14,7 @@ import asyncio
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
 import inspect
+import json
 from pathlib import Path
 import sys
 from typing import Any, Callable, Sequence
@@ -295,10 +296,100 @@ def _extract_actor_browser_auth(http: AgenticHTTPClient, actor: str) -> tuple[st
     )
 
 
+def _extract_actor_local_storage(http: AgenticHTTPClient, actor: str) -> dict[str, str]:
+    """Extract host-side same-origin ``localStorage`` key/value pairs for ``actor``.
+
+    Returns ``{}`` for ``"anon"``. Checks ``http.actors.get_browser_auth_state(actor)``
+    first when it returns a dict containing ``"local_storage"``, otherwise falls back
+    to reading ``session.local_storage`` under ``session._lock``. Values returned here
+    are strictly for host-side Playwright use and must NEVER leak to model outputs.
+    """
+    clean_actor = str(actor or "anon").strip() or "anon"
+    if clean_actor == "anon":
+        return {}
+
+    def _clean_map(raw: Any) -> dict[str, str]:
+        if not isinstance(raw, dict):
+            return {}
+        out: dict[str, str] = {}
+        for k, v in raw.items():
+            if isinstance(k, str) and isinstance(v, str) and k.strip():
+                out[k.strip()] = v
+        return out
+
+    get_state = getattr(http.actors, "get_browser_auth_state", None)
+    used_get_state = callable(get_state)
+    if used_get_state:
+        assert callable(get_state)
+        state = get_state(clean_actor)
+        if isinstance(state, dict) and isinstance(state.get("local_storage"), dict):
+            return _clean_map(state.get("local_storage"))
+
+    try:
+        session = http.actors.get(clean_actor)
+    except (ValueError, KeyError):
+        if used_get_state:
+            return {}
+        raise
+
+    lock = getattr(session, "_lock", None)
+    ctx = lock if lock is not None else nullcontext()
+    with ctx:
+        raw_ls = getattr(session, "local_storage", None)
+        return _clean_map(raw_ls)
+
+
+def _normalize_js_origin(expected_origin: str) -> str:
+    """Normalize an http(s) URL or origin into browser ``window.location.origin`` form."""
+    raw = str(expected_origin or "").strip()
+    if not raw:
+        return ""
+    try:
+        parsed = urlsplit(raw)
+        port = parsed.port
+    except ValueError:
+        return ""
+    scheme = parsed.scheme.lower()
+    host = (parsed.hostname or "").strip().lower().rstrip(".")
+    if scheme not in {"http", "https"} or not host:
+        return ""
+    host_fmt = f"[{host}]" if ":" in host else host
+    default_port = 443 if scheme == "https" else 80
+    if port is None or port == default_port:
+        return f"{scheme}://{host_fmt}"
+    return f"{scheme}://{host_fmt}:{port}"
+
+
+def _build_origin_localstorage_init_script(expected_origin: str, local_storage: dict[str, str]) -> str:
+    """Build a strictly same-origin-guarded Playwright init script seeding ``localStorage``."""
+    norm_origin = _normalize_js_origin(expected_origin)
+    entries = [
+        [k.strip(), v]
+        for k, v in (local_storage or {}).items()
+        if isinstance(k, str) and isinstance(v, str) and k.strip()
+    ]
+    if not norm_origin or not entries:
+        return ""
+    origin_json = json.dumps(norm_origin, ensure_ascii=True)
+    entries_json = json.dumps(entries, ensure_ascii=True)
+    return (
+        "(() => {\n"
+        f"  if (window.location.origin === {origin_json}) {{\n"
+        "    try {\n"
+        f"      for (const [k, v] of {entries_json}) {{\n"
+        "        window.localStorage.setItem(k, v);\n"
+        "      }\n"
+        "    } catch (_) {}\n"
+        "  }\n"
+        "})();\n"
+    )
+
+
 def _collect_actor_secrets(
     http: AgenticHTTPClient,
     cookie_hdr: str,
     extra_headers: dict[str, str],
+    local_storage: dict[str, str] | None = None,
 ) -> list[str]:
     """Collect sensitive strings for defense-in-depth scrubbing of model-facing outputs."""
     secrets: list[str] = []
@@ -318,6 +409,13 @@ def _collect_actor_secrets(
             secrets.append(hv)
             parts = hv.strip().split(None, 1)
             if len(parts) == 2 and len(parts[1].strip()) >= 4:
+                secrets.append(parts[1].strip())
+    for lv in (local_storage or {}).values():
+        sval = str(lv or "")
+        if len(sval) >= 4:
+            secrets.append(sval)
+            parts = sval.strip().split(None, 1)
+            if len(parts) == 2 and parts[0].lower() == "bearer" and len(parts[1].strip()) >= 4:
                 secrets.append(parts[1].strip())
     return sorted(set(secrets), key=len, reverse=True)
 
@@ -423,6 +521,17 @@ def _fn_prefers_headers_kwarg(fn: Callable[..., Any]) -> bool:
     return "headers" in params and "extra_headers" not in params
 
 
+def _fn_accepts_kwarg(fn: Callable[..., Any], kwarg_name: str) -> bool:
+    """Return True if ``fn`` accepts ``kwarg_name`` explicitly or via ``**kwargs``."""
+    try:
+        params = inspect.signature(fn).parameters
+    except (TypeError, ValueError):
+        return False
+    return kwarg_name in params or any(
+        p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()
+    )
+
+
 def _extract_safe_field_names(raw_fields: Any) -> list[str]:
     """Extract deduplicated form/body parameter names ONLY (never values or passwords)."""
     if not isinstance(raw_fields, (list, tuple)):
@@ -489,7 +598,8 @@ def run_browser_crawl(
 
     clean_actor = str(actor or "anon").strip() or "anon"
     cookie_hdr, extra_headers = _extract_actor_browser_auth(http, clean_actor)
-    secrets = _collect_actor_secrets(http, cookie_hdr, extra_headers)
+    local_storage = _extract_actor_local_storage(http, clean_actor)
+    secrets = _collect_actor_secrets(http, cookie_hdr, extra_headers, local_storage=local_storage)
 
     remaining = _budget_remaining(http)
     if remaining <= 0:
@@ -523,19 +633,23 @@ def run_browser_crawl(
             call_kwargs["headers"] = extra_headers
         else:
             call_kwargs["extra_headers"] = extra_headers
+        if local_storage and _fn_accepts_kwarg(crawl_fn, "local_storage"):
+            call_kwargs["local_storage"] = dict(local_storage)
         raw = crawl_fn(full_url, **call_kwargs)
     else:
         assert _default_crawl_site is not None
-        raw = _default_crawl_site(
-            full_url,
-            max_pages=eff_max_pages,
-            cookie=cookie_hdr,
-            headers=extra_headers,
-            timeout_ms=eff_timeout_ms,
-            allow_subdomains=False,
-            wait_ms=eff_wait_ms,
-            wire_gate=_build_crawl_wire_gate(http),
-        )
+        default_kwargs: dict[str, Any] = {
+            "max_pages": eff_max_pages,
+            "cookie": cookie_hdr,
+            "headers": extra_headers,
+            "timeout_ms": eff_timeout_ms,
+            "allow_subdomains": False,
+            "wait_ms": eff_wait_ms,
+            "wire_gate": _build_crawl_wire_gate(http),
+        }
+        if local_storage and _fn_accepts_kwarg(_default_crawl_site, "local_storage"):
+            default_kwargs["local_storage"] = dict(local_storage)
+        raw = _default_crawl_site(full_url, **default_kwargs)
 
     raw_dict = raw if isinstance(raw, dict) else {}
     raw_pages_val = raw_dict.get("pages")
@@ -826,6 +940,7 @@ def _inspect_rendered_page_playwright(
     full_url: str,
     cookie_hdr: str,
     extra_headers: dict[str, str],
+    local_storage: dict[str, str] | None = None,
     marker: str,
     wait_ms: int,
     timeout_ms: int,
@@ -849,6 +964,13 @@ def _inspect_rendered_page_playwright(
                 user_agent=_BROWSER_USER_AGENT,
             )
             try:
+                ls_init_script = _build_origin_localstorage_init_script(
+                    http.base_url,
+                    local_storage or {},
+                )
+                if ls_init_script:
+                    context.add_init_script(ls_init_script)
+
                 if callable(_build_runtime_hook_script):
                     context.add_init_script(_build_runtime_hook_script())
 
@@ -989,7 +1111,8 @@ def inspect_rendered_page(
 
     clean_actor = str(actor or "anon").strip() or "anon"
     cookie_hdr, extra_headers = _extract_actor_browser_auth(http, clean_actor)
-    secrets = _collect_actor_secrets(http, cookie_hdr, extra_headers)
+    local_storage = _extract_actor_local_storage(http, clean_actor)
+    secrets = _collect_actor_secrets(http, cookie_hdr, extra_headers, local_storage=local_storage)
 
     eff_wait_ms = max(0, min(int(wait_ms), _MAX_WAIT_MS))
     eff_timeout_ms = max(_MIN_TIMEOUT_MS, min(int(timeout_ms), _MAX_TIMEOUT_MS))
@@ -1020,6 +1143,8 @@ def inspect_rendered_page(
                 runner_kwargs["headers"] = extra_headers
             else:
                 runner_kwargs["extra_headers"] = extra_headers
+            if local_storage and _fn_accepts_kwarg(runner, "local_storage"):
+                runner_kwargs["local_storage"] = dict(local_storage)
             raw = runner(full_url, **runner_kwargs)
         else:
             raw = _inspect_rendered_page_playwright(
@@ -1027,6 +1152,7 @@ def inspect_rendered_page(
                 full_url=full_url,
                 cookie_hdr=cookie_hdr,
                 extra_headers=extra_headers,
+                local_storage=local_storage,
                 marker=clean_marker,
                 wait_ms=eff_wait_ms,
                 timeout_ms=eff_timeout_ms,
@@ -1110,7 +1236,9 @@ def inspect_rendered_page(
 __all__ = [
     "CHROMIUM_ARGS",
     "HAS_PLAYWRIGHT",
+    "_build_origin_localstorage_init_script",
     "_extract_actor_browser_auth",
+    "_extract_actor_local_storage",
     "inspect_rendered_page",
     "run_browser_crawl",
 ]

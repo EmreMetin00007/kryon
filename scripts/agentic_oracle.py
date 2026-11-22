@@ -10,8 +10,13 @@ import uuid
 
 import requests
 
-from agentic_http import AgenticHTTPClient, BudgetExhaustedError, _decode_raw_response
-from agentic_receipts import ReceiptStore
+from agentic_http import (
+    DEFAULT_BROWSER_USER_AGENT,
+    AgenticHTTPClient,
+    BudgetExhaustedError,
+    _decode_raw_response,
+)
+from agentic_receipts import ReceiptStore, redact_header_value
 from agentic_surface import is_id_segment, normalize_path, route_template_of
 
 VALID_VERIFICATION_GATES = frozenset({"differential", "llm_self_judge"})
@@ -83,7 +88,13 @@ _INPUT_DIFF_CLASSES = frozenset({
     "path_traversal",
     "csrf",
     "ssrf",
+    "cors_misconfiguration",
+    "xxe",
+    "file_upload",
+    "jwt_weakness",
+    "command_injection",
 })
+_OOB_ELIGIBLE_CLASSES = frozenset({"ssrf", "xxe", "ssti", "command_injection"})
 _ACCESS_CLASSES = frozenset({"auth_bypass", "bfla", "bola", "tenant_isolation"})
 _CONCURRENCY_CLASSES = frozenset({"race_condition", "business_logic"})
 _MUTATING_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
@@ -319,6 +330,72 @@ def _receipt_content_type(receipt: dict[str, Any]) -> str:
 def is_html_receipt(receipt: dict[str, Any]) -> bool:
     """Return True if the receipt has an HTML content-type (e.g. text/html or application/xhtml+xml)."""
     return "html" in _receipt_content_type(receipt)
+
+
+def _is_multipart_receipt(receipt: dict[str, Any]) -> bool:
+    """Return True if a receipt represents a multipart/form-data upload with a non-binary body summary."""
+    req_body = str(receipt.get("request_body") or "").lstrip().lower()
+    if req_body.startswith("multipart/form-data "):
+        return True
+    req_headers = receipt.get("request_headers") or {}
+    if isinstance(req_headers, dict):
+        for k, v in req_headers.items():
+            if str(k).strip().lower() == "content-type":
+                if str(v or "").strip().lower().startswith("multipart/form-data"):
+                    return True
+    return False
+
+
+def _response_header_ci(receipt: dict[str, Any], header_name: str) -> str:
+    """Return a response header value matched case-insensitively, stripped."""
+    target = header_name.strip().lower()
+    headers = receipt.get("response_headers") or {}
+    if isinstance(headers, dict):
+        for k, v in headers.items():
+            if str(k).strip().lower() == target:
+                return str(v or "").strip()
+    return ""
+
+
+def _request_header_ci(receipt: dict[str, Any], header_name: str) -> str:
+    """Return a request header value matched case-insensitively, stripped."""
+    target = header_name.strip().lower()
+    headers = receipt.get("request_headers") or {}
+    if isinstance(headers, dict):
+        for k, v in headers.items():
+            if str(k).strip().lower() == target:
+                return str(v or "").strip()
+    return ""
+
+
+def _cors_header_signature(receipt: dict[str, Any]) -> tuple[str, str]:
+    """Return `(Access-Control-Allow-Origin, Access-Control-Allow-Credentials)` for CORS diffing."""
+    acao = _response_header_ci(receipt, "access-control-allow-origin")
+    acac = _response_header_ci(receipt, "access-control-allow-credentials").lower()
+    return acao, acac
+
+
+def _has_overridden_redacted_auth_header(
+    receipt: dict[str, Any],
+    session_obj: Any,
+    method: str,
+) -> bool:
+    """Return True if receipt sent a redacted auth/cookie header differing from the actor's default session."""
+    req_headers = receipt.get("request_headers") or {}
+    if not isinstance(req_headers, dict):
+        return False
+    session_headers = session_obj.build_headers(method)
+    session_redacted = {
+        str(k).strip().lower(): redact_header_value(str(k), str(v))
+        for k, v in session_headers.items()
+    }
+    for k, v in req_headers.items():
+        lk = str(k).strip().lower()
+        val = str(v or "")
+        if lk in {"authorization", "cookie", "x-auth-token", "x-api-key"} and "<REDACTED" in val:
+            if session_redacted.get(lk, "") != val:
+                return True
+    return False
 
 
 def receipt_body_contains_verbatim(receipt: dict[str, Any], evidence_value: str) -> bool:
@@ -614,10 +691,13 @@ class DifferentialOracle:
             if k.lower() not in _NON_REPLAY_REQ_HEADERS and "<REDACTED" not in str(v)
         }
         req_headers = session_obj.build_headers(method, safe_extra)
+        if not any(k.lower() == "user-agent" for k in req_headers):
+            req_headers["User-Agent"] = DEFAULT_BROWSER_USER_AGENT
         body_bytes = raw_body.encode("utf-8") if raw_body else None
 
         fresh = requests.Session()
         fresh.trust_env = False
+        fresh.headers["User-Agent"] = DEFAULT_BROWSER_USER_AGENT
         status = 0
         resp_headers: dict[str, str] = {}
         raw_bytes = b""
@@ -709,7 +789,7 @@ class DifferentialOracle:
         active_oob = oob_server if oob_server is not None else self.oob_server
         effective_oob_hits: list[dict[str, Any]] = [dict(h) for h in (oob_hits or []) if isinstance(h, dict)]
         oob_tokens_submitted: list[str] = []
-        if canonical_class == "ssrf" and active_oob is not None and hasattr(active_oob, "registered_tokens"):
+        if canonical_class in _OOB_ELIGIBLE_CLASSES and active_oob is not None and hasattr(active_oob, "registered_tokens"):
             try:
                 reg_tokens = list(active_oob.registered_tokens())
             except Exception:
@@ -730,14 +810,15 @@ class DifferentialOracle:
                         effective_oob_hits.extend(polled.get("hits") or [])
             if oob_tokens_submitted and not effective_oob_hits:
                 stages["stage1_control"] = "failed_oob_zero_hits"
+                class_label = "SSRF" if canonical_class == "ssrf" else canonical_class
                 return OracleVerdict(
                     verified=False,
                     verdict="REFUTED",
-                    reason="SSRF callback claim rejected: callback_listener recorded 0 hits for submitted token(s).",
+                    reason=f"{class_label} callback claim rejected: callback_listener recorded 0 hits for submitted token(s).",
                     mode=self.mode,
                     stages=stages,
                 )
-        is_oob_ssrf = canonical_class == "ssrf" and bool(effective_oob_hits)
+        is_oob_verified = canonical_class in _OOB_ELIGIBLE_CLASSES and bool(effective_oob_hits)
         render_proof: dict[str, Any] | None = None
         if canonical_class == "stored_xss":
             if str(primary_proof.get("method") or "").upper() == "GET" and 200 <= int(primary_proof.get("status") or 0) < 300:
@@ -802,11 +883,12 @@ class DifferentialOracle:
         p_status = int(diff_target.get("status") or 0)
         p_masked = mask_dynamic_fields(str(diff_target.get("body") or ""), preserve_values=(ev,))
         p_loc = str(diff_target.get("redirect_location") or "")
+        p_cors_sig = _cors_header_signature(diff_target) if canonical_class == "cors_misconfiguration" else ("", "")
 
         # --- Stage 1: Falsification / Control Baseline Check ---
         ctrl_probe_rid = ""
         eff_controls = list(control_receipts)
-        if not eff_controls and not is_oob_ssrf and canonical_class not in _CONCURRENCY_CLASSES and self._has_budget(2):
+        if not eff_controls and not is_oob_verified and canonical_class not in _CONCURRENCY_CLASSES and self._has_budget(2):
             try:
                 if canonical_class in _INPUT_DIFF_CLASSES:
                     ctrl_url = self._benign_control_url(str(diff_target.get("url") or "/"))
@@ -863,7 +945,7 @@ class DifferentialOracle:
                 pass
 
         # Check benign control equivalence and stored_xss baseline absence for input/mutation classes
-        if canonical_class in _INPUT_DIFF_CLASSES and not is_oob_ssrf:
+        if canonical_class in _INPUT_DIFF_CLASSES and not is_oob_verified:
             if canonical_class == "stored_xss" and ev:
                 p_count = str(diff_target.get("body") or "").lower().count(ev.lower())
                 for ctrl in diff_controls:
@@ -883,10 +965,16 @@ class DifferentialOracle:
                 c_masked = mask_dynamic_fields(str(ctrl.get("body") or ""), preserve_values=(ev,))
                 c_status = int(ctrl.get("status") or 0)
                 c_loc = str(ctrl.get("redirect_location") or "")
+                cors_same = (
+                    True
+                    if canonical_class != "cors_misconfiguration"
+                    else _cors_header_signature(ctrl) == p_cors_sig
+                )
                 if (
                     c_status == p_status
                     and c_masked == p_masked
                     and urlsplit(c_loc).netloc == urlsplit(p_loc).netloc
+                    and cors_same
                 ):
                     stages["stage1_control"] = "deception_identical_control"
                     return OracleVerdict(
@@ -965,16 +1053,25 @@ class DifferentialOracle:
                             stages=stages,
                             control_probe_receipt_id=ctrl_probe_rid,
                         )
-        stages["stage1_control"] = "passed_oob_callback" if is_oob_ssrf else "passed"
+        stages["stage1_control"] = "passed_oob_callback" if is_oob_verified else "passed"
 
         # --- Stage 2: Dynamic-Field-Masked Structural & Access-Boundary Diff ---
-        if canonical_class in _INPUT_DIFF_CLASSES and not is_oob_ssrf:
+        if canonical_class in _INPUT_DIFF_CLASSES and not is_oob_verified:
             has_masked_diff = False
             for ctrl in diff_controls:
                 c_masked = mask_dynamic_fields(str(ctrl.get("body") or ""), preserve_values=(ev,))
                 c_status = int(ctrl.get("status") or 0)
                 c_loc = str(ctrl.get("redirect_location") or "")
-                if c_status != p_status or c_masked != p_masked or urlsplit(c_loc).netloc != urlsplit(p_loc).netloc:
+                cors_diff = (
+                    canonical_class == "cors_misconfiguration"
+                    and _cors_header_signature(ctrl) != p_cors_sig
+                )
+                if (
+                    c_status != p_status
+                    or c_masked != p_masked
+                    or urlsplit(c_loc).netloc != urlsplit(p_loc).netloc
+                    or cors_diff
+                ):
                     has_masked_diff = True
                     break
             if diff_controls and not has_masked_diff:
@@ -1041,7 +1138,7 @@ class DifferentialOracle:
                         stages=stages,
                         control_probe_receipt_id=ctrl_probe_rid,
                     )
-        stages["stage2_diff"] = "passed_oob_callback" if is_oob_ssrf else "passed"
+        stages["stage2_diff"] = "passed_oob_callback" if is_oob_verified else "passed"
 
         # --- Stage 3: Clean-Session Replay in fresh isolated requests.Session() ---
         if canonical_class == "race_condition" or (
@@ -1058,7 +1155,7 @@ class DifferentialOracle:
                 control_probe_receipt_id=ctrl_probe_rid,
             )
 
-        if is_oob_ssrf and str(primary_proof.get("method") or "").upper() in _MUTATING_METHODS:
+        if is_oob_verified and str(primary_proof.get("method") or "").upper() in _MUTATING_METHODS:
             stages["stage3_clean_replay"] = "passed_oob_verified"
             return OracleVerdict(
                 verified=True,
@@ -1068,6 +1165,35 @@ class DifferentialOracle:
                 stages=stages,
                 control_probe_receipt_id=ctrl_probe_rid,
             )
+
+        # Prefer replaying a 2xx GET persistence proof receipt when one is present
+        # (including cross-actor GETs after non-idempotent ownership/tenant transfers
+        # and read/render GETs for stored_xss / ssti / mass_assignment / file_upload).
+        replay_target = (
+            render_proof
+            or _select_mutating_get_proof(
+                primary_proof,
+                proof_receipts,
+                ev,
+                canonical_class=canonical_class,
+            )
+            or primary_proof
+        )
+
+        # Do not replay compact non-binary multipart/form-data summary strings as raw_body.
+        if (
+            _is_multipart_receipt(replay_target)
+            and str(replay_target.get("method") or "").upper() in _MUTATING_METHODS
+        ):
+            return OracleVerdict(
+                verified=True,
+                verdict="VERIFIED",
+                reason="Verified by control baseline and masked differential (non-replayable binary multipart upload).",
+                mode=self.mode,
+                stages={**stages, "stage3_clean_replay": "skipped_non_replayable_multipart"},
+                control_probe_receipt_id=ctrl_probe_rid,
+            )
+
         if not self._has_budget(1):
             stages["stage3_clean_replay"] = "skipped_budget"
             return OracleVerdict(
@@ -1079,19 +1205,6 @@ class DifferentialOracle:
                 control_probe_receipt_id=ctrl_probe_rid,
             )
 
-        # Prefer replaying a 2xx GET persistence proof receipt when one is present
-        # (including cross-actor GETs after non-idempotent ownership/tenant transfers
-        # and read/render GETs for stored_xss / ssti / mass_assignment).
-        replay_target = (
-            render_proof
-            or _select_mutating_get_proof(
-                primary_proof,
-                proof_receipts,
-                ev,
-                canonical_class=canonical_class,
-            )
-            or primary_proof
-        )
         replayed_via_stateful_fallback = False
 
         try:
@@ -1116,14 +1229,119 @@ class DifferentialOracle:
         r_status = int(replay_rec.get("status") or 0)
         t_status = int(replay_target.get("status") or 0)
 
+        # Destructive DELETE persistence verification: when re-executing DELETE returns
+        # 404/410 because the resource is already gone, verify an earlier 2xx GET existed
+        # on the same normalized path prior to primary_proof and confirm a fresh clean-session
+        # GET now returns 404/410.
+        if (
+            replay_target is primary_proof
+            and str(primary_proof.get("method") or "").upper() == "DELETE"
+            and 200 <= t_status < 300
+            and r_status in {404, 410}
+            and self._has_budget(1)
+        ):
+            p_norm_path = _norm_url_path(str(primary_proof.get("url") or primary_proof.get("path") or ""))
+            p_rid = str(primary_proof.get("receipt_id") or "")
+            r_rid = str(replay_rec.get("receipt_id") or "")
+            p_seq = _receipt_seq_num(primary_proof)
+            r_seq = _receipt_seq_num(replay_rec)
+            p_ts = str(primary_proof.get("timestamp") or "")
+            ctrl_actors = {
+                str(c.get("actor") or "").strip()
+                for c in eff_controls
+                if str(c.get("actor") or "").strip()
+            }
+            known_actors = {
+                str(a.get("alias") or "").strip()
+                for a in self.http.actors.summaries()
+                if str(a.get("alias") or "").strip()
+            }
+            meta_map = actor_meta_map or {}
+            explicit_owner, _ = _extract_owner_and_tenant_from_receipt(primary_proof, meta_map)
+            eff_owner = explicit_owner or str(inferred_owner or "").strip()
+            if not eff_owner and surface_tracker is not None:
+                p_surface_path = normalize_path(str(primary_proof.get("url") or primary_proof.get("path") or ""))
+                obj_entry = (getattr(surface_tracker, "discovered_objects", None) or {}).get(p_surface_path)
+                if isinstance(obj_entry, dict):
+                    eff_owner = str(obj_entry.get("owner_actor") or "").strip()
+
+            prior_gets: list[dict[str, Any]] = []
+            seen_prior_rids: set[str] = set()
+            for rid in self.receipts.list_ids():
+                if rid in seen_prior_rids or rid in {p_rid, r_rid}:
+                    continue
+                try:
+                    cand = self.receipts.get(rid)
+                except (KeyError, ValueError):
+                    continue
+                c_seq = _receipt_seq_num(cand)
+                c_ts = str(cand.get("timestamp") or "")
+                if p_seq > 0 and c_seq > 0:
+                    if c_seq >= p_seq:
+                        continue
+                elif p_ts and c_ts:
+                    if c_ts >= p_ts:
+                        continue
+                elif r_seq > 0 and c_seq >= r_seq:
+                    continue
+                if str(cand.get("method") or "").upper() != "GET":
+                    continue
+                if not (200 <= int(cand.get("status") or 0) < 300):
+                    continue
+                if _norm_url_path(str(cand.get("url") or cand.get("path") or "")) != p_norm_path:
+                    continue
+                seen_prior_rids.add(rid)
+                prior_gets.append(cand)
+                if not eff_owner:
+                    cand_owner, _ = _extract_owner_and_tenant_from_receipt(cand, meta_map)
+                    if cand_owner:
+                        eff_owner = cand_owner
+
+            if prior_gets:
+                prior_gets.sort(
+                    key=lambda rec: (
+                        1 if str(rec.get("actor") or "").strip() in known_actors else 0,
+                        1 if (eff_owner and str(rec.get("actor") or "").strip() == eff_owner) else 0,
+                        1 if (
+                            str(rec.get("actor") or "").strip() in ctrl_actors
+                            and str(rec.get("actor") or "").strip() != p_actor
+                        ) else 0,
+                        1 if str(rec.get("actor") or "").strip() not in {"", "anon", p_actor} else 0,
+                        1 if str(rec.get("actor") or "").strip() not in {"", p_actor} else 0,
+                        _receipt_seq_num(rec),
+                    ),
+                    reverse=True,
+                )
+                chosen_actor = str(prior_gets[0].get("actor") or "").strip()
+                if not chosen_actor or chosen_actor not in known_actors:
+                    chosen_actor = p_actor
+                try:
+                    fresh_get_rec = self._run_clean_session_request(
+                        actor=chosen_actor,
+                        method="GET",
+                        url=str(primary_proof.get("url") or "/"),
+                    )
+                except BudgetExhaustedError:
+                    fresh_get_rec = None
+                if fresh_get_rec is not None and int(fresh_get_rec.get("status") or 0) in {404, 410}:
+                    stages["stage3_clean_replay"] = "passed_delete_persistence"
+                    return OracleVerdict(
+                        verified=True,
+                        verdict="VERIFIED",
+                        reason="Verified destructive DELETE persistence: resource returned 2xx before DELETE and 404/410 on fresh clean-session GET afterward.",
+                        mode=self.mode,
+                        stages=stages,
+                        clean_replay_receipt_id=fresh_get_rec["receipt_id"],
+                        control_probe_receipt_id=ctrl_probe_rid,
+                    )
         # Stateful persistence fallback: when re-executing a non-idempotent write as
         # the original actor returns 403/404/409 (e.g. ownership/tenant already moved),
         # check previously-denied control actors on the same path and (when evidence is
         # specified) up to 2 distinct-tenant/admin actors from the harness roster to
         # verify the mutated state persisted in a fresh clean session.
-        if (
+        elif (
             replay_target is primary_proof
-            and str(primary_proof.get("method") or "").upper() in _MUTATING_METHODS
+            and str(primary_proof.get("method") or "").upper() in _WRITE_METHODS
             and r_status in {403, 404, 409}
             and self._has_budget(1)
         ):
@@ -1183,6 +1401,37 @@ class DifferentialOracle:
                     replayed_via_stateful_fallback = True
                     break
 
+        # For jwt_weakness proofs sent with an explicit forged Authorization/Cookie override
+        # header that ReceiptStore redacted, clean-session replay runs without the forged header:
+        # receiving 401/403 live confirms the endpoint rejects unprivileged requests.
+        if (
+            canonical_class == "jwt_weakness"
+            and 200 <= t_status < 300
+            and r_status in {401, 403}
+        ):
+            try:
+                replay_session_obj = self.http.actors.get(str(replay_target.get("actor") or "anon"))
+            except ValueError:
+                replay_session_obj = None
+            if replay_session_obj is not None and _has_overridden_redacted_auth_header(
+                replay_target,
+                replay_session_obj,
+                str(replay_target.get("method") or "GET"),
+            ):
+                stages["stage3_clean_replay"] = "passed_redacted_auth_override"
+                return OracleVerdict(
+                    verified=True,
+                    verdict="VERIFIED",
+                    reason=(
+                        "Verified jwt_weakness via control differential and live unprivileged "
+                        "clean-session rejection (forged auth header redacted in receipt)."
+                    ),
+                    mode=self.mode,
+                    stages=stages,
+                    clean_replay_receipt_id=replay_rec["receipt_id"],
+                    control_probe_receipt_id=ctrl_probe_rid,
+                )
+
         if not (200 <= r_status < 400) or (r_status // 100) != (t_status // 100):
             stages["stage3_clean_replay"] = f"failed_status_{r_status}"
             return OracleVerdict(
@@ -1204,6 +1453,30 @@ class DifferentialOracle:
                     verified=False,
                     verdict="REFUTED",
                     reason="Clean-session replay did not reproduce external redirect Location host.",
+                    mode=self.mode,
+                    stages=stages,
+                    clean_replay_receipt_id=replay_rec["receipt_id"],
+                    control_probe_receipt_id=ctrl_probe_rid,
+                )
+        elif canonical_class == "cors_misconfiguration":
+            orig_acao = _response_header_ci(replay_target, "access-control-allow-origin")
+            rep_acao = _response_header_ci(replay_rec, "access-control-allow-origin")
+            proof_origin = _request_header_ci(replay_target, "origin")
+            valid_acao = bool(
+                orig_acao
+                and rep_acao
+                and rep_acao.lower() == orig_acao.lower()
+                and (rep_acao == "*" or (bool(proof_origin) and rep_acao.lower() == proof_origin.lower()))
+            )
+            if not valid_acao:
+                stages["stage3_clean_replay"] = "failed_cors_origin"
+                return OracleVerdict(
+                    verified=False,
+                    verdict="REFUTED",
+                    reason=(
+                        "Clean-session replay did not reproduce Access-Control-Allow-Origin "
+                        "matching proof (* or reflected Origin)."
+                    ),
                     mode=self.mode,
                     stages=stages,
                     clean_replay_receipt_id=replay_rec["receipt_id"],
@@ -1234,7 +1507,7 @@ class DifferentialOracle:
                 )
         else:
             if ev and not _receipt_contains_evidence(replay_rec, ev):
-                ev_in_oob = is_oob_ssrf and any(
+                ev_in_oob = is_oob_verified and any(
                     ev.lower() in json.dumps(h, ensure_ascii=False).lower()
                     for h in effective_oob_hits
                 )
@@ -1252,7 +1525,7 @@ class DifferentialOracle:
 
         stages["stage3_clean_replay"] = (
             "passed_oob_verified"
-            if is_oob_ssrf
+            if is_oob_verified
             else ("passed_stateful_persistence" if replayed_via_stateful_fallback else "passed")
         )
         return OracleVerdict(

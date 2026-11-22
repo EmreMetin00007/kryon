@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 from pathlib import Path
 import sys
@@ -24,7 +25,7 @@ import agentic_vault  # noqa: E402
 import llm_config  # noqa: E402
 import target_bootstrap  # noqa: E402
 from provider_auth import authorize_provider  # noqa: E402
-from agentic_http import ActorManager, AgenticHTTPClient  # noqa: E402
+from agentic_http import ActorManager, AgenticHTTPClient, ServiceDegradationError  # noqa: E402
 from agentic_investigator import (  # noqa: E402
     _EPOCH_HARD_CHAR_LIMIT,
     _PROMPT_HARD_CHAR_LIMIT,
@@ -111,6 +112,7 @@ def run_agentic_target(
     scope_file: Path | None = None,
     allow_non_loopback: bool = False,
     max_degradation_streak: int = 5,
+    max_rps: float = 0.0,
     vault_home: Path | None = None,
     vault_key_name: str = "",
     storage_states: Sequence[str] | None = None,
@@ -123,6 +125,11 @@ def run_agentic_target(
     eff_cache_weight = float(cache_token_weight)
     if not (0.0 <= eff_cache_weight <= 1.0):
         raise ValueError(f"cache_token_weight must be between 0.0 and 1.0, got {cache_token_weight!r}")
+    if isinstance(max_rps, bool):
+        raise ValueError("max_rps must be a finite number >= 0.0")
+    eff_max_rps = float(max_rps)
+    if not math.isfinite(eff_max_rps) or eff_max_rps < 0.0:
+        raise ValueError(f"max_rps must be a finite number >= 0.0, got {max_rps!r}")
     vault_storage_payload: dict[str, Any] | None = None
     if credentials_file is not None:
         bundle = target_bootstrap.load_credentials_bundle(credentials_file)
@@ -241,6 +248,7 @@ def run_agentic_target(
         "max_turns": int(max_turns),
         "epoch_char_limit": eff_epoch_char_limit,
         "cache_token_weight": eff_cache_weight,
+        "max_rps": eff_max_rps,
     }
 
     ablation_cfg = {
@@ -333,6 +341,7 @@ def run_agentic_target(
         max_requests=eff_http_budget,
         excluded_paths=eff_excluded_paths,
         max_degradation_streak=max(0, int(max_degradation_streak)),
+        max_rps=eff_max_rps,
     )
 
     scope_summary = {
@@ -391,10 +400,17 @@ def run_agentic_target(
             cache_token_weight=eff_cache_weight,
             seed_surface=seed_data,
         )
+        if not resume and any(
+            alias != "anon" and bool(sess.login_payload) and not sess.authenticated
+            for alias, sess in actors.actors.items()
+        ):
+            http_client.authenticate_all_actors()
         run_info = investigator.run(resume=resume)
         manifest.update(run_info)
     except KeyboardInterrupt:
         manifest["status"] = "interrupted"
+    except ServiceDegradationError as exc:
+        manifest.update(status="service_degraded", error=type(exc).__name__, error_detail=str(exc)[:300])
     except Exception as exc:
         manifest.update(status="failed", error=type(exc).__name__, error_detail=str(exc)[:300])
     finally:
@@ -529,7 +545,13 @@ def main(argv: list[str] | None = None) -> int:
         "--max-degradation-streak",
         type=int,
         default=5,
-        help="Stop gracefully after N consecutive 429/502/503/504 responses (0 disables, default: 5)",
+        help="Stop gracefully after N consecutive 429/502/503/504 or connection-error responses (0 disables, default: 5)",
+    )
+    parser.add_argument(
+        "--max-rps",
+        type=float,
+        default=0.0,
+        help="Optional maximum HTTP/WS requests per second rate limit (0 disables, default: 0.0)",
     )
     parser.add_argument(
         "--vault-home",
@@ -567,6 +589,8 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if not (0.0 <= float(args.cache_token_weight) <= 1.0):
         parser.error("--cache-token-weight must be between 0.0 and 1.0")
+    if not math.isfinite(float(args.max_rps)) or float(args.max_rps) < 0.0:
+        parser.error("--max-rps must be a finite number >= 0.0")
 
     path, doc = run_agentic_target(
         target=args.target,
@@ -610,6 +634,7 @@ def main(argv: list[str] | None = None) -> int:
         scope_file=args.scope_file,
         allow_non_loopback=args.allow_non_loopback,
         max_degradation_streak=args.max_degradation_streak,
+        max_rps=args.max_rps,
         vault_home=args.vault_home,
         vault_key_name=args.vault_key_name,
         storage_states=args.storage_states,

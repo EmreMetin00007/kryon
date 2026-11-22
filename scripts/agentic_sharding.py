@@ -6,9 +6,18 @@ import re
 from typing import Any, Sequence
 from urllib.parse import urlsplit
 
-from agentic_surface import route_template_of
+from agentic_surface import (
+    is_malformed_url_path,
+    is_non_endpoint_source_path,
+    route_template_of,
+)
 
 _PREFIX_SEGMENT_RE = re.compile(r"^(?:api|rest|v\d+)$", re.IGNORECASE)
+_API_ROUTE_RE = re.compile(r"^/(?:api|rest|v\d+|graphql)(?:/|$)|/graphql(?:/|$)", re.IGNORECASE)
+
+
+def _is_api_route(path: str) -> bool:
+    return bool(_API_ROUTE_RE.search(str(path or "")))
 
 
 @dataclass
@@ -28,11 +37,18 @@ def extract_resource_family(path: str) -> str:
     """Return the normalized top-level resource family for a URL or path.
 
     Strips leading `/api`, `/v[0-9]+`, and `/rest` prefixes before selecting the
-    first resource segment. Root `/` and root-level static files map to `"root"`.
+    first resource segment. Root `/`, root-level static files, malformed paths,
+    and punctuation-only segments map to `"root"`.
     """
-    raw_path = urlsplit(str(path or "").strip()).path or "/"
+    raw = str(path or "")
+    if is_malformed_url_path(raw):
+        return "root"
+    raw_path = urlsplit(raw.strip()).path or "/"
     segments = [seg for seg in raw_path.split("/") if seg]
-    while segments and _PREFIX_SEGMENT_RE.fullmatch(segments[0]):
+    while segments and (
+        _PREFIX_SEGMENT_RE.fullmatch(segments[0])
+        or not any(ch.isalnum() for ch in segments[0])
+    ):
         segments.pop(0)
     if not segments:
         return "root"
@@ -40,6 +56,8 @@ def extract_resource_family(path: str) -> str:
     if first.startswith("{") and first.endswith("}"):
         return "root"
     if len(segments) == 1 and "." in first:
+        return "root"
+    if not any(ch.isalnum() for ch in first):
         return "root"
     return first.lower()
 
@@ -59,8 +77,13 @@ def cluster_discovered_surface(
     family_objects: dict[str, set[str]] = {}
     family_params: dict[str, dict[str, set[str]]] = {}
 
-    def _add_route(raw_path: str) -> str:
-        tmpl = route_template_of(raw_path)
+    def _add_route(raw_path: str) -> str | None:
+        raw = str(raw_path or "")
+        if is_non_endpoint_source_path(raw):
+            return None
+        tmpl = route_template_of(raw)
+        if is_non_endpoint_source_path(tmpl):
+            return None
         fam = extract_resource_family(tmpl)
         family_routes.setdefault(fam, set()).add(tmpl)
         return tmpl
@@ -78,17 +101,26 @@ def cluster_discovered_surface(
         write_ops_seen.add((str(method or "POST").upper(), str(tmpl)))
     for method, raw_tmpl in write_ops_seen:
         tmpl = _add_route(raw_tmpl)
+        if tmpl is None:
+            continue
         fam = extract_resource_family(tmpl)
         family_writes.setdefault(fam, set()).add(f"{method} {tmpl}")
 
     for concrete_path in getattr(surface_tracker, "discovered_objects", {}):
-        clean_obj = urlsplit(str(concrete_path)).path or "/"
+        raw_obj = str(concrete_path or "")
+        if is_non_endpoint_source_path(raw_obj):
+            continue
+        clean_obj = urlsplit(raw_obj.strip()).path or "/"
         tmpl = _add_route(clean_obj)
+        if tmpl is None:
+            continue
         fam = extract_resource_family(tmpl)
         family_objects.setdefault(fam, set()).add(clean_obj)
 
     for raw_tmpl, param_set in getattr(surface_tracker, "discovered_params", {}).items():
         tmpl = _add_route(str(raw_tmpl))
+        if tmpl is None:
+            continue
         fam = extract_resource_family(tmpl)
         cleaned = {str(p).strip() for p in (param_set or ()) if str(p).strip()}
         if cleaned:
@@ -118,17 +150,29 @@ def cluster_discovered_surface(
             )
         ]
 
-    # Score each family by richness: write_ops + concrete_objects + params + route_count.
-    scored_families: list[tuple[int, int, str]] = []
+    # Weight interactive/API signals (write ops, concrete objects, params, API routes)
+    # higher than raw route counts, and cap pure read-only non-API route bloat so
+    # static/UI path proliferation cannot monopolize a shard over real API families.
+    scored_families: list[tuple[int, int, int, int, str]] = []
     for fam in all_families:
+        f_routes = family_routes.get(fam, set())
         w_cnt = len(family_writes.get(fam, ()))
         o_cnt = len(family_objects.get(fam, ()))
         p_cnt = sum(len(ps) for ps in family_params.get(fam, {}).values())
-        r_cnt = len(family_routes.get(fam, ()))
-        richness = w_cnt + o_cnt + p_cnt + r_cnt
-        scored_families.append((richness, r_cnt, fam))
+        api_r_cnt = sum(1 for r in f_routes if _is_api_route(r))
+        non_api_r_cnt = len(f_routes) - api_r_cnt
+        interactive_score = (w_cnt * 4) + (o_cnt * 3) + (p_cnt * 2)
+        api_route_score = min(api_r_cnt, 8) * 3
+        non_api_route_score = (
+            min(non_api_r_cnt, 2)
+            if (interactive_score == 0 and api_r_cnt == 0)
+            else min(non_api_r_cnt, 4)
+        )
+        richness = interactive_score + api_route_score + non_api_route_score
+        eff_r_cnt = api_r_cnt + min(non_api_r_cnt, 3)
+        scored_families.append((richness, interactive_score, api_r_cnt, eff_r_cnt, fam))
 
-    scored_families.sort(key=lambda item: (-item[0], -item[1], item[2]))
+    scored_families.sort(key=lambda item: (-item[0], -item[1], -item[2], -item[3], item[4]))
 
     num_shards = min(eff_max, len(scored_families))
     bins: list[dict[str, Any]] = [
@@ -136,11 +180,11 @@ def cluster_discovered_surface(
         for i in range(num_shards)
     ]
 
-    for richness, r_cnt, fam in scored_families:
+    for richness, _interactive, _api_r, eff_r_cnt, fam in scored_families:
         target_bin = min(bins, key=lambda b: (b["weight"], b["routes"], b["idx"]))
         target_bin["families"].append(fam)
         target_bin["weight"] += richness
-        target_bin["routes"] += r_cnt
+        target_bin["routes"] += eff_r_cnt
 
     clusters: list[SubsystemCluster] = []
     for i, b in enumerate(bins, start=1):

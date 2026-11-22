@@ -593,6 +593,10 @@ def test_vault_storage_state_roundtrip_and_secret_free_summary(tmp_path: Path) -
         "tenant": "retail_tr",
         "cookies": {"session_id": cookie_secret},
         "headers": {"Authorization": f"Bearer {bearer_secret}"},
+        "local_storage": {
+            "access_token": f"Bearer {bearer_secret}",
+            "csrf_token": csrf_secret,
+        },
         "auth_header": f"Bearer {bearer_secret}",
         "access_token": bearer_secret,
         "csrf_token": csrf_secret,

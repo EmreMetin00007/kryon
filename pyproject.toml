@@ -34,6 +34,7 @@ packages = [
   "kryon_core.waf",
   "kryon_core.validator",
   "kryon_core.vault",
+  "kryon_core.protocol",
 ]
 include-package-data = false
 

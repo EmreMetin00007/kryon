@@ -201,6 +201,112 @@ _NON_RESOURCE_FILE_EXTS = (
     ".eot",
     ".webp",
 )
+# Frontend source-module, style-preprocessor, and bundler artifact extensions
+# that are not HTTP application endpoints. `.js` is intentionally excluded so
+# app bundle URLs (e.g. `/assets/app.js`) remain discoverable for surface extraction.
+_NON_ENDPOINT_SOURCE_EXTS = (
+    ".d.ts",
+    ".ts",
+    ".tsx",
+    ".jsx",
+    ".mjs",
+    ".cjs",
+    ".vue",
+    ".svelte",
+    ".scss",
+    ".sass",
+    ".less",
+    ".styl",
+    ".map",
+    ".wasm",
+    ".avif",
+    ".webmanifest",
+)
+_BUNDLER_PATH_MARKERS = (
+    "/node_modules/",
+    "/@vite/",
+    "/@fs/",
+    "/@id/",
+    "/__vite",
+    "/@react-refresh",
+)
+_BUNDLER_EXACT_PATHS = frozenset({
+    "/node_modules",
+    "/@vite",
+    "/@fs",
+    "/@id",
+    "/@react-refresh",
+})
+_FRONTEND_SOURCE_DIR_PREFIXES = (
+    "/components/ui/",
+    "/src/components/",
+)
+
+
+def is_malformed_url_path(url_or_path: str) -> bool:
+    """Return True if a URL/path contains malformed path fragments.
+
+    Rejects backslashes, quotes, JS template-literal syntax (`${`), path whitespace,
+    and control characters while preserving valid OpenAPI/route templates like `{id}`.
+    """
+    raw_in = str(url_or_path or "")
+    raw = raw_in.strip(" ")
+    if not raw:
+        return False
+    # Inspect raw input before urlsplit, which strips ASCII \t, \r, \n per WHATWG.
+    if any(ord(ch) < 32 or ord(ch) == 127 for ch in raw):
+        return True
+    raw_no_qf = raw.split("#", 1)[0].split("?", 1)[0]
+    if "\\" in raw_no_qf:
+        return True
+    try:
+        parsed = urlsplit(raw)
+    except ValueError:
+        return True
+    path = parsed.path or ""
+    if not path:
+        return False
+    if "\\" in path or "${" in path:
+        return True
+    if any(ch in path for ch in ('"', "'", "`")):
+        return True
+    if any(ch.isspace() for ch in path):
+        return True
+    return False
+
+
+def is_non_endpoint_source_path(url_or_path: str) -> bool:
+    """Return True for frontend source/bundler artifact URLs or malformed path fragments.
+
+    Preserves `.js` bundle URLs (e.g. `/assets/app.js`), legitimate API/OpenAPI/GraphQL
+    routes, and valid `{id}` route templates.
+    """
+    if is_malformed_url_path(url_or_path):
+        return True
+    raw = str(url_or_path or "").strip()
+    if not raw:
+        return False
+    try:
+        path = (urlsplit(raw).path or "").strip()
+    except ValueError:
+        return True
+    if not path or path == "/":
+        return False
+    norm_path = path.lower()
+    while norm_path.startswith("./"):
+        norm_path = norm_path[2:]
+    if norm_path and not norm_path.startswith("/"):
+        norm_path = "/" + norm_path
+    trimmed = norm_path.rstrip("/")
+    if not trimmed:
+        return False
+    if trimmed.endswith(_NON_ENDPOINT_SOURCE_EXTS):
+        return True
+    if trimmed in _BUNDLER_EXACT_PATHS or any(marker in norm_path for marker in _BUNDLER_PATH_MARKERS):
+        return True
+    if norm_path.startswith(_FRONTEND_SOURCE_DIR_PREFIXES):
+        return True
+    return False
 
 
 def _extract_api_prefix(path: str) -> str:
@@ -226,8 +332,10 @@ def _is_non_resource_api_subpath(api_prefix: str, path: str) -> bool:
 
 def _extract_ui_resource_info(path: str) -> tuple[str, bool, str] | None:
     """Extract `(resource, is_collection, concrete_id)` from a non-API UI route, or None."""
+    if is_non_endpoint_source_path(path):
+        return None
     norm_p = normalize_path(path)
-    if norm_p == "/" or _extract_api_prefix(norm_p) or is_static_asset_url(norm_p):
+    if norm_p == "/" or _extract_api_prefix(norm_p) or is_static_asset_url(norm_p) or is_non_endpoint_source_path(norm_p):
         return None
     if norm_p.lower().endswith(_NON_RESOURCE_FILE_EXTS):
         return None
@@ -480,6 +588,8 @@ class SurfaceFrontierTracker:
         status: int = 0,
         ctype: str = "",
     ) -> None:
+        if is_non_endpoint_source_path(norm_p):
+            return
         api_prefix = _extract_api_prefix(norm_p)
         if api_prefix:
             if discovered or status != 404:
@@ -516,7 +626,10 @@ class SurfaceFrontierTracker:
             self._sync_ui_api_concrete_siblings(resource)
 
     def _resolve_same_origin(self, raw_url: str, current_url: str = "") -> tuple[str, str] | None:
-        raw = str(raw_url or "").strip()
+        raw_input = str(raw_url or "")
+        if is_non_endpoint_source_path(raw_input):
+            return None
+        raw = raw_input.strip()
         if not raw or raw.startswith(("#", "javascript:", "mailto:", "tel:", "data:", "//")):
             return None
         base_ref = urljoin(self.base_url, current_url) if current_url else self.base_url
@@ -524,7 +637,7 @@ class SurfaceFrontierTracker:
         parsed = urlsplit(resolved)
         if (parsed.scheme, parsed.netloc) != self._origin:
             return None
-        if is_static_asset_url(parsed.path):
+        if is_static_asset_url(parsed.path) or is_non_endpoint_source_path(resolved):
             return None
         norm_p = normalize_path(parsed.path)
         return norm_p, parsed.query
@@ -595,6 +708,8 @@ class SurfaceFrontierTracker:
         verified_2xx: bool = False,
         listed: bool = False,
     ) -> None:
+        if is_non_endpoint_source_path(concrete_path):
+            return
         norm_p = normalize_path(concrete_path)
         tmpl = route_template_of(norm_p)
         if "{id}" not in tmpl or "{" in norm_p or norm_p.lower().endswith((".js", ".mjs")):
@@ -877,21 +992,35 @@ class SurfaceFrontierTracker:
                     actor=actor,
                     current_url=url,
                 )
-            for rec in extract_js(body, url, limit=60):
+            kept_js = 0
+            for rec in extract_js(body, url, limit=240):
+                cand_u = str(rec.get("url") or "")
+                if is_non_endpoint_source_path(cand_u):
+                    continue
                 self._register_discovered_url(
-                    str(rec.get("url") or ""),
+                    cand_u,
                     method=str(rec.get("method") or "GET"),
                     params=rec.get("params") or (),
                     actor=actor,
                     current_url=url,
                 )
-            for sr in extract_spa_routes(body, url, limit=60):
+                kept_js += 1
+                if kept_js >= 60:
+                    break
+            kept_spa = 0
+            for sr in extract_spa_routes(body, url, limit=160):
+                cand_u = str(sr.get("url") or "")
+                if is_non_endpoint_source_path(cand_u):
+                    continue
                 self._register_discovered_url(
-                    str(sr.get("url") or ""),
+                    cand_u,
                     method="GET",
                     actor=actor,
                     current_url=url,
                 )
+                kept_spa += 1
+                if kept_spa >= 60:
+                    break
             for spec_u in find_spec_urls(body, url):
                 self._register_discovered_url(spec_u, method="GET", actor=actor, current_url=url)
 

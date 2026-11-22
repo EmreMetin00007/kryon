@@ -1,9 +1,12 @@
-"""Strict loopback-only out-of-band HTTP callback listener for async/SSRF QA."""
+"""Loopback-default (with opt-in private Docker-bridge) OOB HTTP callback listener for async/SSRF/XXE QA."""
 from __future__ import annotations
 
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import ipaddress
 import json
+import os
+import re
 import secrets
 import socket
 import threading
@@ -13,9 +16,74 @@ from urllib.parse import urlsplit
 from agentic_receipts import redact_headers, redact_secrets
 
 _ALLOWED_LOOPBACK_HOSTS = frozenset({"127.0.0.1", "::1"})
+_HOSTNAME_LABEL_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?$")
+_FORBIDDEN_ADVERTISE_CHARS = frozenset({"/", "\\", "?", "#", "@", "[", "]"})
 DEFAULT_MAX_HITS = 200
 DEFAULT_MAX_BODY_CHARS = 2048
 _MAX_READ_BYTES = 65536
+
+
+def _validate_bind_host(host: str, *, allow_private_bridge: bool) -> str:
+    """Validate callback bind host (strict loopback by default; opt-in private bridge IP)."""
+    clean_host = str(host or "127.0.0.1").strip()
+    if not allow_private_bridge:
+        if clean_host not in _ALLOWED_LOOPBACK_HOSTS:
+            raise ValueError(
+                f"LoopbackCallbackServer rejects non-loopback bind address {host!r}; "
+                "only '127.0.0.1' or '::1' is permitted"
+            )
+        return clean_host
+
+    if not clean_host or "%" in clean_host or any(ch.isspace() or ord(ch) < 32 or ch == "\x7f" for ch in clean_host):
+        raise ValueError(
+            f"LoopbackCallbackServer rejects invalid bind address {host!r}; "
+            "only literal loopback or private bridge IP addresses are permitted"
+        )
+    try:
+        ip = ipaddress.ip_address(clean_host)
+    except ValueError:
+        raise ValueError(
+            f"LoopbackCallbackServer rejects non-IP bind address {host!r}; "
+            "only literal loopback or private bridge IP addresses are permitted"
+        ) from None
+
+    if not (ip.is_loopback or (ip.is_private and not ip.is_unspecified and not ip.is_multicast)):
+        raise ValueError(
+            f"LoopbackCallbackServer rejects bind address {host!r}; "
+            "only literal loopback or private non-unspecified IP addresses are permitted"
+        )
+    return clean_host
+
+
+def _validate_advertise_host(advertise_host: str) -> str:
+    """Validate optional advertise_host as a clean hostname or IP (no scheme, path, port, whitespace, or '@')."""
+    if advertise_host == "":
+        return ""
+    if not isinstance(advertise_host, str):
+        raise ValueError(f"invalid advertise_host: {advertise_host!r}")
+    if any(ch.isspace() or ord(ch) < 32 or ch == "\x7f" for ch in advertise_host):
+        raise ValueError(f"advertise_host must not contain whitespace or control characters: {advertise_host!r}")
+    if any(ch in _FORBIDDEN_ADVERTISE_CHARS for ch in advertise_host) or "%" in advertise_host:
+        raise ValueError(f"advertise_host must be a bare hostname or IP address: {advertise_host!r}")
+
+    try:
+        ip = ipaddress.ip_address(advertise_host)
+    except ValueError:
+        ip = None
+
+    if ip is not None:
+        if ip.is_unspecified or ip.is_multicast:
+            raise ValueError(f"advertise_host rejects unspecified or multicast IP: {advertise_host!r}")
+        return advertise_host
+
+    if ":" in advertise_host:
+        raise ValueError(f"advertise_host must not include a scheme or port: {advertise_host!r}")
+    if len(advertise_host) > 253 or advertise_host.startswith(".") or advertise_host.endswith("."):
+        raise ValueError(f"invalid advertise_host hostname: {advertise_host!r}")
+    labels = advertise_host.split(".")
+    if not all(_HOSTNAME_LABEL_RE.fullmatch(label) for label in labels):
+        raise ValueError(f"invalid advertise_host hostname: {advertise_host!r}")
+    return advertise_host
 
 
 class _LoopbackThreadingHTTPServer(ThreadingHTTPServer):
@@ -28,7 +96,7 @@ class _LoopbackIPv6ThreadingHTTPServer(_LoopbackThreadingHTTPServer):
 
 
 class LoopbackCallbackServer:
-    """Thread-safe loopback-only HTTP callback server for webhook/SSRF verification."""
+    """Thread-safe loopback-default HTTP callback server for webhook/SSRF/XXE verification."""
 
     def __init__(
         self,
@@ -37,17 +105,18 @@ class LoopbackCallbackServer:
         port: int = 0,
         max_hits: int = DEFAULT_MAX_HITS,
         max_body_chars: int = DEFAULT_MAX_BODY_CHARS,
+        allow_private_bridge: bool = False,
+        advertise_host: str = "",
     ) -> None:
-        clean_host = str(host or "127.0.0.1").strip()
-        if clean_host not in _ALLOWED_LOOPBACK_HOSTS:
-            raise ValueError(
-                f"LoopbackCallbackServer rejects non-loopback bind address {host!r}; "
-                "only '127.0.0.1' or '::1' is permitted"
-            )
+        allow_bridge = bool(allow_private_bridge)
+        clean_host = _validate_bind_host(host, allow_private_bridge=allow_bridge)
+        clean_advertise = _validate_advertise_host(advertise_host)
         port_num = int(port)
         if not (0 <= port_num <= 65535):
             raise ValueError(f"invalid port: {port!r}")
         self.host = clean_host
+        self.allow_private_bridge = allow_bridge
+        self.advertise_host = clean_advertise
         self._requested_port = port_num
         self._bound_port = 0
         self.max_hits = max(1, int(max_hits))
@@ -60,13 +129,44 @@ class LoopbackCallbackServer:
         self._hits: list[dict[str, Any]] = []
         self._dropped_hits = 0
 
+    @classmethod
+    def from_env(
+        cls,
+        *,
+        port: int = 0,
+        max_hits: int = DEFAULT_MAX_HITS,
+        max_body_chars: int = DEFAULT_MAX_BODY_CHARS,
+    ) -> LoopbackCallbackServer:
+        """Create a callback server from optional CCO_OOB_BIND_HOST / CCO_OOB_ADVERTISE_HOST env vars."""
+        bind_host = str(os.environ.get("CCO_OOB_BIND_HOST") or "").strip()
+        advertise_host = str(os.environ.get("CCO_OOB_ADVERTISE_HOST") or "").strip()
+        if not bind_host:
+            return cls(
+                host="127.0.0.1",
+                port=port,
+                max_hits=max_hits,
+                max_body_chars=max_body_chars,
+                allow_private_bridge=False,
+                advertise_host=advertise_host,
+            )
+        allow_private = bind_host not in _ALLOWED_LOOPBACK_HOSTS
+        return cls(
+            host=bind_host,
+            port=port,
+            max_hits=max_hits,
+            max_body_chars=max_body_chars,
+            allow_private_bridge=allow_private,
+            advertise_host=advertise_host,
+        )
+
     @property
     def port(self) -> int:
         return self._bound_port
 
     @property
     def base_url(self) -> str:
-        host_fmt = f"[{self.host}]" if ":" in self.host else self.host
+        target_host = self.advertise_host or self.host
+        host_fmt = f"[{target_host}]" if ":" in target_host else target_host
         return f"http://{host_fmt}:{self.port}"
 
     @property

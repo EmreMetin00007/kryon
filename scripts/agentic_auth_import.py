@@ -26,6 +26,8 @@ if str(_SCRIPTS_DIR) not in sys.path:
 import agentic_vault  # noqa: E402
 
 MAX_STORAGE_STATE_BYTES = 5 * 1024 * 1024
+MAX_LOCAL_STORAGE_KEYS = 64
+MAX_LOCAL_STORAGE_BYTES = 64 * 1024
 VAULT_STORAGE_STATE_SCHEMA = "agentic-vault-storage-state/1"
 
 _DEFAULT_ALIAS = "browser-user"
@@ -388,11 +390,13 @@ def load_storage_state_actor(
     for _, name, value in cookie_candidates:
         cookies_dict[name] = value
 
-    # 2. Extract bearer & CSRF tokens strictly from matching-origin localStorage.
+    # 2. Extract bearer & CSRF tokens and preserve exact-origin localStorage entries.
     best_token_rank: int | None = None
     access_token_str = ""
     best_csrf_rank: int | None = None
     csrf_token_str = ""
+    local_storage_dict: dict[str, str] = {}
+    local_storage_bytes = 0
 
     target_origin = (target_scheme, target_host, target_port)
     for origin_entry in state.get("origins") or []:
@@ -417,7 +421,24 @@ def load_storage_state_actor(
             raw_key = item.get("name")
             if not isinstance(raw_key, str):
                 continue
-            key_lower = raw_key.strip().lower()
+            ls_key = raw_key.strip()
+            raw_val = item.get("value")
+            if ls_key and not _has_control_chars(raw_key) and isinstance(raw_val, str):
+                entry_bytes = len(ls_key.encode("utf-8")) + len(raw_val.encode("utf-8"))
+                if ls_key in local_storage_dict:
+                    prev_bytes = len(ls_key.encode("utf-8")) + len(local_storage_dict[ls_key].encode("utf-8"))
+                    new_total = local_storage_bytes - prev_bytes + entry_bytes
+                    if new_total <= MAX_LOCAL_STORAGE_BYTES:
+                        local_storage_dict[ls_key] = raw_val
+                        local_storage_bytes = new_total
+                elif (
+                    len(local_storage_dict) < MAX_LOCAL_STORAGE_KEYS
+                    and local_storage_bytes + entry_bytes <= MAX_LOCAL_STORAGE_BYTES
+                ):
+                    local_storage_dict[ls_key] = raw_val
+                    local_storage_bytes += entry_bytes
+
+            key_lower = ls_key.lower()
             if not key_lower:
                 continue
 
@@ -425,14 +446,14 @@ def load_storage_state_actor(
             if token_rank is None:
                 token_rank = _TOKEN_KEY_RANK.get(key_lower.replace("-", "_"))
             if token_rank is not None:
-                candidate = _normalize_bearer_value(item.get("value"))
+                candidate = _normalize_bearer_value(raw_val)
                 if candidate and (best_token_rank is None or token_rank < best_token_rank):
                     best_token_rank = token_rank
                     access_token_str = candidate
 
             csrf_rank = _LOCALSTORAGE_CSRF_RANK.get(key_lower)
             if csrf_rank is not None:
-                csrf_candidate = _clean_secret_value(item.get("value"))
+                csrf_candidate = _clean_secret_value(raw_val)
                 if csrf_candidate and (best_csrf_rank is None or csrf_rank < best_csrf_rank):
                     best_csrf_rank = csrf_rank
                     csrf_token_str = csrf_candidate
@@ -459,6 +480,7 @@ def load_storage_state_actor(
         "tenant": clean_tenant,
         "cookies": cookies_dict,
         "headers": extra_headers,
+        "local_storage": local_storage_dict,
         "auth_header": auth_header_str,
         "access_token": access_token_str,
         "csrf_token": csrf_token_str,
