@@ -2031,6 +2031,19 @@ class ToolDispatcher:
                 hyp_id = hyp_node.node_id
                 self._step_delta_v += h_dv
                 self._step_delta_e += h_de
+            valid_rids = {
+                str(r.get("receipt_id") or "")
+                for r in valid_receipts_only
+                if r.get("receipt_id")
+            }
+            caller_setup_receipts = [
+                r
+                for r in proof_receipts
+                if str(r.get("receipt_id") or "") not in valid_rids
+                and str(r.get("method") or "").upper() in _MUTATING_WRITE_METHODS
+                and 200 <= int(r.get("status") or 0) < 400
+                and not _is_multipart_receipt(r)
+            ]
             verdict = self.oracle.verify(
                 canonical_class=canonical_class,
                 primary_proof=best_primary,
@@ -2042,6 +2055,7 @@ class ToolDispatcher:
                 inferred_owner=inferred_bola_owner,
                 oob_server=self._oob_server,
                 oob_hits=matching_oob_hits,
+                setup_receipts=caller_setup_receipts,
             )
             if self.bsag is not None and hyp_id:
                 self.bsag.apply_oracle_verdict(

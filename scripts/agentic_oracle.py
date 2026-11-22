@@ -1113,6 +1113,7 @@ class DifferentialOracle:
         inferred_owner: str = "",
         oob_server: Any | None = None,
         oob_hits: Sequence[dict[str, Any]] | None = None,
+        setup_receipts: Sequence[dict[str, Any]] | None = None,
     ) -> OracleVerdict:
         """Run verification gate before promoting a CLAIMED hypothesis to VERIFIED."""
         if self.mode == "llm_self_judge":
@@ -1807,7 +1808,7 @@ class DifferentialOracle:
         if single_step_get_missing_state and self._has_budget(2):
             setup_rec = _find_prior_setup_write_receipt(
                 replay_target,
-                proof_receipts,
+                [*proof_receipts, *(setup_receipts or ())],
                 self.receipts,
             )
             if setup_rec is not None:

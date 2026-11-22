@@ -21,6 +21,7 @@ from agentic_oracle import (  # noqa: E402
     _find_prior_setup_write_receipt,
 )
 from agentic_receipts import ReceiptStore  # noqa: E402
+from agentic_tools import ToolDispatcher  # noqa: E402
 
 
 def _start_server(handler_cls: type[BaseHTTPRequestHandler]) -> tuple[str, ThreadingHTTPServer]:
@@ -700,5 +701,94 @@ def test_two_step_stored_xss_enforces_html_verbatim_check_on_step2(tmp_path: Pat
         assert v_esc.verdict == "REFUTED"
         assert v_esc.stages["stage3_clean_replay"] == "failed_missing_evidence"
     finally:
+        client.close()
+        _stop_server(srv)
+
+
+def test_tool_dispatcher_record_finding_preserves_two_step_setup_receipt(tmp_path: Path) -> None:
+    """ToolDispatcher._tool_record_finding preserves cross-endpoint setup write receipts for two-step replay."""
+    lock = threading.Lock()
+    tokens: dict[str, bool] = {}
+
+    class _ShareHandler(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def log_message(self, *_args: object) -> None:
+            return
+
+        def _send(self, status: int, payload: Any) -> None:
+            body = json.dumps(payload).encode("utf-8")
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_POST(self) -> None:  # noqa: N802
+            if urlsplit(self.path).path != "/api/share":
+                self._send(404, {"error": "not found"})
+                return
+            length = int(self.headers.get("Content-Length") or "0")
+            data = json.loads(self.rfile.read(length).decode("utf-8", errors="replace") or "{}")
+            code = str(data.get("code") or "c1")
+            with lock:
+                tokens[code] = False
+            self._send(200, {"code": code})
+
+        def do_GET(self) -> None:  # noqa: N802
+            parsed = urlsplit(self.path)
+            if parsed.path != "/api/consume":
+                self._send(404, {"error": "not found"})
+                return
+            code = (parse_qs(parsed.query).get("code") or [""])[0]
+            with lock:
+                if code not in tokens:
+                    self._send(404, {"error": "missing"})
+                    return
+                if tokens[code]:
+                    self._send(410, {"error": "consumed"})
+                    return
+                tokens[code] = True
+            self._send(200, {"secret": "ONESHOT_TOOL_SECRET_77"})
+
+    base_url, srv = _start_server(_ShareHandler)
+    store, client, oracle = _make_oracle_env(tmp_path, base_url)
+    dispatcher = ToolDispatcher(
+        http_client=client,
+        receipt_store=store,
+        root_dir=tmp_path,
+        oracle=oracle,
+    )
+    try:
+        setup_rec = client.request(
+            method="POST",
+            url="/api/share",
+            actor="alice",
+            json_body={"code": "tok-1"},
+        )
+        consume_rec = client.request(method="GET", url="/api/consume?code=tok-1", actor="anon")
+        ctrl_rec = client.request(method="GET", url="/api/consume?code=missing", actor="bob")
+
+        res = json.loads(
+            dispatcher.dispatch(
+                "record_finding",
+                {
+                    "title": "Unauthenticated One-Shot Consume",
+                    "class_type": "auth_bypass",
+                    "method": "GET",
+                    "url": "/api/consume",
+                    "actor_alias": "anon",
+                    "proof_receipt_ids": [setup_rec["receipt_id"], consume_rec["receipt_id"]],
+                    "control_receipt_ids": [ctrl_rec["receipt_id"]],
+                    "evidence_value": "ONESHOT_TOOL_SECRET_77",
+                    "summary": "Anonymous consume reads one-shot secret created by alice.",
+                    "severity": "high",
+                },
+            )
+        )
+        assert res.get("accepted") is True, res
+    finally:
+        dispatcher.close()
         client.close()
         _stop_server(srv)

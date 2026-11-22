@@ -1420,8 +1420,8 @@ class AgenticHTTPClient:
     ) -> dict[str, Any]:
         """Execute a scope-locked, metered, receipted HTTP or WebSocket request."""
         raw_url_str = str(url or "").strip()
-        is_ws = raw_url_str.lower().startswith(("ws://", "wss://"))
         norm_method = str(method or "GET").strip().upper()
+        is_ws = raw_url_str.lower().startswith(("ws://", "wss://")) or norm_method == "WS"
         if is_ws:
             if norm_method not in self.allowed_methods and not (norm_method == "WS" and "GET" in self.allowed_methods):
                 raise MethodNotAllowedError(
@@ -1432,6 +1432,9 @@ class AgenticHTTPClient:
                 f"HTTP method {norm_method!r} not allowed; permitted: {sorted(self.allowed_methods)}"
             )
         clean_url, path, norm_query = self._merge_query(url, query, allow_websocket=is_ws)
+        if is_ws and clean_url.lower().startswith(("http://", "https://")):
+            ws_scheme = "wss://" if clean_url.lower().startswith("https://") else "ws://"
+            clean_url = ws_scheme + clean_url.split("://", 1)[1]
         session = self.actors.get(actor)
 
         extra_headers = {str(k): str(v) for k, v in (headers or {}).items()}

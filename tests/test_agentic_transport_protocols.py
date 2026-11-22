@@ -1050,6 +1050,16 @@ def test_websocket_probe_and_http_client_scope_locked_integration(tmp_path: Path
         # Method allowlist still enforced for disallowed methods.
         with pytest.raises(MethodNotAllowedError):
             client.request(method="DELETE", url=f"ws://127.0.0.1:{ws_srv.port}/ws", actor="user-a")
+
+        # Relative /path with explicit method="WS" upgrades to ws:// cleanly under ScopeGuard.
+        rec_rel = client.request(method="WS", url="/ws", actor="user-a", json_body={"ping": 2})
+        assert rec_rel["status"] == 101
+        assert rec_rel["method"] == "WS"
+        assert json.loads(rec_rel["body"])["upgraded"] is True
+        with pytest.raises(ScopeViolationError):
+            client.request(method="WS", url="https://evil.example/ws", actor="user-a")
+        with pytest.raises(ScopeViolationError):
+            client.request(method="WS", url="/logout", actor="user-a")
     finally:
         client.close()
         ws_srv.stop()
