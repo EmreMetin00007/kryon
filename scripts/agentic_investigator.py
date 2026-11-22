@@ -258,6 +258,12 @@ class AgenticInvestigator:
             wrapup_reasons.append(f"turns_left={max(0, eff_max_turns - turn)}")
         if self.http.budget.limit > 15 and http_rem <= 10:
             wrapup_reasons.append(f"http_left={http_rem}/{self.http.budget.limit}")
+        sec_lim = float(getattr(self.budget, "seconds_limit", 0) or self.budget.limits.get("seconds") or 0)
+        sec_rem = float(self.budget.remaining_seconds())
+        if sec_lim > 0:
+            sec_threshold = min(90.0, max(15.0, sec_lim * 0.15)) if sec_lim >= 90.0 else sec_lim * 0.15
+            if sec_rem <= sec_threshold:
+                wrapup_reasons.append(f"seconds_left={int(max(0.0, sec_rem))}/{int(sec_lim)}s")
         return wrapup_reasons
 
     def _sync_coverage_gate(
@@ -370,9 +376,10 @@ class AgenticInvestigator:
             if shard_cluster is not None
             else ""
         )
+        sec_rem = int(max(0.0, float(self.budget.remaining_seconds())))
         return (
             f"\n[STATE] http_budget: {http_rem}/{self.http.budget.limit} left | "
-            f"llm_tokens: {tok_rem}/{tok_lim} left | turn: {turn}/{eff_max_turns} | "
+            f"llm_tokens: {tok_rem}/{tok_lim} left | time_left: {sec_rem}s | turn: {turn}/{eff_max_turns} | "
             f"actors: {actor_list} | findings: {len(eff_disp.findings)} | "
             f"receipts: {self.receipts.count()}"
             f"{shard_line}"

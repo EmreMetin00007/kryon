@@ -12,6 +12,7 @@ import threading
 from typing import Any, Sequence
 
 from agentic_bsag import STATUS_REFUTED, STATUS_SUSPECT_DECOY, BeliefStateAttackGraph
+from agentic_surface import route_template_of
 
 
 def _atomic_write_text(path: Path, text: str) -> None:
@@ -102,12 +103,17 @@ def compute_process_metrics(
         visited_eps = int(snap["endpoints_visited"])
         discovered_templates = set(snap["endpoint_templates"])
     elif surface_tracker is not None:
-        discovered_templates = {
-            tmpl for _, tmpl in getattr(surface_tracker, "discovered_routes", {})
+        raw_discovered = {
+            route_template_of(str(path))
+            for _, path in getattr(surface_tracker, "discovered_routes", {})
+            if str(path or "").strip()
         }
         visited_templates = {
-            tmpl for _, tmpl in getattr(surface_tracker, "visited_method_templates", set())
+            str(tmpl)
+            for _, tmpl in getattr(surface_tracker, "visited_method_templates", set())
+            if str(tmpl or "").strip()
         }
+        discovered_templates = raw_discovered | visited_templates
         discovered_eps = len(discovered_templates)
         visited_eps = len(visited_templates)
     else:
@@ -115,7 +121,7 @@ def compute_process_metrics(
         discovered_eps = len(discovered_templates)
         visited_eps = discovered_eps
 
-    exposure_ratio = round(visited_eps / max(1, discovered_eps), 4) if discovered_eps > 0 else 0.0
+    exposure_ratio = min(1.0, round(visited_eps / max(1, discovered_eps), 4)) if discovered_eps > 0 else 0.0
     exposure_block: dict[str, Any] = {
         "unique_endpoints_discovered": discovered_eps,
         "unique_endpoints_visited": visited_eps,

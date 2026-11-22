@@ -442,3 +442,64 @@ def test_storage_state_actor_live_http_redaction_and_runner_seed_integration(tmp
     finally:
         srv.shutdown()
         srv.server_close()
+
+
+def test_time_based_budget_wrapup_and_bounded_exposure_ratio(tmp_path: Path) -> None:
+    import time
+    from agentic_telemetry import compute_process_metrics
+
+    store = ReceiptStore(tmp_path)
+    client = AgenticHTTPClient(
+        base_url="http://127.0.0.1:18080/",
+        receipt_store=store,
+        actors=ActorManager([]),
+        allowed_methods=["GET", "POST"],
+        max_requests=200,
+    )
+    budget = SharedBudget(http=200, tokens=500_000, seconds=540)
+    inv = AgenticInvestigator(
+        http_client=client,
+        receipt_store=store,
+        transport=object(),  # type: ignore[arg-type]
+        budget=budget,
+        model="test-model",
+        root_dir=tmp_path,
+        max_turns=40,
+    )
+
+    # Healthy remaining time -> no time wrapup, banner includes time_left
+    healthy_banner = inv._state_banner(2)
+    assert "time_left:" in healthy_banner
+    assert "[BUDGET-WRAPUP]" not in healthy_banner
+
+    # Simulate low remaining seconds (<= 15% of 540s = 81s -> 45s left)
+    budget.deadline = time.monotonic() + 45.0
+    low_time_banner = inv._state_banner(5)
+    assert "[BUDGET-WRAPUP]" in low_time_banner
+    assert "seconds_left=" in low_time_banner
+    assert inv.dispatcher.coverage_gate_enabled is False
+    client.close()
+
+    # Exposure ratio stays strictly <= 1.0 even when agent visits routes beyond initial discovered_routes
+    tracker = SurfaceFrontierTracker(base_url="http://127.0.0.1:18080/", allowed_methods=["GET", "POST"])
+    tracker.ingest_surface(
+        {"url": "http://127.0.0.1:18080/", "links": [{"method": "GET", "url": "/v1/projects"}]},
+        actor="seed",
+    )
+    for ep in ("/v1/projects", "/v1/projects/11111111-1111-1111-1111-111111111111", "/v1/orgs", "/v1/users/me"):
+        tracker.ingest_receipt(
+            {
+                "receipt_id": "req-0001",
+                "actor": "user-a",
+                "method": "GET",
+                "url": f"http://127.0.0.1:18080{ep}",
+                "path": ep,
+                "status": 200,
+                "content_type": "application/json",
+                "body": "{}",
+            }
+        )
+    metrics = compute_process_metrics(events=[], surface_tracker=tracker)
+    exp = metrics["exposure_rate"]
+    assert exp["unique_endpoints_discovered"] >= exp["unique_endpoints_visited"]
+    assert 0.0 < exp["coverage_ratio"] <= 1.0
