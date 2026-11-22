@@ -22,7 +22,14 @@ if str(_SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS_DIR))
 
 from agentic_http import is_static_asset_url  # noqa: E402
-from agentic_surface import SurfaceFrontierTracker, is_id_segment, route_template_of  # noqa: E402
+from agentic_surface import (  # noqa: E402
+    SurfaceFrontierTracker,
+    _fit_body_template_budget,
+    _sanitize_json_template,
+    is_id_segment,
+    is_non_endpoint_source_path,
+    route_template_of,
+)
 from target_bootstrap import ScopeGuard, normalize_path  # noqa: E402
 
 MAX_SEED_FILE_BYTES = 10 * 1024 * 1024  # 10 MB hard cap per seed file
@@ -33,6 +40,8 @@ _VALID_HTTP_METHODS = frozenset({"GET", "POST", "PUT", "PATCH", "DELETE", "HEAD"
 _WRITE_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
 
 _SAFE_PARAM_NAME_RE = re.compile(r"^[A-Za-z0-9_.\-\[\]$]{1,64}$")
+_SAFE_PATH_PARAM_MARKER_RE = re.compile(r"^path:[A-Za-z][A-Za-z0-9_.\-]{0,48}=?$")
+_PARAM_TOKEN_SPLIT_RE = re.compile(r"[^a-z0-9]+")
 _METHOD_PATH_KEY_RE = re.compile(
     r"^(GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS)\s+(/\S*)$",
     re.IGNORECASE,
@@ -54,9 +63,41 @@ _SCHEMELESS_HOST_RE = re.compile(
     re.IGNORECASE,
 )
 _API_PATH_RE = re.compile(
-    r"^/(?:api(?:/v\d+)?|v\d+|rest|rpc|graphql)(?:/|$)|/api(?:/v\d+)?/",
+    r"^/(?:(?:ajax[-_]?)?api(?:/(?:v?\d+(?:\.\d+)?))?|v\d+(?:\.\d+)?|rest|rpc|graphql)(?:/|$)"
+    r"|/(?:ajax[-_]?)?api(?:/(?:v?\d+(?:\.\d+)?))?/",
     re.IGNORECASE,
 )
+_HIGH_RISK_PARAM_EXACT = frozenset({
+    "file",
+    "url",
+    "redirect",
+    "path",
+    "upload",
+    "download",
+    "callback",
+    "dest",
+    "target",
+    "next",
+})
+_HIGH_RISK_PARAM_SUBSTRINGS = (
+    "file",
+    "url",
+    "redirect",
+    "upload",
+    "download",
+    "callback",
+)
+_GENERIC_SEED_TOP_KEYS = frozenset({
+    "schema",
+    "links",
+    "forms",
+    "routes",
+    "endpoints",
+    "body_templates",
+    "multipart_schemas",
+    "ws_endpoints",
+    "discovery_hints",
+})
 _HIGH_SIGNAL_KEYWORDS = (
     "admin",
     "internal",
@@ -303,6 +344,8 @@ class _CandidateRoute:
     params: list[str] = field(default_factory=list)
     is_form: bool = False
     status: int | None = None
+    body_template: dict[str, Any] | None = None
+    multipart_schema: dict[str, list[str]] | None = None
 
 
 @dataclass
@@ -313,6 +356,8 @@ class _AcceptedRoute:
     is_form: bool = False
     best_status: int | None = None
     first_seen: int = 0
+    body_template: dict[str, Any] | None = None
+    multipart_schema: dict[str, list[str]] | None = None
 
 
 def _read_seed_file(path: Path | str, *, max_bytes: int = MAX_SEED_FILE_BYTES) -> str:
@@ -392,9 +437,181 @@ def _status_priority(status: int | None) -> int:
 
 def _sanitize_param_name(raw: Any) -> str:
     name = str(raw or "").strip()
-    if not name or not _SAFE_PARAM_NAME_RE.fullmatch(name):
+    if not name:
         return ""
-    return name
+    if _SAFE_PARAM_NAME_RE.fullmatch(name) or _SAFE_PATH_PARAM_MARKER_RE.fullmatch(name):
+        return name
+    return ""
+
+
+def _sanitize_multipart_schema(raw: Any) -> dict[str, list[str]] | None:
+    """Sanitize a multipart schema dict to store only sorted field and file parameter names."""
+    if not isinstance(raw, dict):
+        return None
+
+    def _clean_seq(val: Any) -> list[str]:
+        if not isinstance(val, (list, tuple, set)):
+            return []
+        names: list[str] = []
+        seen: set[str] = set()
+        for item in val:
+            cand = item.get("name") if isinstance(item, dict) else (item if isinstance(item, str) else "")
+            clean = _sanitize_param_name(cand)
+            if clean and clean not in seen and len(names) < _MAX_PARAMS_PER_ROUTE:
+                seen.add(clean)
+                names.append(clean)
+        return sorted(names)
+
+    fields = _clean_seq(raw.get("fields"))
+    files = _clean_seq(raw.get("files"))
+    if not fields and not files:
+        return None
+    return {"fields": fields, "files": files}
+
+
+def _sanitize_seed_body_template(raw: Any) -> dict[str, Any] | None:
+    """Sanitize, secret-redact, and size-cap a JSON body template dict from seed data."""
+    if not isinstance(raw, dict) or not raw:
+        return None
+    sanitized = _sanitize_json_template(raw)
+    if not isinstance(sanitized, dict) or not sanitized:
+        return None
+    fitted = _fit_body_template_budget(sanitized)
+    return fitted if isinstance(fitted, dict) and fitted else None
+
+
+def _extract_template_param_names(doc: Any, *, depth: int = 0) -> list[str]:
+    """Extract sanitized top-level and nested/leaf JSON key names from a body template (never values)."""
+    if depth > 4:
+        return []
+    out: list[str] = []
+    seen: set[str] = set()
+
+    def _add(name: Any) -> None:
+        clean = _sanitize_param_name(name)
+        if clean and clean not in seen and len(out) < _MAX_PARAMS_PER_ROUTE:
+            seen.add(clean)
+            out.append(clean)
+
+    if isinstance(doc, dict):
+        for k, v in doc.items():
+            _add(k)
+            if isinstance(v, (dict, list)) and len(out) < _MAX_PARAMS_PER_ROUTE:
+                for sub in _extract_template_param_names(v, depth=depth + 1):
+                    _add(sub)
+    elif isinstance(doc, list):
+        for elem in doc[:4]:
+            if isinstance(elem, (dict, list)) and len(out) < _MAX_PARAMS_PER_ROUTE:
+                for sub in _extract_template_param_names(elem, depth=depth + 1):
+                    _add(sub)
+    return out
+
+
+def _body_template_richness(doc: dict[str, Any]) -> tuple[int, int]:
+    try:
+        ser_len = len(json.dumps(doc, ensure_ascii=False, sort_keys=True, separators=(",", ":")))
+    except (TypeError, ValueError):
+        ser_len = 0
+    return (len(doc), ser_len)
+
+
+def _merge_body_templates(
+    existing: dict[str, Any] | None,
+    incoming: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    if incoming is None:
+        return existing
+    if existing is None:
+        return incoming
+    if _body_template_richness(incoming) > _body_template_richness(existing):
+        return incoming
+    return existing
+
+
+def _merge_multipart_schemas(
+    existing: dict[str, list[str]] | None,
+    incoming: dict[str, list[str]] | None,
+) -> dict[str, list[str]] | None:
+    if incoming is None:
+        return existing
+    if existing is None:
+        return incoming
+    fields = sorted(set(existing.get("fields") or ()) | set(incoming.get("fields") or ()))[:_MAX_PARAMS_PER_ROUTE]
+    files = sorted(set(existing.get("files") or ()) | set(incoming.get("files") or ()))[:_MAX_PARAMS_PER_ROUTE]
+    if not fields and not files:
+        return None
+    return {"fields": fields, "files": files}
+
+
+def _parse_method_url_key(key: Any) -> tuple[str, str] | None:
+    if not isinstance(key, str):
+        return None
+    match = _METHOD_URL_LINE_RE.fullmatch(key.strip())
+    if not match:
+        return None
+    return match.group(1).upper(), match.group(2)
+
+
+def _normalize_ws_endpoint(raw_item: Any, guard: ScopeGuard) -> tuple[dict[str, str] | None, str]:
+    """Validate a WebSocket endpoint against `ScopeGuard` and strip query values."""
+    raw_url = ""
+    if isinstance(raw_item, str):
+        raw_url = raw_item.strip()
+    elif isinstance(raw_item, dict):
+        raw_url = str(raw_item.get("url") or raw_item.get("path") or "").strip()
+    if not raw_url:
+        return None, ""
+
+    base_parsed = urlsplit(guard.base_origin)
+    base_scheme = base_parsed.scheme.lower()
+    ws_scheme = "wss" if base_scheme == "https" else "ws"
+
+    low = raw_url.lower()
+    if low.startswith("ws://"):
+        if base_scheme != "http":
+            return None, "scope"
+        http_cand = "http://" + raw_url[5:]
+    elif low.startswith("wss://"):
+        if base_scheme != "https":
+            return None, "scope"
+        http_cand = "https://" + raw_url[6:]
+    else:
+        http_cand = raw_url
+
+    try:
+        guard.check_url(http_cand)
+    except ValueError:
+        return None, "scope"
+
+    resolved = urljoin(guard.base_origin, http_cand)
+    parsed = urlsplit(resolved)
+    try:
+        norm_path = normalize_path(parsed.path or "/")
+    except ValueError:
+        return None, "scope"
+
+    if is_static_asset_url(norm_path) or is_non_endpoint_source_path(norm_path):
+        return None, "static"
+
+    return {"url": f"{ws_scheme}://{parsed.netloc}{norm_path}", "path": norm_path}, ""
+
+
+def _has_high_risk_param(params: Sequence[str]) -> bool:
+    """Return True if any parameter name suggests file, URL, upload/download, redirect, or path input."""
+    for raw_p in params:
+        p_low = str(raw_p or "").strip().lower()
+        if not p_low:
+            continue
+        if p_low.startswith("path:"):
+            return True
+        if p_low in _HIGH_RISK_PARAM_EXACT:
+            return True
+        if any(sub in p_low for sub in _HIGH_RISK_PARAM_SUBSTRINGS):
+            return True
+        tokens = [tok for tok in _PARAM_TOKEN_SPLIT_RE.split(p_low) if tok]
+        if any(tok in _HIGH_RISK_PARAM_EXACT for tok in tokens):
+            return True
+    return False
 
 
 def _extract_param_names(raw: Any) -> list[str]:
@@ -717,6 +934,8 @@ def _parse_ffuf(data: dict[str, Any]) -> list[_CandidateRoute]:
 def _is_mitm_scope_dict(data: dict[str, Any]) -> bool:
     if not data:
         return False
+    if any(k in _GENERIC_SEED_TOP_KEYS for k in data):
+        return False
     for key, val in data.items():
         if _parse_method_path_key(key) is not None:
             return True
@@ -840,8 +1059,24 @@ def _parse_route_item(item: Any, *, default_method: str = "GET", is_form: bool =
         params: list[str] = []
         for pkey in ("params", "query_params", "body_fields", "fields", "inputs", "body_keys"):
             params.extend(_extract_param_names(item.get(pkey)))
+        body_template = _sanitize_seed_body_template(item.get("body_template"))
+        if body_template is not None:
+            params.extend(_extract_template_param_names(body_template))
+        multipart_schema = _sanitize_multipart_schema(item.get("multipart_schema"))
+        if multipart_schema is not None:
+            params.extend(multipart_schema["fields"])
+            params.extend(multipart_schema["files"])
         status = _coerce_status(item.get("status"))
-        return _CandidateRoute(method=method, url=url, params=params, is_form=is_form, status=status)
+        eff_is_form = bool(is_form or item.get("is_form"))
+        return _CandidateRoute(
+            method=method,
+            url=url,
+            params=params,
+            is_form=eff_is_form,
+            status=status,
+            body_template=body_template,
+            multipart_schema=multipart_schema,
+        )
     return None
 
 
@@ -857,7 +1092,9 @@ def _parse_generic_json(data: Any) -> list[_CandidateRoute]:
     if not isinstance(data, dict):
         return out
 
-    found_collection = False
+    found_collection = any(
+        k in data for k in ("schema", "body_templates", "multipart_schemas", "ws_endpoints", "discovery_hints")
+    )
     for list_key in ("routes", "urls", "endpoints", "links", "pages", "js_calls", "spa_routes", "api_requests"):
         arr = data.get(list_key)
         if isinstance(arr, list):
@@ -874,6 +1111,70 @@ def _parse_generic_json(data: Any) -> list[_CandidateRoute]:
             rec = _parse_route_item(item, default_method="GET", is_form=True)
             if rec is not None:
                 out.append(rec)
+
+    # Index parsed candidates by (method, raw_url) and (method, path) so top-level
+    # body_templates / multipart_schemas attach cleanly to matching routes or create new ones.
+    by_exact: dict[tuple[str, str], _CandidateRoute] = {}
+    by_path: dict[tuple[str, str], _CandidateRoute] = {}
+    for cand in out:
+        by_exact.setdefault((cand.method, cand.url), cand)
+        cand_path = urlsplit(cand.url).path or "/"
+        by_path.setdefault((cand.method, cand_path), cand)
+
+    raw_body_templates = data.get("body_templates")
+    if isinstance(raw_body_templates, dict):
+        for raw_key, raw_doc in raw_body_templates.items():
+            parsed_key = _parse_method_url_key(raw_key)
+            if parsed_key is None:
+                continue
+            bt = _sanitize_seed_body_template(raw_doc)
+            if bt is None:
+                continue
+            bt_method, bt_url = parsed_key
+            bt_params = _extract_template_param_names(bt)
+            bt_path = urlsplit(bt_url).path or "/"
+            target = by_exact.get((bt_method, bt_url)) or by_path.get((bt_method, bt_path))
+            if target is not None:
+                target.body_template = _merge_body_templates(target.body_template, bt)
+                target.params.extend(bt_params)
+            else:
+                created = _CandidateRoute(
+                    method=bt_method,
+                    url=bt_url,
+                    params=bt_params,
+                    body_template=bt,
+                )
+                out.append(created)
+                by_exact[(bt_method, bt_url)] = created
+                by_path[(bt_method, bt_path)] = created
+
+    raw_multipart_schemas = data.get("multipart_schemas")
+    if isinstance(raw_multipart_schemas, dict):
+        for raw_key, raw_schema in raw_multipart_schemas.items():
+            parsed_key = _parse_method_url_key(raw_key)
+            if parsed_key is None:
+                continue
+            ms = _sanitize_multipart_schema(raw_schema)
+            if ms is None:
+                continue
+            mp_method, mp_url = parsed_key
+            mp_params = [*ms["fields"], *ms["files"]]
+            mp_path = urlsplit(mp_url).path or "/"
+            target = by_exact.get((mp_method, mp_url)) or by_path.get((mp_method, mp_path))
+            if target is not None:
+                target.multipart_schema = _merge_multipart_schemas(target.multipart_schema, ms)
+                target.params.extend(mp_params)
+            else:
+                created = _CandidateRoute(
+                    method=mp_method,
+                    url=mp_url,
+                    params=mp_params,
+                    is_form=True,
+                    multipart_schema=ms,
+                )
+                out.append(created)
+                by_exact[(mp_method, mp_url)] = created
+                by_path[(mp_method, mp_path)] = created
 
     if not found_collection:
         single = _parse_route_item(data)
@@ -915,11 +1216,11 @@ def _parse_plain_text(text: str, guard: ScopeGuard) -> list[_CandidateRoute]:
     return out
 
 
-def _parse_seed_text(text: str, guard: ScopeGuard) -> tuple[str, list[_CandidateRoute]]:
-    """Auto-detect seed artifact format and parse candidate routes offline."""
+def _parse_seed_text_with_extras(text: str, guard: ScopeGuard) -> tuple[str, list[_CandidateRoute], list[Any]]:
+    """Auto-detect seed artifact format and parse candidate routes and optional ws_endpoints offline."""
     stripped = text.strip()
     if not stripped:
-        return "text", []
+        return "text", [], []
 
     if stripped[0] in "{[":
         try:
@@ -929,20 +1230,23 @@ def _parse_seed_text(text: str, guard: ScopeGuard) -> tuple[str, list[_Candidate
 
         if isinstance(parsed, dict):
             if isinstance(parsed.get("log"), dict) and isinstance(parsed["log"].get("entries"), list):
-                return "har", _parse_har(parsed)
+                return "har", _parse_har(parsed), []
             if _is_zap_dict(parsed):
-                return "zap", _parse_zap(parsed, guard)
+                return "zap", _parse_zap(parsed, guard), []
             if _is_ffuf_dict(parsed):
-                return "ffuf", _parse_ffuf(parsed)
+                return "ffuf", _parse_ffuf(parsed), []
             if _is_mitm_scope_dict(parsed):
-                return "mitm_scope", _parse_mitm_scope_dict(parsed, guard)
+                return "mitm_scope", _parse_mitm_scope_dict(parsed, guard), []
             if _is_nuclei_item(parsed):
-                return "nuclei", _parse_nuclei_items([parsed])
-            return "generic_json", _parse_generic_json(parsed)
+                return "nuclei", _parse_nuclei_items([parsed]), []
+            ws_raw = parsed.get("ws_endpoints")
+            ws_list = list(ws_raw) if isinstance(ws_raw, list) else []
+            fmt = "stage0_seed" if str(parsed.get("schema") or "").startswith("stage0-seed/") else "generic_json"
+            return fmt, _parse_generic_json(parsed), ws_list
 
         if isinstance(parsed, list):
             if any(_is_nuclei_item(item) for item in parsed[:20]):
-                return "nuclei", _parse_nuclei_items(parsed)
+                return "nuclei", _parse_nuclei_items(parsed), []
             if any(
                 isinstance(item, dict)
                 and "method" in item
@@ -950,8 +1254,8 @@ def _parse_seed_text(text: str, guard: ScopeGuard) -> tuple[str, list[_Candidate
                 and ("params" in item or "capture_redacted" in item or "statuses" in item)
                 for item in parsed[:20]
             ):
-                return "mitm_scope", _parse_generic_json(parsed)
-            return "generic_json", _parse_generic_json(parsed)
+                return "mitm_scope", _parse_generic_json(parsed), []
+            return "generic_json", _parse_generic_json(parsed), []
 
         # JSONL fallback (e.g., nuclei JSONL or mitm_scope traffic JSONL)
         json_items: list[dict[str, Any]] = []
@@ -968,22 +1272,28 @@ def _parse_seed_text(text: str, guard: ScopeGuard) -> tuple[str, list[_Candidate
                     json_items.append(obj)
         if json_items:
             if any(_is_nuclei_item(item) for item in json_items[:20]):
-                return "nuclei", _parse_nuclei_items(json_items)
+                return "nuclei", _parse_nuclei_items(json_items), []
             if any(
                 "method" in item
                 and "url" in item
                 and ("params" in item or "capture_redacted" in item)
                 for item in json_items[:20]
             ):
-                return "mitm_scope", _parse_generic_json(json_items)
-            return "generic_json", _parse_generic_json(json_items)
-        return "text", []
+                return "mitm_scope", _parse_generic_json(json_items), []
+            return "generic_json", _parse_generic_json(json_items), []
+        return "text", [], []
 
-    return "text", _parse_plain_text(stripped, guard)
+    return "text", _parse_plain_text(stripped, guard), []
+
+
+def _parse_seed_text(text: str, guard: ScopeGuard) -> tuple[str, list[_CandidateRoute]]:
+    """Auto-detect seed artifact format and parse candidate routes offline."""
+    fmt, candidates, _ = _parse_seed_text_with_extras(text, guard)
+    return fmt, candidates
 
 
 def _route_priority_score(route: _AcceptedRoute) -> int:
-    """Compute a deterministic signal score favoring API, write, parameterized, and deeper routes."""
+    """Compute a deterministic signal score favoring API, write, schema-rich, parameterized, and deeper routes."""
     score = 0
     low = route.path.lower()
 
@@ -991,8 +1301,14 @@ def _route_priority_score(route: _AcceptedRoute) -> int:
         score += 40
     if route.method in _WRITE_METHODS:
         score += 30
+    if route.multipart_schema:
+        score += 18
+    if route.body_template:
+        score += 12
     if route.params:
         score += 20 + min(len(route.params), 5)
+        if _has_high_risk_param(route.params):
+            score += 10
 
     segments = [seg for seg in route.path.split("/") if seg]
     score += min(len(segments), 6) * 5
@@ -1052,6 +1368,203 @@ def _select_discovery_hints(routes: Sequence[_AcceptedRoute], max_hints: int) ->
     return selected
 
 
+def _finalize_seed_surface(
+    candidates: Sequence[_CandidateRoute],
+    raw_ws_endpoints: Sequence[Any],
+    *,
+    guard: ScopeGuard,
+    max_routes: int,
+    max_discovery_hints: int,
+    files_loaded: int = 0,
+    initial_dropped_scope: int = 0,
+    initial_dropped_static: int = 0,
+    formats_detected: Sequence[str] = (),
+    extra_discovery_hints: Sequence[str] = (),
+) -> dict[str, Any]:
+    """Scope-filter, sanitize, deduplicate, and rank candidate routes and WS endpoints."""
+    effective_max_routes = max(0, int(max_routes))
+    effective_max_hints = max(0, int(max_discovery_hints))
+
+    routes_dropped_scope = max(0, int(initial_dropped_scope))
+    routes_dropped_static = max(0, int(initial_dropped_static))
+    accepted_by_key: dict[tuple[str, str], _AcceptedRoute] = {}
+    seen_order = 0
+
+    for cand in candidates:
+        raw_url = str(cand.url or "").strip()
+        if not raw_url:
+            continue
+
+        # Strict ScopeGuard enforcement BEFORE static filtering or normalization.
+        try:
+            guard.check_url(raw_url)
+        except ValueError:
+            routes_dropped_scope += 1
+            continue
+
+        resolved = urljoin(guard.base_origin, raw_url)
+        parsed = urlsplit(resolved)
+        try:
+            norm_path = normalize_path(parsed.path or "/")
+        except ValueError:
+            routes_dropped_scope += 1
+            continue
+
+        if (
+            is_static_asset_url(norm_path)
+            or is_static_asset_url(resolved)
+            or is_non_endpoint_source_path(norm_path)
+            or is_non_endpoint_source_path(resolved)
+        ):
+            routes_dropped_static += 1
+            continue
+
+        method = _normalize_method(cand.method, default="GET")
+        sanitized_bt = _sanitize_seed_body_template(cand.body_template)
+        sanitized_mp = _sanitize_multipart_schema(cand.multipart_schema)
+
+        # Extract ONLY parameter names from query string + parsed body/multipart fields; discard all values.
+        param_names: list[str] = []
+        param_seen: set[str] = set()
+
+        def _add_param(raw_p: Any) -> None:
+            clean_p = _sanitize_param_name(raw_p)
+            if clean_p and clean_p not in param_seen and len(param_names) < _MAX_PARAMS_PER_ROUTE:
+                param_seen.add(clean_p)
+                param_names.append(clean_p)
+
+        if parsed.query:
+            for qk, _ in parse_qsl(parsed.query, keep_blank_values=True, max_num_fields=_MAX_QUERY_FIELDS):
+                _add_param(qk)
+        for extra_p in cand.params:
+            _add_param(extra_p)
+        if sanitized_bt is not None:
+            for bt_p in _extract_template_param_names(sanitized_bt):
+                _add_param(bt_p)
+        if sanitized_mp is not None:
+            for mp_p in (*sanitized_mp["fields"], *sanitized_mp["files"]):
+                _add_param(mp_p)
+
+        key = (method, norm_path)
+        existing = accepted_by_key.get(key)
+        if existing is None:
+            seen_order += 1
+            accepted_by_key[key] = _AcceptedRoute(
+                method=method,
+                path=norm_path,
+                params=sorted(param_names),
+                is_form=bool(cand.is_form),
+                best_status=cand.status,
+                first_seen=seen_order,
+                body_template=sanitized_bt,
+                multipart_schema=sanitized_mp,
+            )
+        else:
+            if param_names:
+                merged = sorted(set(existing.params) | set(param_names))[:_MAX_PARAMS_PER_ROUTE]
+                existing.params = merged
+            if cand.is_form:
+                existing.is_form = True
+            if cand.status is not None and _status_priority(cand.status) > _status_priority(existing.best_status):
+                existing.best_status = cand.status
+            if sanitized_bt is not None:
+                existing.body_template = _merge_body_templates(existing.body_template, sanitized_bt)
+            if sanitized_mp is not None:
+                existing.multipart_schema = _merge_multipart_schemas(existing.multipart_schema, sanitized_mp)
+
+    ws_by_path: dict[str, dict[str, str]] = {}
+    for raw_ws in raw_ws_endpoints:
+        ws_entry, drop_reason = _normalize_ws_endpoint(raw_ws, guard)
+        if ws_entry is None:
+            if drop_reason == "scope":
+                routes_dropped_scope += 1
+            elif drop_reason == "static":
+                routes_dropped_static += 1
+            continue
+        ws_by_path.setdefault(ws_entry["path"], ws_entry)
+    ws_endpoints = [ws_by_path[p] for p in sorted(ws_by_path)]
+
+    ranked_routes = sorted(
+        accepted_by_key.values(),
+        key=lambda r: (-_route_priority_score(r), r.first_seen, r.path, r.method),
+    )
+    kept_routes = ranked_routes[:effective_max_routes]
+
+    links: list[dict[str, Any]] = []
+    forms: list[dict[str, Any]] = []
+    body_templates_map: dict[str, dict[str, Any]] = {}
+    multipart_schemas_map: dict[str, dict[str, list[str]]] = {}
+
+    for route in kept_routes:
+        entry: dict[str, Any] = {
+            "method": route.method,
+            "url": route.path,
+            "params": list(route.params),
+        }
+        if route.body_template is not None:
+            entry["body_template"] = route.body_template
+            tmpl_key = f"{route.method} {route_template_of(route.path)}"
+            merged_bt = _merge_body_templates(body_templates_map.get(tmpl_key), route.body_template)
+            if merged_bt is not None:
+                body_templates_map[tmpl_key] = merged_bt
+        if route.multipart_schema is not None:
+            entry["multipart_schema"] = route.multipart_schema
+            tmpl_key = f"{route.method} {route_template_of(route.path)}"
+            merged_mp = _merge_multipart_schemas(multipart_schemas_map.get(tmpl_key), route.multipart_schema)
+            if merged_mp is not None:
+                multipart_schemas_map[tmpl_key] = merged_mp
+        if route.is_form:
+            forms.append(entry)
+        else:
+            links.append(entry)
+
+    discovery_hints = _select_discovery_hints(kept_routes, effective_max_hints)
+    if extra_discovery_hints and len(discovery_hints) < effective_max_hints:
+        seen_hints = set(discovery_hints)
+        for raw_h in extra_discovery_hints:
+            h_str = str(raw_h or "").strip()
+            if not h_str:
+                continue
+            try:
+                guard.check_url(h_str)
+            except ValueError:
+                continue
+            resolved_h = urljoin(guard.base_origin, h_str)
+            try:
+                norm_h = normalize_path(urlsplit(resolved_h).path or "/")
+            except ValueError:
+                continue
+            if is_static_asset_url(norm_h) or is_non_endpoint_source_path(norm_h):
+                continue
+            if norm_h not in seen_hints:
+                seen_hints.add(norm_h)
+                discovery_hints.append(norm_h)
+                if len(discovery_hints) >= effective_max_hints:
+                    break
+
+    result: dict[str, Any] = {
+        "url": guard.base_origin,
+        "links": links,
+        "forms": forms,
+        "discovery_hints": discovery_hints,
+        "body_templates": dict(sorted(body_templates_map.items())),
+        "multipart_schemas": dict(sorted(multipart_schemas_map.items())),
+        "stats": {
+            "files_loaded": files_loaded,
+            "routes_accepted": len(links) + len(forms),
+            "routes_dropped_scope": routes_dropped_scope,
+            "routes_dropped_static": routes_dropped_static,
+            "formats_detected": list(formats_detected),
+            "body_templates_count": len(body_templates_map),
+            "multipart_schemas_count": len(multipart_schemas_map),
+            "ws_endpoints_count": len(ws_endpoints),
+        },
+    }
+    if ws_endpoints:
+        result["ws_endpoints"] = ws_endpoints
+    return result
+
+
 def load_seed_surface_files(
     paths: Sequence[Path | str],
     *,
@@ -1062,119 +1575,105 @@ def load_seed_surface_files(
 ) -> dict[str, Any]:
     """Load, scope-filter, secret-strip, deduplicate, and rank offline seed surface files."""
     guard = ScopeGuard(base_origin=base_url, excluded_paths=tuple(excluded_paths or ()))
-    effective_max_routes = max(0, int(max_routes))
-    effective_max_hints = max(0, int(max_discovery_hints))
 
     files_loaded = 0
-    routes_dropped_scope = 0
-    routes_dropped_static = 0
     formats_detected: list[str] = []
-    accepted_by_key: dict[tuple[str, str], _AcceptedRoute] = {}
-    seen_order = 0
+    all_candidates: list[_CandidateRoute] = []
+    all_ws_endpoints: list[Any] = []
 
     for raw_file in paths:
         text = _read_seed_file(raw_file)
         files_loaded += 1
-        fmt, candidates = _parse_seed_text(text, guard)
+        fmt, candidates, ws_items = _parse_seed_text_with_extras(text, guard)
         if fmt and fmt not in formats_detected:
             formats_detected.append(fmt)
+        all_candidates.extend(candidates)
+        all_ws_endpoints.extend(ws_items)
 
-        for cand in candidates:
-            raw_url = str(cand.url or "").strip()
-            if not raw_url:
-                continue
-
-            # Strict ScopeGuard enforcement BEFORE static filtering or normalization.
-            try:
-                guard.check_url(raw_url)
-            except ValueError:
-                routes_dropped_scope += 1
-                continue
-
-            resolved = urljoin(guard.base_origin, raw_url)
-            parsed = urlsplit(resolved)
-            try:
-                norm_path = normalize_path(parsed.path or "/")
-            except ValueError:
-                routes_dropped_scope += 1
-                continue
-
-            if is_static_asset_url(norm_path) or is_static_asset_url(resolved):
-                routes_dropped_static += 1
-                continue
-
-            method = _normalize_method(cand.method, default="GET")
-
-            # Extract ONLY parameter names from query string + parsed body fields; discard all values.
-            param_names: list[str] = []
-            param_seen: set[str] = set()
-            if parsed.query:
-                for qk, _ in parse_qsl(parsed.query, keep_blank_values=True, max_num_fields=_MAX_QUERY_FIELDS):
-                    clean_k = _sanitize_param_name(qk)
-                    if clean_k and clean_k not in param_seen and len(param_names) < _MAX_PARAMS_PER_ROUTE:
-                        param_seen.add(clean_k)
-                        param_names.append(clean_k)
-            for extra_p in cand.params:
-                clean_p = _sanitize_param_name(extra_p)
-                if clean_p and clean_p not in param_seen and len(param_names) < _MAX_PARAMS_PER_ROUTE:
-                    param_seen.add(clean_p)
-                    param_names.append(clean_p)
-
-            key = (method, norm_path)
-            existing = accepted_by_key.get(key)
-            if existing is None:
-                seen_order += 1
-                accepted_by_key[key] = _AcceptedRoute(
-                    method=method,
-                    path=norm_path,
-                    params=sorted(param_names),
-                    is_form=bool(cand.is_form),
-                    best_status=cand.status,
-                    first_seen=seen_order,
-                )
-            else:
-                if param_names:
-                    merged = sorted(set(existing.params) | set(param_names))[:_MAX_PARAMS_PER_ROUTE]
-                    existing.params = merged
-                if cand.is_form:
-                    existing.is_form = True
-                if cand.status is not None and _status_priority(cand.status) > _status_priority(existing.best_status):
-                    existing.best_status = cand.status
-
-    ranked_routes = sorted(
-        accepted_by_key.values(),
-        key=lambda r: (-_route_priority_score(r), r.first_seen, r.path, r.method),
+    return _finalize_seed_surface(
+        all_candidates,
+        all_ws_endpoints,
+        guard=guard,
+        max_routes=max_routes,
+        max_discovery_hints=max_discovery_hints,
+        files_loaded=files_loaded,
+        formats_detected=formats_detected,
     )
-    kept_routes = ranked_routes[:effective_max_routes]
 
-    links: list[dict[str, Any]] = []
-    forms: list[dict[str, Any]] = []
-    for route in kept_routes:
-        entry: dict[str, Any] = {
-            "method": route.method,
-            "url": route.path,
-            "params": list(route.params),
-        }
-        if route.is_form:
-            forms.append(entry)
-        else:
-            links.append(entry)
 
-    discovery_hints = _select_discovery_hints(kept_routes, effective_max_hints)
+def merge_seed_surfaces(
+    seed_dicts: Sequence[dict[str, Any] | None],
+    *,
+    base_url: str,
+    excluded_paths: Sequence[str] = (),
+    max_routes: int = 200,
+    max_discovery_hints: int = 12,
+) -> dict[str, Any] | None:
+    """Combine multiple in-memory seed surface dicts with full ScopeGuard filtering and deduplication."""
+    guard = ScopeGuard(base_origin=base_url, excluded_paths=tuple(excluded_paths or ()))
 
-    return {
-        "url": guard.base_origin,
-        "links": links,
-        "forms": forms,
-        "discovery_hints": discovery_hints,
-        "stats": {
-            "files_loaded": files_loaded,
-            "routes_accepted": len(links) + len(forms),
-            "routes_dropped_scope": routes_dropped_scope,
-            "routes_dropped_static": routes_dropped_static,
-            "formats_detected": formats_detected,
-        },
-    }
+    all_candidates: list[_CandidateRoute] = []
+    all_ws_endpoints: list[Any] = []
+    extra_hints: list[str] = []
+    files_loaded = 0
+    prior_dropped_scope = 0
+    prior_dropped_static = 0
+    formats_detected: list[str] = []
+
+    for doc in seed_dicts:
+        if not isinstance(doc, dict) or not doc:
+            continue
+        all_candidates.extend(_parse_generic_json(doc))
+        ws_raw = doc.get("ws_endpoints")
+        if isinstance(ws_raw, list):
+            all_ws_endpoints.extend(ws_raw)
+        hints_raw = doc.get("discovery_hints")
+        if isinstance(hints_raw, list):
+            for h in hints_raw:
+                if isinstance(h, str) and h.strip():
+                    extra_hints.append(h.strip())
+        stats = doc.get("stats")
+        if isinstance(stats, dict):
+            if isinstance(stats.get("files_loaded"), int):
+                files_loaded += max(0, stats["files_loaded"])
+            if isinstance(stats.get("routes_dropped_scope"), int):
+                prior_dropped_scope += max(0, stats["routes_dropped_scope"])
+            if isinstance(stats.get("routes_dropped_static"), int):
+                prior_dropped_static += max(0, stats["routes_dropped_static"])
+            raw_fmts = stats.get("formats_detected")
+            if isinstance(raw_fmts, list):
+                for fmt in raw_fmts:
+                    fmt_s = str(fmt or "").strip()
+                    if fmt_s and fmt_s not in formats_detected:
+                        formats_detected.append(fmt_s)
+        schema_tag = str(doc.get("schema") or "").strip()
+        if schema_tag.startswith("stage0-seed/") and "stage0_seed" not in formats_detected:
+            formats_detected.append("stage0_seed")
+
+    if not all_candidates and not all_ws_endpoints:
+        return None
+
+    merged = _finalize_seed_surface(
+        all_candidates,
+        all_ws_endpoints,
+        guard=guard,
+        max_routes=max_routes,
+        max_discovery_hints=max_discovery_hints,
+        files_loaded=files_loaded,
+        initial_dropped_scope=prior_dropped_scope,
+        initial_dropped_static=prior_dropped_static,
+        formats_detected=formats_detected,
+        extra_discovery_hints=extra_hints,
+    )
+    if (
+        not merged["links"]
+        and not merged["forms"]
+        and not merged["body_templates"]
+        and not merged["multipart_schemas"]
+        and not merged.get("ws_endpoints")
+    ):
+        return None
+    return merged
 
 
 def apply_seed_surface(
@@ -1189,10 +1688,18 @@ def apply_seed_surface(
     links = [item for item in (seed_data.get("links") or []) if isinstance(item, dict) and item.get("url")]
     forms = [item for item in (seed_data.get("forms") or []) if isinstance(item, dict) and item.get("url")]
     count = len(links) + len(forms)
-    if count == 0:
+    raw_bt = seed_data.get("body_templates")
+    raw_mp = seed_data.get("multipart_schemas")
+    raw_ws = seed_data.get("ws_endpoints")
+    standalone = (
+        (len(raw_bt) if isinstance(raw_bt, dict) else 0)
+        + (len(raw_mp) if isinstance(raw_mp, dict) else 0)
+        + (len(raw_ws) if isinstance(raw_ws, list) else 0)
+    )
+    if count == 0 and standalone == 0:
         return 0
     surface_tracker.ingest_surface(seed_data, actor=actor)
-    return count
+    return count if count > 0 else standalone
 
 
 def _normalize_hint_path(raw: str) -> str:

@@ -289,6 +289,18 @@ _VALIDATION_FIELD_SEG_RE = re.compile(r"^[A-Za-z0-9_$-]{1,48}$")
 _VALIDATION_TYPE_RE = re.compile(r"^[A-Za-z0-9_.-]{1,48}$")
 _VALIDATION_ROOT_SCOPES = frozenset({"body", "query", "path", "header", "cookie"})
 _NON_TYPE_LABELS = frozenset({"field", "error", "validation_error", "invalid"})
+_SAFE_MULTIPART_NAME_RE = re.compile(r"^[A-Za-z0-9_.\-\[\]$]{1,64}$")
+_METHOD_URL_KEY_RE = re.compile(
+    r"^(GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS)\s+(\S+)$",
+    re.IGNORECASE,
+)
+
+
+def _sanitize_multipart_name(raw: Any) -> str:
+    name = str(raw or "").strip()
+    if not name or not _SAFE_MULTIPART_NAME_RE.fullmatch(name):
+        return ""
+    return name
 
 _PATH_KV_KEY_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_-]{0,31}$")
 _URL_SCHEME_VAL_RE = re.compile(r"^[A-Za-z][A-Za-z0-9+.-]{0,15}:$")
@@ -978,17 +990,55 @@ class SurfaceFrontierTracker:
         elif len(fitted) > len(existing):
             self.discovered_body_templates[key] = fitted
 
+    def _add_schema_hints(self, tmpl: str, hints: Sequence[str]) -> None:
+        """Add compact schema/protocol hints for `tmpl` within per-template and global caps."""
+        if not hints or not tmpl:
+            return
+        existing = self.discovered_schema_hints.get(tmpl)
+        if existing is None and len(self.discovered_schema_hints) >= _MAX_SCHEMA_HINT_TEMPLATES:
+            return
+        bucket = self.discovered_schema_hints.setdefault(tmpl, set())
+        for raw_h in hints:
+            h = str(raw_h or "").strip()
+            if not h or h in bucket:
+                continue
+            if len(bucket) >= _MAX_SCHEMA_HINTS_PER_TEMPLATE:
+                break
+            bucket.add(h)
+
+    def _record_multipart_schema(self, tmpl: str, schema: Any) -> list[str]:
+        """Record sanitized multipart file/field parameter names and compact schema hints."""
+        if not isinstance(schema, dict) or not tmpl:
+            return []
+
+        def _clean_names(raw_seq: Any) -> list[str]:
+            if not isinstance(raw_seq, (list, tuple, set)):
+                return []
+            out: list[str] = []
+            seen: set[str] = set()
+            for item in raw_seq:
+                cand = item.get("name") if isinstance(item, dict) else (item if isinstance(item, str) else "")
+                clean = _sanitize_multipart_name(cand)
+                if clean and clean not in seen and len(out) < _MAX_PARAMS_PER_TEMPLATE:
+                    seen.add(clean)
+                    out.append(clean)
+            return sorted(out)
+
+        files = _clean_names(schema.get("files"))
+        fields = _clean_names(schema.get("fields"))
+        all_names = sorted(set(files) | set(fields))[:_MAX_PARAMS_PER_TEMPLATE]
+        if all_names:
+            self._add_discovered_params(tmpl, all_names)
+        hints = [*(f"multipart:file={f}" for f in files), *(f"multipart:field={k}" for k in fields)]
+        if hints:
+            self._add_schema_hints(tmpl, hints)
+        return all_names
+
     def _ingest_validation_hints(self, tmpl: str, parsed: Any, *, method: str) -> None:
         """Record 400/422 validation schema hints and leaf parameter names for `tmpl`."""
         hints, leaves = _extract_validation_schema_hints(parsed, method=method)
         if hints:
-            existing = self.discovered_schema_hints.get(tmpl)
-            if existing is not None or len(self.discovered_schema_hints) < _MAX_SCHEMA_HINT_TEMPLATES:
-                bucket = self.discovered_schema_hints.setdefault(tmpl, set())
-                for h in hints:
-                    if len(bucket) >= _MAX_SCHEMA_HINTS_PER_TEMPLATE:
-                        break
-                    bucket.add(h)
+            self._add_schema_hints(tmpl, hints)
         if leaves:
             self._add_discovered_params(tmpl, leaves)
 
@@ -1181,6 +1231,22 @@ class SurfaceFrontierTracker:
             return None
         norm_p = normalize_path(parsed.path)
         return norm_p, parsed.query
+
+    def _resolve_same_origin_ws(self, raw_url: str, current_url: str = "") -> tuple[str, str] | None:
+        """Resolve a WebSocket or relative URL enforcing strict scheme parity (`http`<->`ws`, `https`<->`wss`)."""
+        raw = str(raw_url or "").strip()
+        if not raw:
+            return None
+        low = raw.lower()
+        if low.startswith("ws://"):
+            if self._origin[0] != "http":
+                return None
+            raw = "http://" + raw[5:]
+        elif low.startswith("wss://"):
+            if self._origin[0] != "https":
+                return None
+            raw = "https://" + raw[6:]
+        return self._resolve_same_origin(raw, current_url=current_url)
 
     def _register_discovered_url(
         self,
@@ -1651,29 +1717,52 @@ class SurfaceFrontierTracker:
         if not isinstance(surface, dict):
             return
         curr_url = str(surface.get("url") or self.base_url)
+
+        def _ingest_item_schemas(raw_url: str, method: str, item: dict[str, Any]) -> None:
+            norm_method = str(method or "GET").strip().upper()
+            if norm_method not in self.allowed_methods:
+                return
+            resolved = self._resolve_same_origin(raw_url, current_url=curr_url)
+            if resolved is None:
+                return
+            norm_p, _ = resolved
+            tmpl = route_template_of(norm_p)
+            bt = item.get("body_template")
+            if isinstance(bt, dict) and bt and norm_method in {"POST", "PUT", "PATCH"}:
+                self._record_body_template(norm_method, tmpl, bt)
+            mp = item.get("multipart_schema")
+            if isinstance(mp, dict) and mp:
+                self._record_multipart_schema(tmpl, mp)
+
         for item in (surface.get("forms") or []):
             if isinstance(item, dict):
+                item_url = str(item.get("url") or "")
+                item_method = str(item.get("method") or "GET")
                 self._register_discovered_url(
-                    str(item.get("url") or ""),
-                    method=str(item.get("method") or "GET"),
+                    item_url,
+                    method=item_method,
                     params=item.get("params") or (),
                     actor=actor,
                     current_url=curr_url,
                     is_form=True,
                 )
+                _ingest_item_schemas(item_url, item_method, item)
         for item in [
             *(surface.get("links") or []),
             *(surface.get("js_calls") or []),
             *(surface.get("spa_routes") or []),
         ]:
             if isinstance(item, dict):
+                item_url = str(item.get("url") or "")
+                item_method = str(item.get("method") or "GET")
                 self._register_discovered_url(
-                    str(item.get("url") or ""),
-                    method=str(item.get("method") or "GET"),
+                    item_url,
+                    method=item_method,
                     params=item.get("params") or (),
                     actor=actor,
                     current_url=curr_url,
                 )
+                _ingest_item_schemas(item_url, item_method, item)
         for spec_u in (surface.get("spec_urls") or []):
             if isinstance(spec_u, str):
                 self._register_discovered_url(spec_u, method="GET", actor=actor, current_url=curr_url)
@@ -1723,6 +1812,90 @@ class SurfaceFrontierTracker:
                 actor=actor,
                 current_url=curr_url,
             )
+
+        body_templates = surface.get("body_templates")
+        if isinstance(body_templates, dict):
+            for raw_key, doc in body_templates.items():
+                if not isinstance(raw_key, str) or not isinstance(doc, dict) or not doc:
+                    continue
+                m_key = _METHOD_URL_KEY_RE.fullmatch(raw_key.strip())
+                if m_key is None:
+                    continue
+                bt_method = m_key.group(1).upper()
+                bt_path = m_key.group(2)
+                if bt_method not in self.allowed_methods:
+                    continue
+                resolved = self._resolve_same_origin(bt_path, current_url=curr_url)
+                if resolved is None:
+                    continue
+                norm_p, _ = resolved
+                tmpl = route_template_of(norm_p)
+                top_keys = [
+                    clean
+                    for k in doc
+                    if (clean := _sanitize_multipart_name(k))
+                ][:_MAX_PARAMS_PER_TEMPLATE]
+                self._register_discovered_url(
+                    bt_path,
+                    method=bt_method,
+                    params=top_keys,
+                    actor=actor,
+                    current_url=curr_url,
+                )
+                if bt_method in {"POST", "PUT", "PATCH"}:
+                    self._record_body_template(bt_method, tmpl, doc)
+
+        multipart_schemas = surface.get("multipart_schemas")
+        if isinstance(multipart_schemas, dict):
+            for raw_key, schema in multipart_schemas.items():
+                if not isinstance(raw_key, str) or not isinstance(schema, dict) or not schema:
+                    continue
+                m_key = _METHOD_URL_KEY_RE.fullmatch(raw_key.strip())
+                if m_key is None:
+                    continue
+                mp_method = m_key.group(1).upper()
+                mp_path = m_key.group(2)
+                if mp_method not in self.allowed_methods:
+                    continue
+                resolved = self._resolve_same_origin(mp_path, current_url=curr_url)
+                if resolved is None:
+                    continue
+                norm_p, _ = resolved
+                tmpl = route_template_of(norm_p)
+                mp_params = self._record_multipart_schema(tmpl, schema)
+                self._register_discovered_url(
+                    mp_path,
+                    method=mp_method,
+                    params=mp_params,
+                    actor=actor,
+                    current_url=curr_url,
+                    is_form=True,
+                )
+
+        ws_endpoints = surface.get("ws_endpoints")
+        if isinstance(ws_endpoints, list):
+            for ws_item in ws_endpoints:
+                raw_ws = ""
+                if isinstance(ws_item, str):
+                    raw_ws = ws_item.strip()
+                elif isinstance(ws_item, dict):
+                    raw_ws = str(ws_item.get("url") or ws_item.get("path") or "").strip()
+                if not raw_ws:
+                    continue
+                resolved_ws = self._resolve_same_origin_ws(raw_ws, current_url=curr_url)
+                if resolved_ws is None:
+                    continue
+                norm_p, query = resolved_ws
+                tmpl = route_template_of(norm_p)
+                if "GET" in self.allowed_methods:
+                    ws_target = f"{norm_p}?{query}" if query else norm_p
+                    self._register_discovered_url(
+                        ws_target,
+                        method="GET",
+                        actor=actor,
+                        current_url=curr_url,
+                    )
+                self._add_schema_hints(tmpl, ["ws:upgrade"])
 
     def unvisited_routes(self) -> list[str]:
         """Return discovered routes and parameterized endpoints not yet tested."""

@@ -9,13 +9,20 @@ from urllib.parse import urlsplit
 
 from agentic_surface import (
     _split_path_kv_segment,
+    is_id_segment,
     is_malformed_url_path,
     is_non_endpoint_source_path,
     route_template_of,
 )
 
-_PREFIX_SEGMENT_RE = re.compile(r"^(?:api|rest|v\d+)$", re.IGNORECASE)
-_API_ROUTE_RE = re.compile(r"^/(?:api|rest|v\d+|graphql)(?:/|$)|/graphql(?:/|$)", re.IGNORECASE)
+_PREFIX_SEGMENT_RE = re.compile(
+    r"^(?:api|ajax[-_]?api|rest|rpc|v\d+(?:\.\d+)?|\d+\.\d+)$",
+    re.IGNORECASE,
+)
+_API_ROUTE_RE = re.compile(
+    r"^/(?:api|ajax[-_]?api|rest|rpc|v\d+(?:\.\d+)?|graphql)(?:/|$)|/graphql(?:/|$)",
+    re.IGNORECASE,
+)
 
 
 def _is_api_route(path: str) -> bool:
@@ -67,6 +74,33 @@ def extract_resource_family(path: str) -> str:
     if not any(ch.isalnum() for ch in first):
         return "root"
     return first.lower()
+
+
+def _extract_subfamily_after(path: str, umbrella: str) -> str | None:
+    """Return the normalized non-ID sub-family immediately following stripped prefix + `umbrella`."""
+    raw = str(path or "")
+    if is_malformed_url_path(raw):
+        return None
+    raw_path = urlsplit(raw.strip()).path or "/"
+    segments = [seg for seg in raw_path.split("/") if seg]
+    while segments and (
+        _PREFIX_SEGMENT_RE.fullmatch(segments[0])
+        or not any(ch.isalnum() for ch in segments[0])
+    ):
+        segments.pop(0)
+    if len(segments) < 2 or segments[0].lower() != umbrella.lower():
+        return None
+    sub = segments[1]
+    if is_id_segment(sub) or (sub.startswith("{") and sub.endswith("}")):
+        return None
+    if not any(ch.isalnum() for ch in sub):
+        return None
+    kv = _split_path_kv_segment(sub)
+    if kv is not None:
+        return kv[0]
+    if len(segments) == 2 and "." in sub:
+        return None
+    return sub.lower()
 
 
 def cluster_discovered_surface(
@@ -153,6 +187,61 @@ def cluster_discovered_surface(
         cleaned_hints = {str(h).strip() for h in (hint_set or ()) if str(h).strip()}
         if cleaned_hints:
             family_schema_hints.setdefault(fam, {}).setdefault(tmpl, set()).update(cleaned_hints)
+
+    # Single-umbrella API namespace expansion: when one API family accounts for >=70%
+    # of all API routes (e.g. /api/2.0/<namespace>/<subfamily>/...) and has >=2 distinct
+    # valid non-ID sub-families, re-bucket it into those sub-families so sharding can
+    # balance work across subsystems without expanding non-API UI bloat.
+    api_routes_by_family: dict[str, set[str]] = {
+        fam: {r for r in routes if _is_api_route(r)}
+        for fam, routes in family_routes.items()
+    }
+    non_root_api_families = [
+        fam for fam, ars in api_routes_by_family.items() if ars and fam != "root"
+    ]
+    total_api_routes = sum(len(ars) for ars in api_routes_by_family.values())
+    if total_api_routes > 0 and non_root_api_families:
+        non_root_api_families.sort(key=lambda fam: (-len(api_routes_by_family[fam]), fam))
+        umbrella = non_root_api_families[0]
+        umbrella_api_routes = api_routes_by_family[umbrella]
+        if (
+            len(umbrella_api_routes) * 10 >= total_api_routes * 7
+            and (len(non_root_api_families) == 1 or len(family_routes) < eff_max)
+            and len(family_routes.get(umbrella, ())) >= 4
+        ):
+            api_subfamilies = {
+                sub
+                for r in umbrella_api_routes
+                if (sub := _extract_subfamily_after(r, umbrella)) is not None
+            }
+            if len(api_subfamilies) >= 2:
+                def _retarget(route_path: str) -> str:
+                    sub = _extract_subfamily_after(route_path, umbrella)
+                    return sub if sub is not None else umbrella
+
+                u_routes = family_routes.pop(umbrella, set())
+                u_writes = family_writes.pop(umbrella, set())
+                u_objects = family_objects.pop(umbrella, set())
+                u_params = family_params.pop(umbrella, {})
+                u_bt = family_body_templates.pop(umbrella, {})
+                u_sh = family_schema_hints.pop(umbrella, {})
+
+                for r in u_routes:
+                    family_routes.setdefault(_retarget(r), set()).add(r)
+                for w in u_writes:
+                    w_path = w.split(" ", 1)[1] if " " in w else w
+                    family_writes.setdefault(_retarget(w_path), set()).add(w)
+                for o in u_objects:
+                    family_objects.setdefault(_retarget(o), set()).add(o)
+                for tmpl, pset in u_params.items():
+                    if pset:
+                        family_params.setdefault(_retarget(tmpl), {}).setdefault(tmpl, set()).update(pset)
+                for op_key, tmpl_doc in u_bt.items():
+                    op_path = op_key.split(" ", 1)[1] if " " in op_key else op_key
+                    family_body_templates.setdefault(_retarget(op_path), {})[op_key] = tmpl_doc
+                for tmpl, hset in u_sh.items():
+                    if hset:
+                        family_schema_hints.setdefault(_retarget(tmpl), {}).setdefault(tmpl, set()).update(hset)
 
     all_families = sorted(family_routes)
     all_routes = sorted({r for rs in family_routes.values() for r in rs})
@@ -356,6 +445,7 @@ def build_shard_prompts(
     sys_prompt = base_system_prompt.rstrip() + "\n\n" + "\n".join(scope_sections)
 
     cluster_fams = set(cluster.families)
+    cluster_routes = set(cluster.routes)
     receipt_lines: list[str] = []
     if receipts is not None and hasattr(receipts, "list_ids") and hasattr(receipts, "get"):
         seen_sig: set[tuple[str, str, str, int]] = set()
@@ -365,8 +455,16 @@ def build_shard_prompts(
             except Exception:
                 continue
             path_or_url = str(rec.get("path") or rec.get("url") or "/")
-            if cluster_fams and extract_resource_family(path_or_url) not in cluster_fams:
-                continue
+            if cluster_fams:
+                rec_fam = extract_resource_family(path_or_url)
+                rec_sub = _extract_subfamily_after(path_or_url, rec_fam)
+                rec_tmpl = route_template_of(path_or_url)
+                if (
+                    rec_fam not in cluster_fams
+                    and rec_tmpl not in cluster_routes
+                    and (rec_sub is None or rec_sub not in cluster_fams)
+                ):
+                    continue
             actor = str(rec.get("actor") or "anon")
             method = str(rec.get("method") or "GET")
             parsed = urlsplit(str(rec.get("url") or path_or_url))

@@ -118,6 +118,10 @@ def run_agentic_target(
     storage_states: Sequence[str] | None = None,
     seed_surface_files: Sequence[Path] | None = None,
     tech_hints: Sequence[str] | None = None,
+    auto_crawl: bool = False,
+    auto_crawl_forms: bool = False,
+    auto_crawl_max_pages: int = 12,
+    auto_crawl_max_actions: int = 24,
 ) -> tuple[Path, dict[str, Any]]:
     """Run (or plan when execute=False) AgenticInvestigator against an authorized target."""
     if isinstance(cache_token_weight, bool):
@@ -269,6 +273,16 @@ def run_agentic_target(
     if eff_bootstrap_model:
         sharding_cfg["bootstrap_model"] = models["bootstrap"]
 
+    eff_auto_crawl = bool(auto_crawl or auto_crawl_forms)
+    eff_auto_crawl_forms = bool(auto_crawl_forms and "POST" in eff_methods)
+    stage0_cfg: dict[str, Any] = {
+        "enabled": eff_auto_crawl,
+        "forms_requested": bool(auto_crawl_forms),
+        "forms_allowed": eff_auto_crawl_forms,
+        "max_pages": max(1, int(auto_crawl_max_pages)),
+        "max_actions": max(0, int(auto_crawl_max_actions)),
+    }
+
     if not execute:
         plan_path = output / "agentic-plan.json"
         plan = {
@@ -288,6 +302,7 @@ def run_agentic_target(
             "allowed_methods": eff_methods,
             "discovery_hints": eff_discovery_hints,
             "seed_surface": dict(seed_data.get("stats") or {}) if seed_data is not None else None,
+            "stage0_crawl": dict(stage0_cfg),
             "ablation": ablation_cfg,
             "sharding": sharding_cfg,
             "selected_accounts": [
@@ -360,8 +375,9 @@ def run_agentic_target(
         "models": models,
         "provider_kind": auth["provider_kind"],
         "allowed_methods": eff_methods,
-        "discovery_hints": eff_discovery_hints,
+        "discovery_hints": list(eff_discovery_hints),
         "seed_surface": dict(seed_data.get("stats") or {}) if seed_data is not None else None,
+        "stage0_crawl": dict(stage0_cfg),
         "ablation": ablation_cfg,
         "sharding": sharding_cfg,
         "limits": limits,
@@ -371,6 +387,46 @@ def run_agentic_target(
 
     investigator: AgenticInvestigator | None = None
     try:
+        if not resume:
+            if any(
+                alias != "anon" and bool(sess.login_payload) and not sess.authenticated
+                for alias, sess in actors.actors.items()
+            ):
+                http_client.authenticate_all_actors()
+            if eff_auto_crawl:
+                import agentic_stage0_crawl  # type: ignore[import-not-found]
+
+                stage0_result = agentic_stage0_crawl.run_stage0_crawl(
+                    http_client,
+                    output_dir=output,
+                    start_paths=list(eff_discovery_hints),
+                    max_pages=stage0_cfg["max_pages"],
+                    max_actions=stage0_cfg["max_actions"],
+                    allow_forms=eff_auto_crawl_forms,
+                )
+                if isinstance(stage0_result, dict):
+                    stage0_stats = dict(stage0_result.get("stats") or {})
+                    if stage0_result.get("status") is not None and "status" not in stage0_stats:
+                        stage0_stats["status"] = str(stage0_result.get("status"))
+                    manifest["stage0_crawl"] = {
+                        **stage0_cfg,
+                        **stage0_stats,
+                        "seed_file": str(stage0_result.get("seed_file") or ""),
+                    }
+                    merged_seed = agentic_seed.merge_seed_surfaces(
+                        [seed_data, stage0_result],
+                        base_url=base,
+                        excluded_paths=eff_excluded_paths,
+                    )
+                    if merged_seed is not None:
+                        seed_data = merged_seed
+                        for hint in seed_data.get("discovery_hints") or []:
+                            if hint not in eff_discovery_hints:
+                                eff_discovery_hints.append(hint)
+                        manifest["discovery_hints"] = list(eff_discovery_hints)
+                        manifest["seed_surface"] = dict(seed_data.get("stats") or {})
+                    dump(manifest_path, manifest)
+
         worker_model_id = models["worker"].split("/", 1)[1]
         investigator = AgenticInvestigator(
             http_client=http_client,
@@ -400,11 +456,6 @@ def run_agentic_target(
             cache_token_weight=eff_cache_weight,
             seed_surface=seed_data,
         )
-        if not resume and any(
-            alias != "anon" and bool(sess.login_payload) and not sess.authenticated
-            for alias, sess in actors.actors.items()
-        ):
-            http_client.authenticate_all_actors()
         run_info = investigator.run(resume=resume)
         manifest.update(run_info)
     except KeyboardInterrupt:
@@ -586,6 +637,28 @@ def main(argv: list[str] | None = None) -> int:
         default=None,
         help="Optional technology stack hint (e.g. nextjs, django, spring) to enrich initial discovery paths",
     )
+    parser.add_argument(
+        "--auto-crawl",
+        action="store_true",
+        help="Run Stage 0 deterministic Playwright crawler before LLM discovery",
+    )
+    parser.add_argument(
+        "--auto-crawl-forms",
+        action="store_true",
+        help="Opt-in non-destructive form/upload submission during Stage 0 crawl (requires POST in --allowed-methods; implies --auto-crawl)",
+    )
+    parser.add_argument(
+        "--auto-crawl-max-pages",
+        type=int,
+        default=12,
+        help="Maximum pages to visit during Stage 0 crawl (default: 12)",
+    )
+    parser.add_argument(
+        "--auto-crawl-max-actions",
+        type=int,
+        default=24,
+        help="Maximum interactive UI actions during Stage 0 crawl (default: 24)",
+    )
     args = parser.parse_args(argv)
     if not (0.0 <= float(args.cache_token_weight) <= 1.0):
         parser.error("--cache-token-weight must be between 0.0 and 1.0")
@@ -640,6 +713,10 @@ def main(argv: list[str] | None = None) -> int:
         storage_states=args.storage_states,
         seed_surface_files=args.seed_surface_files,
         tech_hints=args.tech_hints,
+        auto_crawl=args.auto_crawl,
+        auto_crawl_forms=args.auto_crawl_forms,
+        auto_crawl_max_pages=args.auto_crawl_max_pages,
+        auto_crawl_max_actions=args.auto_crawl_max_actions,
     )
     print(json.dumps({
         "artifact": str(path),
