@@ -479,11 +479,15 @@ def test_class_owasp_cwe_mapping_coverage() -> None:
         "csrf",
         "race_condition",
         "business_logic",
+        "jwt_weakness",
+        "insecure_deserialization",
     )
     for cls_name in expected_classes:
         meta = agentic_report._class_metadata(cls_name)
         assert "OWASP" in meta["owasp"]
         assert meta["cwe"].startswith("CWE-")
+    assert agentic_report._class_metadata("insecure_deserialization")["cwe"] == "CWE-502"
+    assert agentic_report._class_metadata("jwt_weakness")["cwe"] == "CWE-347"
 
 
 def test_agent_cli_report_end_to_end(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:

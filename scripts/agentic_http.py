@@ -142,20 +142,41 @@ class ActorSession:
 
     def build_headers(self, method: str, extra_headers: dict[str, str] | None = None) -> dict[str, str]:
         with self._lock:
+            extra_items = list((extra_headers or {}).items())
+            extra_low = {str(k).strip().lower(): ("" if v is None else str(v)) for k, v in extra_items}
+            override_auth = bool(extra_low.get("authorization", "").strip())
+            override_cookie = bool(extra_low.get("cookie", "").strip())
+
             headers = dict(self.base_headers)
-            if self.access_token and not any(k.lower() == "authorization" for k in headers):
-                headers["Authorization"] = f"Bearer {self.access_token}"
-            if self.cookies and not any(k.lower() == "cookie" for k in headers):
-                headers["Cookie"] = "; ".join(f"{k}={v}" for k, v in sorted(self.cookies.items()))
+            # When an explicit Authorization override is supplied without Cookie (or vice
+            # versa), suppress the actor's default peer auth channel so a stale session
+            # cookie or bearer token does not shadow the tested credential on dual-auth apps.
+            if override_auth and "cookie" not in extra_low:
+                for ek in [k for k in headers if k.lower() == "cookie"]:
+                    headers.pop(ek, None)
+            if override_cookie and "authorization" not in extra_low:
+                for ek in [k for k in headers if k.lower() == "authorization"]:
+                    headers.pop(ek, None)
+
+            if self.access_token and not (override_cookie and "authorization" not in extra_low):
+                if not any(k.lower() == "authorization" for k in headers):
+                    headers["Authorization"] = f"Bearer {self.access_token}"
+            if self.cookies and not (override_auth and "cookie" not in extra_low):
+                if not any(k.lower() == "cookie" for k in headers):
+                    headers["Cookie"] = "; ".join(f"{k}={v}" for k, v in sorted(self.cookies.items()))
             if method.upper() in _MUTATING_METHODS and self.csrf_token:
                 headers.setdefault("X-CSRF-Token", self.csrf_token)
-            if extra_headers:
-                for k, v in extra_headers.items():
+            if extra_items:
+                for k, v in extra_items:
                     key_str = str(k)
-                    key_low = key_str.lower()
+                    key_low = key_str.strip().lower()
                     for existing_key in [ek for ek in headers if ek.lower() == key_low and ek != key_str]:
                         headers.pop(existing_key, None)
-                    headers[key_str] = str(v)
+                    val_str = "" if v is None else str(v)
+                    if val_str == "":
+                        headers.pop(key_str, None)
+                    else:
+                        headers[key_str] = val_str
             return headers
 
 

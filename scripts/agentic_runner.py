@@ -31,6 +31,7 @@ from agentic_investigator import (  # noqa: E402
     _PROMPT_HARD_CHAR_LIMIT,
     AgenticInvestigator,
 )
+from agentic_oob import LoopbackCallbackServer  # noqa: E402
 from agentic_receipts import ReceiptStore  # noqa: E402
 from agentic_tools import canonicalize_and_deduplicate_findings  # noqa: E402
 from full_agent_budget import SharedBudget  # noqa: E402
@@ -122,6 +123,8 @@ def run_agentic_target(
     auto_crawl_forms: bool = False,
     auto_crawl_max_pages: int = 12,
     auto_crawl_max_actions: int = 24,
+    oob_bind_host: str = "",
+    oob_advertise_host: str = "",
 ) -> tuple[Path, dict[str, Any]]:
     """Run (or plan when execute=False) AgenticInvestigator against an authorized target."""
     if isinstance(cache_token_weight, bool):
@@ -283,6 +286,24 @@ def run_agentic_target(
         "max_actions": max(0, int(auto_crawl_max_actions)),
     }
 
+    eff_oob_bind = str(oob_bind_host or os.environ.get("CCO_OOB_BIND_HOST") or "").strip()
+    eff_oob_adv = str(oob_advertise_host or os.environ.get("CCO_OOB_ADVERTISE_HOST") or "").strip()
+    configured_oob: LoopbackCallbackServer | None = None
+    if eff_oob_bind or eff_oob_adv:
+        configured_oob = LoopbackCallbackServer.from_config(
+            bind_host=eff_oob_bind,
+            advertise_host=eff_oob_adv,
+        )
+    oob_summary: dict[str, Any] = {
+        "bind_host": configured_oob.host if configured_oob is not None else "127.0.0.1",
+        "advertise_host": configured_oob.advertise_host if configured_oob is not None else "",
+        "bind_scope": (
+            "bridge"
+            if (configured_oob is not None and (configured_oob.allow_private_bridge or configured_oob.advertise_host))
+            else "loopback"
+        ),
+    }
+
     if not execute:
         plan_path = output / "agentic-plan.json"
         plan = {
@@ -303,6 +324,7 @@ def run_agentic_target(
             "discovery_hints": eff_discovery_hints,
             "seed_surface": dict(seed_data.get("stats") or {}) if seed_data is not None else None,
             "stage0_crawl": dict(stage0_cfg),
+            "oob_listener": dict(oob_summary),
             "ablation": ablation_cfg,
             "sharding": sharding_cfg,
             "selected_accounts": [
@@ -378,6 +400,7 @@ def run_agentic_target(
         "discovery_hints": list(eff_discovery_hints),
         "seed_surface": dict(seed_data.get("stats") or {}) if seed_data is not None else None,
         "stage0_crawl": dict(stage0_cfg),
+        "oob_listener": dict(oob_summary),
         "ablation": ablation_cfg,
         "sharding": sharding_cfg,
         "limits": limits,
@@ -455,6 +478,7 @@ def run_agentic_target(
             epoch_char_limit=eff_epoch_char_limit,
             cache_token_weight=eff_cache_weight,
             seed_surface=seed_data,
+            oob_server=configured_oob,
         )
         run_info = investigator.run(resume=resume)
         manifest.update(run_info)
@@ -465,6 +489,8 @@ def run_agentic_target(
     except Exception as exc:
         manifest.update(status="failed", error=type(exc).__name__, error_detail=str(exc)[:300])
     finally:
+        if configured_oob is not None:
+            configured_oob.close()
         http_client.close()
         transport.close_upstream()
         findings_file = output / "findings.json"
@@ -659,6 +685,16 @@ def main(argv: list[str] | None = None) -> int:
         default=24,
         help="Maximum interactive UI actions during Stage 0 crawl (default: 24)",
     )
+    parser.add_argument(
+        "--oob-bind-host",
+        default="",
+        help="Optional OOB callback bind IP (default 127.0.0.1; private Docker bridge IP permitted)",
+    )
+    parser.add_argument(
+        "--oob-advertise-host",
+        default="",
+        help="Optional OOB callback advertised hostname/IP (e.g. host.docker.internal for Dockerized targets)",
+    )
     args = parser.parse_args(argv)
     if not (0.0 <= float(args.cache_token_weight) <= 1.0):
         parser.error("--cache-token-weight must be between 0.0 and 1.0")
@@ -717,6 +753,8 @@ def main(argv: list[str] | None = None) -> int:
         auto_crawl_forms=args.auto_crawl_forms,
         auto_crawl_max_pages=args.auto_crawl_max_pages,
         auto_crawl_max_actions=args.auto_crawl_max_actions,
+        oob_bind_host=args.oob_bind_host,
+        oob_advertise_host=args.oob_advertise_host,
     )
     print(json.dumps({
         "artifact": str(path),

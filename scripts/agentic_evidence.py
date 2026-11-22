@@ -166,6 +166,13 @@ _CLASS_ALIASES = {
     "directory_traversal": "path_traversal",
     "arbitrary_file_read": "path_traversal",
     "arbitrary_file_delete": "path_traversal",
+    "deserialization": "insecure_deserialization",
+    "unsafe_deserialization": "insecure_deserialization",
+    "object_deserialization": "insecure_deserialization",
+    "node_serialize": "insecure_deserialization",
+    "pickle_deserialization": "insecure_deserialization",
+    "java_deserialization": "insecure_deserialization",
+    "php_deserialization": "insecure_deserialization",
 }
 _READ_SQLI_HINTS = ("order by", "order_by", "sort", "read", "differential", "boolean", "error-based", "error based", "case when")
 _ADMIN_ROLE_TOKENS = ("admin", "superadmin", "administrator", "root", "superuser", "sysadmin", "staff")

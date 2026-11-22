@@ -130,6 +130,38 @@ class LoopbackCallbackServer:
         self._dropped_hits = 0
 
     @classmethod
+    def from_config(
+        cls,
+        *,
+        bind_host: str = "",
+        advertise_host: str = "",
+        port: int = 0,
+        max_hits: int = DEFAULT_MAX_HITS,
+        max_body_chars: int = DEFAULT_MAX_BODY_CHARS,
+    ) -> LoopbackCallbackServer:
+        """Create a callback server from explicit host/advertise settings (loopback by default)."""
+        clean_bind = str(bind_host or "").strip()
+        clean_adv = str(advertise_host or "").strip()
+        if not clean_bind:
+            return cls(
+                host="127.0.0.1",
+                port=port,
+                max_hits=max_hits,
+                max_body_chars=max_body_chars,
+                allow_private_bridge=False,
+                advertise_host=clean_adv,
+            )
+        allow_private = clean_bind not in _ALLOWED_LOOPBACK_HOSTS
+        return cls(
+            host=clean_bind,
+            port=port,
+            max_hits=max_hits,
+            max_body_chars=max_body_chars,
+            allow_private_bridge=allow_private,
+            advertise_host=clean_adv,
+        )
+
+    @classmethod
     def from_env(
         cls,
         *,
@@ -138,25 +170,12 @@ class LoopbackCallbackServer:
         max_body_chars: int = DEFAULT_MAX_BODY_CHARS,
     ) -> LoopbackCallbackServer:
         """Create a callback server from optional CCO_OOB_BIND_HOST / CCO_OOB_ADVERTISE_HOST env vars."""
-        bind_host = str(os.environ.get("CCO_OOB_BIND_HOST") or "").strip()
-        advertise_host = str(os.environ.get("CCO_OOB_ADVERTISE_HOST") or "").strip()
-        if not bind_host:
-            return cls(
-                host="127.0.0.1",
-                port=port,
-                max_hits=max_hits,
-                max_body_chars=max_body_chars,
-                allow_private_bridge=False,
-                advertise_host=advertise_host,
-            )
-        allow_private = bind_host not in _ALLOWED_LOOPBACK_HOSTS
-        return cls(
-            host=bind_host,
+        return cls.from_config(
+            bind_host=str(os.environ.get("CCO_OOB_BIND_HOST") or ""),
+            advertise_host=str(os.environ.get("CCO_OOB_ADVERTISE_HOST") or ""),
             port=port,
             max_hits=max_hits,
             max_body_chars=max_body_chars,
-            allow_private_bridge=allow_private,
-            advertise_host=advertise_host,
         )
 
     @property
@@ -330,7 +349,7 @@ class LoopbackCallbackServer:
             return True
 
     def create_token(self, label: str = "") -> dict[str, Any]:
-        """Register a fresh URL-safe correlation token and return its loopback URL."""
+        """Register a fresh URL-safe correlation token and return its callback URL."""
         self.start()
         clean_label = str(label or "").strip()[:120]
         with self._lock:
@@ -342,7 +361,19 @@ class LoopbackCallbackServer:
                 "created_at": datetime.now(timezone.utc).isoformat(),
             }
             url = f"{self.base_url}/cb/{tok}"
-        return {"token": tok, "url": url, "label": clean_label}
+        bind_scope = "bridge" if (self.allow_private_bridge or bool(self.advertise_host)) else "loopback"
+        info: dict[str, Any] = {
+            "token": tok,
+            "url": url,
+            "label": clean_label,
+            "bind_scope": bind_scope,
+        }
+        if bind_scope == "loopback":
+            info["reachability_note"] = (
+                "Host-loopback only (127.0.0.1); unreachable from inside Docker containers unless "
+                "--oob-bind-host/--oob-advertise-host or CCO_OOB_BIND_HOST is configured."
+            )
+        return info
 
     def registered_tokens(self) -> list[str]:
         """Return all registered correlation tokens."""

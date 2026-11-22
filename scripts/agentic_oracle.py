@@ -103,8 +103,9 @@ _INPUT_DIFF_CLASSES = frozenset({
     "file_upload",
     "jwt_weakness",
     "command_injection",
+    "insecure_deserialization",
 })
-_OOB_ELIGIBLE_CLASSES = frozenset({"ssrf", "xxe", "ssti", "command_injection"})
+_OOB_ELIGIBLE_CLASSES = frozenset({"ssrf", "xxe", "ssti", "command_injection", "insecure_deserialization"})
 _ACCESS_CLASSES = frozenset({"auth_bypass", "bfla", "bola", "tenant_isolation"})
 _CONCURRENCY_CLASSES = frozenset({"race_condition", "business_logic"})
 _MUTATING_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})

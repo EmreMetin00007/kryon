@@ -249,6 +249,20 @@ _VULN_CLASS_METADATA: dict[str, dict[str, Any]] = {
         "default_severity": "high",
         "description": "XML parser processes external entity references from untrusted input.",
     },
+    "jwt_weakness": {
+        "name": "JWT Verification / Key Confusion Weakness",
+        "owasp": "OWASP API2:2023 / A07:2021",
+        "cwe": "CWE-347",
+        "default_severity": "critical",
+        "description": "Application accepts forged, unsigned (alg=none), or algorithm-confused JSON Web Tokens.",
+    },
+    "insecure_deserialization": {
+        "name": "Insecure Deserialization",
+        "owasp": "OWASP A08:2021 (Software and Data Integrity Failures)",
+        "cwe": "CWE-502",
+        "default_severity": "critical",
+        "description": "Application deserializes untrusted input into executable functions, gadgets, or unintended objects.",
+    },
     "info_disclosure": {
         "name": "Sensitive Information Exposure",
         "owasp": "OWASP A01:2021 / API3:2023",

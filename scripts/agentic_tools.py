@@ -76,7 +76,14 @@ from agentic_browser import (
     inspect_rendered_page as inspect_rendered_page,
     run_browser_crawl as run_browser_crawl,
 )
-from agentic_crypto import analyze_token as analyze_token
+from agentic_crypto import (
+    _b64url_decode_segment as _b64url_decode_segment,
+    _sanitize_claims as _sanitize_claims,
+    _strip_bearer as _strip_bearer,
+    analyze_jwt as analyze_jwt,
+    analyze_token as analyze_token,
+    build_jwt_test_variants as build_jwt_test_variants,
+)
 from agentic_http import (
     AgenticHTTPClient,
     BudgetExhaustedError,
@@ -143,7 +150,7 @@ _SKIP_REPLAY_HEADERS = frozenset({
     "host",
 })
 _PERSISTENT_VULN_CLASSES = frozenset({"stored_xss", "mass_assignment", "ssti"})
-_OOB_CALLBACK_CLASSES = frozenset({"ssrf", "xxe", "ssti", "command_injection"})
+_OOB_CALLBACK_CLASSES = frozenset({"ssrf", "xxe", "ssti", "command_injection", "insecure_deserialization"})
 _MUTATING_WRITE_METHODS = frozenset({"POST", "PUT", "PATCH"})
 
 RECORD_FINDING_CLASS_ENUM: list[str] = [
@@ -166,6 +173,7 @@ RECORD_FINDING_CLASS_ENUM: list[str] = [
     "csrf",
     "jwt_weakness",
     "command_injection",
+    "insecure_deserialization",
     "race_condition",
     "business_logic",
     "other",
@@ -183,7 +191,11 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                     "method": {"type": "string", "description": "HTTP method (defaults GET; POST if body)."},
                     "url": {"type": "string", "description": "In-scope path/URL (http(s):// or ws(s)://)."},
                     "actor": {"type": "string"},
-                    "headers": {"type": "object", "additionalProperties": {"type": "string"}},
+                    "headers": {
+                        "type": "object",
+                        "additionalProperties": {"type": "string"},
+                        "description": "Request headers; setting Authorization or Cookie isolates auth from actor's default peer auth (use '' to strip).",
+                    },
                     "query": {"type": "object", "additionalProperties": {"type": "string"}},
                     "json_body": {},
                     "base_receipt_id": {"type": "string", "description": "GET receipt_id for base JSON."},
@@ -233,7 +245,11 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                     "method": {"type": "string"},
                     "url": {"type": "string"},
                     "query_overrides": {"type": "object", "additionalProperties": {"type": "string"}},
-                    "header_overrides": {"type": "object", "additionalProperties": {"type": "string"}},
+                    "header_overrides": {
+                        "type": "object",
+                        "additionalProperties": {"type": "string"},
+                        "description": "Header overrides; Authorization or Cookie overrides actor's default peer auth (use '' to strip).",
+                    },
                     "base_receipt_id": {"type": "string"},
                     "json_merge": {"type": "object"},
                     "json_overrides": {"type": "object"},
@@ -279,7 +295,7 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "callback_listener",
-            "description": "Local OOB callback URLs (create_url/poll) for SSRF/XXE/SSTI/webhook checks. 0 HTTP cost.",
+            "description": "OOB callback URLs (create_url/poll); host loopback by default (set --oob-bind-host for Docker).",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -302,7 +318,11 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                     "url": {"type": "string"},
                     "method": {"type": "string"},
                     "actor": {"type": "string"},
-                    "headers": {"type": "object", "additionalProperties": {"type": "string"}},
+                    "headers": {
+                        "type": "object",
+                        "additionalProperties": {"type": "string"},
+                        "description": "Request headers; setting Authorization or Cookie isolates auth from actor's default peer auth (use '' to strip).",
+                    },
                     "query": {"type": "object", "additionalProperties": {"type": "string"}},
                     "json_body": {},
                     "form_body": {"type": "object", "additionalProperties": {"type": "string"}},
@@ -334,12 +354,30 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "analyze_token",
-            "description": "Offline read-only inspection of JWTs, opaque tokens, or serialized blobs (0 HTTP cost).",
+            "description": "Offline JWT/token/serialization inspector and JWT alg-confusion test builder (0 HTTP cost).",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "value": {"type": "string"},
-                    "kind": {"type": "string", "enum": ["auto", "jwt", "opaque", "serialization"]},
+                    "value": {
+                        "type": "string",
+                        "description": "Token, serialized blob, JSON payload, or 'actor:<alias>'.",
+                    },
+                    "kind": {
+                        "type": "string",
+                        "enum": ["auto", "jwt", "opaque", "serialization", "jwt_test"],
+                    },
+                    "alg": {
+                        "type": "string",
+                        "description": "JWT test alg ('none', 'HS256', 'HS384', 'HS512', 'confusion', 'strip_sig').",
+                    },
+                    "hmac_key": {
+                        "type": "string",
+                        "description": "HMAC key text or 'receipt:<id>' PEM/JWKS for HS256 test signing.",
+                    },
+                    "claim_overrides": {
+                        "type": "object",
+                        "description": "Optional JWT payload claim overrides for jwt_test.",
+                    },
                 },
                 "required": ["value"],
             },
@@ -435,6 +473,32 @@ def _deep_merge_json(base: dict[str, Any], patch: dict[str, Any]) -> dict[str, A
         else:
             merged[key] = copy.deepcopy(value)
     return merged
+
+
+def _coerce_json_payload(value: Any) -> Any:
+    """Decode stringified JSON objects/arrays once so callers avoid double-encoded JSON strings."""
+    if isinstance(value, str) and value.lstrip().startswith(("{", "[")):
+        try:
+            parsed = json.loads(value)
+        except ValueError:
+            return value
+        if isinstance(parsed, (dict, list)):
+            return parsed
+    return value
+
+
+def _coerce_mapping_arg(value: Any) -> dict[str, Any] | None:
+    """Return a dict from either a dict or a JSON-encoded object string, else None."""
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str) and value.lstrip().startswith("{"):
+        try:
+            parsed = json.loads(value)
+        except ValueError:
+            return None
+        if isinstance(parsed, dict):
+            return parsed
+    return None
 
 
 def _is_multipart_receipt(receipt: dict[str, Any]) -> bool:
@@ -682,22 +746,8 @@ class ToolDispatcher:
         raise ValueError(f"receipt {receipt_id} does not contain a JSON object")
 
     def _tool_http_request(self, args: dict[str, Any]) -> str:
-        json_body = args.get("json_body")
-        if isinstance(json_body, str) and json_body.lstrip().startswith(("{", "[")):
-            try:
-                parsed_json = json.loads(json_body)
-            except ValueError:
-                parsed_json = None
-            if isinstance(parsed_json, (dict, list)):
-                json_body = parsed_json
-        form_body = args.get("form_body")
-        if isinstance(form_body, str) and form_body.lstrip().startswith("{"):
-            try:
-                parsed_form = json.loads(form_body)
-            except ValueError:
-                parsed_form = None
-            if isinstance(parsed_form, dict):
-                form_body = parsed_form
+        json_body = _coerce_json_payload(args.get("json_body"))
+        form_body = _coerce_mapping_arg(args.get("form_body"))
         raw_body = args.get("raw_body")
         raw_files = args.get("files")
         if isinstance(raw_files, str) and raw_files.lstrip().startswith("["):
@@ -712,9 +762,7 @@ class ToolDispatcher:
             if raw_files:
                 files = raw_files
         base_receipt_id = str(args.get("base_receipt_id") or "").strip()
-        json_merge = args.get("json_merge") if isinstance(args.get("json_merge"), dict) else (
-            args.get("mutate_json") if isinstance(args.get("mutate_json"), dict) else None
-        )
+        json_merge = _coerce_mapping_arg(args.get("json_merge")) or _coerce_mapping_arg(args.get("mutate_json"))
         if base_receipt_id:
             merged_obj = self._load_receipt_json_object(base_receipt_id)
             if isinstance(json_body, dict):
@@ -744,13 +792,15 @@ class ToolDispatcher:
         else:
             eff_method = "GET"
 
+        headers = _coerce_mapping_arg(args.get("headers"))
+        query = _coerce_mapping_arg(args.get("query"))
         follow_redirects = bool(args.get("follow_redirects", False))
         request_kwargs: dict[str, Any] = {
             "method": eff_method,
             "url": str(args.get("url") or ""),
             "actor": str(args.get("actor") or "anon"),
-            "headers": args.get("headers"),
-            "query": args.get("query"),
+            "headers": headers,
+            "query": query,
             "json_body": json_body,
             "form_body": form_body,
             "raw_body": raw_body,
@@ -817,11 +867,9 @@ class ToolDispatcher:
         base_body_str = str(baseline.get("request_body") or "")
         baseline_is_multipart = _is_multipart_receipt(baseline)
 
-        query_overrides = args.get("query_overrides") if isinstance(args.get("query_overrides"), dict) else None
-        json_overrides = args.get("json_overrides") if isinstance(args.get("json_overrides"), dict) else None
-        json_merge = args.get("json_merge") if isinstance(args.get("json_merge"), dict) else (
-            args.get("mutate_json") if isinstance(args.get("mutate_json"), dict) else None
-        )
+        query_overrides = _coerce_mapping_arg(args.get("query_overrides"))
+        json_overrides = _coerce_mapping_arg(args.get("json_overrides"))
+        json_merge = _coerce_mapping_arg(args.get("json_merge")) or _coerce_mapping_arg(args.get("mutate_json"))
         patch_obj: dict[str, Any] | None = None
         if json_overrides is not None and json_merge is not None:
             patch_obj = _deep_merge_json(json_overrides, json_merge)
@@ -848,13 +896,14 @@ class ToolDispatcher:
             if baseline_is_multipart and kl == "content-type":
                 continue
             req_headers[k] = str(v)
-        if isinstance(args.get("header_overrides"), dict):
-            for k, v in args["header_overrides"].items():
+        header_overrides = _coerce_mapping_arg(args.get("header_overrides"))
+        if header_overrides is not None:
+            for k, v in header_overrides.items():
                 key_str = str(k)
                 key_low = key_str.lower()
                 for existing_key in [ek for ek in req_headers if ek.lower() == key_low and ek != key_str]:
                     req_headers.pop(existing_key, None)
-                req_headers[key_str] = str(v)
+                req_headers[key_str] = "" if v is None else str(v)
 
         json_body = None
         raw_body = None
@@ -936,10 +985,110 @@ class ToolDispatcher:
         )
         return wrap_untrusted(result)
 
+    def _resolve_hmac_key_arg(self, raw_key: Any) -> str:
+        text = "" if raw_key is None else str(raw_key)
+        stripped = text.strip()
+        if not stripped:
+            return ""
+        cand_rid = ""
+        if stripped.lower().startswith("receipt:"):
+            cand_rid = stripped.split(":", 1)[1].strip()
+        else:
+            try:
+                cand_rid = ReceiptStore.validate_receipt_id(stripped)
+            except ValueError:
+                cand_rid = ""
+        if cand_rid:
+            rec = self.receipts.get(cand_rid)
+            return str(rec.get("body") or "")
+        return text
+
+    def _extract_actor_jwt_claims(self, alias: str) -> tuple[dict[str, Any], dict[str, Any], list[str]] | None:
+        session = self.http.actors.get(alias)
+        candidates: list[str] = []
+        with session._lock:
+            if session.access_token:
+                candidates.append(session.access_token)
+            for k, v in session.base_headers.items():
+                if str(k).strip().lower() == "authorization" and v:
+                    candidates.append(str(v))
+            for cv in session.cookies.values():
+                if cv:
+                    candidates.append(str(cv))
+        for raw_cand in candidates:
+            tok = _strip_bearer(raw_cand)
+            parts = tok.split(".")
+            if len(parts) != 3:
+                continue
+            hb = _b64url_decode_segment(parts[0])
+            pb = _b64url_decode_segment(parts[1])
+            if hb is None or pb is None:
+                continue
+            try:
+                h_obj = json.loads(hb.decode("utf-8"))
+                p_obj = json.loads(pb.decode("utf-8"))
+            except (UnicodeDecodeError, ValueError):
+                continue
+            if not isinstance(h_obj, dict) or not isinstance(p_obj, dict):
+                continue
+            safe_payload = {
+                str(k): v
+                for k, v in p_obj.items()
+                if not _is_sensitive_json_key(str(k))
+            }
+            findings = analyze_jwt(tok).get("findings") or []
+            return dict(h_obj), safe_payload, list(findings)
+        return None
+
     def _tool_analyze_token(self, args: dict[str, Any]) -> str:
         value = str(args.get("value") or "")
         kind = str(args.get("kind") or "auto").strip().lower() or "auto"
-        result = analyze_token(value, kind=kind)
+        alg = str(args.get("alg") or "").strip()
+        hmac_key = self._resolve_hmac_key_arg(args.get("hmac_key"))
+        claim_overrides = _coerce_mapping_arg(args.get("claim_overrides"))
+
+        if value.strip().lower().startswith("actor:"):
+            alias = value.split(":", 1)[1].strip() or "anon"
+            extracted = self._extract_actor_jwt_claims(alias)
+            if extracted is None:
+                return json.dumps(
+                    {"kind": "jwt", "valid_jwt": False, "actor": alias, "error": "no JWT found in actor session"},
+                    ensure_ascii=False,
+                )
+            base_hdr, safe_pay, findings = extracted
+            want_test = kind in {"jwt_test", "jwt_forge", "jwt_confusion"} or bool(
+                alg or hmac_key or claim_overrides is not None
+            )
+            if want_test:
+                result = build_jwt_test_variants(
+                    "",
+                    alg=alg,
+                    hmac_key=hmac_key,
+                    claim_overrides=claim_overrides,
+                    base_header=base_hdr,
+                    base_payload=safe_pay,
+                )
+                return json.dumps(result, ensure_ascii=False)
+            return json.dumps(
+                {
+                    "kind": "jwt",
+                    "valid_jwt": True,
+                    "source": "actor_session",
+                    "actor": alias,
+                    "header": _sanitize_claims(base_hdr),
+                    "payload": _sanitize_claims(safe_pay),
+                    "findings": findings,
+                },
+                ensure_ascii=False,
+            )
+
+        result = analyze_token(
+            value,
+            kind=kind,
+            alg=alg,
+            hmac_key=hmac_key,
+            claim_overrides=claim_overrides,
+        )
         return json.dumps(result, ensure_ascii=False)
 
     def _tool_extract_surface(self, args: dict[str, Any]) -> str:
@@ -1026,10 +1175,10 @@ class ToolDispatcher:
             raise MethodNotAllowedError(
                 f"HTTP method {norm_method!r} not allowed; permitted: {sorted(self.http.allowed_methods)}"
             )
-        headers = args.get("headers") if isinstance(args.get("headers"), dict) else None
-        query = args.get("query") if isinstance(args.get("query"), dict) else None
-        json_body = args.get("json_body")
-        form_body = args.get("form_body") if isinstance(args.get("form_body"), dict) else None
+        headers = _coerce_mapping_arg(args.get("headers"))
+        query = _coerce_mapping_arg(args.get("query"))
+        json_body = _coerce_json_payload(args.get("json_body"))
+        form_body = _coerce_mapping_arg(args.get("form_body"))
         raw_body = str(args["raw_body"]) if args.get("raw_body") is not None else None
 
         clean_url, _, _ = self.http._merge_query(url, query)
@@ -1055,10 +1204,10 @@ class ToolDispatcher:
                 method=norm_method,
                 url=url,
                 actor=actor,
-                headers=headers,
-                query=query,
-                json_body=json_body,
-                form_body=form_body,
+                headers=copy.deepcopy(headers) if headers is not None else None,
+                query=copy.deepcopy(query) if query is not None else None,
+                json_body=copy.deepcopy(json_body) if json_body is not None else None,
+                form_body=copy.deepcopy(form_body) if form_body is not None else None,
                 raw_body=raw_body,
                 force=True,
             )

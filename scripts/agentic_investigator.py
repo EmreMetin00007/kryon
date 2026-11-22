@@ -65,6 +65,7 @@ from agentic_context import (
     estimate_tokens as estimate_tokens,
 )
 from agentic_http import AgenticHTTPClient, ServiceDegradationError
+from agentic_oob import LoopbackCallbackServer
 from agentic_oracle import DifferentialOracle
 from agentic_receipts import ReceiptStore
 from agentic_seed import apply_seed_surface
@@ -117,6 +118,7 @@ class AgenticInvestigator:
         epoch_char_limit: int = _EPOCH_HARD_CHAR_LIMIT,
         cache_token_weight: float = 0.10,
         seed_surface: dict[str, Any] | None = None,
+        oob_server: LoopbackCallbackServer | None = None,
     ):
         self.http = http_client
         self.receipts = receipt_store
@@ -180,10 +182,12 @@ class AgenticInvestigator:
             if self.use_bsag
             else None
         )
+        self._oob_server: LoopbackCallbackServer | None = oob_server
         self.oracle: DifferentialOracle = DifferentialOracle(
             http_client=http_client,
             receipt_store=receipt_store,
             mode=self.verification_gate,
+            oob_server=self._oob_server,
         )
         self.scheduler = AntiBiasUCBScheduler(mode=self.scheduler_mode)
         self.intervention_monitor = LazyInterventionMonitor(
@@ -197,6 +201,7 @@ class AgenticInvestigator:
             bsag=self.bsag,
             oracle=self.oracle,
             telemetry=self.telemetry,
+            oob_server=self._oob_server,
         )
         self.seeded_surface_count: int = (
             apply_seed_surface(self.dispatcher.surface_tracker, seed_surface)
@@ -1985,6 +1990,11 @@ class AgenticInvestigator:
             def _run_shard_worker(cluster: SubsystemCluster) -> dict[str, Any]:
                 shard_dir = self.root_dir / "shards" / cluster.shard_id
                 shard_dir.mkdir(parents=True, exist_ok=True)
+                shared_oob = (
+                    self._oob_server
+                    if self._oob_server is not None
+                    else getattr(self.dispatcher, "_oob_server", None)
+                )
                 shard_dispatcher = ToolDispatcher(
                     http_client=self.http,
                     receipt_store=self.receipts,
@@ -1992,6 +2002,7 @@ class AgenticInvestigator:
                     bsag=None,
                     oracle=self.oracle,
                     telemetry=self.telemetry,
+                    oob_server=shared_oob,
                 )
                 try:
                     shard_dispatcher.surface_tracker.load_dict(copy.deepcopy(bootstrap_surface_snap))
