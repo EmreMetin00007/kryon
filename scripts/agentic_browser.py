@@ -18,7 +18,7 @@ import json
 from pathlib import Path
 import sys
 from typing import Any, Callable, Sequence
-from urllib.parse import parse_qsl, urljoin, urlsplit, urlunsplit
+from urllib.parse import parse_qsl, quote, urlencode, urljoin, urlsplit, urlunsplit
 
 from agentic_http import (
     AgenticHTTPClient,
@@ -48,10 +48,14 @@ except Exception:  # pragma: no cover - optional dependency fallback
 try:
     from kryon_core.browser.hooks import (  # noqa: E402
         build_runtime_hook_script as _build_runtime_hook_script,
+        normalize_dom_sinks as _normalize_dom_sinks,
+        normalize_postmessage_listeners as _normalize_postmessage_listeners,
         normalize_runtime_events as _normalize_runtime_events,
     )
 except Exception:  # pragma: no cover - optional dependency fallback
     _build_runtime_hook_script = None  # type: ignore[assignment]
+    _normalize_dom_sinks = None  # type: ignore[assignment]
+    _normalize_postmessage_listeners = None  # type: ignore[assignment]
     _normalize_runtime_events = None  # type: ignore[assignment]
 
 try:
@@ -95,11 +99,28 @@ _BROWSER_USER_AGENT = (
 
 _COLLECT_RUNTIME_JS = r"""() => {
   const rt = window.__ccoRuntime;
-  if (!rt) return {events: [], state: {}};
+  if (!rt) return {events: [], state: {}, dom_sinks: [], postmessage_listeners: []};
   return {
     events: Array.isArray(rt.events) ? rt.events : [],
     state: typeof rt.snapshot === "function" ? rt.snapshot() : {},
+    dom_sinks: Array.isArray(rt.dom_sinks) ? rt.dom_sinks : [],
+    postmessage_listeners: Array.isArray(rt.postmessage_listeners) ? rt.postmessage_listeners : [],
   };
+}"""
+
+_CHECK_DOM_CANARY_JS = r"""(attrName) => {
+  const targetAttr = String(attrName || "data-kryon-dom-canary");
+  const walk = (root) => {
+    if (!root || !root.querySelectorAll) return false;
+    try {
+      if (root.querySelector(`[${targetAttr}]`)) return true;
+      for (const el of root.querySelectorAll("*")) {
+        if (el.shadowRoot && walk(el.shadowRoot)) return true;
+      }
+    } catch (_) {}
+    return false;
+  };
+  return walk(document);
 }"""
 
 _INSPECT_DOM_JS = r"""(marker) => {
@@ -1046,8 +1067,10 @@ def _inspect_rendered_page_playwright(
                 try:
                     rt_payload = page.evaluate(_COLLECT_RUNTIME_JS)
                 except Exception:
-                    rt_payload = {"events": [], "state": {}}
+                    rt_payload = {"events": [], "state": {}, "dom_sinks": [], "postmessage_listeners": []}
                 rt_events = rt_payload.get("events") if isinstance(rt_payload, dict) else []
+                rt_dom_sinks = rt_payload.get("dom_sinks") if isinstance(rt_payload, dict) else []
+                rt_pm_listeners = rt_payload.get("postmessage_listeners") if isinstance(rt_payload, dict) else []
 
                 try:
                     dom_info = page.evaluate(_INSPECT_DOM_JS, marker)
@@ -1061,6 +1084,8 @@ def _inspect_rendered_page_playwright(
                     "title": str(dom_info.get("title") or "") if isinstance(dom_info, dict) else "",
                     "csp": csp_value,
                     "runtime_events": rt_events if isinstance(rt_events, list) else [],
+                    "dom_sinks": rt_dom_sinks if isinstance(rt_dom_sinks, list) else [],
+                    "postmessage_listeners": rt_pm_listeners if isinstance(rt_pm_listeners, list) else [],
                     "console_error_count": console_error_count,
                     "blocked_request_count": len(blocked_requests),
                     "marker_check": {
@@ -1218,6 +1243,9 @@ def inspect_rendered_page(
         ][:20],
     }
 
+    dom_sinks = _sanitize_dom_sinks(raw_dict.get("dom_sinks"), secrets)
+    postmessage_listeners = _sanitize_postmessage_listeners(raw_dict.get("postmessage_listeners"), secrets)
+
     return {
         "ok": True,
         "url": _redact_secrets(final_url, secrets),
@@ -1227,9 +1255,271 @@ def inspect_rendered_page(
         "csp_present": bool(csp_safe),
         "csp": csp_safe,
         "runtime_requests": runtime_requests,
+        "dom_sinks": dom_sinks,
+        "postmessage_listeners": postmessage_listeners,
         "console_error_count": int(raw_dict.get("console_error_count") or 0),
         "blocked_request_count": int(raw_dict.get("blocked_request_count") or 0),
         "marker_check": marker_check,
+    }
+
+
+def _sanitize_dom_sinks(raw_sinks: Any, secrets: list[str]) -> list[dict[str, Any]]:
+    normalized = (
+        _normalize_dom_sinks(raw_sinks)
+        if callable(_normalize_dom_sinks)
+        else (raw_sinks if isinstance(raw_sinks, list) else [])
+    )
+    out: list[dict[str, Any]] = []
+    for item in normalized:
+        if not isinstance(item, dict):
+            continue
+        sink = str(item.get("sink") or "").strip()[:60]
+        if not sink:
+            continue
+        out.append({
+            "sink": sink,
+            "tag": str(item.get("tag") or "").strip().lower()[:40],
+            "snippet": _redact_secrets(str(item.get("snippet") or ""), secrets)[:200],
+            "source_matches": [
+                str(s)[:40] for s in (item.get("source_matches") or []) if str(s).strip()
+            ][:8],
+        })
+        if len(out) >= 40:
+            break
+    return out
+
+
+def _sanitize_postmessage_listeners(raw_listeners: Any, secrets: list[str]) -> list[dict[str, Any]]:
+    normalized = (
+        _normalize_postmessage_listeners(raw_listeners)
+        if callable(_normalize_postmessage_listeners)
+        else (raw_listeners if isinstance(raw_listeners, list) else [])
+    )
+    out: list[dict[str, Any]] = []
+    for item in normalized:
+        if not isinstance(item, dict):
+            continue
+        out.append({
+            "type": str(item.get("type") or "addEventListener").strip()[:40],
+            "has_origin_check": bool(item.get("has_origin_check")),
+            "handler_preview": _redact_secrets(str(item.get("handler_preview") or ""), secrets)[:240],
+        })
+        if len(out) >= 20:
+            break
+    return out
+
+
+def _build_dom_probe_url(full_url: str, *, source: str, param_name: str, canary: str) -> str:
+    parsed = urlsplit(full_url)
+    if source == "hash":
+        encoded = quote(canary, safe="")
+        frag = f"{param_name}={encoded}" if param_name else encoded
+        return urlunsplit((parsed.scheme, parsed.netloc, parsed.path or "/", parsed.query, frag))
+    if source == "query":
+        pairs = list(parse_qsl(parsed.query, keep_blank_values=True))
+        key = str(param_name or "q").strip() or "q"
+        pairs.append((key, canary))
+        return urlunsplit((parsed.scheme, parsed.netloc, parsed.path or "/", urlencode(pairs), parsed.fragment))
+    return full_url
+
+
+def verify_dom_sink_in_browser(
+    http: AgenticHTTPClient,
+    *,
+    url: str,
+    actor: str = "anon",
+    source: str = "hash",
+    param_name: str = "",
+    canary: str = '<span data-kryon-dom-canary="1"></span>',
+    wait_ms: int = 250,
+    timeout_ms: int = 8000,
+) -> dict[str, Any]:
+    """Deterministically verify whether a benign DOM canary is parsed into live DOM in an isolated read-only browser."""
+    clean_source = str(source or "hash").strip().lower()
+    if clean_source not in {"hash", "query", "postmessage"}:
+        raise ValueError(f"Unsupported DOM verification source: {source!r}")
+
+    full_url = _resolve_and_check_scope(http, url)
+    base_parsed = urlsplit(http.base_url)
+    base_scheme = base_parsed.scheme
+    base_netloc = base_parsed.netloc
+
+    probe_url = _build_dom_probe_url(
+        full_url,
+        source=clean_source,
+        param_name=param_name if clean_source != "query" else (param_name or "q"),
+        canary=canary,
+    )
+    _resolve_and_check_scope(http, probe_url)
+
+    clean_actor = str(actor or "anon").strip() or "anon"
+    cookie_hdr, extra_headers = _extract_actor_browser_auth(http, clean_actor)
+    local_storage = _extract_actor_local_storage(http, clean_actor)
+    secrets = _collect_actor_secrets(http, cookie_hdr, extra_headers, local_storage=local_storage)
+
+    eff_wait_ms = max(0, min(int(wait_ms), _MAX_WAIT_MS))
+    eff_timeout_ms = max(_MIN_TIMEOUT_MS, min(int(timeout_ms), _MAX_TIMEOUT_MS))
+
+    if _budget_remaining(http) <= 0:
+        raise BudgetExhaustedError("campaign request budget exhausted")
+
+    if not HAS_PLAYWRIGHT or _sync_playwright is None:
+        return {
+            "ok": False,
+            "verified_dom_injection": False,
+            "dom_element_parsed": False,
+            "matched_sinks": [],
+            "postmessage_listeners": [],
+            "source": clean_source,
+            "url": _redact_secrets(probe_url, secrets),
+            "actor": clean_actor,
+            "error": "playwright_unavailable",
+        }
+
+    allowed, reason = http.budget.consume()
+    if not allowed:
+        raise BudgetExhaustedError(reason)
+
+    def _run() -> dict[str, Any]:
+        assert _sync_playwright is not None
+        with _sync_playwright() as playwright:
+            browser = playwright.chromium.launch(headless=True, args=CHROMIUM_ARGS)
+            context = browser.new_context(
+                ignore_https_errors=True,
+                service_workers="block",
+                user_agent=_BROWSER_USER_AGENT,
+            )
+            try:
+                ls_init = _build_origin_localstorage_init_script(http.base_url, local_storage or {})
+                if ls_init:
+                    context.add_init_script(ls_init)
+                if callable(_build_runtime_hook_script):
+                    context.add_init_script(_build_runtime_hook_script())
+                cookie_pairs = _parse_cookie_pairs(cookie_hdr)
+                if cookie_pairs:
+                    context.add_cookies([
+                        {"name": cname, "value": cval, "url": http.base_url}
+                        for cname, cval in cookie_pairs
+                    ])
+
+                async def _on_websocket(socket: Any) -> None:
+                    route_obj = getattr(socket, "_impl_obj", socket)
+                    closing = route_obj.close(code=1008, reason="readonly dom verifier: websocket blocked")
+                    if inspect.isawaitable(closing):
+                        await closing
+
+                def _on_route(route: Any) -> None:
+                    req = route.request
+                    req_method = str(getattr(req, "method", "GET") or "GET").strip().upper()
+                    req_url = str(getattr(req, "url", "") or "")
+                    if req_method not in {"GET", "HEAD"}:
+                        route.abort("blockedbyclient")
+                        return
+                    try:
+                        _resolve_and_check_scope(http, req_url)
+                    except ScopeViolationError:
+                        route.abort("blockedbyclient")
+                        return
+                    if extra_headers:
+                        try:
+                            merged = dict(req.all_headers() or {})
+                        except Exception:
+                            merged = dict(getattr(req, "headers", None) or {})
+                        existing_lower = {str(k).lower() for k in merged}
+                        for hk, hv in extra_headers.items():
+                            if hk.lower() not in existing_lower:
+                                merged[hk] = hv
+                        route.continue_(headers=merged)
+                    else:
+                        route.continue_()
+
+                if hasattr(context, "route_web_socket"):
+                    context.route_web_socket("**/*", _on_websocket)
+                context.route("**/*", _on_route)
+
+                page = context.new_page()
+                page.goto(probe_url, wait_until="domcontentloaded", timeout=eff_timeout_ms)
+                if eff_wait_ms > 0:
+                    page.wait_for_timeout(eff_wait_ms)
+
+                if clean_source == "postmessage":
+                    page.evaluate(
+                        "(payload) => window.postMessage(payload, window.location.origin)",
+                        canary,
+                    )
+                    page.wait_for_timeout(max(150, eff_wait_ms))
+
+                final_raw_url = str(page.url or probe_url)
+                _resolve_and_check_scope(http, final_raw_url)
+
+                dom_parsed = bool(page.evaluate(_CHECK_DOM_CANARY_JS, "data-kryon-dom-canary"))
+                try:
+                    rt_payload = page.evaluate(_COLLECT_RUNTIME_JS)
+                except Exception:
+                    rt_payload = {"dom_sinks": [], "postmessage_listeners": []}
+                return {
+                    "ok": True,
+                    "url": final_raw_url,
+                    "dom_element_parsed": dom_parsed,
+                    "dom_sinks": rt_payload.get("dom_sinks") if isinstance(rt_payload, dict) else [],
+                    "postmessage_listeners": (
+                        rt_payload.get("postmessage_listeners") if isinstance(rt_payload, dict) else []
+                    ),
+                }
+            finally:
+                context.close()
+                browser.close()
+
+    try:
+        raw = _run_sync(_run, timeout=max(30.0, (eff_timeout_ms / 1000.0) + 15.0))
+    except ScopeViolationError:
+        return {
+            "ok": False,
+            "verified_dom_injection": False,
+            "dom_element_parsed": False,
+            "matched_sinks": [],
+            "postmessage_listeners": [],
+            "source": clean_source,
+            "url": _redact_secrets(probe_url, secrets),
+            "actor": clean_actor,
+            "error": "off_origin_navigation",
+        }
+    except Exception as exc:
+        return {
+            "ok": False,
+            "verified_dom_injection": False,
+            "dom_element_parsed": False,
+            "matched_sinks": [],
+            "postmessage_listeners": [],
+            "source": clean_source,
+            "url": _redact_secrets(probe_url, secrets),
+            "actor": clean_actor,
+            "error": _redact_secrets(f"{type(exc).__name__}: {str(exc)[:240]}", secrets),
+        }
+
+    sinks = _sanitize_dom_sinks(raw.get("dom_sinks"), secrets)
+    listeners = _sanitize_postmessage_listeners(raw.get("postmessage_listeners"), secrets)
+    dom_element_parsed = bool(raw.get("dom_element_parsed"))
+    final_url = (
+        _compact_same_origin_url(
+            str(raw.get("url") or probe_url),
+            base_url=http.base_url,
+            base_scheme=base_scheme,
+            base_netloc=base_netloc,
+            allow_fragment_route=True,
+        )
+        or probe_url
+    )
+    return {
+        "ok": True,
+        "verified_dom_injection": dom_element_parsed,
+        "dom_element_parsed": dom_element_parsed,
+        "matched_sinks": sinks,
+        "postmessage_listeners": listeners,
+        "source": clean_source,
+        "url": _redact_secrets(final_url, secrets),
+        "actor": clean_actor,
+        "error": "",
     }
 
 
@@ -1241,4 +1531,5 @@ __all__ = [
     "_extract_actor_local_storage",
     "inspect_rendered_page",
     "run_browser_crawl",
+    "verify_dom_sink_in_browser",
 ]

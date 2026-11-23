@@ -172,6 +172,117 @@ _PROBE_PRIORITY_PARAM_NAMES = frozenset({
     "message",
     "comment",
 })
+HIGH_RISK_PARAM_NAMES: frozenset[str] = frozenset({
+    "id",
+    "file",
+    "filename",
+    "path",
+    "dir",
+    "folder",
+    "url",
+    "uri",
+    "next",
+    "redirect",
+    "return",
+    "callback",
+    "q",
+    "query",
+    "search",
+    "sort",
+    "order",
+    "filter",
+    "template",
+    "view",
+    "page",
+    "cate",
+    "cat",
+    "cmd",
+    "exec",
+    "email",
+    "username",
+    "role",
+    "admin",
+    "token",
+})
+_HIGH_RISK_COMPOUND_PARAM_TOKENS: frozenset[str] = frozenset({
+    "file",
+    "filename",
+    "filepath",
+    "path",
+    "folder",
+    "url",
+    "uri",
+    "redirect",
+    "return",
+    "callback",
+    "query",
+    "search",
+    "sort",
+    "filter",
+    "template",
+    "cmd",
+    "exec",
+    "email",
+    "username",
+    "role",
+    "admin",
+    "token",
+})
+_HIGH_RISK_LOW_SIGNAL_META_PARAMS: frozenset[str] = _NON_PROBE_PARAM_NAMES - HIGH_RISK_PARAM_NAMES
+_UPLOAD_ROUTE_TOKENS: frozenset[str] = frozenset({
+    "upload",
+    "uploads",
+    "fileupload",
+    "import",
+    "attach",
+    "attachment",
+    "attachments",
+})
+_AUTH_ADMIN_ROUTE_TOKENS: frozenset[str] = frozenset({
+    "admin",
+    "login",
+    "signin",
+    "signup",
+    "register",
+    "auth",
+    "password",
+    "passwd",
+    "reset",
+    "role",
+    "roles",
+    "permission",
+    "permissions",
+})
+_LOGOUT_OR_DESTRUCTIVE_SEGMENTS: frozenset[str] = frozenset({
+    "logout",
+    "log-out",
+    "log_out",
+    "signout",
+    "sign-out",
+    "sign_out",
+    "reboot",
+    "restart",
+    "shutdown",
+    "shut-down",
+    "shut_down",
+    "poweroff",
+    "power-off",
+    "power_off",
+    "factory-reset",
+    "factory_reset",
+})
+_MUTATING_HTTP_METHODS: frozenset[str] = frozenset({"POST", "PUT", "PATCH", "DELETE"})
+_HIGH_RISK_SCORE_THRESHOLD = 25
+_ROUTE_FAMILY_PREFIX_RE = re.compile(
+    r"^(?:api|ajax[-_]?api|rest|rpc|v\d+(?:\.\d+)?|\d+\.\d+)$",
+    re.IGNORECASE,
+)
+_ROUTE_API_PATH_RE = re.compile(
+    r"^/(?:api|ajax[-_]?api|rest|rpc|v\d+(?:\.\d+)?|graphql)(?:/|$)|/graphql(?:/|$)",
+    re.IGNORECASE,
+)
+_BENIGN_QUERY_VAL_RE = re.compile(r"^[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)?$")
+_BENIGN_EMAIL_VAL_RE = re.compile(r"^[A-Za-z0-9._+-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+$")
 _API_PREFIX_RE = re.compile(r"^/(api(?:/v\d+)?|v\d+)(?=/|$)", re.IGNORECASE)
 _NON_RESOURCE_UI_SEGMENTS = frozenset({
     "login",
@@ -917,6 +1028,223 @@ def is_virgin_state_sensitive_path(path_or_url: str) -> bool:
     return any(seg in _VIRGIN_STATE_SENSITIVE_TOKENS for seg in segments)
 
 
+def _strip_param_marker(param_name: str) -> str:
+    raw = str(param_name or "").strip()
+    if raw.lower().startswith("path:"):
+        raw = raw[5:]
+    return raw.rstrip("=").strip()
+
+
+def is_high_risk_param_name(param_name: str) -> bool:
+    """Return True if a query/body/path parameter name belongs to the high-risk input tier."""
+    raw = str(param_name or "").strip()
+    if not raw:
+        return False
+    if raw.lower().startswith("path:"):
+        return True
+    base = _strip_param_marker(raw)
+    if not base:
+        return False
+    base_low = base.lower()
+    if base_low in HIGH_RISK_PARAM_NAMES:
+        return True
+    snake = _CAMEL_BOUNDARY_RE.sub(r"\1_\2", base).lower().replace("-", "_")
+    if snake in HIGH_RISK_PARAM_NAMES:
+        return True
+    if snake.endswith("_id") and len(snake) > 3:
+        return True
+    tokens = [tok for tok in _TOKEN_SPLIT_RE.split(snake) if tok]
+    if len(tokens) >= 2:
+        return any(tok in _HIGH_RISK_COMPOUND_PARAM_TOKENS for tok in tokens)
+    return False
+
+
+def is_logout_or_destructive_route(route_or_path: str) -> bool:
+    """Return True for logout or destructive host lifecycle routes that must never be nudged."""
+    raw = str(route_or_path or "").strip()
+    if not raw:
+        return False
+    try:
+        norm_p = normalize_path(urlsplit(raw).path or "/")
+    except ValueError:
+        return False
+    for seg in norm_p.lower().split("/"):
+        if not seg:
+            continue
+        stem = seg.rsplit(".", 1)[0] if "." in seg else seg
+        if seg in _LOGOUT_OR_DESTRUCTIVE_SEGMENTS or stem in _LOGOUT_OR_DESTRUCTIVE_SEGMENTS:
+            return True
+    return False
+
+
+def _is_active_probe_param_value(val: str) -> bool:
+    """Return True when a parameter value contains active security-probe characters rather than a plain benign token."""
+    raw = str(val or "").strip()
+    if not raw:
+        return False
+    if ".." in raw:
+        return True
+    if _BENIGN_QUERY_VAL_RE.fullmatch(raw) is not None:
+        return False
+    if _BENIGN_EMAIL_VAL_RE.fullmatch(raw) is not None:
+        return False
+    return True
+
+
+def _extract_route_family(path: str) -> str:
+    """Return the normalized top-level resource family for a URL or route template."""
+    raw = str(path or "")
+    if is_non_endpoint_source_path(raw):
+        return "root"
+    raw_path = urlsplit(raw.strip()).path or "/"
+    segments = [seg for seg in raw_path.split("/") if seg]
+    while segments and (
+        _ROUTE_FAMILY_PREFIX_RE.fullmatch(segments[0])
+        or not any(ch.isalnum() for ch in segments[0])
+    ):
+        segments.pop(0)
+    if not segments:
+        return "root"
+    first = segments[0]
+    if (first.startswith("{") and first.endswith("}")) or first.startswith("$"):
+        return "root"
+    kv = _split_path_kv_segment(first)
+    if kv is not None:
+        return kv[0]
+    if "=" in first:
+        return "root"
+    if len(segments) == 1 and "." in first:
+        return "root"
+    if not any(ch.isalnum() for ch in first):
+        return "root"
+    return first.lower()
+
+
+def _extract_api_subfamily(path: str, umbrella: str) -> str | None:
+    """Return the normalized non-ID sub-family under an API umbrella prefix, or None."""
+    raw = str(path or "")
+    if is_non_endpoint_source_path(raw) or not _ROUTE_API_PATH_RE.search(raw):
+        return None
+    raw_path = urlsplit(raw.strip()).path or "/"
+    segments = [seg for seg in raw_path.split("/") if seg]
+    while segments and (
+        _ROUTE_FAMILY_PREFIX_RE.fullmatch(segments[0])
+        or not any(ch.isalnum() for ch in segments[0])
+    ):
+        segments.pop(0)
+    if len(segments) < 2 or segments[0].lower() != umbrella.lower():
+        return None
+    sub = segments[1]
+    if is_id_segment(sub) or (sub.startswith("{") and sub.endswith("}")) or not any(ch.isalnum() for ch in sub):
+        return None
+    kv = _split_path_kv_segment(sub)
+    if kv is not None:
+        return kv[0]
+    if "=" in sub or (len(segments) == 2 and "." in sub):
+        return None
+    return sub.lower()
+
+
+def _order_params_by_risk(params: Sequence[str]) -> list[str]:
+    """Return deduplicated parameter names ordered high-risk first, then alphabetically."""
+    unique = {str(p or "").strip() for p in params if str(p or "").strip()}
+    return sorted(
+        unique,
+        key=lambda p: (
+            0 if is_high_risk_param_name(p) else (2 if p.lower() in _HIGH_RISK_LOW_SIGNAL_META_PARAMS else 1),
+            p.lower(),
+            p,
+        ),
+    )
+
+
+def score_route_input_risk(
+    route_template: str,
+    *,
+    methods: Sequence[str] = (),
+    params: Sequence[str] = (),
+    schema_hints: Sequence[str] = (),
+    is_form: bool = False,
+    has_body_template: bool = False,
+) -> tuple[int, str]:
+    """Deterministically score a route template by input attack-surface risk.
+
+    Highest tier: multipart/file-upload endpoints, routes with high-risk query/body/path
+    parameter names, and mutating (POST/PUT/PATCH/DELETE) forms/API routes.
+    Lower tier: parameterless GET listing/informational pages.
+    """
+    tmpl = route_template_of(route_template) if str(route_template or "").strip() else "/"
+    norm_methods = {str(m or "").strip().upper() for m in methods if str(m or "").strip()}
+    mutating_methods = norm_methods & _MUTATING_HTTP_METHODS
+    ordered_params = _order_params_by_risk(params)
+    high_risk_params = [p for p in ordered_params if is_high_risk_param_name(p)]
+    other_params = [
+        p
+        for p in ordered_params
+        if p not in high_risk_params and p.lower() not in _HIGH_RISK_LOW_SIGNAL_META_PARAMS
+    ]
+
+    clean_hints = [str(h or "").strip() for h in schema_hints if str(h or "").strip()]
+    has_multipart_hint = any(h.lower().startswith("multipart:") for h in clean_hints)
+
+    path_tokens: set[str] = set()
+    for seg in tmpl.lower().split("/"):
+        if not seg or seg.startswith("{"):
+            continue
+        stem = seg.rsplit(".", 1)[0] if "." in seg else seg
+        for tok in _TOKEN_SPLIT_RE.split(stem):
+            if tok:
+                path_tokens.add(tok)
+
+    is_upload_path = bool(path_tokens & _UPLOAD_ROUTE_TOKENS)
+    is_auth_or_admin_path = bool(path_tokens & _AUTH_ADMIN_ROUTE_TOKENS)
+    is_api = bool(_ROUTE_API_PATH_RE.search(tmpl))
+
+    score = 0
+    reasons: list[str] = []
+
+    if has_multipart_hint:
+        score += 45 + (5 if is_upload_path else 0)
+        reasons.append("multipart_upload")
+    elif is_upload_path:
+        score += 35
+        reasons.append("file_upload")
+
+    if high_risk_params:
+        score += 30 + min(16, (len(high_risk_params) - 1) * 4) + min(4, len(other_params))
+        reasons.append(f"high_risk_params({','.join(high_risk_params[:4])})")
+    elif other_params:
+        score += 18 + min(8, (len(other_params) - 1) * 2)
+        reasons.append(f"parameterized_input({','.join(other_params[:4])})")
+
+    if mutating_methods:
+        score += 25 + (4 if has_body_template else 0)
+        reasons.append(f"mutating_endpoint({','.join(sorted(mutating_methods))})")
+    elif has_body_template:
+        score += 20
+        reasons.append("body_template")
+
+    if is_form:
+        score += 15
+        reasons.append("form_endpoint")
+
+    if is_auth_or_admin_path:
+        if mutating_methods or is_form or high_risk_params or other_params:
+            score += 10
+            reasons.append("auth_or_admin")
+        else:
+            score += 6
+            reasons.append("auth_or_admin_page")
+
+    if is_api:
+        score += 3
+    if "{id}" in tmpl:
+        score += 2
+
+    reason_text = ", ".join(reasons) if reasons else "parameterless_get_page"
+    return score, reason_text
+
+
 class SurfaceFrontierTracker:
     """Passively tracks discovered routes, per-actor objects, write ops, and untested frontier items."""
 
@@ -954,6 +1282,9 @@ class SurfaceFrontierTracker:
         self.tested_params_by_template: dict[str, set[str]] = {}
         self.param_probes_by_template: dict[str, dict[str, dict[str, Any]]] = {}
         self.html_or_form_templates: set[str] = set()
+        self.discovered_form_templates: set[str] = set()
+        self.actively_probed_templates: set[str] = set()
+        self._non_404_templates: set[str] = set()
         self.actors_by_template: dict[str, set[str]] = {}
         self.actors_by_path: dict[str, set[str]] = {}
         self.route_2xx_actors: dict[str, set[str]] = {}
@@ -1055,6 +1386,7 @@ class SurfaceFrontierTracker:
         hints = [*(f"multipart:file={f}" for f in files), *(f"multipart:field={k}" for k in fields)]
         if hints:
             self._add_schema_hints(tmpl, hints)
+            self.discovered_form_templates.add(tmpl)
         return all_names
 
     def _ingest_validation_hints(self, tmpl: str, parsed: Any, *, method: str) -> None:
@@ -1315,6 +1647,7 @@ class SurfaceFrontierTracker:
             self._add_discovered_params(tmpl, path_params)
         if is_form:
             self.html_or_form_templates.add(tmpl)
+            self.discovered_form_templates.add(tmpl)
 
         if norm_method in self.allowed_methods:
             display = f"{norm_p}?{ '&'.join(f'{k}=' for k in q_names[:4]) }" if q_names else norm_p
@@ -1485,29 +1818,47 @@ class SurfaceFrontierTracker:
         self.visited_method_templates.add((method, tmpl))
         self.actors_by_path.setdefault(norm_p, set()).add(actor)
         self.actors_by_template.setdefault(tmpl, set()).add(actor)
+        if status and status != 404:
+            self._non_404_templates.add(tmpl)
 
+        active_probe_tmpl = tmpl
         raw_norm_p = normalize_path(str(receipt.get("path") or raw_url))
         raw_path_pairs = _extract_path_embedded_param_pairs(raw_norm_p)
         path_param_pairs = _extract_path_embedded_param_pairs(norm_p)
+        observed_param_pairs: list[tuple[str, str]] = []
         if raw_path_pairs and not path_param_pairs:
             raw_tmpl = route_template_of(raw_norm_p)
+            active_probe_tmpl = raw_tmpl
             if status != 404:
                 self._add_discovered_params(raw_tmpl, [k for k, _ in raw_path_pairs])
+                self._non_404_templates.add(raw_tmpl)
             concrete_raw_pairs = [(k, v) for k, v in raw_path_pairs if v or k.endswith("=")]
             if concrete_raw_pairs:
                 self._record_param_probes(raw_tmpl, concrete_raw_pairs)
+                observed_param_pairs.extend(concrete_raw_pairs)
         elif path_param_pairs:
             if status != 404:
                 self._add_discovered_params(tmpl, [k for k, _ in path_param_pairs])
             concrete_path_pairs = [(k, v) for k, v in path_param_pairs if v or k.endswith("=")]
             if concrete_path_pairs:
                 self._record_param_probes(tmpl, concrete_path_pairs)
+                observed_param_pairs.extend(concrete_path_pairs)
 
         parsed_url = urlsplit(url)
         query_str = str(receipt.get("query") or parsed_url.query or "")
         q_pairs = [(k.strip(), v) for k, v in parse_qsl(query_str, keep_blank_values=True) if k.strip()]
         if q_pairs:
             self._record_param_probes(tmpl, q_pairs)
+            observed_param_pairs.extend(q_pairs)
+
+        if method in _MUTATING_HTTP_METHODS:
+            self.actively_probed_templates.add(tmpl)
+            if active_probe_tmpl != tmpl:
+                self.actively_probed_templates.add(active_probe_tmpl)
+        elif observed_param_pairs:
+            self._maybe_mark_param_actively_probed(active_probe_tmpl, observed_param_pairs)
+            if active_probe_tmpl != tmpl and q_pairs:
+                self._maybe_mark_param_actively_probed(tmpl, q_pairs)
 
         is_html_resp = (
             "html" in ctype
@@ -2299,6 +2650,258 @@ class SurfaceFrontierTracker:
         candidates.sort(key=lambda pair: pair[0])
         return [label for _, label in candidates]
 
+    def _template_known_methods(self, tmpl: str) -> tuple[set[str], set[str]]:
+        """Return `(all_methods, allowed_methods)` observed or declared for `tmpl`."""
+        all_methods: set[str] = set()
+        for m, norm_p in self.discovered_routes:
+            if route_template_of(norm_p) == tmpl:
+                all_methods.add(str(m or "GET").strip().upper())
+        for m, v_tmpl in self.visited_method_templates:
+            if v_tmpl == tmpl:
+                all_methods.add(str(m or "GET").strip().upper())
+        for m, w_tmpl in self.declared_write_ops:
+            if w_tmpl == tmpl:
+                all_methods.add(str(m or "POST").strip().upper())
+        for m, w_tmpl in self.discovered_write_ops:
+            if w_tmpl == tmpl:
+                all_methods.add(str(m or "POST").strip().upper())
+        for m, bt_tmpl in self.discovered_body_templates:
+            if bt_tmpl == tmpl:
+                all_methods.add(str(m or "POST").strip().upper())
+        allowed = all_methods & self.allowed_methods
+        return all_methods, allowed
+
+    def _requires_mutating_probe(self, tmpl: str, allowed_methods: set[str]) -> bool:
+        """Return True when `tmpl` is a multipart/upload or write-only endpoint requiring a mutating probe."""
+        if not (allowed_methods & _MUTATING_HTTP_METHODS):
+            return False
+        hints = self.discovered_schema_hints.get(tmpl) or ()
+        if any(str(h).lower().startswith("multipart:") for h in hints):
+            return True
+        path_tokens = {
+            tok
+            for seg in tmpl.lower().split("/")
+            if seg and not seg.startswith("{")
+            for tok in _TOKEN_SPLIT_RE.split(seg.rsplit(".", 1)[0] if "." in seg else seg)
+            if tok
+        }
+        if path_tokens & _UPLOAD_ROUTE_TOKENS:
+            return True
+        return "GET" not in allowed_methods and "HEAD" not in allowed_methods
+
+    def _maybe_mark_param_actively_probed(
+        self,
+        tmpl: str,
+        pairs: Sequence[tuple[str, str]],
+    ) -> None:
+        """Mark `tmpl` as actively probed when query/path params show >=2 value variants or an active probe payload."""
+        if not tmpl or not pairs:
+            return
+        _, allowed_methods = self._template_known_methods(tmpl)
+        if self._requires_mutating_probe(tmpl, allowed_methods):
+            return
+        pmap = self.param_probes_by_template.get(tmpl) or {}
+        for raw_k, raw_v in pairs:
+            pname = str(raw_k or "").strip()
+            if not pname or pname.lower() in _HIGH_RISK_LOW_SIGNAL_META_PARAMS:
+                continue
+            val = str(raw_v or "")[:64]
+            if _is_active_probe_param_value(val):
+                self.actively_probed_templates.add(tmpl)
+                return
+            rec = pmap.get(pname)
+            if rec is not None and len(rec.get("values") or ()) >= 2:
+                self.actively_probed_templates.add(tmpl)
+                return
+
+    def is_route_actively_probed(
+        self,
+        route_template: str,
+        *,
+        methods: Sequence[str] | None = None,
+    ) -> bool:
+        """Return True if `route_template` has been actively probed rather than merely passively observed."""
+        tmpl = route_template_of(route_template) if str(route_template or "").strip() else "/"
+        if tmpl in self.actively_probed_templates:
+            return True
+        if any(
+            m in _MUTATING_HTTP_METHODS and t == tmpl
+            for m, t in (*self.visited_method_templates, *self.tested_write_ops)
+        ):
+            return True
+        if methods is not None:
+            allowed_methods = {str(m or "").strip().upper() for m in methods if str(m or "").strip()} & self.allowed_methods
+        else:
+            _, allowed_methods = self._template_known_methods(tmpl)
+        if self._requires_mutating_probe(tmpl, allowed_methods):
+            return False
+        pmap = self.param_probes_by_template.get(tmpl) or {}
+        for pname, rec in pmap.items():
+            if not pname or pname.lower() in _HIGH_RISK_LOW_SIGNAL_META_PARAMS:
+                continue
+            vals = rec.get("values") or ()
+            if len(vals) >= 2 or any(_is_active_probe_param_value(str(v)) for v in vals):
+                return True
+        return False
+
+    def score_route_risk(
+        self,
+        route_template: str,
+        *,
+        methods: Sequence[str] | None = None,
+        params: Sequence[str] | None = None,
+    ) -> tuple[int, str]:
+        """Score `route_template` using this tracker's known methods, params, forms, and schemas."""
+        tmpl = route_template_of(route_template) if str(route_template or "").strip() else "/"
+        if methods is None:
+            _, allowed = self._template_known_methods(tmpl)
+            eff_methods = sorted(allowed) if allowed else (["GET"] if "GET" in self.allowed_methods else sorted(self.allowed_methods)[:1])
+        else:
+            eff_methods = [str(m or "").strip().upper() for m in methods if str(m or "").strip()]
+        if params is None:
+            p_set = set(self.discovered_params.get(tmpl) or ())
+            p_set.update((self.param_probes_by_template.get(tmpl) or {}).keys())
+            eff_params = _order_params_by_risk(sorted(p_set))
+        else:
+            eff_params = _order_params_by_risk(params)
+        hints = sorted(self.discovered_schema_hints.get(tmpl) or ())
+        has_bt = any(t == tmpl for _, t in self.discovered_body_templates)
+        return score_route_input_risk(
+            tmpl,
+            methods=eff_methods,
+            params=eff_params,
+            schema_hints=hints,
+            is_form=(tmpl in self.discovered_form_templates),
+            has_body_template=has_bt,
+        )
+
+    def high_risk_unprobed_routes(
+        self,
+        allowed_families: set[str] | None = None,
+        limit: int = 8,
+    ) -> list[dict[str, Any]]:
+        """Return deterministically ranked high-risk parameterized/upload/form/mutating routes not yet actively probed."""
+        cap = max(0, int(limit))
+        if cap == 0:
+            return []
+        norm_allowed_fams: set[str] | None = None
+        if allowed_families is not None:
+            norm_allowed_fams = {str(f or "").strip().lower() for f in allowed_families if str(f or "").strip()}
+            if not norm_allowed_fams:
+                return []
+
+        route_methods_all: dict[str, set[str]] = {}
+        route_params: dict[str, set[str]] = {}
+        candidate_templates: set[str] = set()
+
+        def _add_candidate(raw_path: str, method: str = "", display: str = "") -> str | None:
+            raw = str(raw_path or "").strip()
+            if not raw or is_non_endpoint_source_path(raw) or self._is_port_in_path_noise(raw):
+                return None
+            tmpl = route_template_of(raw)
+            if (
+                is_non_endpoint_source_path(tmpl)
+                or self._is_port_in_path_noise(tmpl)
+                or is_os_filesystem_path(tmpl)
+                or is_hashed_asset_chunk_path(tmpl)
+                or (is_static_asset_url(tmpl) and not _extract_path_embedded_params(tmpl))
+                or is_logout_or_destructive_route(tmpl)
+            ):
+                return None
+            candidate_templates.add(tmpl)
+            if method:
+                route_methods_all.setdefault(tmpl, set()).add(str(method).strip().upper())
+            if display and "?" in display:
+                q_part = display.split("?", 1)[1]
+                for k, _ in parse_qsl(q_part, keep_blank_values=True):
+                    if k.strip():
+                        route_params.setdefault(tmpl, set()).add(k.strip())
+            return tmpl
+
+        for (method, norm_p), display in self.discovered_routes.items():
+            _add_candidate(norm_p, method=method, display=display)
+        for method, tmpl in self.declared_write_ops:
+            _add_candidate(tmpl, method=method)
+        for method, tmpl in self.discovered_write_ops:
+            _add_candidate(tmpl, method=method)
+        for method, tmpl in self.discovered_body_templates:
+            _add_candidate(tmpl, method=method)
+        for tmpl, pset in self.discovered_params.items():
+            clean_t = _add_candidate(tmpl)
+            if clean_t is not None and pset:
+                route_params.setdefault(clean_t, set()).update(str(p).strip() for p in pset if str(p).strip())
+        for tmpl in self.discovered_form_templates:
+            _add_candidate(tmpl)
+        for tmpl, hset in self.discovered_schema_hints.items():
+            if any(str(h).lower().startswith("multipart:") for h in (hset or ())):
+                _add_candidate(tmpl)
+        for method, tmpl in self.visited_method_templates:
+            if tmpl in candidate_templates:
+                route_methods_all.setdefault(tmpl, set()).add(str(method).strip().upper())
+
+        non_404_templates = set(self._non_404_templates)
+        for ok_p in self.route_2xx_actors:
+            non_404_templates.add(route_template_of(ok_p))
+        for tmpl, pmap in self.param_probes_by_template.items():
+            if tmpl in candidate_templates or tmpl in non_404_templates:
+                clean_t = _add_candidate(tmpl)
+                if clean_t is not None and isinstance(pmap, dict):
+                    route_params.setdefault(clean_t, set()).update(
+                        str(k).strip() for k in pmap if str(k).strip()
+                    )
+
+        scored_entries: list[dict[str, Any]] = []
+        for tmpl in sorted(candidate_templates):
+            if norm_allowed_fams is not None:
+                fam = _extract_route_family(tmpl)
+                sub = _extract_api_subfamily(tmpl, fam)
+                if fam not in norm_allowed_fams and (sub is None or sub not in norm_allowed_fams):
+                    continue
+
+            all_m = route_methods_all.get(tmpl) or set()
+            allowed_m = all_m & self.allowed_methods
+            if all_m and not allowed_m:
+                continue
+            if not allowed_m:
+                if "GET" in self.allowed_methods:
+                    allowed_m = {"GET"}
+                elif self.allowed_methods:
+                    allowed_m = {sorted(self.allowed_methods)[0]}
+                else:
+                    continue
+
+            if self.is_route_actively_probed(tmpl, methods=sorted(allowed_m)):
+                continue
+
+            ordered_params = _order_params_by_risk(sorted(route_params.get(tmpl) or ()))
+            hints = sorted(self.discovered_schema_hints.get(tmpl) or ())
+            has_bt = any(t == tmpl for _, t in self.discovered_body_templates)
+            risk_score, reason = score_route_input_risk(
+                tmpl,
+                methods=sorted(allowed_m),
+                params=ordered_params,
+                schema_hints=hints,
+                is_form=(tmpl in self.discovered_form_templates),
+                has_body_template=has_bt,
+            )
+            if risk_score < _HIGH_RISK_SCORE_THRESHOLD:
+                continue
+
+            ordered_methods = sorted(
+                allowed_m,
+                key=lambda m: (0 if m in _MUTATING_HTTP_METHODS else 1, m),
+            )
+            scored_entries.append({
+                "route_template": tmpl,
+                "methods": ordered_methods,
+                "params": ordered_params,
+                "risk_score": risk_score,
+                "reason": reason,
+            })
+
+        scored_entries.sort(key=lambda item: (-int(item["risk_score"]), str(item["route_template"])))
+        return scored_entries[:cap]
+
     def high_value_frontier(self) -> dict[str, list[str]]:
         """Return remaining high-value frontier items grouped by category."""
         return {
@@ -2428,6 +3031,9 @@ class SurfaceFrontierTracker:
                 for tmpl, pmap in sorted(self.param_probes_by_template.items())
             },
             "html_or_form_templates": sorted(self.html_or_form_templates),
+            "discovered_form_templates": sorted(self.discovered_form_templates),
+            "actively_probed_templates": sorted(self.actively_probed_templates),
+            "non_404_templates": sorted(self._non_404_templates),
             "actors_by_template": {k: sorted(v) for k, v in self.actors_by_template.items()},
             "actors_by_path": {k: sorted(v) for k, v in self.actors_by_path.items()},
             "discovered_routes": [[k[0], k[1], v] for k, v in sorted(self.discovered_routes.items())],
@@ -2491,6 +3097,21 @@ class SurfaceFrontierTracker:
                 if restored_pmap:
                     self.param_probes_by_template[str(tmpl)] = restored_pmap
         self.html_or_form_templates = {str(x) for x in (data.get("html_or_form_templates") or [])}
+        self.discovered_form_templates = {
+            str(x)
+            for x in (data.get("discovered_form_templates") or [])
+            if not is_non_endpoint_source_path(str(x))
+        }
+        self.actively_probed_templates = {
+            str(x)
+            for x in (data.get("actively_probed_templates") or [])
+            if not is_non_endpoint_source_path(str(x))
+        }
+        self._non_404_templates = {
+            str(x)
+            for x in (data.get("non_404_templates") or [])
+            if not is_non_endpoint_source_path(str(x))
+        }
         self.actors_by_template = {
             str(k): set(v) for k, v in (data.get("actors_by_template") or {}).items() if isinstance(v, list)
         }

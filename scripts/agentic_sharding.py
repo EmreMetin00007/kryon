@@ -4,15 +4,19 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 import json
 import re
-from typing import Any, Sequence
+from typing import Any, Mapping, Sequence
 from urllib.parse import urlsplit
 
 from agentic_surface import (
+    _HIGH_RISK_SCORE_THRESHOLD,
+    _order_params_by_risk,
     _split_path_kv_segment,
     is_id_segment,
+    is_logout_or_destructive_route,
     is_non_endpoint_source_path,
     is_virgin_state_sensitive_path,
     route_template_of,
+    score_route_input_risk,
 )
 
 _PREFIX_SEGMENT_RE = re.compile(
@@ -226,6 +230,124 @@ def _extract_subfamily_after(path: str, umbrella: str) -> str | None:
     return sub.lower()
 
 
+def _rank_routes_by_input_risk(
+    routes: Sequence[str],
+    *,
+    write_ops: Sequence[str] = (),
+    params: Mapping[str, Sequence[str]] | None = None,
+    body_templates: Mapping[str, Any] | None = None,
+    schema_hints: Mapping[str, Sequence[str]] | None = None,
+    methods_by_route: Mapping[str, set[str]] | None = None,
+    form_templates: set[str] | None = None,
+    surface_tracker: Any | None = None,
+) -> list[dict[str, Any]]:
+    """Score and deterministically sort routes by descending input attack-surface risk."""
+    route_set: set[str] = set()
+    inferred_methods: dict[str, set[str]] = {}
+    body_template_routes: set[str] = set()
+    params_map = params or {}
+    schema_map = schema_hints or {}
+    forms_set = set(form_templates or ())
+    if surface_tracker is not None:
+        forms_set.update(getattr(surface_tracker, "discovered_form_templates", ()) or ())
+
+    def _register_route(raw_path: str, method: str = "") -> str | None:
+        raw = str(raw_path or "").strip()
+        if not raw or is_non_endpoint_source_path(raw):
+            return None
+        tmpl = route_template_of(raw)
+        if is_non_endpoint_source_path(tmpl):
+            return None
+        route_set.add(tmpl)
+        if method:
+            inferred_methods.setdefault(tmpl, set()).add(str(method).strip().upper())
+        return tmpl
+
+    for r in routes:
+        _register_route(str(r))
+
+    for w in write_ops:
+        parts = str(w or "").strip().split(None, 1)
+        if len(parts) == 2:
+            _register_route(parts[1], method=parts[0])
+        elif parts:
+            _register_route(parts[0], method="POST")
+
+    for op_key in (body_templates or {}):
+        parts = str(op_key or "").strip().split(None, 1)
+        if len(parts) == 2:
+            tmpl = _register_route(parts[1], method=parts[0])
+            if tmpl is not None:
+                body_template_routes.add(tmpl)
+
+    for tmpl in params_map:
+        _register_route(str(tmpl))
+
+    for tmpl in schema_map:
+        _register_route(str(tmpl))
+
+    for tmpl, mset in (methods_by_route or {}).items():
+        clean_t = _register_route(str(tmpl))
+        if clean_t is not None and mset:
+            inferred_methods.setdefault(clean_t, set()).update(
+                str(m).strip().upper() for m in mset if str(m).strip()
+            )
+
+    tracker_allowed = getattr(surface_tracker, "allowed_methods", None)
+    tracker_probed_fn = getattr(surface_tracker, "is_route_actively_probed", None)
+    tracker_known_methods_fn = getattr(surface_tracker, "_template_known_methods", None)
+
+    ranked: list[dict[str, Any]] = []
+    for tmpl in sorted(route_set):
+        mset = set(inferred_methods.get(tmpl) or ())
+        if callable(tracker_known_methods_fn):
+            try:
+                _all_m, allowed_m = tracker_known_methods_fn(tmpl)
+                if allowed_m:
+                    mset.update(allowed_m)
+            except Exception:
+                pass
+        if isinstance(tracker_allowed, (set, frozenset)) and mset:
+            filtered = mset & set(tracker_allowed)
+            if filtered:
+                mset = filtered
+        if not mset:
+            mset = {"GET"}
+
+        ordered_methods = sorted(
+            mset,
+            key=lambda m: (0 if m in _WRITE_HTTP_METHODS else 1, m),
+        )
+        p_raw = list(params_map.get(tmpl) or ())
+        ordered_params = _order_params_by_risk(p_raw)
+        hints = [str(h).strip() for h in (schema_map.get(tmpl) or ()) if str(h).strip()]
+        risk_score, reason = score_route_input_risk(
+            tmpl,
+            methods=ordered_methods,
+            params=ordered_params,
+            schema_hints=hints,
+            is_form=(tmpl in forms_set),
+            has_body_template=(tmpl in body_template_routes),
+        )
+        actively_probed = False
+        if callable(tracker_probed_fn):
+            try:
+                actively_probed = bool(tracker_probed_fn(tmpl, methods=ordered_methods))
+            except Exception:
+                actively_probed = False
+        ranked.append({
+            "route_template": tmpl,
+            "methods": ordered_methods,
+            "params": ordered_params,
+            "risk_score": risk_score,
+            "reason": reason,
+            "actively_probed": actively_probed,
+        })
+
+    ranked.sort(key=lambda item: (-int(item["risk_score"]), str(item["route_template"])))
+    return ranked
+
+
 def cluster_discovered_surface(
     surface_tracker: Any,
     *,
@@ -237,13 +359,19 @@ def cluster_discovered_surface(
     eff_min_routes = max(1, int(min_routes_for_sharding))
 
     family_routes: dict[str, set[str]] = {}
+    family_methods: dict[str, dict[str, set[str]]] = {}
     family_writes: dict[str, set[str]] = {}
     family_objects: dict[str, set[str]] = {}
     family_params: dict[str, dict[str, set[str]]] = {}
     family_body_templates: dict[str, dict[str, Any]] = {}
     family_schema_hints: dict[str, dict[str, set[str]]] = {}
+    form_templates: set[str] = {
+        str(t)
+        for t in (getattr(surface_tracker, "discovered_form_templates", ()) or ())
+        if str(t).strip()
+    }
 
-    def _add_route(raw_path: str) -> str | None:
+    def _add_route(raw_path: str, *, method: str = "") -> str | None:
         raw = str(raw_path or "")
         if is_non_endpoint_source_path(raw):
             return None
@@ -252,13 +380,15 @@ def cluster_discovered_surface(
             return None
         fam = extract_resource_family(tmpl)
         family_routes.setdefault(fam, set()).add(tmpl)
+        if method:
+            family_methods.setdefault(fam, {}).setdefault(tmpl, set()).add(str(method).strip().upper())
         return tmpl
 
-    for _, raw_path in getattr(surface_tracker, "discovered_routes", {}):
-        _add_route(str(raw_path))
+    for method, raw_path in getattr(surface_tracker, "discovered_routes", {}):
+        _add_route(str(raw_path), method=str(method or "GET"))
 
-    for _, tmpl in getattr(surface_tracker, "visited_method_templates", set()):
-        _add_route(str(tmpl))
+    for method, tmpl in getattr(surface_tracker, "visited_method_templates", set()):
+        _add_route(str(tmpl), method=str(method or "GET"))
 
     write_ops_seen: set[tuple[str, str]] = set()
     for method, tmpl in getattr(surface_tracker, "declared_write_ops", set()):
@@ -266,7 +396,7 @@ def cluster_discovered_surface(
     for method, tmpl in getattr(surface_tracker, "discovered_write_ops", {}):
         write_ops_seen.add((str(method or "POST").upper(), str(tmpl)))
     for method, raw_tmpl in write_ops_seen:
-        tmpl = _add_route(raw_tmpl)
+        tmpl = _add_route(raw_tmpl, method=method)
         if tmpl is None:
             continue
         fam = extract_resource_family(tmpl)
@@ -296,7 +426,7 @@ def cluster_discovered_surface(
         if not isinstance(raw_key, tuple) or len(raw_key) != 2 or not isinstance(tmpl_doc, dict) or not tmpl_doc:
             continue
         method = str(raw_key[0] or "POST").strip().upper()
-        tmpl = _add_route(str(raw_key[1] or ""))
+        tmpl = _add_route(str(raw_key[1] or ""), method=method)
         if tmpl is None:
             continue
         fam = extract_resource_family(tmpl)
@@ -343,6 +473,7 @@ def cluster_discovered_surface(
                     return sub if sub is not None else umbrella
 
                 u_routes = family_routes.pop(umbrella, set())
+                u_methods = family_methods.pop(umbrella, {})
                 u_writes = family_writes.pop(umbrella, set())
                 u_objects = family_objects.pop(umbrella, set())
                 u_params = family_params.pop(umbrella, {})
@@ -351,6 +482,9 @@ def cluster_discovered_surface(
 
                 for r in u_routes:
                     family_routes.setdefault(_retarget(r), set()).add(r)
+                for tmpl, mset in u_methods.items():
+                    if mset:
+                        family_methods.setdefault(_retarget(tmpl), {}).setdefault(tmpl, set()).update(mset)
                 for w in u_writes:
                     w_path = w.split(" ", 1)[1] if " " in w else w
                     family_writes.setdefault(_retarget(w_path), set()).add(w)
@@ -367,9 +501,14 @@ def cluster_discovered_surface(
                         family_schema_hints.setdefault(_retarget(tmpl), {}).setdefault(tmpl, set()).update(hset)
 
     all_families = sorted(family_routes)
-    all_routes = sorted({r for rs in family_routes.values() for r in rs})
+    all_routes_raw = sorted({r for rs in family_routes.values() for r in rs})
     all_writes = sorted({w for ws in family_writes.values() for w in ws})
     all_objects = sorted({o for os_ in family_objects.values() for o in os_})
+    all_methods: dict[str, set[str]] = {}
+    for mmap in family_methods.values():
+        for tmpl, mset in mmap.items():
+            if mset:
+                all_methods.setdefault(tmpl, set()).update(mset)
     all_params: dict[str, list[str]] = {}
     for pmap in family_params.values():
         for tmpl, pset in pmap.items():
@@ -385,8 +524,18 @@ def cluster_discovered_surface(
             if hset:
                 all_schema_hints[tmpl] = sorted(set(all_schema_hints.get(tmpl, [])) | hset)
 
-    if eff_max <= 1 or len(all_routes) < eff_min_routes or len(all_families) <= 1:
+    if eff_max <= 1 or len(all_routes_raw) < eff_min_routes or len(all_families) <= 1:
         single_name = all_families[0] if len(all_families) == 1 else "all"
+        ranked_all = _rank_routes_by_input_risk(
+            all_routes_raw,
+            write_ops=all_writes,
+            params=all_params,
+            body_templates=all_body_templates,
+            schema_hints=all_schema_hints,
+            methods_by_route=all_methods,
+            form_templates=form_templates,
+        )
+        all_routes = [str(item["route_template"]) for item in ranked_all]
         return [
             SubsystemCluster(
                 shard_id="shard-1",
@@ -442,13 +591,17 @@ def cluster_discovered_surface(
         fams = list(b["families"])
         if not fams:
             continue
-        c_routes = sorted({r for fam in fams for r in family_routes.get(fam, ())})
+        c_routes_raw = sorted({r for fam in fams for r in family_routes.get(fam, ())})
         c_writes = sorted({w for fam in fams for w in family_writes.get(fam, ())})
         c_objects = sorted({o for fam in fams for o in family_objects.get(fam, ())})
+        c_methods: dict[str, set[str]] = {}
         c_params: dict[str, list[str]] = {}
         c_body_templates: dict[str, Any] = {}
         c_schema_hints: dict[str, list[str]] = {}
         for fam in fams:
+            for tmpl, mset in family_methods.get(fam, {}).items():
+                if mset:
+                    c_methods.setdefault(tmpl, set()).update(mset)
             for tmpl, pset in family_params.get(fam, {}).items():
                 if pset:
                     c_params[tmpl] = sorted(pset)
@@ -457,6 +610,16 @@ def cluster_discovered_surface(
             for tmpl, hset in family_schema_hints.get(fam, {}).items():
                 if hset:
                     c_schema_hints[tmpl] = sorted(set(c_schema_hints.get(tmpl, [])) | hset)
+        ranked_cluster = _rank_routes_by_input_risk(
+            c_routes_raw,
+            write_ops=c_writes,
+            params=c_params,
+            body_templates=c_body_templates,
+            schema_hints=c_schema_hints,
+            methods_by_route=c_methods,
+            form_templates=form_templates,
+        )
+        c_routes = [str(item["route_template"]) for item in ranked_cluster]
         c_name = "+".join(fams[:3]) + (f"+{len(fams) - 3}" if len(fams) > 3 else "")
         clusters.append(
             SubsystemCluster(
@@ -481,6 +644,7 @@ def build_shard_prompts(
     bootstrap_findings: Sequence[dict[str, Any]] = (),
     receipts: Any | None = None,
     state_banner: str = "",
+    surface_tracker: Any | None = None,
 ) -> tuple[str, str]:
     """Construct focused system and initial user prompts for one subsystem shard."""
     findings_lines: list[str] = []
@@ -495,9 +659,27 @@ def build_shard_prompts(
         )
     findings_block = "\n".join(findings_lines) if findings_lines else "  (none yet)"
 
+    ranked_entries = _rank_routes_by_input_risk(
+        cluster.routes,
+        write_ops=cluster.write_ops,
+        params=cluster.params,
+        body_templates=cluster.body_templates,
+        schema_hints=cluster.schema_hints,
+        surface_tracker=surface_tracker,
+    )
+    risk_score_by_route = {
+        str(item["route_template"]): int(item["risk_score"])
+        for item in ranked_entries
+    }
+    ordered_routes = [str(item["route_template"]) for item in ranked_entries]
+
+    ordered_param_items = sorted(
+        cluster.params.items(),
+        key=lambda kv: (-risk_score_by_route.get(route_template_of(kv[0]), 0), kv[0]),
+    )
     params_lines = [
-        f"  - {tmpl}: {', '.join(pnames[:10])}"
-        for tmpl, pnames in sorted(cluster.params.items())[:20]
+        f"  - {tmpl}: {', '.join(_order_params_by_risk(pnames)[:10])}"
+        for tmpl, pnames in ordered_param_items[:20]
     ]
     has_path_params = any(
         str(p).startswith("path:")
@@ -509,11 +691,11 @@ def build_shard_prompts(
         f"- Assigned resource families: {', '.join(cluster.families) or '(all)'}",
         "- Focus strictly on testing your assigned routes, concrete objects, parameters, and write operations thoroughly. "
         "Do NOT duplicate work on unrelated subsystems or already-verified bootstrap findings.",
-        "- Assigned routes:\n  " + ("\n  ".join(cluster.routes[:35]) if cluster.routes else "(none)"),
+        "- Assigned routes:\n  " + ("\n  ".join(ordered_routes[:35]) if ordered_routes else "(none)"),
     ]
     if cluster.write_ops:
         scope_sections.append("- Assigned write operations:\n  " + "\n  ".join(cluster.write_ops[:25]))
-    if any(_is_virgin_state_action_path(r) for r in (*cluster.routes, *cluster.write_ops)):
+    if any(_is_virgin_state_action_path(r) for r in (*ordered_routes, *cluster.write_ops)):
         scope_sections.append(
             "- Virgin-state race priority: run concurrent_check BEFORE sequential single mutations on primary actors "
             "for claim/redeem/promo/coupon/bonus actions so single-use state is not consumed prematurely."
@@ -578,8 +760,38 @@ def build_shard_prompts(
 
     sys_prompt = base_system_prompt.rstrip() + "\n\n" + "\n".join(scope_sections)
 
+    must_test_candidates = [
+        item
+        for item in ranked_entries
+        if not is_logout_or_destructive_route(str(item["route_template"]))
+        and (
+            int(item["risk_score"]) >= _HIGH_RISK_SCORE_THRESHOLD
+            or (bool(item["params"]) and int(item["risk_score"]) >= 18)
+        )
+    ]
+    must_test_candidates.sort(
+        key=lambda item: (
+            1 if item.get("actively_probed") else 0,
+            -int(item["risk_score"]),
+            str(item["route_template"]),
+        )
+    )
+    must_test_lines: list[str] = []
+    for item in must_test_candidates[:6]:
+        methods_str = ",".join(item.get("methods") or ["GET"])
+        route_str = str(item["route_template"])
+        p_list = list(item.get("params") or [])[:6]
+        params_part = f" | params: {', '.join(p_list)}" if p_list else ""
+        must_test_lines.append(f"  - {methods_str} {route_str}{params_part}")
+    must_test_block = (
+        "\n[MUST-TEST HIGH-RISK INPUTS] Actively probe these assigned parameterized/upload/auth routes before calling `finish`:\n"
+        + "\n".join(must_test_lines)
+        if must_test_lines
+        else ""
+    )
+
     cluster_fams = set(cluster.families)
-    cluster_routes = set(cluster.routes)
+    cluster_routes = set(ordered_routes)
     receipt_lines: list[str] = []
     if receipts is not None and hasattr(receipts, "list_ids") and hasattr(receipts, "get"):
         seen_sig: set[tuple[str, str, str, int]] = set()
@@ -627,6 +839,7 @@ def build_shard_prompts(
         f"(families: {', '.join(cluster.families) or cluster.name}). "
         "Reuse relevant bootstrap receipts with `replay_as` where helpful, test all assigned objects across peers/tenants, "
         "probe all assigned parameters and write operations, record verified findings immediately, and call `finish` when done."
+        f"{must_test_block}"
         f"{receipt_block}"
         f"{state_banner}"
     )
@@ -1160,6 +1373,23 @@ def collect_cross_shard_synthesis_context(
                     seen=seen_values,
                 )
 
+    high_risk_unprobed_routes: list[dict[str, Any]] = []
+    if surface_tracker is not None:
+        hr_fn = getattr(surface_tracker, "high_risk_unprobed_routes", None)
+        if callable(hr_fn):
+            raw_hr = hr_fn(limit=6) or ()
+            for entry in raw_hr:
+                if isinstance(entry, dict) and entry.get("route_template"):
+                    high_risk_unprobed_routes.append({
+                        "route_template": str(entry["route_template"]),
+                        "methods": [str(m) for m in (entry.get("methods") or ())],
+                        "params": [str(p) for p in (entry.get("params") or ())[:8]],
+                        "risk_score": int(entry.get("risk_score") or 0),
+                        "reason": str(entry.get("reason") or ""),
+                    })
+                if len(high_risk_unprobed_routes) >= 6:
+                    break
+
     truncated_shard = any(
         isinstance(s, dict) and str(s.get("status") or "") in {"budget_exhausted", "max_turns_reached"}
         for s in shard_results
@@ -1170,6 +1400,7 @@ def collect_cross_shard_synthesis_context(
         internal_urls
         or blockers
         or untested_writes_and_blocked
+        or high_risk_unprobed_routes
         or ((extracted_values or auth_capabilities) and has_remaining_work)
     )
     return {
@@ -1180,6 +1411,7 @@ def collect_cross_shard_synthesis_context(
         "auth_capabilities": auth_capabilities,
         "blockers": blockers,
         "untested_writes_and_blocked": untested_writes_and_blocked,
+        "high_risk_unprobed_routes": high_risk_unprobed_routes,
         "findings": compact_findings[:30],
     }
 
@@ -1209,6 +1441,11 @@ def build_cross_shard_synthesis_prompts(
     auth_capabilities = [str(c) for c in (ctx.get("auth_capabilities") or ()) if str(c).strip()][:20]
     blockers = [str(b) for b in (ctx.get("blockers") or ()) if str(b).strip()][:20]
     untested_writes = [str(w) for w in (ctx.get("untested_writes_and_blocked") or ()) if str(w).strip()][:25]
+    high_risk_unprobed = [
+        item
+        for item in (ctx.get("high_risk_unprobed_routes") or ())
+        if isinstance(item, dict) and str(item.get("route_template") or "").strip()
+    ][:6]
 
     finding_lines: list[str] = []
     for f in findings:
@@ -1253,6 +1490,7 @@ def build_cross_shard_synthesis_prompts(
         },
         "blockers": blockers,
         "untested_writes_and_blocked": untested_writes,
+        "high_risk_unprobed_routes": high_risk_unprobed,
     }
     compact_json = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
 

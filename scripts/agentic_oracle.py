@@ -5,9 +5,12 @@ from dataclasses import dataclass, field
 from datetime import datetime
 import html
 import json
+import math
 import re
-from typing import Any, Sequence
-from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+import statistics
+import time
+from typing import Any, Callable, Sequence
+from urllib.parse import parse_qsl, quote, unquote, urlencode, urlsplit, urlunsplit
 import uuid
 
 import requests
@@ -16,10 +19,12 @@ from agentic_http import (
     DEFAULT_BROWSER_USER_AGENT,
     AgenticHTTPClient,
     BudgetExhaustedError,
+    ScopeViolationError,
     _decode_raw_response,
 )
 from agentic_receipts import ReceiptStore, redact_header_value
 from agentic_surface import is_id_segment, normalize_path, route_template_of
+from target_bootstrap import is_destructive_lifecycle_route, is_logout_route
 
 VALID_VERIFICATION_GATES = frozenset({"differential", "llm_self_judge"})
 
@@ -132,11 +137,74 @@ _INPUT_DIFF_CLASSES = frozenset({
     "insecure_deserialization",
 })
 _OOB_ELIGIBLE_CLASSES = frozenset({"ssrf", "xxe", "ssti", "command_injection", "insecure_deserialization"})
+_TIMING_ELIGIBLE_CLASSES = frozenset({
+    "sqli_read",
+    "sqli",
+    "rce",
+    "cmd_injection",
+    "command_injection",
+    "ssti",
+    "ssrf",
+})
 _ACCESS_CLASSES = frozenset({"auth_bypass", "bfla", "bola", "tenant_isolation"})
 _CONCURRENCY_CLASSES = frozenset({"race_condition", "business_logic"})
 _MUTATING_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
 _WRITE_METHODS = frozenset({"POST", "PUT", "PATCH"})
 _PERSISTENT_CLASSES = frozenset({"stored_xss", "mass_assignment", "ssti"})
+_MAX_MULTISTEP_PRECURSORS = 3
+_MULTISTEP_STORE_LOOKBACK = 60
+_MULTISTEP_ID_EXACT_KEYS = frozenset({
+    "id",
+    "uid",
+    "uuid",
+    "guid",
+    "token",
+    "code",
+    "slug",
+    "key",
+    "order_id",
+    "orderid",
+    "draft_id",
+    "draftid",
+    "item_id",
+    "itemid",
+    "cart_id",
+    "cartid",
+    "checkout_id",
+    "checkoutid",
+    "session_id",
+    "sessionid",
+    "job_id",
+    "jobid",
+    "task_id",
+    "taskid",
+    "workflow_id",
+    "workflowid",
+    "ticket_id",
+    "invoice_id",
+    "payment_id",
+    "booking_id",
+    "record_id",
+    "resource_id",
+    "object_id",
+    "document_id",
+    "doc_id",
+    "project_id",
+    "run_id",
+})
+_MULTISTEP_ID_SUFFIXES = ("_id", "_uid", "_uuid", "_token")
+_MULTISTEP_EXCLUDED_ID_KEYS = frozenset({
+    "csrf_token",
+    "xsrf_token",
+    "access_token",
+    "refresh_token",
+    "id_token",
+    "trace_id",
+    "span_id",
+    "correlation_id",
+    "request_id",
+})
+_CAMEL_ID_KEY_RE = re.compile(r"^[a-z][a-zA-Z0-9]*(?:Id|Uid|Uuid|Token)$")
 _API_PREFIX_SEGMENTS = frozenset({"api", "v1", "v2", "v3", "v4"})
 _API_VERSION_SEG_RE = re.compile(r"^v\d+$", re.I)
 _CREATE_CONFLICT_INDICATOR_RE = re.compile(
@@ -935,6 +1003,625 @@ def _find_prior_setup_write_receipt(
     return candidates[0][4]
 
 
+def _receipt_elapsed_ms(receipt: dict[str, Any]) -> float | None:
+    """Return finite non-negative elapsed_ms recorded on a receipt, or None if absent/invalid."""
+    raw = receipt.get("elapsed_ms")
+    if isinstance(raw, bool) or raw is None:
+        return None
+    try:
+        val = float(raw)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(val) or val < 0.0:
+        return None
+    return val
+
+
+def _is_timing_pair_significant(
+    proof_ms: float | None,
+    control_ms: float | None,
+    *,
+    min_delta_ms: float,
+    min_ratio: float,
+) -> bool:
+    """Return True when proof latency exceeds control latency by both absolute delta and ratio."""
+    if proof_ms is None or control_ms is None:
+        return False
+    return (
+        (proof_ms - control_ms) >= min_delta_ms
+        and proof_ms >= min_ratio * max(control_ms, 20.0)
+    )
+
+
+def _is_resource_id_key(raw_key: str) -> bool:
+    """Return True if a JSON/query field name represents a resource identifier."""
+    clean = str(raw_key or "").strip()
+    if not clean:
+        return False
+    low = clean.lower()
+    if low in _MULTISTEP_EXCLUDED_ID_KEYS:
+        return False
+    if low in _MULTISTEP_ID_EXACT_KEYS:
+        return True
+    if any(low.endswith(sfx) for sfx in _MULTISTEP_ID_SUFFIXES):
+        return True
+    return bool(_CAMEL_ID_KEY_RE.fullmatch(clean))
+
+
+def _clean_id_scalar(value: Any) -> str:
+    """Return a clean identifier string for scalar str/int values, or empty string if unusable."""
+    if isinstance(value, bool) or value is None:
+        return ""
+    if not isinstance(value, (str, int)):
+        return ""
+    text = str(value).strip()
+    if not text or len(text) > 128:
+        return ""
+    if "<REDACTED" in text or any(ch.isspace() or ch in "/\\?#\x00" for ch in text):
+        return ""
+    return text
+
+
+def _is_short_numeric_id(id_val: str) -> bool:
+    return len(id_val) <= 2 and id_val.isdigit()
+
+
+def _extract_response_resource_ids(receipt: dict[str, Any]) -> dict[tuple[Any, ...], str]:
+    """Extract candidate resource identifier slots from a receipt's Location header and JSON response body."""
+    slots: dict[tuple[Any, ...], str] = {}
+
+    loc = str(receipt.get("redirect_location") or _response_header_ci(receipt, "location") or "").strip()
+    if loc:
+        loc_segs = [unquote(seg) for seg in urlsplit(loc).path.split("/") if seg]
+        if loc_segs:
+            last_seg = _clean_id_scalar(loc_segs[-1])
+            if last_seg and (len(loc_segs) >= 2 or is_id_segment(last_seg)):
+                slots[("location",)] = last_seg
+
+    body = str(receipt.get("body") or "").strip()
+    parsed = _try_parse_json_body(body) if body else None
+    if parsed is not None:
+        stack: list[tuple[tuple[Any, ...], Any, int]] = [(("json",), parsed, 0)]
+        visited = 0
+        while stack and visited < 120:
+            path_key, cur, depth = stack.pop(0)
+            visited += 1
+            if depth > 4:
+                continue
+            if isinstance(cur, dict):
+                for k, v in cur.items():
+                    sk = str(k)
+                    child_path = (*path_key, sk.lower())
+                    if _is_resource_id_key(sk):
+                        clean_val = _clean_id_scalar(v)
+                        if clean_val:
+                            slots[child_path] = clean_val
+                    if isinstance(v, (dict, list)) and depth < 4:
+                        stack.append((child_path, v, depth + 1))
+            elif isinstance(cur, list):
+                for idx, item in enumerate(cur[:20]):
+                    if isinstance(item, (dict, list)) and depth < 4:
+                        stack.append(((*path_key, idx), item, depth + 1))
+    return slots
+
+
+def _value_matches_id_str(raw_val: str, id_val: str, *, allow_short_numeric: bool = True) -> bool:
+    if not raw_val or not id_val:
+        return False
+    if raw_val == id_val:
+        return allow_short_numeric or not _is_short_numeric_id(id_val)
+    if "/" in raw_val and raw_val.startswith(("/", "http://", "https://")):
+        segs = [unquote(s) for s in urlsplit(raw_val).path.split("/") if s]
+        if id_val in segs:
+            return True
+    return False
+
+
+def _step_references_id(step: dict[str, Any], id_val: str) -> bool:
+    """Return True if `step`'s request URL (path/query) or request body references `id_val`."""
+    if not id_val:
+        return False
+    short_num = _is_short_numeric_id(id_val)
+    url = str(step.get("url") or step.get("path") or "")
+    parsed = urlsplit(url)
+    for seg in parsed.path.split("/"):
+        if seg and (seg == id_val or unquote(seg) == id_val):
+            return True
+    query_str = parsed.query or str(step.get("query") or "")
+    if query_str:
+        for k, v in parse_qsl(query_str, keep_blank_values=True):
+            if _value_matches_id_str(v, id_val, allow_short_numeric=(not short_num or _is_resource_id_key(k))):
+                return True
+
+    raw_body = str(step.get("request_body") or "").strip()
+    if not raw_body:
+        return False
+    parsed_body = _try_parse_json_body(raw_body)
+    if parsed_body is not None:
+        stack: list[tuple[str, Any]] = [("", parsed_body)]
+        visited = 0
+        while stack and visited < 120:
+            enclosing_key, cur = stack.pop()
+            visited += 1
+            if isinstance(cur, dict):
+                for k, v in cur.items():
+                    stack.append((str(k), v))
+            elif isinstance(cur, list):
+                for item in cur[:50]:
+                    stack.append((enclosing_key, item))
+            elif isinstance(cur, bool) or cur is None:
+                continue
+            elif isinstance(cur, (str, int)):
+                allow_short = not short_num or _is_resource_id_key(enclosing_key)
+                if _value_matches_id_str(str(cur), id_val, allow_short_numeric=allow_short):
+                    return True
+        return False
+
+    if "=" in raw_body and not raw_body.startswith("<") and "\n" not in raw_body[:256]:
+        for k, v in parse_qsl(raw_body, keep_blank_values=True):
+            if _value_matches_id_str(v, id_val, allow_short_numeric=(not short_num or _is_resource_id_key(k))):
+                return True
+    return False
+
+
+def _extract_newly_minted_ids(receipt: dict[str, Any]) -> dict[tuple[Any, ...], str]:
+    """Return response resource IDs minted by `receipt` that were NOT already present in its own request."""
+    slots = _extract_response_resource_ids(receipt)
+    if not slots:
+        return {}
+    minted: dict[tuple[Any, ...], str] = {}
+    for slot, val in slots.items():
+        if val.lower() in _TRIVIAL_CORRELATION_TOKENS and not val.isdigit():
+            continue
+        if _step_references_id(receipt, val):
+            continue
+        minted[slot] = val
+    return minted
+
+
+def _extract_minted_id_substitutions(
+    orig_step: dict[str, Any],
+    replayed_step: dict[str, Any],
+    subsequent_steps: Sequence[dict[str, Any]],
+) -> dict[str, str]:
+    """Return `{old_id: new_id}` pairs for IDs that changed on replay and are referenced downstream."""
+    orig_ids = _extract_response_resource_ids(orig_step)
+    if not orig_ids:
+        return {}
+    replay_ids = _extract_response_resource_ids(replayed_step)
+    if not replay_ids:
+        return {}
+    subs: dict[str, str] = {}
+    for slot, old_val in orig_ids.items():
+        new_val = replay_ids.get(slot)
+        if not new_val or new_val == old_val:
+            continue
+        if any(_step_references_id(step, old_val) for step in subsequent_steps):
+            subs[old_val] = new_val
+    return subs
+
+
+def _replace_path_segments(path: str, id_map: dict[str, str]) -> str:
+    if not path or not id_map:
+        return path
+    parts = path.split("/")
+    changed = False
+    out: list[str] = []
+    for seg in parts:
+        if not seg:
+            out.append(seg)
+            continue
+        if seg in id_map:
+            out.append(quote(id_map[seg], safe="-_.~"))
+            changed = True
+            continue
+        decoded = unquote(seg)
+        if decoded in id_map:
+            out.append(quote(id_map[decoded], safe="-_.~"))
+            changed = True
+            continue
+        out.append(seg)
+    return "/".join(out) if changed else path
+
+
+def _substitute_scalar_or_path_str(
+    val: str,
+    id_map: dict[str, str],
+    *,
+    allow_short_numeric: bool = True,
+) -> str:
+    if not val or not id_map:
+        return val
+    if val in id_map:
+        if allow_short_numeric or not _is_short_numeric_id(val):
+            return id_map[val]
+        return val
+    if "/" in val and val.startswith(("/", "http://", "https://")):
+        parsed = urlsplit(val)
+        new_path = _replace_path_segments(parsed.path, id_map)
+        new_query = parsed.query
+        if parsed.query:
+            q_pairs = parse_qsl(parsed.query, keep_blank_values=True)
+            new_q_pairs = [
+                (
+                    qk,
+                    _substitute_scalar_or_path_str(
+                        qv,
+                        id_map,
+                        allow_short_numeric=(not _is_short_numeric_id(qv) or _is_resource_id_key(qk)),
+                    ),
+                )
+                for qk, qv in q_pairs
+            ]
+            if new_q_pairs != q_pairs:
+                new_query = urlencode(new_q_pairs, doseq=True)
+        if new_path != parsed.path or new_query != parsed.query:
+            return urlunsplit((parsed.scheme, parsed.netloc, new_path, new_query, parsed.fragment))
+    return val
+
+
+def _apply_id_substitutions_to_request(
+    url: str,
+    raw_body: str,
+    id_map: dict[str, str],
+) -> tuple[str, str]:
+    """Substitute minted resource IDs into a subsequent step's URL (path/query) and JSON/form body."""
+    if not id_map:
+        return url, raw_body
+
+    new_url = url
+    if url:
+        parsed = urlsplit(url)
+        new_path = _replace_path_segments(parsed.path, id_map)
+        new_query = parsed.query
+        if parsed.query:
+            q_pairs = parse_qsl(parsed.query, keep_blank_values=True)
+            new_q_pairs = [
+                (
+                    k,
+                    _substitute_scalar_or_path_str(
+                        v,
+                        id_map,
+                        allow_short_numeric=(not _is_short_numeric_id(v) or _is_resource_id_key(k)),
+                    ),
+                )
+                for k, v in q_pairs
+            ]
+            if new_q_pairs != q_pairs:
+                new_query = urlencode(new_q_pairs, doseq=True)
+        if new_path != parsed.path or new_query != parsed.query:
+            new_url = urlunsplit((parsed.scheme, parsed.netloc, new_path, new_query, parsed.fragment))
+
+    new_body = raw_body
+    stripped = str(raw_body or "").strip()
+    if stripped:
+        parsed_body = _try_parse_json_body(stripped)
+        if parsed_body is not None:
+            body_changed = False
+
+            def _sub_json(obj: Any, key_name: str = "") -> Any:
+                nonlocal body_changed
+                if isinstance(obj, dict):
+                    return {k: _sub_json(v, str(k)) for k, v in obj.items()}
+                if isinstance(obj, list):
+                    return [_sub_json(item, key_name) for item in obj]
+                if isinstance(obj, bool) or obj is None:
+                    return obj
+                if isinstance(obj, int):
+                    s = str(obj)
+                    if s in id_map and (not _is_short_numeric_id(s) or _is_resource_id_key(key_name)):
+                        repl = id_map[s]
+                        body_changed = True
+                        if repl.lstrip("-").isdigit() and not (len(repl) > 1 and repl.startswith("0")):
+                            return int(repl)
+                        return repl
+                    return obj
+                if isinstance(obj, str):
+                    allow_short = not _is_short_numeric_id(obj) or _is_resource_id_key(key_name)
+                    replaced = _substitute_scalar_or_path_str(obj, id_map, allow_short_numeric=allow_short)
+                    if replaced != obj:
+                        body_changed = True
+                    return replaced
+                return obj
+
+            transformed = _sub_json(parsed_body)
+            if body_changed:
+                new_body = json.dumps(transformed, ensure_ascii=False, separators=(",", ":"))
+        elif "=" in stripped and not stripped.startswith("<") and "\n" not in stripped[:256]:
+            f_pairs = parse_qsl(raw_body, keep_blank_values=True)
+            new_f_pairs = [
+                (
+                    k,
+                    _substitute_scalar_or_path_str(
+                        v,
+                        id_map,
+                        allow_short_numeric=(not _is_short_numeric_id(v) or _is_resource_id_key(k)),
+                    ),
+                )
+                for k, v in f_pairs
+            ]
+            if new_f_pairs != f_pairs:
+                new_body = urlencode(new_f_pairs, doseq=True)
+
+    return new_url, new_body
+
+
+def _is_safe_precursor_receipt(
+    rec: dict[str, Any],
+    *,
+    allowed_methods: frozenset[str] | None = None,
+    require_2xx_only: bool = False,
+) -> bool:
+    """Return True if a receipt is a safe, replayable in-scope write precursor."""
+    if not isinstance(rec, dict):
+        return False
+    method = str(rec.get("method") or "").upper()
+    if method not in _WRITE_METHODS:
+        return False
+    if allowed_methods is not None and method not in allowed_methods:
+        return False
+    status = int(rec.get("status") or 0)
+    if require_2xx_only:
+        if not (200 <= status < 300):
+            return False
+    else:
+        if not (200 <= status < 400):
+            return False
+    if _is_multipart_receipt(rec):
+        return False
+    url = str(rec.get("url") or rec.get("path") or "").strip()
+    if not url:
+        return False
+    if is_logout_route(url) or is_destructive_lifecycle_route(url):
+        return False
+    return True
+
+
+def _receipt_sort_key(rec: dict[str, Any]) -> tuple[int, str]:
+    return (_receipt_seq_num(rec), str(rec.get("timestamp") or ""))
+
+
+def _receipt_dedup_key(rec: dict[str, Any]) -> str:
+    rid = str(rec.get("receipt_id") or "").strip()
+    return rid or f"obj:{id(rec)}"
+
+
+def _receipts_share_correlation(cand: dict[str, Any], downstream: dict[str, Any]) -> bool:
+    target_tokens = _extract_receipt_correlation_tokens(downstream, include_response=False)
+    if not target_tokens:
+        return False
+    cand_tokens = _extract_receipt_correlation_tokens(cand, include_response=True)
+    if target_tokens & cand_tokens:
+        return True
+    cand_haystack = "\n".join(
+        part
+        for part in (
+            str(cand.get("url") or ""),
+            str(cand.get("request_body") or ""),
+            str(cand.get("body") or ""),
+            str(cand.get("redirect_location") or ""),
+        )
+        if part
+    ).lower()
+    if not cand_haystack:
+        return False
+    return any(
+        len(tok) >= 4
+        and re.search(rf"(?<![a-z0-9_-]){re.escape(tok)}(?![a-z0-9_-])", cand_haystack)
+        for tok in target_tokens
+    )
+
+
+def _receipt_mints_id_for(cand: dict[str, Any], downstream: dict[str, Any]) -> list[str]:
+    minted = _extract_newly_minted_ids(cand)
+    if not minted:
+        return []
+    matched: list[str] = []
+    for val in dict.fromkeys(minted.values()):
+        if _step_references_id(downstream, val):
+            matched.append(val)
+    return matched
+
+
+def _bound_precursor_chain(
+    precursors: Sequence[dict[str, Any]],
+    *,
+    max_precursors: int = _MAX_MULTISTEP_PRECURSORS,
+) -> list[dict[str, Any]]:
+    ordered = sorted(precursors, key=_receipt_sort_key)
+    cap = max(1, int(max_precursors))
+    if len(ordered) <= cap:
+        return ordered
+    if cap == 1:
+        return [ordered[-1]]
+    return [ordered[0], *ordered[-(cap - 1) :]]
+
+
+def _discover_precursor_chain(
+    replay_target: dict[str, Any],
+    explicit_receipts: Sequence[dict[str, Any]],
+    receipt_store: ReceiptStore | None = None,
+    *,
+    allowed_methods: frozenset[str] | None = None,
+    resolve_scope_fn: Callable[[str], tuple[str, str, str]] | None = None,
+    max_precursors: int = _MAX_MULTISTEP_PRECURSORS,
+) -> list[dict[str, Any]]:
+    """Discover up to `max_precursors` ordered in-scope precursor writes before `replay_target`.
+
+    Discovery order:
+    1. Explicitly supplied earlier safe writes in `proof_receipts` / `setup_receipts` linked via
+       minted resource IDs, correlation tokens, or related path family (preserving single-step
+       GET fallback semantics from `_find_prior_setup_write_receipt`).
+    2. Recent prior 2xx writes by the proof actor in `receipt_store` whose response body or
+       `Location` header newly minted an identifier referenced downstream (plus intermediate
+       2xx writes by the proof actor mutating that same minted identifier).
+    """
+    cap = max(1, min(_MAX_MULTISTEP_PRECURSORS, int(max_precursors)))
+    t_rid = str(replay_target.get("receipt_id") or "").strip()
+    t_key = _receipt_dedup_key(replay_target)
+    t_actor = str(replay_target.get("actor") or "anon")
+    t_method = str(replay_target.get("method") or "GET").upper()
+    t_norm_path = _norm_url_path(str(replay_target.get("url") or replay_target.get("path") or ""))
+
+    def _in_scope(rec: dict[str, Any]) -> bool:
+        if resolve_scope_fn is None:
+            return True
+        try:
+            resolve_scope_fn(str(rec.get("url") or rec.get("path") or ""))
+            return True
+        except (ScopeViolationError, ValueError):
+            return False
+
+    # 1. Explicit ordered candidates from proof_receipts / setup_receipts.
+    explicit_writes: list[dict[str, Any]] = []
+    seen_explicit: set[str] = {t_key}
+    for raw_rec in explicit_receipts:
+        if not isinstance(raw_rec, dict):
+            continue
+        rec = raw_rec
+        r_rid = str(rec.get("receipt_id") or "").strip()
+        if not rec.get("method") and r_rid and receipt_store is not None:
+            try:
+                rec = receipt_store.get(r_rid)
+            except (KeyError, ValueError):
+                continue
+        r_key = _receipt_dedup_key(rec)
+        if rec is replay_target or (t_rid and r_rid and r_rid == t_rid) or r_key in seen_explicit:
+            continue
+        seen_explicit.add(r_key)
+        if not _is_safe_precursor_receipt(rec, allowed_methods=allowed_methods, require_2xx_only=False):
+            continue
+        if not _is_strictly_earlier_receipt(rec, replay_target):
+            continue
+        if not _in_scope(rec):
+            continue
+        explicit_writes.append(rec)
+
+    explicit_writes.sort(key=_receipt_sort_key)
+
+    selected_explicit: dict[str, dict[str, Any]] = {}
+    tracked_explicit_ids: set[str] = set()
+    if explicit_writes:
+        chain_nodes: list[dict[str, Any]] = [replay_target]
+        changed = True
+        while changed and len(selected_explicit) < cap:
+            changed = False
+            for cand in reversed(explicit_writes):
+                ckey = _receipt_dedup_key(cand)
+                if ckey in selected_explicit:
+                    continue
+                c_method = str(cand.get("method") or "").upper()
+                c_norm_path = _norm_url_path(str(cand.get("url") or cand.get("path") or ""))
+                linked = False
+                for node in chain_nodes:
+                    if not _is_strictly_earlier_receipt(cand, node):
+                        continue
+                    n_method = str(node.get("method") or "").upper()
+                    n_url = str(node.get("url") or node.get("path") or "")
+                    n_norm_path = _norm_url_path(n_url)
+                    minted_matches = _receipt_mints_id_for(cand, node)
+                    if minted_matches:
+                        tracked_explicit_ids.update(minted_matches)
+                        linked = True
+                        break
+                    if c_method == n_method and c_norm_path == n_norm_path:
+                        continue
+                    if _receipts_share_correlation(cand, node) or is_persistent_read_path_related(cand, n_url):
+                        linked = True
+                        break
+                if linked:
+                    selected_explicit[ckey] = cand
+                    chain_nodes.append(cand)
+                    changed = True
+                    if len(selected_explicit) >= cap:
+                        break
+
+        if not selected_explicit and t_method == "GET":
+            fallback_one = _find_prior_setup_write_receipt(replay_target, explicit_writes, receipt_store)
+            if fallback_one is not None and _is_safe_precursor_receipt(
+                fallback_one, allowed_methods=allowed_methods, require_2xx_only=False
+            ) and _in_scope(fallback_one):
+                selected_explicit[_receipt_dedup_key(fallback_one)] = fallback_one
+
+    # 2. Implicit minted-ID chain discovery from recent prior 2xx writes by proof actor in receipt_store.
+    store_selected: dict[str, dict[str, Any]] = {}
+    if receipt_store is not None and len(selected_explicit) < cap:
+        all_rids = receipt_store.list_ids()
+        prior_store_writes: list[dict[str, Any]] = []
+        for rid in reversed(all_rids):
+            if len(prior_store_writes) >= _MULTISTEP_STORE_LOOKBACK:
+                break
+            if t_rid and rid == t_rid:
+                continue
+            try:
+                rec = receipt_store.get(rid)
+            except (KeyError, ValueError):
+                continue
+            if str(rec.get("actor") or "anon") != t_actor:
+                continue
+            if not _is_safe_precursor_receipt(rec, allowed_methods=allowed_methods, require_2xx_only=True):
+                continue
+            if not _is_strictly_earlier_receipt(rec, replay_target):
+                continue
+            if not _in_scope(rec):
+                continue
+            prior_store_writes.append(rec)
+
+        if prior_store_writes:
+            prior_store_writes.sort(key=_receipt_sort_key)
+            frontier: list[dict[str, Any]] = (
+                list(selected_explicit.values()) if selected_explicit else [replay_target]
+            )
+            tracked_store_ids: set[str] = set(tracked_explicit_ids)
+            for _ in range(cap):
+                next_frontier: list[dict[str, Any]] = []
+                for node in frontier:
+                    covered_ids_for_node: set[str] = set()
+                    for cand in reversed(prior_store_writes):
+                        if (len(selected_explicit) + len(store_selected)) >= cap:
+                            break
+                        ckey = _receipt_dedup_key(cand)
+                        if ckey in selected_explicit or ckey in store_selected:
+                            continue
+                        if not _is_strictly_earlier_receipt(cand, node):
+                            continue
+                        minted_matches = [
+                            mid for mid in _receipt_mints_id_for(cand, node) if mid not in covered_ids_for_node
+                        ]
+                        if minted_matches:
+                            store_selected[ckey] = cand
+                            covered_ids_for_node.update(minted_matches)
+                            tracked_store_ids.update(minted_matches)
+                            next_frontier.append(cand)
+                if not next_frontier or (len(selected_explicit) + len(store_selected)) >= cap:
+                    break
+                frontier = next_frontier
+
+            # Include intermediate 2xx writes by the same proof actor mutating the newly-minted resource ID.
+            if tracked_store_ids and (len(selected_explicit) + len(store_selected)) < cap:
+                combined_producers = [*selected_explicit.values(), *store_selected.values()]
+                earliest_prod = min(combined_producers, key=_receipt_sort_key)
+                for cand in prior_store_writes:
+                    if (len(selected_explicit) + len(store_selected)) >= cap:
+                        break
+                    ckey = _receipt_dedup_key(cand)
+                    if ckey in selected_explicit or ckey in store_selected:
+                        continue
+                    if not _is_strictly_earlier_receipt(earliest_prod, cand):
+                        continue
+                    c_method = str(cand.get("method") or "").upper()
+                    c_norm_path = _norm_url_path(str(cand.get("url") or cand.get("path") or ""))
+                    if c_method == t_method and c_norm_path == t_norm_path:
+                        continue
+                    if any(_step_references_id(cand, mid) for mid in tracked_store_ids):
+                        store_selected[ckey] = cand
+
+    merged_map: dict[str, dict[str, Any]] = {**selected_explicit, **store_selected}
+    if not merged_map:
+        return []
+    return _bound_precursor_chain(list(merged_map.values()), max_precursors=cap)
+
+
 def mask_dynamic_fields(text: str, *, preserve_values: Sequence[str] = ()) -> str:
     """Mask ephemeral timestamps, nonces, and request/trace UUIDs before structural comparison."""
     raw = str(text or "")
@@ -1402,6 +2089,9 @@ class DifferentialOracle:
         mode: str = "differential",
         timeout_s: float = 15.0,
         oob_server: Any | None = None,
+        timing_min_delta_ms: float = 1500.0,
+        timing_min_ratio: float = 3.0,
+        timing_replay_pairs: int = 2,
     ):
         norm_mode = str(mode or "differential").strip().lower()
         if norm_mode not in VALID_VERIFICATION_GATES:
@@ -1411,6 +2101,9 @@ class DifferentialOracle:
         self.mode = norm_mode
         self.timeout_s = float(timeout_s)
         self.oob_server = oob_server
+        self.timing_min_delta_ms = max(1.0, float(timing_min_delta_ms))
+        self.timing_min_ratio = max(1.0, float(timing_min_ratio))
+        self.timing_replay_pairs = max(1, int(timing_replay_pairs))
 
     def _has_budget(self, needed: int = 1) -> bool:
         return (self.http.budget.limit - self.http.budget.used) >= needed
@@ -1451,6 +2144,7 @@ class DifferentialOracle:
         content_type = ""
         redirect_location = ""
         error = ""
+        started = time.monotonic()
         try:
             resp = fresh.request(
                 method=method,
@@ -1478,6 +2172,7 @@ class DifferentialOracle:
         finally:
             fresh.cookies.clear()
             fresh.close()
+        elapsed_ms = max(0.0, (time.monotonic() - started) * 1000.0)
 
         return self.receipts.record(
             actor=actor,
@@ -1488,7 +2183,7 @@ class DifferentialOracle:
             request_headers=req_headers,
             request_body=raw_body,
             status=status,
-            elapsed_ms=1.0,
+            elapsed_ms=elapsed_ms,
             content_type=content_type,
             response_headers=resp_headers,
             redirect_location=redirect_location,
@@ -1496,6 +2191,209 @@ class DifferentialOracle:
             response_text=text,
             error=error,
             secret_values=self.http.actors.all_secrets(),
+        )
+
+    def _run_timing_statistical_replay(
+        self,
+        *,
+        canonical_class: str,
+        diff_target: dict[str, Any],
+        timing_control: dict[str, Any],
+        stages: dict[str, Any],
+        ctrl_probe_rid: str,
+    ) -> OracleVerdict:
+        """Execute fail-closed alternating clean-session timing replay pairs in Stage 3."""
+        pairs = max(1, int(self.timing_replay_pairs))
+        needed_requests = 2 * pairs
+        if not self._has_budget(needed_requests):
+            stages["stage3_clean_replay"] = "failed_timing_budget"
+            return OracleVerdict(
+                verified=False,
+                verdict="REFUTED",
+                reason=(
+                    f"Statistical timing verification requires {needed_requests} HTTP requests for "
+                    f"{pairs} alternating clean-session replay pairs, but remaining budget is insufficient."
+                ),
+                mode=self.mode,
+                stages=stages,
+                control_probe_receipt_id=ctrl_probe_rid,
+            )
+
+        ctrl_method = str(timing_control.get("method") or "GET").upper()
+        proof_method = str(diff_target.get("method") or "GET").upper()
+        if ctrl_method not in self.http.allowed_methods or proof_method not in self.http.allowed_methods:
+            stages["stage3_clean_replay"] = "failed_timing_method_not_allowed"
+            return OracleVerdict(
+                verified=False,
+                verdict="REFUTED",
+                reason=(
+                    f"Statistical timing verification skipped: HTTP method(s) "
+                    f"{ctrl_method!r}/{proof_method!r} not in allowed_methods."
+                ),
+                mode=self.mode,
+                stages=stages,
+                control_probe_receipt_id=ctrl_probe_rid,
+            )
+
+        orig_ctrl_status = int(timing_control.get("status") or 0)
+        orig_proof_status = int(diff_target.get("status") or 0)
+        ctrl_samples: list[float] = []
+        proof_samples: list[float] = []
+        ctrl_recs: list[dict[str, Any]] = []
+        proof_recs: list[dict[str, Any]] = []
+
+        def _record_summary() -> tuple[float, float, float, float]:
+            ctrl_med_val = float(statistics.median(ctrl_samples)) if ctrl_samples else 0.0
+            proof_med_val = float(statistics.median(proof_samples)) if proof_samples else 0.0
+            ctrl_med_r = round(ctrl_med_val, 2)
+            proof_med_r = round(proof_med_val, 2)
+            delta_r = round(proof_med_val - ctrl_med_val, 2)
+            min_gap_val = (
+                (min(proof_samples) - max(ctrl_samples))
+                if (ctrl_samples and proof_samples)
+                else 0.0
+            )
+            stages["control_ms"] = ctrl_med_r
+            stages["proof_ms"] = proof_med_r
+            stages["delta_ms"] = delta_r
+            stages["timing_summary"] = {
+                "control_ms": ctrl_med_r,
+                "proof_ms": proof_med_r,
+                "delta_ms": delta_r,
+                "min_gap_ms": round(min_gap_val, 2),
+                "control_samples_ms": [round(x, 2) for x in ctrl_samples],
+                "proof_samples_ms": [round(x, 2) for x in proof_samples],
+                "pairs": pairs,
+            }
+            return ctrl_med_val, proof_med_val, delta_r, min_gap_val
+
+        for _ in range(pairs):
+            try:
+                t0 = time.monotonic()
+                c_rec = self._run_clean_session_request(
+                    actor=str(timing_control.get("actor") or "anon"),
+                    method=ctrl_method,
+                    url=str(timing_control.get("url") or "/"),
+                    headers=timing_control.get("request_headers") or {},
+                    raw_body=str(timing_control.get("request_body") or ""),
+                )
+                c_wall_ms = max(0.0, (time.monotonic() - t0) * 1000.0)
+            except BudgetExhaustedError:
+                _record_summary()
+                stages["stage3_clean_replay"] = "failed_timing_budget"
+                return OracleVerdict(
+                    verified=False,
+                    verdict="REFUTED",
+                    reason="HTTP budget exhausted during statistical timing differential replay.",
+                    mode=self.mode,
+                    stages=stages,
+                    control_probe_receipt_id=ctrl_probe_rid,
+                )
+            c_ms = _receipt_elapsed_ms(c_rec)
+            ctrl_samples.append(c_ms if c_ms is not None else c_wall_ms)
+            ctrl_recs.append(c_rec)
+            c_status = int(c_rec.get("status") or 0)
+            if (
+                c_status <= 0
+                or bool(c_rec.get("error"))
+                or (c_status // 100) != (orig_ctrl_status // 100)
+            ):
+                _record_summary()
+                stages["stage3_clean_replay"] = "failed_timing_status"
+                return OracleVerdict(
+                    verified=False,
+                    verdict="REFUTED",
+                    reason=(
+                        f"Timing control replay returned inconsistent/error status {c_status} "
+                        f"(expected {orig_ctrl_status // 100}xx)."
+                    ),
+                    mode=self.mode,
+                    stages=stages,
+                    clean_replay_receipt_id=proof_recs[-1]["receipt_id"] if proof_recs else "",
+                    control_probe_receipt_id=ctrl_probe_rid or str(c_rec.get("receipt_id") or ""),
+                )
+
+            try:
+                t1 = time.monotonic()
+                p_rec = self._run_clean_session_request(
+                    actor=str(diff_target.get("actor") or "anon"),
+                    method=proof_method,
+                    url=str(diff_target.get("url") or "/"),
+                    headers=diff_target.get("request_headers") or {},
+                    raw_body=str(diff_target.get("request_body") or ""),
+                )
+                p_wall_ms = max(0.0, (time.monotonic() - t1) * 1000.0)
+            except BudgetExhaustedError:
+                _record_summary()
+                stages["stage3_clean_replay"] = "failed_timing_budget"
+                return OracleVerdict(
+                    verified=False,
+                    verdict="REFUTED",
+                    reason="HTTP budget exhausted during statistical timing differential replay.",
+                    mode=self.mode,
+                    stages=stages,
+                    clean_replay_receipt_id=proof_recs[-1]["receipt_id"] if proof_recs else "",
+                    control_probe_receipt_id=ctrl_probe_rid or str(c_rec.get("receipt_id") or ""),
+                )
+            p_ms = _receipt_elapsed_ms(p_rec)
+            proof_samples.append(p_ms if p_ms is not None else p_wall_ms)
+            proof_recs.append(p_rec)
+            p_status = int(p_rec.get("status") or 0)
+            if (
+                p_status <= 0
+                or bool(p_rec.get("error"))
+                or (p_status // 100) != (orig_proof_status // 100)
+            ):
+                _record_summary()
+                stages["stage3_clean_replay"] = "failed_timing_status"
+                return OracleVerdict(
+                    verified=False,
+                    verdict="REFUTED",
+                    reason=(
+                        f"Timing proof replay returned inconsistent/error status {p_status} "
+                        f"(expected {orig_proof_status // 100}xx)."
+                    ),
+                    mode=self.mode,
+                    stages=stages,
+                    clean_replay_receipt_id=str(p_rec.get("receipt_id") or ""),
+                    control_probe_receipt_id=ctrl_probe_rid or str(c_rec.get("receipt_id") or ""),
+                )
+
+        ctrl_med, proof_med, delta_r, min_gap = _record_summary()
+        last_proof_rid = str(proof_recs[-1].get("receipt_id") or "")
+        last_ctrl_rid = ctrl_probe_rid or str(ctrl_recs[-1].get("receipt_id") or "")
+
+        zero_overlap_ok = min_gap >= self.timing_min_delta_ms
+        ratio_ok = proof_med >= self.timing_min_ratio * max(ctrl_med, 20.0)
+        if zero_overlap_ok and ratio_ok:
+            stages["stage3_clean_replay"] = "passed_timing_statistical"
+            return OracleVerdict(
+                verified=True,
+                verdict="VERIFIED",
+                reason=(
+                    f"Verified {canonical_class} via statistical timing differential across {pairs} "
+                    f"alternating clean-session replay pairs (control={ctrl_med:.1f}ms, "
+                    f"proof={proof_med:.1f}ms, delta={delta_r:.1f}ms, min_gap={min_gap:.1f}ms)."
+                ),
+                mode=self.mode,
+                stages=stages,
+                clean_replay_receipt_id=last_proof_rid,
+                control_probe_receipt_id=last_ctrl_rid,
+            )
+
+        stages["stage3_clean_replay"] = "failed_timing_overlap"
+        return OracleVerdict(
+            verified=False,
+            verdict="REFUTED",
+            reason=(
+                f"Statistical timing differential refuted across {pairs} alternating clean-session "
+                f"replay pairs (control_median={ctrl_med:.1f}ms, proof_median={proof_med:.1f}ms, "
+                f"min_gap={min_gap:.1f}ms < {self.timing_min_delta_ms:.1f}ms or ratio < {self.timing_min_ratio:.1f}x)."
+            ),
+            mode=self.mode,
+            stages=stages,
+            clean_replay_receipt_id=last_proof_rid,
+            control_probe_receipt_id=last_ctrl_rid,
         )
 
     def _benign_control_url(self, url: str) -> str:
@@ -1633,6 +2531,9 @@ class DifferentialOracle:
         p_cors_sig = _cors_header_signature(diff_target) if canonical_class == "cors_misconfiguration" else ("", "")
 
         # --- Stage 1: Falsification / Control Baseline Check ---
+        input_diff_eligible = (
+            canonical_class in _INPUT_DIFF_CLASSES or canonical_class in _TIMING_ELIGIBLE_CLASSES
+        )
         ctrl_probe_rid = ""
         eff_controls = list(control_receipts)
         if (
@@ -1643,7 +2544,7 @@ class DifferentialOracle:
             and self._has_budget(2)
         ):
             try:
-                if canonical_class in _INPUT_DIFF_CLASSES:
+                if input_diff_eligible:
                     ctrl_url = self._benign_control_url(str(diff_target.get("url") or "/"))
                     probe = self._run_clean_session_request(
                         actor=p_actor,
@@ -1698,7 +2599,7 @@ class DifferentialOracle:
                 pass
 
         # Check benign control equivalence and stored_xss baseline absence for input/mutation classes
-        if canonical_class in _INPUT_DIFF_CLASSES and not is_oob_verified:
+        if input_diff_eligible and not is_oob_verified:
             if canonical_class == "weak_credentials" and not eff_controls:
                 stages["stage1_control"] = "failed_missing_control"
                 return OracleVerdict(
@@ -1726,6 +2627,8 @@ class DifferentialOracle:
                             control_probe_receipt_id=ctrl_probe_rid,
                         )
             same_actor_ctrls = [c for c in diff_controls if str(c.get("actor") or "") == p_actor]
+            p_elapsed = _receipt_elapsed_ms(diff_target)
+            p_diff_rid = str(diff_target.get("receipt_id") or "").strip()
             for ctrl in same_actor_ctrls:
                 if canonical_class == "weak_credentials":
                     is_equivalent = _weak_credentials_controls_equivalent(diff_target, ctrl, ev=ev)
@@ -1745,6 +2648,23 @@ class DifferentialOracle:
                         and cors_same
                     )
                 if is_equivalent:
+                    c_rid = str(ctrl.get("receipt_id") or "").strip()
+                    if (
+                        canonical_class in _TIMING_ELIGIBLE_CLASSES
+                        and ctrl is not diff_target
+                        and not (p_diff_rid and c_rid and c_rid == p_diff_rid)
+                        and p_status > 0
+                        and int(ctrl.get("status") or 0) > 0
+                        and not _is_multipart_receipt(diff_target)
+                        and not _is_multipart_receipt(ctrl)
+                        and _is_timing_pair_significant(
+                            p_elapsed,
+                            _receipt_elapsed_ms(ctrl),
+                            min_delta_ms=self.timing_min_delta_ms,
+                            min_ratio=self.timing_min_ratio,
+                        )
+                    ):
+                        continue
                     stages["stage1_control"] = "deception_identical_control"
                     return OracleVerdict(
                         verified=False,
@@ -1825,7 +2745,10 @@ class DifferentialOracle:
         stages["stage1_control"] = "passed_oob_callback" if is_oob_verified else "passed"
 
         # --- Stage 2: Dynamic-Field-Masked Structural & Access-Boundary Diff ---
-        if canonical_class in _INPUT_DIFF_CLASSES and not is_oob_verified:
+        timing_differential_control: dict[str, Any] | None = None
+        if (
+            input_diff_eligible or canonical_class not in (_CONCURRENCY_CLASSES | _ACCESS_CLASSES)
+        ) and not is_oob_verified:
             has_masked_diff = False
             for ctrl in diff_controls:
                 if canonical_class == "weak_credentials":
@@ -1848,16 +2771,39 @@ class DifferentialOracle:
                     has_masked_diff = True
                     break
             if diff_controls and not has_masked_diff:
-                stages["stage2_diff"] = "failed_masked_equivalence"
-                return OracleVerdict(
-                    verified=False,
-                    verdict="REFUTED",
-                    reason="Proof and control differ only in masked dynamic fields (timestamps/nonces/request IDs).",
-                    deception_detected=True,
-                    mode=self.mode,
-                    stages=stages,
-                    control_probe_receipt_id=ctrl_probe_rid,
-                )
+                if canonical_class in _TIMING_ELIGIBLE_CLASSES and p_status > 0 and not _is_multipart_receipt(diff_target):
+                    p_elapsed = _receipt_elapsed_ms(diff_target)
+                    p_diff_rid = str(diff_target.get("receipt_id") or "").strip()
+                    timing_candidates: list[tuple[int, float, dict[str, Any]]] = []
+                    for ctrl in diff_controls:
+                        c_rid = str(ctrl.get("receipt_id") or "").strip()
+                        if ctrl is diff_target or (p_diff_rid and c_rid and c_rid == p_diff_rid):
+                            continue
+                        if int(ctrl.get("status") or 0) <= 0 or _is_multipart_receipt(ctrl):
+                            continue
+                        c_elapsed = _receipt_elapsed_ms(ctrl)
+                        if _is_timing_pair_significant(
+                            p_elapsed,
+                            c_elapsed,
+                            min_delta_ms=self.timing_min_delta_ms,
+                            min_ratio=self.timing_min_ratio,
+                        ):
+                            same_act = 1 if str(ctrl.get("actor") or "") == p_actor else 0
+                            timing_candidates.append((same_act, -(c_elapsed or 0.0), ctrl))
+                    if timing_candidates:
+                        timing_candidates.sort(key=lambda item: (item[0], item[1]), reverse=True)
+                        timing_differential_control = timing_candidates[0][2]
+                if timing_differential_control is None:
+                    stages["stage2_diff"] = "failed_masked_equivalence"
+                    return OracleVerdict(
+                        verified=False,
+                        verdict="REFUTED",
+                        reason="Proof and control differ only in masked dynamic fields (timestamps/nonces/request IDs).",
+                        deception_detected=True,
+                        mode=self.mode,
+                        stages=stages,
+                        control_probe_receipt_id=ctrl_probe_rid,
+                    )
         elif canonical_class in _CONCURRENCY_CLASSES:
             p_method = str(diff_target.get("method") or "").upper()
             has_diff = any(
@@ -1911,7 +2857,10 @@ class DifferentialOracle:
                         stages=stages,
                         control_probe_receipt_id=ctrl_probe_rid,
                     )
-        stages["stage2_diff"] = "passed_oob_callback" if is_oob_verified else "passed"
+        if timing_differential_control is not None:
+            stages["stage2_diff"] = "passed_timing_differential"
+        else:
+            stages["stage2_diff"] = "passed_oob_callback" if is_oob_verified else "passed"
 
         # --- Stage 3: Clean-Session Replay in fresh isolated requests.Session() ---
         if canonical_class == "race_condition" or (
@@ -1937,6 +2886,15 @@ class DifferentialOracle:
                 mode=self.mode,
                 stages=stages,
                 control_probe_receipt_id=ctrl_probe_rid,
+            )
+
+        if timing_differential_control is not None:
+            return self._run_timing_statistical_replay(
+                canonical_class=canonical_class,
+                diff_target=diff_target,
+                timing_control=timing_differential_control,
+                stages=stages,
+                ctrl_probe_rid=ctrl_probe_rid,
             )
 
         # Prefer replaying a 2xx GET persistence proof receipt when one is present
@@ -1985,7 +2943,12 @@ class DifferentialOracle:
 
         replayed_via_stateful_fallback = False
         replayed_via_two_step = False
+        replayed_via_multistep = False
         two_step_setup_rid = ""
+        multistep_step_count = 0
+        multistep_precursor_rids: list[str] = []
+        multistep_substitutions: dict[str, str] = {}
+        attempted_precursor_chain = False
 
         try:
             replay_rec = self._run_clean_session_request(
@@ -2337,12 +3300,169 @@ class DifferentialOracle:
                             clean_replay_receipt_id=replay_rec["receipt_id"],
                             control_probe_receipt_id=ctrl_probe_rid,
                         )
+        # Multi-step stateful workflow replay (up to 3 ordered precursor steps + dynamic ID substitution):
+        # When direct single-step replay fails status or evidence verification (e.g. one-shot queue
+        # drains, consumed tokens, or multi-step draft/order finalize chains returning 409/404),
+        # replay the discovered precursor chain in fresh sessions, extract newly minted IDs, and
+        # substitute old_id -> new_id cleanly into subsequent step URLs and bodies.
+        target_method_upper = str(replay_target.get("method") or "GET").upper()
+        single_step_status_failed = (
+            not (200 <= r_status < 400) or (r_status // 100) != (t_status // 100)
+        )
+        single_step_evidence_failed = (
+            200 <= r_status < 300
+            and bool(ev)
+            and not ev_in_oob
+            and (
+                (canonical_class == "stored_xss" and not receipt_body_contains_verbatim(replay_rec, ev))
+                or (
+                    canonical_class != "stored_xss"
+                    and not _receipt_contains_evidence(replay_rec, ev, canonical_class=canonical_class)
+                )
+            )
+        )
+        single_step_needs_multistep = (
+            not has_redacted_auth_override
+            and target_method_upper != "DELETE"
+            and canonical_class not in {"open_redirect", "cors_misconfiguration", "weak_credentials"}
+            and 200 <= t_status < 400
+            and (single_step_status_failed or single_step_evidence_failed)
+        )
+        if single_step_needs_multistep:
+            precursor_chain = _discover_precursor_chain(
+                replay_target,
+                [*proof_receipts, *(setup_receipts or ())],
+                self.receipts,
+                allowed_methods=self.http.allowed_methods,
+                resolve_scope_fn=self.http.resolve_in_scope,
+                max_precursors=_MAX_MULTISTEP_PRECURSORS,
+            )
+            if precursor_chain:
+                attempted_precursor_chain = True
+                total_chain_steps = len(precursor_chain) + 1
+                if not self._has_budget(total_chain_steps):
+                    if total_chain_steps >= 3 or target_method_upper != "GET":
+                        stages["stage3_clean_replay"] = "failed_multistep_budget"
+                        stages["stage3_multistep_count"] = total_chain_steps
+                        return OracleVerdict(
+                            verified=False,
+                            verdict="REFUTED",
+                            reason=(
+                                f"Multi-step replay requires {total_chain_steps} HTTP requests "
+                                f"({len(precursor_chain)} precursor step(s) + final step), "
+                                "but remaining budget is insufficient."
+                            ),
+                            mode=self.mode,
+                            stages=stages,
+                            clean_replay_receipt_id=replay_rec["receipt_id"],
+                            control_probe_receipt_id=ctrl_probe_rid,
+                        )
+                else:
+                    id_map: dict[str, str] = {}
+                    replayed_rids: list[str] = []
+                    all_chain_steps = [*precursor_chain, replay_target]
+                    precursor_failed = False
+                    failed_step_num = 0
+                    failed_step_status = 0
+                    failed_step_rid = ""
+
+                    for step_idx, orig_step in enumerate(precursor_chain):
+                        sub_url, sub_body = _apply_id_substitutions_to_request(
+                            str(orig_step.get("url") or "/"),
+                            str(orig_step.get("request_body") or ""),
+                            id_map,
+                        )
+                        step_method = str(orig_step.get("method") or "POST").upper()
+                        try:
+                            step_replay_rec = self._run_clean_session_request(
+                                actor=str(orig_step.get("actor") or "anon"),
+                                method=step_method,
+                                url=sub_url,
+                                headers=orig_step.get("request_headers") or {},
+                                raw_body=sub_body,
+                            )
+                        except (BudgetExhaustedError, ValueError):
+                            precursor_failed = True
+                            failed_step_num = step_idx + 1
+                            break
+
+                        step_status = int(step_replay_rec.get("status") or 0)
+                        step_rid = str(step_replay_rec.get("receipt_id") or "")
+                        if not (200 <= step_status < 400):
+                            precursor_failed = True
+                            failed_step_num = step_idx + 1
+                            failed_step_status = step_status
+                            failed_step_rid = step_rid
+                            break
+
+                        if step_rid:
+                            replayed_rids.append(step_rid)
+                        new_subs = _extract_minted_id_substitutions(
+                            orig_step,
+                            step_replay_rec,
+                            all_chain_steps[step_idx + 1 :],
+                        )
+                        if new_subs:
+                            id_map.update(new_subs)
+
+                    if precursor_failed:
+                        stages["stage3_clean_replay"] = (
+                            f"failed_multistep_precursor_{failed_step_status}"
+                            if failed_step_status > 0
+                            else "failed_multistep_precursor"
+                        )
+                        stages["stage3_multistep_count"] = total_chain_steps
+                        stages["stage3_multistep_failed_step"] = failed_step_num
+                        if replayed_rids:
+                            stages["stage3_precursor_replay_receipt_ids"] = replayed_rids
+                        return OracleVerdict(
+                            verified=False,
+                            verdict="REFUTED",
+                            reason=(
+                                f"Multi-step replay precursor step {failed_step_num}/{total_chain_steps} "
+                                f"failed with status {failed_step_status}."
+                            ),
+                            mode=self.mode,
+                            stages=stages,
+                            clean_replay_receipt_id=failed_step_rid or replay_rec["receipt_id"],
+                            control_probe_receipt_id=ctrl_probe_rid,
+                        )
+
+                    final_url, final_body = _apply_id_substitutions_to_request(
+                        str(replay_target.get("url") or "/"),
+                        str(replay_target.get("request_body") or ""),
+                        id_map,
+                    )
+                    try:
+                        final_replay_rec = self._run_clean_session_request(
+                            actor=str(replay_target.get("actor") or "anon"),
+                            method=target_method_upper,
+                            url=final_url,
+                            headers=replay_target.get("request_headers") or {},
+                            raw_body=final_body,
+                        )
+                    except (BudgetExhaustedError, ValueError):
+                        final_replay_rec = None
+
+                    if final_replay_rec is not None:
+                        replay_rec = final_replay_rec
+                        r_status = int(final_replay_rec.get("status") or 0)
+                        if total_chain_steps == 2:
+                            replayed_via_two_step = True
+                            two_step_setup_rid = replayed_rids[0] if replayed_rids else ""
+                        else:
+                            replayed_via_multistep = True
+                            multistep_step_count = total_chain_steps
+                            multistep_precursor_rids = replayed_rids
+                            multistep_substitutions = dict(id_map)
+
         # Case B — Single-use POST create conflict verification:
         # When re-executing a 200/201 POST returns 409 Conflict (or 400 Bad Request
         # with an explicit duplicate/conflict indicator) because the resource already
         # exists from the original request, verify after Stages 1-2 passed.
-        elif (
-            not has_redacted_auth_override
+        if (
+            not attempted_precursor_chain
+            and not has_redacted_auth_override
             and replay_target is primary_proof
             and str(primary_proof.get("method") or "").upper() == "POST"
             and t_status in {200, 201}
@@ -2373,7 +3493,8 @@ class DifferentialOracle:
         # specified) up to 2 distinct-tenant/admin actors from the harness roster to
         # verify the mutated state persisted in a fresh clean session.
         elif (
-            not has_redacted_auth_override
+            not attempted_precursor_chain
+            and not has_redacted_auth_override
             and replay_target is primary_proof
             and str(primary_proof.get("method") or "").upper() in _WRITE_METHODS
             and r_status in {403, 404, 409}
@@ -2436,66 +3557,6 @@ class DifferentialOracle:
                     t_status = 200
                     replayed_via_stateful_fallback = True
                     break
-
-        # Two-step clean replay fallback: for one-shot / stateful GET workflows whose
-        # item/event was drained on the first read (e.g. POST /queue/join -> GET /queue/data,
-        # POST /tokens -> GET /tokens/consume), replay the strictly-earlier non-multipart
-        # setup write from proof_receipts followed immediately by the GET in fresh sessions.
-        single_step_get_missing_state = (
-            str(replay_target.get("method") or "").upper() == "GET"
-            and canonical_class not in {"open_redirect", "cors_misconfiguration"}
-            and 200 <= t_status < 300
-            and (
-                r_status in {404, 410}
-                or (
-                    200 <= r_status < 300
-                    and bool(ev)
-                    and not ev_in_oob
-                    and (
-                        (canonical_class == "stored_xss" and not receipt_body_contains_verbatim(replay_rec, ev))
-                        or (
-                            canonical_class != "stored_xss"
-                            and not _receipt_contains_evidence(replay_rec, ev, canonical_class=canonical_class)
-                        )
-                    )
-                )
-            )
-        )
-        if single_step_get_missing_state and self._has_budget(2):
-            setup_rec = _find_prior_setup_write_receipt(
-                replay_target,
-                [*proof_receipts, *(setup_receipts or ())],
-                self.receipts,
-            )
-            if setup_rec is not None:
-                setup_method = str(setup_rec.get("method") or "").upper()
-                if setup_method in self.http.allowed_methods:
-                    try:
-                        setup_replay_rec = self._run_clean_session_request(
-                            actor=str(setup_rec.get("actor") or "anon"),
-                            method=setup_method,
-                            url=str(setup_rec.get("url") or "/"),
-                            headers=setup_rec.get("request_headers") or {},
-                            raw_body=str(setup_rec.get("request_body") or ""),
-                        )
-                    except (BudgetExhaustedError, ValueError):
-                        setup_replay_rec = None
-                    if setup_replay_rec is not None and 200 <= int(setup_replay_rec.get("status") or 0) < 400:
-                        try:
-                            step2_replay_rec = self._run_clean_session_request(
-                                actor=str(replay_target.get("actor") or "anon"),
-                                method="GET",
-                                url=str(replay_target.get("url") or "/"),
-                                headers=replay_target.get("request_headers") or {},
-                                raw_body=str(replay_target.get("request_body") or ""),
-                            )
-                        except (BudgetExhaustedError, ValueError):
-                            step2_replay_rec = None
-                        if step2_replay_rec is not None:
-                            replay_rec = step2_replay_rec
-                            r_status = int(step2_replay_rec.get("status") or 0)
-                            replayed_via_two_step = True
-                            two_step_setup_rid = str(setup_replay_rec.get("receipt_id") or "")
 
         if not (200 <= r_status < 400) or (r_status // 100) != (t_status // 100):
             stages["stage3_clean_replay"] = f"failed_status_{r_status}"
@@ -2642,7 +3703,14 @@ class DifferentialOracle:
                         control_probe_receipt_id=ctrl_probe_rid,
                     )
 
-        if replayed_via_two_step:
+        if replayed_via_multistep:
+            stages["stage3_clean_replay"] = "passed_multistep_replay"
+            stages["stage3_multistep_count"] = multistep_step_count
+            if multistep_precursor_rids:
+                stages["stage3_precursor_replay_receipt_ids"] = multistep_precursor_rids
+            if multistep_substitutions:
+                stages["stage3_id_substitutions"] = dict(multistep_substitutions)
+        elif replayed_via_two_step:
             stages["stage3_clean_replay"] = "passed_two_step_replay"
             if two_step_setup_rid:
                 stages["stage3_setup_replay_receipt_id"] = two_step_setup_rid
@@ -2652,14 +3720,19 @@ class DifferentialOracle:
             stages["stage3_clean_replay"] = "passed_stateful_persistence"
         else:
             stages["stage3_clean_replay"] = "passed"
+        if replayed_via_multistep:
+            verdict_reason = (
+                f"Verified across control baseline, masked structural diff, and "
+                f"{multistep_step_count}-step stateful clean-session replay."
+            )
+        elif replayed_via_two_step:
+            verdict_reason = "Verified across control baseline, masked structural diff, and two-step clean-session replay."
+        else:
+            verdict_reason = "Verified across control baseline, masked structural diff, and isolated clean-session replay."
         return OracleVerdict(
             verified=True,
             verdict="VERIFIED",
-            reason=(
-                "Verified across control baseline, masked structural diff, and two-step clean-session replay."
-                if replayed_via_two_step
-                else "Verified across control baseline, masked structural diff, and isolated clean-session replay."
-            ),
+            reason=verdict_reason,
             mode=self.mode,
             stages=stages,
             clean_replay_receipt_id=replay_rec["receipt_id"],

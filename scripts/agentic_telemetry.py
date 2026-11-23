@@ -7,12 +7,298 @@ import json
 import math
 import os
 from pathlib import Path
+import re
 import tempfile
 import threading
 from typing import Any, Sequence
 
 from agentic_bsag import STATUS_REFUTED, STATUS_SUSPECT_DECOY, BeliefStateAttackGraph
 from agentic_surface import route_template_of
+
+_HEALTH_CHECK_COUNT = 6
+_HIGH_404_MIN_HTTP_EVENTS = 20
+_HIGH_404_RATIO_THRESHOLD = 0.40
+_ORACLE_FRICTION_STAGE3_REASONS = frozenset({
+    "failed_status_404",
+    "failed_status_409",
+    "failed_status_400",
+})
+_URL_PATH_REDACTION_CORRUPTION_RE = re.compile(
+    r"https?://[^/\s\"'<>`()\[\]]+/[^\s?\"'<>`()\[\]]*<REDACTED_SECRET[^\s\"'`()\[\]]*"
+)
+
+
+def _safe_int(value: Any) -> int | None:
+    """Convert an integer or numeric string to int, returning None for bools or invalid values."""
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str):
+        stripped = value.strip()
+        if stripped and (stripped.isdigit() or (stripped[0] in {"+", "-"} and stripped[1:].isdigit())):
+            return int(stripped)
+    return None
+
+
+def _extract_oracle_endpoint(event: dict[str, Any]) -> str:
+    """Resolve a human-readable endpoint identifier from an `oracle_verdict` event."""
+    for key in ("route_template", "endpoint", "path", "url"):
+        raw = str(event.get(key) or "").strip()
+        if raw:
+            return raw
+    node_id = str(event.get("node_id") or "").strip()
+    if node_id:
+        return node_id[3:] if node_id.startswith("ep:") and len(node_id) > 3 else node_id
+    return "unknown"
+
+
+def compute_harness_health_checks(
+    *,
+    events: Sequence[dict[str, Any]] = (),
+    manifest: dict[str, Any] | None = None,
+    auth_metadata: dict[str, Any] | None = None,
+    sharding_summary: dict[str, Any] | None = None,
+    post_auth_stage0_crawl: dict[str, Any] | None = None,
+    run_status: str | None = None,
+    report_text: str | None = None,
+) -> dict[str, Any]:
+    """Deterministically evaluate run telemetry, metadata, and report text for harness anomalies."""
+    anomalies: list[dict[str, Any]] = []
+
+    http_events = [e for e in events if isinstance(e, dict) and e.get("event") == "http_event"]
+    oracle_events = [e for e in events if isinstance(e, dict) and e.get("event") == "oracle_verdict"]
+
+    # 1. high_404_ratio
+    total_http = len(http_events)
+    count_404 = sum(1 for e in http_events if _safe_int(e.get("status")) == 404)
+    if total_http >= _HIGH_404_MIN_HTTP_EVENTS and (count_404 / total_http) > _HIGH_404_RATIO_THRESHOLD:
+        ratio = round(count_404 / total_http, 4)
+        anomalies.append({
+            "code": "high_404_ratio",
+            "severity": "medium",
+            "detail": (
+                f"HTTP 404 ratio {ratio:.2%} ({count_404}/{total_http}) exceeds "
+                f"{_HIGH_404_RATIO_THRESHOLD:.0%} threshold."
+            ),
+            "metrics": {
+                "ratio": ratio,
+                "count_404": count_404,
+                "total_http": total_http,
+            },
+        })
+
+    # 2. credentials_unauthenticated
+    auth_block: dict[str, Any] | None = None
+    if isinstance(auth_metadata, dict):
+        auth_block = auth_metadata
+    elif isinstance(manifest, dict):
+        raw_auth = manifest.get("auth")
+        if isinstance(raw_auth, dict):
+            auth_block = raw_auth
+        elif "unauthenticated_credentialed_actors" in manifest or "authenticated_actors" in manifest:
+            auth_block = manifest
+
+    if auth_block is not None:
+        raw_unauth = auth_block.get("unauthenticated_credentialed_actors")
+        raw_authed = auth_block.get("authenticated_actors")
+        unauth = (
+            [str(a).strip() for a in raw_unauth if str(a).strip()]
+            if isinstance(raw_unauth, (list, tuple, set))
+            else []
+        )
+        authed = (
+            [str(a).strip() for a in raw_authed if str(a).strip()]
+            if isinstance(raw_authed, (list, tuple, set))
+            else []
+        )
+        if unauth and not authed:
+            anomalies.append({
+                "code": "credentials_unauthenticated",
+                "severity": "high",
+                "detail": (
+                    f"{len(unauth)} credentialed actor(s) failed authentication "
+                    f"({', '.join(unauth[:5])}) with 0 authenticated actors."
+                ),
+                "metrics": {
+                    "unauthenticated_credentialed_actors": unauth,
+                    "authenticated_actors": authed,
+                    "unauthenticated_count": len(unauth),
+                    "authenticated_count": 0,
+                },
+            })
+
+    # 3. oracle_state_transition_friction
+    friction_count = 0
+    friction_endpoints: list[str] = []
+    seen_friction_endpoints: set[str] = set()
+    friction_reasons: Counter[str] = Counter()
+    for ev in oracle_events:
+        raw_stages = ev.get("stages")
+        stages = raw_stages if isinstance(raw_stages, dict) else {}
+        s1 = str(stages.get("stage1_control") or ev.get("stage1_control") or "").strip()
+        s2 = str(stages.get("stage2_diff") or ev.get("stage2_diff") or "").strip()
+        s3 = str(stages.get("stage3_clean_replay") or ev.get("stage3_clean_replay") or "").strip()
+        if s1.startswith("passed") and s2.startswith("passed") and s3 in _ORACLE_FRICTION_STAGE3_REASONS:
+            friction_count += 1
+            friction_reasons[s3] += 1
+            ep = _extract_oracle_endpoint(ev)
+            if ep not in seen_friction_endpoints:
+                seen_friction_endpoints.add(ep)
+                friction_endpoints.append(ep)
+    if friction_count > 0:
+        reasons_summary = ", ".join(f"{k}={v}" for k, v in sorted(friction_reasons.items()))
+        anomalies.append({
+            "code": "oracle_state_transition_friction",
+            "severity": "medium",
+            "detail": (
+                f"{friction_count} oracle verdict(s) passed Stage 1-2 but failed Stage 3 "
+                f"({reasons_summary}) on {', '.join(friction_endpoints[:5])}."
+            ),
+            "metrics": {
+                "count": friction_count,
+                "endpoints": friction_endpoints,
+                "stage3_reasons": dict(sorted(friction_reasons.items())),
+            },
+        })
+
+    # 4. url_path_redaction_corruption
+    if isinstance(report_text, str) and report_text:
+        corrupted_urls = list(dict.fromkeys(_URL_PATH_REDACTION_CORRUPTION_RE.findall(report_text)))
+        if corrupted_urls:
+            anomalies.append({
+                "code": "url_path_redaction_corruption",
+                "severity": "high",
+                "detail": (
+                    f"Detected {len(corrupted_urls)} URL(s) in report output whose path segment "
+                    "contains <REDACTED_SECRET (over-redaction corruption)."
+                ),
+                "metrics": {
+                    "count": len(corrupted_urls),
+                    "sample_urls": corrupted_urls[:10],
+                },
+            })
+
+    # Resolve sharding_summary once for checks 5 & 6
+    eff_sharding: dict[str, Any] | None = (
+        sharding_summary
+        if isinstance(sharding_summary, dict)
+        else (
+            manifest.get("sharding_summary")
+            if isinstance(manifest, dict) and isinstance(manifest.get("sharding_summary"), dict)
+            else None
+        )
+    )
+
+    # 5. post_auth_zero_new_routes
+    pa_meta: dict[str, Any] | None = None
+    if isinstance(post_auth_stage0_crawl, dict):
+        pa_meta = post_auth_stage0_crawl
+    elif isinstance(eff_sharding, dict) and isinstance(eff_sharding.get("post_auth_stage0_crawl"), dict):
+        pa_meta = eff_sharding["post_auth_stage0_crawl"]
+    elif isinstance(manifest, dict) and isinstance(manifest.get("post_auth_stage0_crawl"), dict):
+        pa_meta = manifest["post_auth_stage0_crawl"]
+
+    if pa_meta is not None:
+        pa_status = str(pa_meta.get("status") or "").strip().lower()
+        pa_enabled = pa_meta.get("enabled")
+        pa_triggered = pa_meta.get("triggered")
+        explicitly_disabled = (
+            pa_enabled is False
+            or pa_triggered is False
+            or pa_status in {"skipped", "disabled", "not_run"}
+        )
+        pa_ran = (not explicitly_disabled) and (
+            pa_status == "ok"
+            or (not pa_status and (pa_enabled is True or pa_triggered is True))
+        )
+        if pa_ran:
+            raw_pa_stats = pa_meta.get("stats")
+            pa_stats: dict[str, Any] = raw_pa_stats if isinstance(raw_pa_stats, dict) else {}
+            new_added = _safe_int(pa_meta.get("new_routes_added"))
+            accepted = _safe_int(pa_meta.get("routes_accepted"))
+            if accepted is None:
+                accepted = _safe_int(pa_stats.get("routes_accepted"))
+            ingested = _safe_int(pa_meta.get("routes_ingested"))
+
+            zero_metric_key = ""
+            if new_added == 0:
+                zero_metric_key = "new_routes_added"
+            elif accepted == 0:
+                zero_metric_key = "routes_accepted"
+            elif new_added is None and accepted is None and ingested == 0:
+                zero_metric_key = "routes_ingested"
+
+            if zero_metric_key:
+                pa_metrics: dict[str, Any] = {
+                    "status": pa_status or "enabled",
+                    "trigger_field": zero_metric_key,
+                }
+                if new_added is not None:
+                    pa_metrics["new_routes_added"] = new_added
+                if accepted is not None:
+                    pa_metrics["routes_accepted"] = accepted
+                if ingested is not None:
+                    pa_metrics["routes_ingested"] = ingested
+                anomalies.append({
+                    "code": "post_auth_zero_new_routes",
+                    "severity": "medium",
+                    "detail": (
+                        f"Post-auth Stage 0 crawl ran ({pa_status or 'enabled'}) "
+                        f"but added 0 new routes ({zero_metric_key}=0)."
+                    ),
+                    "metrics": pa_metrics,
+                })
+
+    # 6. service_degradation_triggered
+    eff_run_status = str(
+        run_status
+        if run_status is not None
+        else (manifest.get("status") if isinstance(manifest, dict) else "")
+        or ""
+    ).strip().lower()
+    degraded_shards: list[str] = []
+    if isinstance(eff_sharding, dict):
+        raw_shards = eff_sharding.get("shards")
+        if isinstance(raw_shards, (list, tuple)):
+            for idx, shard in enumerate(raw_shards):
+                if isinstance(shard, dict) and str(shard.get("status") or "").strip().lower() == "service_degraded":
+                    label = str(shard.get("shard_id") or shard.get("name") or f"shard-{idx + 1}")
+                    degraded_shards.append(label)
+        s3_meta = eff_sharding.get("stage3_synthesis")
+        if isinstance(s3_meta, dict) and str(s3_meta.get("status") or "").strip().lower() == "service_degraded":
+            degraded_shards.append("stage3_synthesis")
+
+    if eff_run_status == "service_degraded" or degraded_shards:
+        if eff_run_status == "service_degraded" and degraded_shards:
+            detail = (
+                f"Run status and {len(degraded_shards)} shard(s) ({', '.join(degraded_shards[:5])}) "
+                "terminated with service_degraded."
+            )
+        elif eff_run_status == "service_degraded":
+            detail = "Run terminated with status=service_degraded (circuit breaker triggered)."
+        else:
+            detail = (
+                f"{len(degraded_shards)} shard(s) ({', '.join(degraded_shards[:5])}) "
+                "terminated with status=service_degraded."
+            )
+        anomalies.append({
+            "code": "service_degradation_triggered",
+            "severity": "high",
+            "detail": detail,
+            "metrics": {
+                "run_status": eff_run_status or "unknown",
+                "degraded_shards": degraded_shards,
+                "degraded_shard_count": len(degraded_shards),
+            },
+        })
+
+    return {
+        "status": "warnings" if anomalies else "healthy",
+        "warning_count": len(anomalies),
+        "anomalies": anomalies,
+        "checks_evaluated": _HEALTH_CHECK_COUNT,
+    }
 
 
 def _atomic_write_text(path: Path, text: str) -> None:
@@ -88,6 +374,12 @@ def compute_process_metrics(
     token_usage: dict[str, Any] | None = None,
     ablation_config: dict[str, Any] | None = None,
     reference_endpoints: Sequence[str] = (),
+    manifest: dict[str, Any] | None = None,
+    auth_metadata: dict[str, Any] | None = None,
+    sharding_summary: dict[str, Any] | None = None,
+    post_auth_stage0_crawl: dict[str, Any] | None = None,
+    run_status: str | None = None,
+    report_text: str | None = None,
 ) -> dict[str, Any]:
     """Compute Thin-Control, Thick-State process metrics from telemetry and BSAG."""
     http_events = [e for e in events if e.get("event") == "http_event"]
@@ -187,6 +479,15 @@ def compute_process_metrics(
     )
 
     interventions_by_trigger = dict(Counter(str(e.get("trigger") or "unknown") for e in interventions))
+    harness_health = compute_harness_health_checks(
+        events=events,
+        manifest=manifest,
+        auth_metadata=auth_metadata,
+        sharding_summary=sharding_summary,
+        post_auth_stage0_crawl=post_auth_stage0_crawl,
+        run_status=run_status,
+        report_text=report_text,
+    )
 
     return {
         "schema": "agentic-process-metrics/1",
@@ -213,6 +514,7 @@ def compute_process_metrics(
             "total_tokens": total_tokens,
         },
         "ablation_config": dict(ablation_config or {}),
+        "harness_health": harness_health,
     }
 
 
@@ -244,6 +546,33 @@ def render_process_metrics_markdown(metrics: dict[str, Any]) -> str:
         f"**Ablation Config:** `{json.dumps(ablation, sort_keys=True)}`",
         "",
     ]
+    health = metrics.get("harness_health")
+    if isinstance(health, dict):
+        h_status = str(health.get("status") or "healthy")
+        h_warnings = int(health.get("warning_count") or 0)
+        h_checked = int(health.get("checks_evaluated") or 0)
+        h_anomalies = health.get("anomalies") or []
+        lines.extend([
+            "## Harness Health Checks",
+            "",
+            f"- **Status:** `{h_status}` ({h_warnings} warning(s), {h_checked} checks evaluated)",
+        ])
+        if h_anomalies:
+            lines.extend([
+                "",
+                "| Code | Severity | Detail |",
+                "| :--- | :--- | :--- |",
+            ])
+            for item in h_anomalies:
+                if not isinstance(item, dict):
+                    continue
+                code = str(item.get("code") or "")
+                sev = str(item.get("severity") or "")
+                detail = str(item.get("detail") or "").replace("|", "\\|").replace("\n", " ")
+                lines.append(f"| `{code}` | `{sev}` | {detail} |")
+        else:
+            lines.append("- No harness anomalies detected.")
+        lines.append("")
     return "\n".join(lines)
 
 
@@ -257,6 +586,12 @@ def write_process_metrics(
     token_usage: dict[str, Any] | None = None,
     ablation_config: dict[str, Any] | None = None,
     reference_endpoints: Sequence[str] = (),
+    manifest: dict[str, Any] | None = None,
+    auth_metadata: dict[str, Any] | None = None,
+    sharding_summary: dict[str, Any] | None = None,
+    post_auth_stage0_crawl: dict[str, Any] | None = None,
+    run_status: str | None = None,
+    report_text: str | None = None,
 ) -> tuple[Path, Path, dict[str, Any]]:
     """Compute and atomically write `process_metrics.json` and `process_metrics.md`."""
     out_dir = Path(root_dir).expanduser().resolve()
@@ -268,6 +603,12 @@ def write_process_metrics(
         token_usage=token_usage,
         ablation_config=ablation_config,
         reference_endpoints=reference_endpoints,
+        manifest=manifest,
+        auth_metadata=auth_metadata,
+        sharding_summary=sharding_summary,
+        post_auth_stage0_crawl=post_auth_stage0_crawl,
+        run_status=run_status,
+        report_text=report_text,
     )
     json_path = out_dir / "process_metrics.json"
     md_path = out_dir / "process_metrics.md"

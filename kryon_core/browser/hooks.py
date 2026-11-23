@@ -22,11 +22,202 @@ def build_runtime_hook_script(max_events: int = MAX_EVENTS) -> str:
     return """
 (() => {
   const MAX_EVENTS = %d;
-  const runtime = { events: [], installed: true };
+  const MAX_DOM_SINKS = 40;
+  const MAX_PM_LISTENERS = 20;
+  const runtime = {
+    events: [],
+    dom_sinks: [],
+    postmessage_listeners: [],
+    last_postmessage: "",
+    installed: true,
+  };
   window.__ccoRuntime = runtime;
+  window.__kryon_dom_telemetry = {
+    dom_sinks: runtime.dom_sinks,
+    postmessage_listeners: runtime.postmessage_listeners,
+  };
   const push = (event) => {
     try { if (runtime.events.length < MAX_EVENTS) runtime.events.push(event); } catch (_) {}
   };
+  const safeDecode = (s) => {
+    try { return decodeURIComponent(String(s || "")); } catch (_) { return String(s || ""); }
+  };
+  const extractSourceTokens = () => {
+    const out = [];
+    const addToken = (src, val) => {
+      const raw = String(val || "").trim();
+      if (raw.length >= 6) out.push([src, raw]);
+      const dec = safeDecode(raw).trim();
+      if (dec.length >= 6 && dec !== raw) out.push([src, dec]);
+    };
+    try {
+      const h = String(window.location && window.location.hash || "").replace(/^#/, "");
+      if (h) {
+        addToken("location.hash", h);
+        h.split("&").forEach((part) => {
+          const idx = part.indexOf("=");
+          if (idx >= 0) addToken("location.hash", part.slice(idx + 1));
+        });
+      }
+    } catch (_) {}
+    try {
+      const sp = new URLSearchParams(String(window.location && window.location.search || ""));
+      sp.forEach((v) => addToken("location.search", v));
+    } catch (_) {}
+    try {
+      if (window.name) addToken("window.name", window.name);
+    } catch (_) {}
+    try {
+      if (runtime.last_postmessage) addToken("postmessage", runtime.last_postmessage);
+    } catch (_) {}
+    return out;
+  };
+  const recordDomSink = (sinkName, tagName, rawVal) => {
+    try {
+      if (runtime.dom_sinks.length >= MAX_DOM_SINKS) return;
+      const text = String(rawVal == null ? "" : rawVal);
+      if (!text) return;
+      const matches = [];
+      const tokens = extractSourceTokens();
+      for (let i = 0; i < tokens.length; i++) {
+        const src = tokens[i][0];
+        const tok = tokens[i][1];
+        if (tok && text.includes(tok) && !matches.includes(src)) {
+          matches.push(src);
+        }
+      }
+      const hasMarker = text.includes("data-kryon-dom-canary");
+      if (matches.length === 0 && !hasMarker) return;
+      runtime.dom_sinks.push({
+        sink: String(sinkName || ""),
+        tag: String(tagName || "").toLowerCase().slice(0, 40),
+        snippet: text.slice(0, 200),
+        source_matches: matches.slice(0, 8),
+      });
+    } catch (_) {}
+  };
+  const inspectMessageHandler = (kind, fn) => {
+    try {
+      if (runtime.postmessage_listeners.length >= MAX_PM_LISTENERS) return;
+      const src = typeof fn === "function"
+        ? String(Function.prototype.toString.call(fn) || "")
+        : (fn && typeof fn.handleEvent === "function"
+          ? String(Function.prototype.toString.call(fn.handleEvent) || "")
+          : "");
+      const hasOriginCheck = /\\.origin\\b|\\borigin\\s*(?:===|!==|==|!=)|origin\\.includes\\s*\\(/i.test(src);
+      runtime.postmessage_listeners.push({
+        type: String(kind || "addEventListener"),
+        has_origin_check: Boolean(hasOriginCheck),
+        handler_preview: src.replace(/\\s+/g, " ").trim().slice(0, 240),
+      });
+    } catch (_) {}
+  };
+  const capturePostMessageData = (evt) => {
+    try {
+      if (!evt) return;
+      const d = evt.data;
+      if (typeof d === "string") {
+        runtime.last_postmessage = d.slice(0, 512);
+      } else if (d && typeof d === "object") {
+        runtime.last_postmessage = JSON.stringify(d).slice(0, 512);
+      }
+    } catch (_) {}
+  };
+  try {
+    const origAddEventListener = window.addEventListener;
+    if (typeof origAddEventListener === "function") {
+      window.addEventListener = function(type, listener, options) {
+        try {
+          if (String(type || "").toLowerCase() === "message" && listener) {
+            inspectMessageHandler("addEventListener", listener);
+            if (typeof listener === "function") {
+              const wrapped = function(evt) {
+                capturePostMessageData(evt);
+                return listener.apply(this, arguments);
+              };
+              return origAddEventListener.call(this, type, wrapped, options);
+            }
+          }
+        } catch (_) {}
+        return origAddEventListener.apply(this, arguments);
+      };
+    }
+  } catch (_) {}
+  try {
+    const onMsgDesc = Object.getOwnPropertyDescriptor(window, "onmessage")
+      || (typeof Window !== "undefined" && Object.getOwnPropertyDescriptor(Window.prototype, "onmessage"));
+    if (onMsgDesc && onMsgDesc.configurable && typeof onMsgDesc.set === "function") {
+      Object.defineProperty(window, "onmessage", {
+        configurable: true,
+        enumerable: onMsgDesc.enumerable,
+        get() { return onMsgDesc.get ? onMsgDesc.get.call(this) : undefined; },
+        set(fn) {
+          try {
+            if (typeof fn === "function") {
+              inspectMessageHandler("onmessage", fn);
+              const wrapped = function(evt) {
+                capturePostMessageData(evt);
+                return fn.apply(this, arguments);
+              };
+              return onMsgDesc.set.call(this, wrapped);
+            }
+          } catch (_) {}
+          return onMsgDesc.set.call(this, fn);
+        },
+      });
+    }
+  } catch (_) {}
+  try {
+    const wrapHtmlProp = (proto, propName) => {
+      const desc = proto && Object.getOwnPropertyDescriptor(proto, propName);
+      if (!desc || !desc.configurable || typeof desc.set !== "function") return;
+      Object.defineProperty(proto, propName, {
+        configurable: true,
+        enumerable: desc.enumerable,
+        get: desc.get,
+        set(value) {
+          recordDomSink(propName, this && this.tagName, value);
+          return desc.set.call(this, value);
+        },
+      });
+    };
+    if (typeof Element !== "undefined" && Element.prototype) {
+      wrapHtmlProp(Element.prototype, "innerHTML");
+      wrapHtmlProp(Element.prototype, "outerHTML");
+      const origInsertAdj = Element.prototype.insertAdjacentHTML;
+      if (typeof origInsertAdj === "function") {
+        Element.prototype.insertAdjacentHTML = function(position, text) {
+          recordDomSink("insertAdjacentHTML", this && this.tagName, text);
+          return origInsertAdj.apply(this, arguments);
+        };
+      }
+    }
+    if (typeof Document !== "undefined" && Document.prototype) {
+      const origWrite = Document.prototype.write;
+      if (typeof origWrite === "function") {
+        Document.prototype.write = function() {
+          recordDomSink("document.write", "document", Array.prototype.join.call(arguments, ""));
+          return origWrite.apply(this, arguments);
+        };
+      }
+      const origWriteln = Document.prototype.writeln;
+      if (typeof origWriteln === "function") {
+        Document.prototype.writeln = function() {
+          recordDomSink("document.writeln", "document", Array.prototype.join.call(arguments, ""));
+          return origWriteln.apply(this, arguments);
+        };
+      }
+    }
+    if (typeof Range !== "undefined" && Range.prototype) {
+      const origFrag = Range.prototype.createContextualFragment;
+      if (typeof origFrag === "function") {
+        Range.prototype.createContextualFragment = function(tagString) {
+          recordDomSink("createContextualFragment", "range", tagString);
+          return origFrag.apply(this, arguments);
+        };
+      }
+    }
+  } catch (_) {}
   const headerNames = (headers) => {
     const names = [];
     try {
@@ -156,10 +347,68 @@ def build_runtime_hook_script(max_events: int = MAX_EVENTS) -> str:
       })(),
       framework_hints: frameworkHints,
       signer_candidates: signerCandidates,
+      dom_sinks: runtime.dom_sinks.slice(0, MAX_DOM_SINKS),
+      postmessage_listeners: runtime.postmessage_listeners.slice(0, MAX_PM_LISTENERS),
     };
   };
 })();
 """ % limit
+
+
+def normalize_dom_sinks(raw_sinks: Any, limit: int = 40) -> list[dict[str, Any]]:
+    """Normalize bounded DOM sink mutation telemetry records."""
+    if not isinstance(raw_sinks, list):
+        return []
+    out: list[dict[str, Any]] = []
+    seen: set[tuple[str, str, str, tuple[str, ...]]] = set()
+    for item in raw_sinks:
+        if not isinstance(item, dict):
+            continue
+        sink = str(item.get("sink") or "").strip()[:60]
+        if not sink:
+            continue
+        tag = str(item.get("tag") or "").strip().lower()[:40]
+        snippet = str(item.get("snippet") or "")[:200]
+        sources = tuple(_safe_names(item.get("source_matches"), 8))
+        key = (sink, tag, snippet, sources)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append({
+            "sink": sink,
+            "tag": tag,
+            "snippet": snippet,
+            "source_matches": list(sources),
+        })
+        if len(out) >= limit:
+            break
+    return out
+
+
+def normalize_postmessage_listeners(raw_listeners: Any, limit: int = 20) -> list[dict[str, Any]]:
+    """Normalize bounded window postMessage listener telemetry records."""
+    if not isinstance(raw_listeners, list):
+        return []
+    out: list[dict[str, Any]] = []
+    seen: set[tuple[str, bool, str]] = set()
+    for item in raw_listeners:
+        if not isinstance(item, dict):
+            continue
+        ltype = str(item.get("type") or "addEventListener").strip()[:40]
+        has_origin = bool(item.get("has_origin_check"))
+        preview = str(item.get("handler_preview") or "").strip()[:240]
+        key = (ltype, has_origin, preview)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append({
+            "type": ltype,
+            "has_origin_check": has_origin,
+            "handler_preview": preview,
+        })
+        if len(out) >= limit:
+            break
+    return out
 
 
 def _redact_url(url: str) -> tuple[str, str, list[str]]:

@@ -643,13 +643,6 @@ def run_agentic_target(
             )
             dump(findings_file, findings_list)
         snap = budget.snapshot()
-        if investigator is not None:
-            if isinstance(findings_list, list):
-                investigator.dispatcher.findings = findings_list
-            m_json, m_md, metrics_doc = investigator.write_metrics()
-            manifest["process_metrics_json"] = str(m_json)
-            manifest["process_metrics_md"] = str(m_md)
-            manifest["process_metrics"] = metrics_doc
         manifest.update(
             auth=_build_auth_metadata(actors, login_path_source=login_path_source),
             budget=snap,
@@ -660,17 +653,43 @@ def run_agentic_target(
             receipts_dir=str(receipt_store.receipts_dir),
             wall_clock_seconds=round(time.monotonic() - started, 2),
         )
+        if investigator is not None:
+            if isinstance(findings_list, list):
+                investigator.dispatcher.findings = findings_list
+            try:
+                m_json, m_md, metrics_doc = investigator.write_metrics(manifest=manifest)
+            except TypeError:
+                m_json, m_md, metrics_doc = investigator.write_metrics()
+            manifest["process_metrics_json"] = str(m_json)
+            manifest["process_metrics_md"] = str(m_md)
+            manifest["process_metrics"] = metrics_doc
         dump(private_dir / "budget.json", snap)
         dump(manifest_path, manifest)
         dump(output / "launch.json", manifest)
+        report_md_text: str | None = None
         try:
             rep = agentic_report.generate_run_reports(output)
             if rep.get("markdown_path"):
                 manifest["report_md"] = rep["markdown_path"]
+                try:
+                    report_md_text = Path(str(rep["markdown_path"])).read_text(encoding="utf-8", errors="replace")
+                except OSError:
+                    report_md_text = None
             if rep.get("sarif_path"):
                 manifest["report_sarif"] = rep["sarif_path"]
         except Exception as report_exc:
             manifest["report_error"] = type(report_exc).__name__
+        if investigator is not None and report_md_text is not None:
+            try:
+                m_json, m_md, metrics_doc = investigator.write_metrics(
+                    manifest=manifest,
+                    report_text=report_md_text,
+                )
+            except TypeError:
+                m_json, m_md, metrics_doc = investigator.write_metrics()
+            manifest["process_metrics_json"] = str(m_json)
+            manifest["process_metrics_md"] = str(m_md)
+            manifest["process_metrics"] = metrics_doc
         dump(manifest_path, manifest)
         dump(output / "launch.json", manifest)
     return manifest_path, manifest

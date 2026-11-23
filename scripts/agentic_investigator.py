@@ -1131,7 +1131,12 @@ class AgenticInvestigator:
             "synthesis_interval": self.synthesis_interval,
         }
 
-    def write_metrics(self) -> tuple[Path, Path, dict[str, Any]]:
+    def write_metrics(
+        self,
+        *,
+        manifest: dict[str, Any] | None = None,
+        report_text: str | None = None,
+    ) -> tuple[Path, Path, dict[str, Any]]:
         events = self.telemetry.events() if self.telemetry is not None else []
         json_p, md_p, metrics = write_process_metrics(
             self.root_dir,
@@ -1141,6 +1146,8 @@ class AgenticInvestigator:
             findings=self.dispatcher.findings,
             token_usage=self.token_usage,
             ablation_config=self._ablation_config(),
+            manifest=manifest,
+            report_text=report_text,
         )
         self._last_metrics_paths = (json_p, md_p)
         return json_p, md_p, metrics
@@ -1649,6 +1656,9 @@ class AgenticInvestigator:
         dst.visited_method_paths.update(src.visited_method_paths)
         dst.visited_method_templates.update(src.visited_method_templates)
         dst.html_or_form_templates.update(src.html_or_form_templates)
+        dst.discovered_form_templates.update(src.discovered_form_templates)
+        dst.actively_probed_templates.update(src.actively_probed_templates)
+        dst._non_404_templates.update(src._non_404_templates)
         dst.declared_write_ops.update(src.declared_write_ops)
         dst.tested_write_ops.update(src.tested_write_ops)
         dst.discovered_write_ops.update(src.discovered_write_ops)
@@ -1667,11 +1677,18 @@ class AgenticInvestigator:
             "discovered_params",
             "collection_listed_objects",
             "api_prefix_routes",
+            "discovered_schema_hints",
         ):
             dst_map = getattr(dst, dict_attr)
             src_map = getattr(src, dict_attr)
             for key, vals in src_map.items():
                 dst_map.setdefault(key, set()).update(vals)
+
+        for op_key, tmpl_doc in src.discovered_body_templates.items():
+            if isinstance(tmpl_doc, dict) and tmpl_doc:
+                existing_bt = dst.discovered_body_templates.get(op_key)
+                if existing_bt is None or len(tmpl_doc) > len(existing_bt):
+                    dst.discovered_body_templates[op_key] = copy.deepcopy(tmpl_doc)
 
         for tmpl, pmap in src.param_probes_by_template.items():
             dst_pmap = dst.param_probes_by_template.setdefault(tmpl, {})
@@ -1700,6 +1717,83 @@ class AgenticInvestigator:
                 existing["tested_by"].update(entry.get("tested_by") or ())
                 existing["verified_2xx"] = bool(existing.get("verified_2xx") or entry.get("verified_2xx"))
 
+    def _maybe_nudge_shard_high_risk_finish(
+        self,
+        *,
+        dispatcher: ToolDispatcher,
+        shard_cluster: SubsystemCluster | None,
+        turn: int,
+        max_turns: int,
+        shard_high_risk_nudges: int,
+        shard_token_quota: int | None,
+        shard_tokens_used: int,
+    ) -> str | None:
+        """Return a bounded (max 1) premature-finish rejection when high-risk shard inputs remain unprobed."""
+        if shard_cluster is None or shard_high_risk_nudges >= 1:
+            return None
+        remaining_turns = max_turns - turn
+        if remaining_turns < 3:
+            return None
+
+        http_rem = self.http.budget.limit - self.http.budget.used
+        http_reserve_floor = int(getattr(dispatcher, "http_reserve_floor", 0) or 0)
+        usable_http_rem = max(0, http_rem - http_reserve_floor)
+        if usable_http_rem < 6:
+            return None
+
+        tok_rem = int(self.budget.available("tokens"))
+        tok_lim = int(self.budget.limits.get("tokens") or 0)
+        min_comfortable_tokens = max(12_000, int(tok_lim * 0.15)) if tok_lim > 0 else 12_000
+        if tok_rem < min_comfortable_tokens:
+            return None
+        if (
+            shard_token_quota is not None
+            and shard_token_quota > 0
+            and shard_tokens_used >= int(shard_token_quota * 0.80)
+        ):
+            return None
+        if float(self.budget.remaining_seconds()) <= 15.0:
+            return None
+
+        shard_families = {
+            str(f).strip().lower()
+            for f in (shard_cluster.families or ())
+            if str(f).strip()
+        }
+        unprobed = dispatcher.surface_tracker.high_risk_unprobed_routes(
+            allowed_families=shard_families if shard_families else None,
+            limit=5,
+        )
+        if not unprobed:
+            return None
+
+        top_items = unprobed[:5]
+        route_bullets = "; ".join(
+            f"{'/'.join(item.get('methods') or ['GET'])} {item['route_template']}"
+            + (f" (params: {', '.join(item['params'][:6])})" if item.get("params") else "")
+            for item in top_items
+        )
+        return json.dumps(
+            {
+                "finished": False,
+                "rejected": True,
+                "nudge_type": "shard_high_risk_coverage",
+                "nudge_count": 1,
+                "max_nudges": 1,
+                "shard_id": shard_cluster.shard_id,
+                "remaining_turns": remaining_turns,
+                "http_budget_remaining": usable_http_rem,
+                "unprobed_high_risk_routes": top_items,
+                "reason": (
+                    f"Premature shard finish rejected (1/1): {len(top_items)} high-risk parameterized/upload "
+                    f"route(s) in shard `{shard_cluster.shard_id}` have not been actively probed yet: "
+                    f"{route_bullets}. Actively probe these concrete inputs (differential/special-char query "
+                    "payloads or POST/multipart submission), record any confirmed findings, and then call `finish`."
+                ),
+            },
+            ensure_ascii=False,
+        )
+
     def _execute_monolithic_loop(
         self,
         *,
@@ -1724,6 +1818,7 @@ class AgenticInvestigator:
         status = "running"
         empty_nudges = 0
         reserve_floor_turns = 0
+        shard_high_risk_nudges = 0
         last_completed_turn = start_turn - 1
         recent_local_reads: list[tuple[int, str, str, str]] = []
         eff_model = model_name or self.model
@@ -1871,6 +1966,21 @@ class AgenticInvestigator:
                                 },
                                 ensure_ascii=False,
                             )
+                        elif name == "finish" and shard_cluster is not None:
+                            nudge_reply = self._maybe_nudge_shard_high_risk_finish(
+                                dispatcher=dispatcher,
+                                shard_cluster=shard_cluster,
+                                turn=turn,
+                                max_turns=max_turns,
+                                shard_high_risk_nudges=shard_high_risk_nudges,
+                                shard_token_quota=shard_token_quota,
+                                shard_tokens_used=_shard_tokens_used(),
+                            )
+                            if nudge_reply is not None:
+                                shard_high_risk_nudges += 1
+                                result_text = nudge_reply
+                            else:
+                                result_text = dispatcher.dispatch(name, parsed_args)
                         else:
                             result_text = dispatcher.dispatch(name, parsed_args)
                         if name in _LOCAL_READ_TOOLS and not (
@@ -2741,6 +2851,7 @@ class AgenticInvestigator:
                         bootstrap_findings=boot_findings_snap,
                         receipts=self.receipts,
                         state_banner=init_banner,
+                        surface_tracker=shard_dispatcher.surface_tracker,
                     )
                     shard_messages: list[dict[str, Any]] = [
                         {"role": "system", "content": s_sys},

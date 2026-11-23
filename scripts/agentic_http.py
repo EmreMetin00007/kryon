@@ -4,17 +4,22 @@ from __future__ import annotations
 import base64
 import binascii
 from dataclasses import dataclass, field
+from datetime import timezone
+from email.utils import parsedate_to_datetime
 import gzip
+import hashlib
+import html
 import json
 import math
 from pathlib import Path
+import random
 import re
 import socket
 import sys
 import threading
 import time
 from typing import Any, Callable, Sequence
-from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit, urlunsplit
+from urllib.parse import parse_qsl, quote, quote_plus, unquote, urlencode, urljoin, urlsplit, urlunsplit
 import uuid
 import zlib
 
@@ -41,7 +46,55 @@ STATIC_EXTENSIONS = frozenset({
 })
 _MUTATING_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
 _AUTH_OVERRIDE_HEADERS = frozenset({"authorization", "cookie"})
+_CSRF_HEADER_NAMES = frozenset({"x-csrf-token", "x-csrftoken", "x-xsrf-token"})
+_CSRF_RESPONSE_HEADERS: tuple[tuple[str, str], ...] = (
+    ("x-csrf-token-next", "X-CSRF-Token"),
+    ("x-csrf-token", "X-CSRF-Token"),
+    ("x-csrftoken", "X-CSRFToken"),
+    ("x-xsrf-token", "X-XSRF-TOKEN"),
+)
+_CSRF_META_SPECS: dict[str, tuple[str, str]] = {
+    "csrf-token": ("X-CSRF-Token", ""),
+    "xsrf-token": ("X-XSRF-TOKEN", ""),
+    "csrfmiddlewaretoken": ("X-CSRFToken", "csrfmiddlewaretoken"),
+    "_token": ("X-CSRF-Token", "_token"),
+    "authenticity_token": ("X-CSRF-Token", "authenticity_token"),
+}
+_CSRF_INPUT_SPECS: dict[str, tuple[str, str]] = {
+    "csrfmiddlewaretoken": ("csrfmiddlewaretoken", "X-CSRFToken"),
+    "_token": ("_token", "X-CSRF-Token"),
+    "authenticity_token": ("authenticity_token", "X-CSRF-Token"),
+    "__token__": ("__token__", "X-CSRF-Token"),
+    "__requestverificationtoken": ("__RequestVerificationToken", "X-CSRF-Token"),
+    "csrf_token": ("csrf_token", "X-CSRF-Token"),
+    "_csrf": ("_csrf", "X-CSRF-Token"),
+    "csrf": ("csrf", "X-CSRF-Token"),
+    "xsrf_token": ("xsrf_token", "X-XSRF-TOKEN"),
+}
+_CSRF_COOKIE_SPECS: tuple[tuple[str, str, bool], ...] = (
+    ("csrftoken", "X-CSRFToken", False),
+    ("xsrf-token", "X-XSRF-TOKEN", True),
+    ("csrf_token", "X-CSRF-Token", False),
+    ("xsrf_token", "X-XSRF-TOKEN", True),
+    ("_csrf", "X-CSRF-Token", False),
+    ("_csrf_token", "X-CSRF-Token", False),
+)
+_HTML_META_TAG_RE = re.compile(r"<meta\b[^>]*>", re.IGNORECASE)
+_HTML_INPUT_TAG_RE = re.compile(r"<input\b[^>]*>", re.IGNORECASE)
+_HTML_ATTR_RE = re.compile(
+    r"""([a-zA-Z_:][-a-zA-Z0-9_:.]*)\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'=<>`]+))"""
+)
+_HTML_SKIP_INPUT_TYPES = frozenset({"submit", "button", "reset", "image", "file", "checkbox", "radio"})
+_HTML_CSRF_SCAN_LIMIT = 262_144
 _DEGRADATION_STATUS_CODES = frozenset({429, 502, 503, 504})
+_DEFAULT_MAX_RETRY_AFTER_S = 5.0
+_MAX_RATE_LIMIT_RETRIES = 2
+_RATE_LIMIT_FALLBACK_BASE_S = 0.5
+_ADAPTIVE_DELAY_MIN_S = 0.25
+_ADAPTIVE_DELAY_MAX_S = 1.0
+_ADAPTIVE_DECAY_FACTOR = 0.5
+_ADAPTIVE_DECAY_FLOOR_S = 0.05
+_ADAPTIVE_HEALTHY_STREAK_FOR_DECAY = 2
 _REDIRECT_STATUS_CODES = frozenset({301, 302, 303, 307, 308})
 _MAX_REDIRECTS = 5
 _SSE_DEFAULT_MAX_BYTES = 16384
@@ -122,6 +175,71 @@ def _extract_token_from_auth(auth_header: str) -> str:
     return parts[1].strip() if len(parts) == 2 else ""
 
 
+def _redact_framework_csrf_headers(headers: dict[str, str]) -> dict[str, str]:
+    """Ensure framework-specific CSRF headers (e.g. X-CSRFToken) are redacted before receipt persistence."""
+    if not headers:
+        return {}
+    out: dict[str, str] = {}
+    for k, v in headers.items():
+        key_str = str(k)
+        val_str = str(v)
+        if key_str.strip().lower() == "x-csrftoken" and val_str and not val_str.startswith("<REDACTED"):
+            digest8 = hashlib.sha256(val_str.encode("utf-8", errors="replace")).hexdigest()[:8]
+            out[key_str] = f"<REDACTED:len={len(val_str)},sha256_8={digest8}>"
+        else:
+            out[key_str] = val_str
+    return out
+
+
+def _parse_retry_after_seconds(
+    headers: dict[str, str] | None,
+    *,
+    max_retry_after_s: float = _DEFAULT_MAX_RETRY_AFTER_S,
+    now: float | None = None,
+) -> float | None:
+    """Parse HTTP Retry-After (delta-seconds or RFC 7231 HTTP-date), clamped to [0, max_retry_after_s]."""
+    if not headers:
+        return None
+    raw_val = ""
+    for k, v in headers.items():
+        if str(k).strip().lower() == "retry-after":
+            raw_val = str(v or "").strip()
+            break
+    if not raw_val:
+        return None
+    cap = max(0.0, float(max_retry_after_s))
+    try:
+        numeric = float(raw_val)
+    except ValueError:
+        numeric = math.nan
+    if math.isfinite(numeric):
+        return max(0.0, min(numeric, cap))
+    try:
+        dt = parsedate_to_datetime(raw_val)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    now_ts = time.time() if now is None else float(now)
+    delta = dt.timestamp() - now_ts
+    if not math.isfinite(delta):
+        return None
+    return max(0.0, min(delta, cap))
+
+
+def _parse_html_tag_attrs(tag_html: str) -> dict[str, str]:
+    attrs: dict[str, str] = {}
+    for match in _HTML_ATTR_RE.finditer(tag_html):
+        key = match.group(1).strip().lower()
+        raw_val = match.group(2) if match.group(2) is not None else (
+            match.group(3) if match.group(3) is not None else (match.group(4) or "")
+        )
+        attrs[key] = html.unescape(raw_val).strip()
+    return attrs
+
+
 @dataclass
 class ActorSession:
     """In-memory credentials and active session state for one actor."""
@@ -137,7 +255,10 @@ class ActorSession:
     local_storage: dict[str, str] = field(default_factory=dict)
     access_token: str = ""
     refresh_token: str = ""
+    refresh_path: str = ""
     csrf_token: str = ""
+    csrf_header_name: str = ""
+    csrf_field_name: str = ""
     authenticated: bool = False
     dynamic: bool = False
     source_receipt_id: str = ""
@@ -152,8 +273,13 @@ class ActorSession:
             for candidate in (self.password, self.access_token, self.refresh_token, self.csrf_token):
                 if candidate and len(candidate) >= 4:
                     secrets.append(candidate)
+            if self.csrf_token and len(self.csrf_token) >= 4:
+                for encoded in (quote_plus(self.csrf_token), quote(self.csrf_token, safe="")):
+                    if encoded and encoded != self.csrf_token and encoded not in secrets:
+                        secrets.append(encoded)
+            secret_header_names = {"authorization", "cookie", "x-api-key"} | _CSRF_HEADER_NAMES
             for k, v in self.base_headers.items():
-                if k.lower() in {"authorization", "cookie", "x-api-key", "x-csrf-token"} and v:
+                if k.lower() in secret_header_names and v:
                     secrets.append(v)
                     tok = _extract_token_from_auth(v)
                     if tok:
@@ -191,7 +317,10 @@ class ActorSession:
                 if not any(k.lower() == "cookie" for k in headers):
                     headers["Cookie"] = "; ".join(f"{k}={v}" for k, v in sorted(self.cookies.items()))
             if method.upper() in _MUTATING_METHODS and self.csrf_token:
-                headers.setdefault("X-CSRF-Token", self.csrf_token)
+                has_caller_csrf = any(k in _CSRF_HEADER_NAMES for k in extra_low)
+                has_existing_csrf = any(k.lower() in _CSRF_HEADER_NAMES for k in headers)
+                if not has_caller_csrf and not has_existing_csrf:
+                    headers[self.csrf_header_name or "X-CSRF-Token"] = self.csrf_token
             if extra_items:
                 for k, v in extra_items:
                     key_str = str(k)
@@ -206,16 +335,26 @@ class ActorSession:
             return headers
 
 
-def _extract_session_material_from_response(
+def _extract_session_material_details(
     *,
     headers: dict[str, str],
     cookies: dict[str, str],
     body_text: str,
-) -> tuple[dict[str, str], str, str, str]:
-    """Extract (cookies, bearer_token, refresh_token, csrf_token) from an HTTP response."""
+) -> tuple[dict[str, str], str, str, str, str, str]:
+    """Extract (cookies, bearer_token, refresh_token, csrf_token, csrf_header_name, csrf_field_name)."""
     captured_cookies = {str(k): str(v) for k, v in (cookies or {}).items() if k and v}
     lower_headers = {str(k).lower(): str(v) for k, v in (headers or {}).items()}
-    csrf_token = (lower_headers.get("x-csrf-token-next") or lower_headers.get("x-csrf-token") or "").strip()
+    csrf_token = ""
+    csrf_header_name = ""
+    csrf_field_name = ""
+    csrf_from_response_header = False
+    for hdr_key, canonical_hdr in _CSRF_RESPONSE_HEADERS:
+        hdr_val = (lower_headers.get(hdr_key) or "").strip()
+        if hdr_val:
+            csrf_token = hdr_val
+            csrf_header_name = canonical_hdr
+            csrf_from_response_header = True
+            break
     bearer_token = ""
     auth_hdr = lower_headers.get("authorization", "").strip()
     if auth_hdr:
@@ -274,28 +413,74 @@ def _extract_session_material_from_response(
                         if isinstance(cval, str) and cval.strip():
                             csrf_token = cval.strip()
                             break
-    elif body_text and ("<meta" in body_text.lower() or "csrf" in body_text.lower()):
-        if not csrf_token:
-            for pattern in (
-                r'<meta[^>]+name=["\'](?:csrf-token|xsrf-token)["\'][^>]+content=["\']([^"\']+)["\']',
-                r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+name=["\'](?:csrf-token|xsrf-token)["\']',
-                r'<input[^>]+name=["\'](?:csrf_token|_csrf|csrf)["\'][^>]+value=["\']([^"\']+)["\']',
-                r'<input[^>]+value=["\']([^"\']+)["\'][^>]+name=["\'](?:csrf_token|_csrf|csrf)["\']',
-            ):
-                match = re.search(pattern, body_text, re.IGNORECASE)
-                if match and match.group(1).strip():
-                    csrf_token = match.group(1).strip()
-                    break
+    elif body_text:
+        html_slice = body_text[:_HTML_CSRF_SCAN_LIMIT]
+        html_low = html_slice.lower()
+        if "<meta" in html_low or "<input" in html_low:
+            if "<meta" in html_low:
+                for tag_match in _HTML_META_TAG_RE.finditer(html_slice):
+                    attrs = _parse_html_tag_attrs(tag_match.group(0))
+                    meta_name = attrs.get("name", "").lower()
+                    meta_content = attrs.get("content", "")
+                    spec = _CSRF_META_SPECS.get(meta_name)
+                    if spec is not None and meta_content:
+                        meta_hdr, meta_field = spec
+                        if not csrf_token:
+                            csrf_token = meta_content
+                        if not csrf_header_name:
+                            csrf_header_name = meta_hdr
+                        if meta_field and not csrf_field_name:
+                            csrf_field_name = meta_field
+                        break
+            if "<input" in html_low:
+                for tag_match in _HTML_INPUT_TAG_RE.finditer(html_slice):
+                    attrs = _parse_html_tag_attrs(tag_match.group(0))
+                    input_type = attrs.get("type", "").lower()
+                    if input_type in _HTML_SKIP_INPUT_TYPES:
+                        continue
+                    raw_name = attrs.get("name", "")
+                    input_val = attrs.get("value", "")
+                    spec = _CSRF_INPUT_SPECS.get(raw_name.lower())
+                    if spec is not None and input_val:
+                        canonical_field, input_hdr = spec
+                        if not csrf_token:
+                            csrf_token = input_val
+                        if not csrf_field_name:
+                            csrf_field_name = raw_name or canonical_field
+                        if not csrf_from_response_header:
+                            if not csrf_header_name or canonical_field == "csrfmiddlewaretoken":
+                                csrf_header_name = input_hdr
+                        break
 
     if not csrf_token and captured_cookies:
         lower_cookies = {k.lower(): v for k, v in captured_cookies.items()}
-        for ckey in ("csrftoken", "csrf_token", "xsrf-token", "xsrf_token", "_csrf"):
+        for ckey, cookie_hdr, should_unquote in _CSRF_COOKIE_SPECS:
             cval = (lower_cookies.get(ckey) or "").strip()
             if cval:
-                csrf_token = cval
-                break
+                if should_unquote and "%" in cval:
+                    cval = unquote(cval).strip()
+                if cval:
+                    csrf_token = cval
+                    if not csrf_header_name:
+                        csrf_header_name = cookie_hdr
+                    break
 
-    return captured_cookies, bearer_token, refresh_token, csrf_token
+    return captured_cookies, bearer_token, refresh_token, csrf_token, csrf_header_name, csrf_field_name
+
+
+def _extract_session_material_from_response(
+    *,
+    headers: dict[str, str],
+    cookies: dict[str, str],
+    body_text: str,
+) -> tuple[dict[str, str], str, str, str]:
+    """Extract (cookies, bearer_token, refresh_token, csrf_token) from an HTTP response."""
+    cap_cookies, bearer_token, refresh_token, csrf_token, _, _ = _extract_session_material_details(
+        headers=headers,
+        cookies=cookies,
+        body_text=body_text,
+    )
+    return cap_cookies, bearer_token, refresh_token, csrf_token
 
 
 class ActorManager:
@@ -362,7 +547,11 @@ class ActorManager:
                 cookies=cookies,
                 local_storage=local_storage,
                 access_token=access_token,
+                refresh_token=str(raw.get("refresh_token") or "").strip(),
+                refresh_path=str(raw.get("refresh_path") or "").strip(),
                 csrf_token=str(raw.get("csrf_token") or "").strip(),
+                csrf_header_name=str(raw.get("csrf_header_name") or "").strip(),
+                csrf_field_name=str(raw.get("csrf_field_name") or "").strip(),
                 authenticated=has_preauth,
             )
 
@@ -442,6 +631,8 @@ class ActorManager:
         bearer_token: str | None = None,
         refresh_token: str | None = None,
         csrf_token: str | None = None,
+        csrf_header_name: str | None = None,
+        csrf_field_name: str | None = None,
         source_receipt_id: str = "",
         base_headers: dict[str, str] | None = None,
     ) -> ActorSession:
@@ -453,6 +644,8 @@ class ActorManager:
         clean_bearer = str(bearer_token or "").strip()
         clean_refresh = str(refresh_token or "").strip()
         clean_csrf = str(csrf_token or "").strip()
+        clean_csrf_header = str(csrf_header_name or "").strip()
+        clean_csrf_field = str(csrf_field_name or "").strip()
         clean_headers = {str(k): str(v) for k, v in (base_headers or {}).items() if k and v}
         is_auth = bool(clean_cookies or clean_bearer or clean_headers)
         with self._lock:
@@ -462,11 +655,16 @@ class ActorManager:
                     existing.cookies.update(clean_cookies)
                     if clean_bearer:
                         existing.access_token = clean_bearer
-                        existing.base_headers.pop("Authorization", None)
+                        for auth_key in [k for k in existing.base_headers if k.lower() == "authorization"]:
+                            existing.base_headers.pop(auth_key, None)
                     if clean_refresh:
                         existing.refresh_token = clean_refresh
                     if clean_csrf:
                         existing.csrf_token = clean_csrf
+                    if clean_csrf_header:
+                        existing.csrf_header_name = clean_csrf_header
+                    if clean_csrf_field:
+                        existing.csrf_field_name = clean_csrf_field
                     if clean_headers:
                         existing.base_headers.update(clean_headers)
                     if role:
@@ -487,6 +685,8 @@ class ActorManager:
                 access_token=clean_bearer,
                 refresh_token=clean_refresh,
                 csrf_token=clean_csrf,
+                csrf_header_name=clean_csrf_header,
+                csrf_field_name=clean_csrf_field,
                 authenticated=is_auth,
                 dynamic=True,
                 source_receipt_id=str(source_receipt_id or ""),
@@ -516,19 +716,39 @@ class ActorManager:
             session = self.actors.get(alias)
         if session is None:
             return
-        cap_cookies, cap_bearer, cap_refresh, cap_csrf = _extract_session_material_from_response(
+        (
+            cap_cookies,
+            cap_bearer,
+            cap_refresh,
+            cap_csrf,
+            cap_csrf_header,
+            cap_csrf_field,
+        ) = _extract_session_material_details(
             headers=headers,
             cookies=cookies,
             body_text=body_text,
         )
         with session._lock:
-            for k, v in cap_cookies.items():
-                session.cookies[k] = v
+            if cap_cookies:
+                for cookie_hdr_key in [k for k in session.base_headers if k.lower() == "cookie"]:
+                    raw_cookie_hdr = str(session.base_headers.pop(cookie_hdr_key, "") or "")
+                    for part in raw_cookie_hdr.split(";"):
+                        if "=" in part:
+                            ck, cv = part.split("=", 1)
+                            if ck.strip() and cv.strip():
+                                session.cookies.setdefault(ck.strip(), cv.strip())
+                for k, v in cap_cookies.items():
+                    session.cookies[k] = v
             if cap_csrf:
                 session.csrf_token = cap_csrf
+            if cap_csrf_header:
+                session.csrf_header_name = cap_csrf_header
+            if cap_csrf_field:
+                session.csrf_field_name = cap_csrf_field
             if cap_bearer:
                 session.access_token = cap_bearer
-                session.base_headers.pop("Authorization", None)
+                for auth_key in [k for k in session.base_headers if k.lower() == "authorization"]:
+                    session.base_headers.pop(auth_key, None)
                 session.authenticated = True
             if cap_refresh:
                 session.refresh_token = cap_refresh
@@ -556,8 +776,8 @@ class ActorManager:
                     auth_headers[str(key)] = str(val)
             if session.access_token and not any(k.lower() == "authorization" for k in auth_headers):
                 auth_headers["Authorization"] = f"Bearer {session.access_token}"
-            if session.csrf_token and not any(k.lower() == "x-csrf-token" for k in auth_headers):
-                auth_headers["X-CSRF-Token"] = session.csrf_token
+            if session.csrf_token and not any(k.lower() in _CSRF_HEADER_NAMES for k in auth_headers):
+                auth_headers[session.csrf_header_name or "X-CSRF-Token"] = session.csrf_token
             state: dict[str, Any] = {"cookies": cookies, "headers": auth_headers}
             if session.local_storage:
                 state["local_storage"] = dict(session.local_storage)
@@ -859,6 +1079,9 @@ class AgenticHTTPClient:
         max_degradation_streak: int = 5,
         max_rps: float = 0.0,
         allow_lifecycle_routes: bool = False,
+        max_retry_after_s: float = _DEFAULT_MAX_RETRY_AFTER_S,
+        max_rate_limit_retries: int = _MAX_RATE_LIMIT_RETRIES,
+        deadline_monotonic: float | None = None,
         _sleep_fn: Callable[[float], None] | None = None,
         _monotonic_fn: Callable[[], float] | None = None,
     ):
@@ -881,10 +1104,18 @@ class AgenticHTTPClient:
         self.max_degradation_streak: int = max(0, int(max_degradation_streak))
         self._degradation_streak: int = 0
         self.max_rps: float = eff_max_rps
+        self.max_retry_after_s: float = max(0.0, float(max_retry_after_s))
+        self.max_rate_limit_retries: int = max(0, int(max_rate_limit_retries))
+        self.deadline_monotonic: float | None = (
+            None if deadline_monotonic is None else float(deadline_monotonic)
+        )
         self._sleep_fn: Callable[[float], None] = _sleep_fn or time.sleep
         self._monotonic_fn: Callable[[], float] = _monotonic_fn or time.monotonic
         self._rate_lock = threading.Lock()
         self._next_allowed_at: float | None = None
+        self._adaptive_delay_s: float = 0.0
+        self._adaptive_healthy_streak: int = 0
+        self._last_wire_at: float | None = None
         self.receipt_store = receipt_store
         self.actors = actors or ActorManager()
         self.allowed_methods = frozenset(
@@ -898,23 +1129,58 @@ class AgenticHTTPClient:
         self._sessions_lock = threading.Lock()
         self._cache: dict[tuple[Any, ...], dict[str, Any]] = {}
         self._lock = threading.Lock()
-        self._auth_lock = threading.Lock()
+        self._auth_lock = threading.RLock()
+        self._in_session_refresh: bool = False
+        self._refresh_already_attempted: bool = False
 
-    def _acquire_rate_limit_slot(self) -> None:
-        """Pace live wire calls monotonically to stay at or below self.max_rps."""
-        if self.max_rps <= 0.0:
-            return
-        interval = 1.0 / self.max_rps
+    def _acquire_rate_limit_slot(self, *, skip_adaptive: bool = False) -> None:
+        """Pace live wire calls monotonically using max_rps and adaptive 429 delay."""
+        rps_wait_s = 0.0
+        adaptive_wait_s = 0.0
         with self._rate_lock:
             now = float(self._monotonic_fn())
-            if self._next_allowed_at is None or now >= self._next_allowed_at:
-                scheduled = now
-            else:
-                scheduled = self._next_allowed_at
-            self._next_allowed_at = scheduled + interval
-            wait_s = scheduled - now
+            if self.max_rps > 0.0:
+                interval = 1.0 / self.max_rps
+                if self._next_allowed_at is None or now >= self._next_allowed_at:
+                    scheduled = now
+                else:
+                    scheduled = self._next_allowed_at
+                self._next_allowed_at = scheduled + interval
+                rps_wait_s = max(0.0, scheduled - now)
+            if not skip_adaptive and self._adaptive_delay_s > 0.0 and self._last_wire_at is not None:
+                elapsed = max(0.0, now - self._last_wire_at)
+                adaptive_wait_s = max(0.0, self._adaptive_delay_s - elapsed)
+        wait_s = max(rps_wait_s, adaptive_wait_s)
         if wait_s > 0.0:
             self._sleep_fn(wait_s)
+
+    def _update_adaptive_pacing(self, *, status: int, retry_after_s: float | None = None) -> None:
+        """Increase adaptive delay after rate-limit signals and decay smoothly on consecutive 2xx/3xx."""
+        with self._rate_lock:
+            if status == 429 or (status == 503 and retry_after_s is not None):
+                self._adaptive_healthy_streak = 0
+                if self._adaptive_delay_s <= 0.0:
+                    hint = (
+                        retry_after_s * 0.25
+                        if (retry_after_s is not None and retry_after_s > 0.0)
+                        else _ADAPTIVE_DELAY_MIN_S
+                    )
+                    self._adaptive_delay_s = min(_ADAPTIVE_DELAY_MAX_S, max(_ADAPTIVE_DELAY_MIN_S, hint))
+                else:
+                    self._adaptive_delay_s = min(
+                        _ADAPTIVE_DELAY_MAX_S,
+                        max(self._adaptive_delay_s * 1.5, self._adaptive_delay_s + 0.2),
+                    )
+            elif 200 <= status < 400:
+                if self._adaptive_delay_s > 0.0:
+                    self._adaptive_healthy_streak += 1
+                    if self._adaptive_healthy_streak >= _ADAPTIVE_HEALTHY_STREAK_FOR_DECAY:
+                        decayed = self._adaptive_delay_s * _ADAPTIVE_DECAY_FACTOR
+                        if decayed < _ADAPTIVE_DECAY_FLOOR_S:
+                            self._adaptive_delay_s = 0.0
+                            self._adaptive_healthy_streak = 0
+                        else:
+                            self._adaptive_delay_s = decayed
 
     def _get_session(self) -> requests.Session:
         sess = getattr(self._thread_local, "session", None)
@@ -1109,12 +1375,14 @@ class AgenticHTTPClient:
         record_receipt: bool = True,
         save_session_as: str = "",
         out_cookies: dict[str, str] | None = None,
+        record_degradation: bool = True,
+        skip_adaptive_pacing: bool = False,
     ) -> dict[str, Any]:
         allowed, reason = self.budget.consume()
         if not allowed:
             raise BudgetExhaustedError(reason)
 
-        self._acquire_rate_limit_slot()
+        self._acquire_rate_limit_slot(skip_adaptive=skip_adaptive_pacing)
 
         wire_headers = dict(headers)
         if not any(k.lower() == "user-agent" for k in wire_headers):
@@ -1179,7 +1447,14 @@ class AgenticHTTPClient:
                 http_session.cookies.clear()
                 clean_save_alias = str(save_session_as or "").strip()
                 if clean_save_alias and clean_save_alias != "anon" and 200 <= status < 400:
-                    cap_cookies, cap_bearer, cap_refresh, cap_csrf = _extract_session_material_from_response(
+                    (
+                        cap_cookies,
+                        cap_bearer,
+                        cap_refresh,
+                        cap_csrf,
+                        cap_csrf_header,
+                        cap_csrf_field,
+                    ) = _extract_session_material_details(
                         headers=resp_headers,
                         cookies=cookies,
                         body_text=text,
@@ -1191,6 +1466,8 @@ class AgenticHTTPClient:
                             bearer_token=cap_bearer,
                             refresh_token=cap_refresh,
                             csrf_token=cap_csrf,
+                            csrf_header_name=cap_csrf_header,
+                            csrf_field_name=cap_csrf_field,
                         )
                         saved_session_meta = {
                             "alias": dyn.alias,
@@ -1209,10 +1486,14 @@ class AgenticHTTPClient:
                 resp.close()
         except Exception as exc:
             error = f"{type(exc).__name__}: {str(exc)[:200]}"
+        finally:
+            with self._rate_lock:
+                self._last_wire_at = float(self._monotonic_fn())
 
         elapsed_ms = (time.monotonic() - started) * 1000.0
         if not record_receipt:
-            self._record_degradation_status(status=int(status), url=str(url))
+            if record_degradation:
+                self._record_degradation_status(status=int(status), url=str(url))
             graphql_has_errors = False
             stripped_body = text.lstrip()
             if stripped_body.startswith("{"):
@@ -1245,12 +1526,12 @@ class AgenticHTTPClient:
             url=url,
             path=path,
             query=query,
-            request_headers=wire_headers,
+            request_headers=_redact_framework_csrf_headers(wire_headers),
             request_body=body_preview,
             status=status,
             elapsed_ms=elapsed_ms,
             content_type=content_type,
-            response_headers=resp_headers,
+            response_headers=_redact_framework_csrf_headers(resp_headers),
             redirect_location=redirect_location,
             raw_response_bytes=raw_bytes,
             response_text=text,
@@ -1262,8 +1543,73 @@ class AgenticHTTPClient:
             saved_session_meta["source_receipt_id"] = rec["receipt_id"]
             rec = dict(rec)
             rec["saved_session"] = saved_session_meta
-        self._record_degradation_status(status=int(status), url=str(url))
+        if record_degradation:
+            self._record_degradation_status(status=int(status), url=str(url))
         return rec
+
+    def _send_wire_with_rate_limit_retry(
+        self,
+        *,
+        actor: str,
+        method: str,
+        url: str,
+        path: str,
+        query: str,
+        headers: dict[str, str],
+        body_bytes: bytes | None,
+        body_preview: str,
+        save_session_as: str = "",
+        out_cookies: dict[str, str] | None = None,
+    ) -> dict[str, Any]:
+        """Send wire request with bounded 429/503 Retry-After backoff, adaptive pacing, and degradation accounting."""
+        receipt: dict[str, Any] = {}
+        for attempt in range(self.max_rate_limit_retries + 1):
+            receipt = self._send_wire(
+                actor=actor,
+                method=method,
+                url=url,
+                path=path,
+                query=query,
+                headers=headers,
+                body_bytes=body_bytes,
+                body_preview=body_preview,
+                save_session_as=save_session_as,
+                out_cookies=out_cookies,
+                record_degradation=False,
+                skip_adaptive_pacing=(attempt > 0),
+            )
+            status = int(receipt["status"])
+            retry_after_s = _parse_retry_after_seconds(
+                receipt.get("response_headers"),
+                max_retry_after_s=self.max_retry_after_s,
+            )
+            is_retryable = status == 429 or (status == 503 and retry_after_s is not None)
+            if is_retryable:
+                self._update_adaptive_pacing(status=status, retry_after_s=retry_after_s)
+            elif 200 <= status < 400:
+                self._update_adaptive_pacing(status=status, retry_after_s=None)
+            if (
+                not is_retryable
+                or attempt >= self.max_rate_limit_retries
+                or self._budget_remaining() <= 4
+            ):
+                break
+            if retry_after_s is not None:
+                delay_s = retry_after_s
+            else:
+                base_delay = _RATE_LIMIT_FALLBACK_BASE_S * (2 ** attempt)
+                delay_s = min(self.max_retry_after_s, base_delay * random.uniform(0.85, 1.15))
+            if self.deadline_monotonic is not None:
+                remaining_wall = self.deadline_monotonic - float(self._monotonic_fn())
+                if remaining_wall <= delay_s:
+                    break
+            if delay_s > 0.0:
+                self._sleep_fn(delay_s)
+            if out_cookies is not None:
+                out_cookies.clear()
+
+        self._record_degradation_status(status=int(receipt["status"]), url=str(url))
+        return receipt
 
     def _send_websocket_wire(
         self,
@@ -1349,14 +1695,16 @@ class AgenticHTTPClient:
             with session._lock:
                 already_auth = session.authenticated
                 refresh_tok = session.refresh_token
+                actor_refresh_path = session.refresh_path
                 login_payload = dict(session.login_payload)
                 login_graphql_query = session.login_graphql_query
             if already_auth and not force_login:
                 return True
             # Try refresh endpoint first if refresh_token exists and force_login was requested.
-            if force_login and refresh_tok and self.actors.refresh_path:
+            eff_refresh_path = actor_refresh_path or self.actors.refresh_path
+            if force_login and not self._refresh_already_attempted and refresh_tok and eff_refresh_path:
                 try:
-                    r_url, r_path, r_query = self.resolve_in_scope(self.actors.refresh_path)
+                    r_url, r_path, r_query = self.resolve_in_scope(eff_refresh_path, allow_websocket=False)
                     r_body = json.dumps({"refresh_token": refresh_tok}).encode("utf-8")
                     r_headers = session.build_headers("POST", {"Content-Type": "application/json"})
                     receipt = self._send_wire(
@@ -1375,6 +1723,7 @@ class AgenticHTTPClient:
                             session.last_auth_status = int(receipt["status"])
                             session.last_auth_path = r_path
                             session.last_auth_error = ""
+                            session.authenticated = True
                         return True
                 except (BudgetExhaustedError, ServiceDegradationError):
                     raise
@@ -1403,6 +1752,15 @@ class AgenticHTTPClient:
                 active_body_bytes = json.dumps(login_payload).encode("utf-8")
                 active_body_preview = json.dumps(redacted_vars)
 
+            def _build_form_login_bytes() -> bytes:
+                form_data = dict(login_payload)
+                with session._lock:
+                    c_tok = session.csrf_token
+                    c_field = session.csrf_field_name
+                if c_tok and c_field and c_field not in form_data:
+                    form_data[c_field] = c_tok
+                return urlencode(form_data).encode("utf-8")
+
             receipt = self._send_wire(
                 actor=alias,
                 method="POST",
@@ -1416,7 +1774,7 @@ class AgenticHTTPClient:
             )
             if not login_graphql_query and receipt["status"] in {400, 415}:
                 active_content_type = "application/x-www-form-urlencoded"
-                active_body_bytes = urlencode(login_payload).encode("utf-8")
+                active_body_bytes = _build_form_login_bytes()
                 active_body_preview = "<REDACTED_FORM_LOGIN>"
                 receipt = self._send_wire(
                     actor=alias,
@@ -1460,13 +1818,23 @@ class AgenticHTTPClient:
                         harvested = True
                         break
                 if harvested:
+                    retry_headers = session.build_headers("POST", {"Content-Type": active_content_type})
+                    with session._lock:
+                        if (
+                            session.csrf_token
+                            and session.csrf_header_name == "X-CSRFToken"
+                            and not session.csrf_field_name
+                        ):
+                            retry_headers.setdefault("X-CSRF-Token", session.csrf_token)
+                    if active_content_type == "application/x-www-form-urlencoded":
+                        active_body_bytes = _build_form_login_bytes()
                     receipt = self._send_wire(
                         actor=alias,
                         method="POST",
                         url=login_url,
                         path=login_path,
                         query=login_query,
-                        headers=session.build_headers("POST", {"Content-Type": active_content_type}),
+                        headers=retry_headers,
                         body_bytes=active_body_bytes,
                         body_preview=active_body_preview,
                         record_receipt=False,
@@ -1477,15 +1845,23 @@ class AgenticHTTPClient:
                         and receipt["status"] in {400, 415}
                     ):
                         active_content_type = "application/x-www-form-urlencoded"
-                        active_body_bytes = urlencode(login_payload).encode("utf-8")
+                        active_body_bytes = _build_form_login_bytes()
                         active_body_preview = "<REDACTED_FORM_LOGIN>"
+                        retry_form_headers = session.build_headers("POST", {"Content-Type": active_content_type})
+                        with session._lock:
+                            if (
+                                session.csrf_token
+                                and session.csrf_header_name == "X-CSRFToken"
+                                and not session.csrf_field_name
+                            ):
+                                retry_form_headers.setdefault("X-CSRF-Token", session.csrf_token)
                         receipt = self._send_wire(
                             actor=alias,
                             method="POST",
                             url=login_url,
                             path=login_path,
                             query=login_query,
-                            headers=session.build_headers("POST", {"Content-Type": active_content_type}),
+                            headers=retry_form_headers,
                             body_bytes=active_body_bytes,
                             body_preview=active_body_preview,
                             record_receipt=False,
@@ -1656,6 +2032,167 @@ class AgenticHTTPClient:
                 results[alias] = False
         return results
 
+    def _try_refresh_actor_session(self, alias: str) -> bool:
+        """Renew an expired authenticated actor session via refresh_path or fallback re-login."""
+        if not alias or alias == "anon":
+            return False
+        session = self.actors.get(alias)
+        with self._lock:
+            if self._in_session_refresh:
+                return False
+            self._in_session_refresh = True
+        try:
+            with self._auth_lock:
+                with session._lock:
+                    was_authenticated = bool(session.authenticated)
+                    refresh_tok = session.refresh_token
+                    actor_refresh_path = session.refresh_path
+                    has_password = bool(session.password)
+                if not was_authenticated:
+                    return False
+
+                attempted_step1_refresh = False
+                if refresh_tok and actor_refresh_path:
+                    attempted_step1_refresh = True
+                    try:
+                        r_url, r_path, r_query = self.resolve_in_scope(
+                            actor_refresh_path,
+                            allow_websocket=False,
+                        )
+                        r_body = json.dumps({"refresh_token": refresh_tok}).encode("utf-8")
+                        r_headers = session.build_headers("POST", {"Content-Type": "application/json"})
+                        r_receipt = self._send_wire(
+                            actor=alias,
+                            method="POST",
+                            url=r_url,
+                            path=r_path,
+                            query=r_query,
+                            headers=r_headers,
+                            body_bytes=r_body,
+                            body_preview='{"refresh_token":"<REDACTED>"}',
+                            record_receipt=False,
+                        )
+                        if 200 <= int(r_receipt["status"]) < 300:
+                            with session._lock:
+                                session.last_auth_status = int(r_receipt["status"])
+                                session.last_auth_path = r_path
+                                session.last_auth_error = ""
+                                session.authenticated = True
+                            return True
+                    except (BudgetExhaustedError, ServiceDegradationError):
+                        raise
+                    except Exception:
+                        pass
+
+                if has_password and self.actors.login_path:
+                    prev_skip = self._refresh_already_attempted
+                    self._refresh_already_attempted = attempted_step1_refresh
+                    try:
+                        return bool(self.authenticate_actor(alias, force_login=True))
+                    finally:
+                        self._refresh_already_attempted = prev_skip
+                return False
+        finally:
+            with self._lock:
+                self._in_session_refresh = False
+
+    def _auth_exempt_paths(self, actor_refresh_path: str = "") -> set[str]:
+        """Return normalized paths (login / refresh) that must never trigger mid-run auto-refresh."""
+        exempt: set[str] = set()
+        for raw_p in (self.actors.login_path, self.actors.refresh_path, actor_refresh_path):
+            clean = str(raw_p or "").strip()
+            if not clean:
+                continue
+            try:
+                _, norm_p, _ = self.resolve_in_scope(clean, allow_websocket=False)
+                exempt.add(norm_p.rstrip("/") or "/")
+            except ScopeViolationError:
+                parsed_p = urlsplit(clean).path or "/"
+                exempt.add(parsed_p.rstrip("/") or "/")
+        return exempt
+
+    @staticmethod
+    def _prepare_request_body(
+        *,
+        norm_method: str,
+        session: ActorSession,
+        extra_headers: dict[str, str],
+        has_auth_override: bool,
+        has_files: bool,
+        files: Sequence[dict[str, Any]] | None,
+        json_body: Any,
+        form_body: dict[str, Any] | None,
+        raw_body: str | None,
+    ) -> tuple[bytes | None, str, dict[str, str]]:
+        """Encode request body without mutating caller dicts, injecting CSRF form fields when appropriate."""
+        eff_headers = dict(extra_headers)
+        with session._lock:
+            csrf_tok = session.csrf_token
+            csrf_field = session.csrf_field_name
+            base_ct = next(
+                (v for k, v in session.base_headers.items() if k.lower() == "content-type"),
+                "",
+            )
+        should_inject_csrf = (
+            norm_method in _MUTATING_METHODS
+            and bool(csrf_tok and csrf_field)
+            and not has_auth_override
+        )
+
+        body_bytes: bytes | None = None
+        body_preview = ""
+        if has_files:
+            assert files is not None
+            if json_body is not None or raw_body is not None:
+                raise ValueError("files cannot be combined with json_body or raw_body")
+            eff_form_fields: Any = form_body
+            if should_inject_csrf:
+                if form_body is None:
+                    eff_form_fields = {csrf_field: csrf_tok}
+                elif isinstance(form_body, dict):
+                    eff_form_fields = dict(form_body)
+                    if not any(str(k) == csrf_field for k in eff_form_fields):
+                        eff_form_fields[csrf_field] = csrf_tok
+            body_bytes, multipart_ct, body_preview = _encode_multipart_form_data(
+                files,
+                form_fields=eff_form_fields,
+            )
+            if not any(k.lower() == "content-type" for k in eff_headers):
+                eff_headers["Content-Type"] = multipart_ct
+        elif json_body is not None:
+            body_preview = json.dumps(json_body, ensure_ascii=False)
+            body_bytes = body_preview.encode("utf-8")
+            if not any(k.lower() == "content-type" for k in eff_headers):
+                eff_headers["Content-Type"] = "application/json"
+        elif form_body is not None:
+            eff_form = {str(k): str(v) for k, v in form_body.items()}
+            if should_inject_csrf and csrf_field not in eff_form:
+                eff_form[csrf_field] = csrf_tok
+            body_preview = urlencode(eff_form)
+            body_bytes = body_preview.encode("utf-8")
+            if not any(k.lower() == "content-type" for k in eff_headers):
+                eff_headers["Content-Type"] = "application/x-www-form-urlencoded"
+        elif raw_body is not None:
+            body_preview = str(raw_body)
+            explicit_ct = next(
+                (v for k, v in eff_headers.items() if k.lower() == "content-type"),
+                base_ct,
+            )
+            media_type = str(explicit_ct or "").split(";", 1)[0].strip().lower()
+            if should_inject_csrf and media_type == "application/x-www-form-urlencoded":
+                existing_keys = {k for k, _ in parse_qsl(body_preview, keep_blank_values=True)}
+                if csrf_field not in existing_keys:
+                    csrf_pair = urlencode([(csrf_field, csrf_tok)])
+                    if not body_preview:
+                        body_preview = csrf_pair
+                    elif body_preview.endswith("&"):
+                        body_preview = f"{body_preview}{csrf_pair}"
+                    else:
+                        body_preview = f"{body_preview}&{csrf_pair}"
+            body_bytes = body_preview.encode("utf-8")
+
+        return body_bytes, body_preview, eff_headers
+
     def _refresh_csrf_from_session(self, alias: str) -> None:
         session = self.actors.get(alias)
         if alias == "anon" or not self.actors.session_check_path:
@@ -1787,37 +2324,23 @@ class AgenticHTTPClient:
                 raise ValueError("files must be a list of file objects")
             has_files = len(files) > 0
 
-        body_bytes: bytes | None = None
-        body_preview = ""
-        if has_files:
-            assert files is not None
-            if json_body is not None or raw_body is not None:
-                raise ValueError("files cannot be combined with json_body or raw_body")
-            body_bytes, multipart_ct, body_preview = _encode_multipart_form_data(
-                files,
-                form_fields=form_body,
-            )
-            if not any(k.lower() == "content-type" for k in extra_headers):
-                extra_headers["Content-Type"] = multipart_ct
-        elif json_body is not None:
-            body_preview = json.dumps(json_body, ensure_ascii=False)
-            body_bytes = body_preview.encode("utf-8")
-            if not any(k.lower() == "content-type" for k in extra_headers):
-                extra_headers["Content-Type"] = "application/json"
-        elif form_body is not None:
-            body_preview = urlencode({str(k): str(v) for k, v in form_body.items()})
-            body_bytes = body_preview.encode("utf-8")
-            if not any(k.lower() == "content-type" for k in extra_headers):
-                extra_headers["Content-Type"] = "application/x-www-form-urlencoded"
-        elif raw_body is not None:
-            body_preview = str(raw_body)
-            body_bytes = body_preview.encode("utf-8")
+        body_bytes, body_preview, eff_extra_headers = self._prepare_request_body(
+            norm_method=norm_method,
+            session=session,
+            extra_headers=extra_headers,
+            has_auth_override=has_auth_override,
+            has_files=has_files,
+            files=files,
+            json_body=json_body,
+            form_body=form_body,
+            raw_body=raw_body,
+        )
 
         cache_key = (
             actor,
             norm_method,
             _canonical_url(clean_url),
-            tuple(sorted((k.lower(), v) for k, v in extra_headers.items())),
+            tuple(sorted((k.lower(), v) for k, v in eff_extra_headers.items())),
             bool(follow_redirects),
         )
         if norm_method in {"GET", "HEAD"} and not force and not save_session_as:
@@ -1828,9 +2351,9 @@ class AgenticHTTPClient:
                     result["cached"] = True
                     return result
 
-        req_headers = session.build_headers(norm_method, extra_headers)
+        req_headers = session.build_headers(norm_method, eff_extra_headers)
         hop_cookies: dict[str, str] = {}
-        receipt = self._send_wire(
+        receipt = self._send_wire_with_rate_limit_retry(
             actor=actor,
             method=norm_method,
             url=clean_url,
@@ -1843,12 +2366,33 @@ class AgenticHTTPClient:
             out_cookies=hop_cookies if follow_redirects else None,
         )
 
-        # Auto re-auth once on 401 when not testing explicit auth header overrides.
-        if receipt["status"] == 401 and actor != "anon" and not has_auth_override and path != self.actors.login_path:
-            if self.authenticate_actor(actor, force_login=True):
-                req_headers = session.build_headers(norm_method, extra_headers)
+        # Auto mid-run session refresh / re-login once on unexpected 401 when not overriding auth.
+        with session._lock:
+            actor_refresh_path = session.refresh_path
+        auth_exempt_paths = self._auth_exempt_paths(actor_refresh_path)
+        norm_req_path = path.rstrip("/") or "/"
+        if (
+            receipt["status"] == 401
+            and actor != "anon"
+            and not has_auth_override
+            and not save_session_as
+            and norm_req_path not in auth_exempt_paths
+        ):
+            if self._try_refresh_actor_session(actor):
+                body_bytes, body_preview, eff_extra_headers = self._prepare_request_body(
+                    norm_method=norm_method,
+                    session=session,
+                    extra_headers=extra_headers,
+                    has_auth_override=has_auth_override,
+                    has_files=has_files,
+                    files=files,
+                    json_body=json_body,
+                    form_body=form_body,
+                    raw_body=raw_body,
+                )
+                req_headers = session.build_headers(norm_method, eff_extra_headers)
                 hop_cookies.clear()
-                receipt = self._send_wire(
+                receipt = self._send_wire_with_rate_limit_retry(
                     actor=actor,
                     method=norm_method,
                     url=clean_url,
@@ -1860,8 +2404,8 @@ class AgenticHTTPClient:
                     out_cookies=hop_cookies if follow_redirects else None,
                 )
 
-        # Auto CSRF refresh once on mutating 403 mentioning CSRF when caller didn't override X-CSRF-Token.
-        has_csrf_override = any(k.lower() == "x-csrf-token" for k in extra_headers)
+        # Auto CSRF refresh once on mutating 403 mentioning CSRF when caller didn't override a CSRF header.
+        has_csrf_override = any(k.lower() in _CSRF_HEADER_NAMES for k in extra_headers)
         if (
             receipt["status"] == 403
             and norm_method in _MUTATING_METHODS
@@ -1870,30 +2414,20 @@ class AgenticHTTPClient:
             and "csrf" in (receipt.get("body") or "").lower()
         ):
             self._refresh_csrf_from_session(actor)
-            req_headers = session.build_headers(norm_method, extra_headers)
-            hop_cookies.clear()
-            receipt = self._send_wire(
-                actor=actor,
-                method=norm_method,
-                url=clean_url,
-                path=path,
-                query=norm_query,
-                headers=req_headers,
-                body_bytes=body_bytes,
-                body_preview=body_preview,
-                out_cookies=hop_cookies if follow_redirects else None,
+            body_bytes, body_preview, eff_extra_headers = self._prepare_request_body(
+                norm_method=norm_method,
+                session=session,
+                extra_headers=extra_headers,
+                has_auth_override=has_auth_override,
+                has_files=has_files,
+                files=files,
+                json_body=json_body,
+                form_body=form_body,
+                raw_body=raw_body,
             )
-
-        # Polite bounded single retry on HTTP 429 if budget has headroom.
-        if receipt["status"] == 429 and self._budget_remaining() > 4:
-            retry_after_raw = receipt.get("response_headers", {}).get("Retry-After", "1")
-            try:
-                delay_s = min(max(0.2, float(retry_after_raw)), 3.0)
-            except ValueError:
-                delay_s = 1.0
-            self._sleep_fn(delay_s)
+            req_headers = session.build_headers(norm_method, eff_extra_headers)
             hop_cookies.clear()
-            receipt = self._send_wire(
+            receipt = self._send_wire_with_rate_limit_retry(
                 actor=actor,
                 method=norm_method,
                 url=clean_url,
@@ -1911,7 +2445,7 @@ class AgenticHTTPClient:
             cur_url = clean_url
             cur_body_bytes = body_bytes
             cur_body_preview = body_preview
-            cur_extra_headers = dict(extra_headers)
+            cur_extra_headers = dict(eff_extra_headers)
             for _ in range(_MAX_REDIRECTS):
                 status_code = int(receipt["status"])
                 location = str(receipt.get("redirect_location") or "").strip()
@@ -1966,7 +2500,7 @@ class AgenticHTTPClient:
                 if hop_cookies:
                     hop_headers = self._merge_hop_cookies(hop_headers, hop_cookies)
                 new_hop_cookies: dict[str, str] = {}
-                receipt = self._send_wire(
+                receipt = self._send_wire_with_rate_limit_retry(
                     actor=actor,
                     method=cur_method,
                     url=next_url,
