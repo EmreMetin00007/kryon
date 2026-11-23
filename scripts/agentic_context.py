@@ -433,12 +433,14 @@ def _sanitize_untrusted_blocks(content: str) -> str:
 
 
 def _sanitize_messages_for_http400(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Return a deep copy of messages with untrusted tool response blocks sanitized for HTTP 400 recovery."""
+    """Return a deep copy of messages with untrusted tool blocks and assistant reasoning_content stripped for HTTP 400 recovery."""
     sanitized: list[dict[str, Any]] = []
     for msg in messages:
         item = copy.deepcopy(msg)
         if item.get("role") == "tool" and isinstance(item.get("content"), str):
             item["content"] = _sanitize_untrusted_blocks(item["content"])
+        elif item.get("role") == "assistant":
+            item.pop("reasoning_content", None)
         sanitized.append(item)
     return sanitized
 
@@ -652,6 +654,14 @@ def _turn_cutoff_index(messages: list[dict[str, Any]], keep_recent_turns: int) -
     return 2
 
 
+def _compact_assistant_message(item: dict[str, Any]) -> None:
+    """Drop stale reasoning chains and trim long assistant prose during context compaction."""
+    item.pop("reasoning_content", None)
+    content = item.get("content")
+    if isinstance(content, str) and len(content) > 160:
+        item["content"] = content[:120].rstrip() + " ...[trimmed]"
+
+
 def compact_messages_for_context(
     messages: list[dict[str, Any]],
     *,
@@ -681,8 +691,8 @@ def compact_messages_for_context(
             if 2 <= idx < cutoff:
                 if role == "tool" and isinstance(content, str):
                     item["content"] = _collapse_tool_content(content)
-                elif role == "assistant" and isinstance(content, str) and len(content) > 160:
-                    item["content"] = content[:120].rstrip() + " ...[trimmed]"
+                elif role == "assistant":
+                    _compact_assistant_message(item)
             elif (
                 max_recent_tool_chars is not None
                 and idx >= cutoff
@@ -725,8 +735,8 @@ def compact_messages_for_context(
                     item["content"] = content
                 if role == "tool" and isinstance(content, str):
                     item["content"] = _collapse_tool_content(content)
-                elif role == "assistant" and isinstance(content, str) and len(content) > 160:
-                    item["content"] = content[:120].rstrip() + " ...[trimmed]"
+                elif role == "assistant":
+                    _compact_assistant_message(item)
                 compacted.append(item)
 
     for g_idx, group in enumerate(recent_groups):
@@ -742,10 +752,10 @@ def compact_messages_for_context(
 
             # Keep the last 2-3 turns (`recent_groups`) readable/verbatim so multi-turn comparisons
             # (e.g. SQLi/XSS/BOLA proof vs control across consecutive turns) never lose their body!
-            if role == "assistant" and isinstance(content, str) and len(content) > 160 and (
+            if role == "assistant" and (
                 not is_latest_turn or max_recent_tool_chars is not None
             ):
-                item["content"] = content[:120].rstrip() + " ...[trimmed]"
+                _compact_assistant_message(item)
             elif (
                 role == "tool"
                 and isinstance(content, str)

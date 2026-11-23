@@ -82,6 +82,22 @@ from full_agent_budget import BudgetError, SharedBudget, compact_tools
 from full_agent_provider import MeteredProviderTransport, SessionGate
 
 
+def _build_assistant_history_entry(msg: dict[str, Any]) -> dict[str, Any]:
+    """Build an assistant message dict, preserving non-empty reasoning_content across tool-call turns."""
+    content = msg.get("content")
+    tool_calls = msg.get("tool_calls") or []
+    entry: dict[str, Any] = {
+        "role": "assistant",
+        "content": content if content is not None else "",
+    }
+    if tool_calls:
+        entry["tool_calls"] = tool_calls
+        reasoning_content = msg.get("reasoning_content")
+        if isinstance(reasoning_content, str) and reasoning_content:
+            entry["reasoning_content"] = reasoning_content
+    return entry
+
+
 class AgenticInvestigator:
     """ReAct tool-calling security investigator backed by MeteredProviderTransport."""
 
@@ -620,7 +636,7 @@ class AgenticInvestigator:
                     break
 
         headroom = avail - (serialized_bytes + _FRAMING_RESERVE_TOKENS)
-        max_out = min(2048, max(256, headroom)) if headroom > 0 else 2048
+        max_out = min(8192, max(256, headroom)) if headroom > 0 else 2048
         body: dict[str, Any] = {
             "model": model_override or self._active_model,
             "messages": chosen_msgs,
@@ -1073,14 +1089,7 @@ class AgenticInvestigator:
                     choice = (resp.get("choices") or [{}])[0]
                     msg = choice.get("message") or {}
                     tool_calls = msg.get("tool_calls") or []
-                    content = msg.get("content")
-                    assistant_entry: dict[str, Any] = {
-                        "role": "assistant",
-                        "content": content if content is not None else "",
-                    }
-                    if tool_calls:
-                        assistant_entry["tool_calls"] = tool_calls
-                    worker_messages.append(assistant_entry)
+                    worker_messages.append(_build_assistant_history_entry(msg))
 
                     if not tool_calls:
                         stop_reason = "no_signal"
@@ -1497,16 +1506,7 @@ class AgenticInvestigator:
                 choice = (resp.get("choices") or [{}])[0]
                 msg = choice.get("message") or {}
                 tool_calls = msg.get("tool_calls") or []
-                content = msg.get("content")
-
-                assistant_entry: dict[str, Any] = {"role": "assistant"}
-                if content is not None:
-                    assistant_entry["content"] = content
-                else:
-                    assistant_entry["content"] = ""
-                if tool_calls:
-                    assistant_entry["tool_calls"] = tool_calls
-                messages.append(assistant_entry)
+                messages.append(_build_assistant_history_entry(msg))
 
                 if tool_calls:
                     cur_shard_tokens = _shard_tokens_used()

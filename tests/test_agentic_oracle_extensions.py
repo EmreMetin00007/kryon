@@ -1054,3 +1054,387 @@ def test_jwt_weakness_input_diff_and_redacted_auth_override_verification(tmp_pat
     finally:
         client.close()
         _stop_server(srv)
+
+
+def test_chained_redacted_auth_override_verification_and_guards(tmp_path: Path) -> None:
+    forged_admin_jwt = "eyJhbGciOiJub25lIiwidHlwIjoiSldUIn0.eyJzdWIiOiJhZG1pbiIsInJvbGUiOiJhZG1pbiJ9."
+    custom_auth_token = "forged-x-auth-token-admin-999"
+    token_active = {"alice_valid": True}
+
+    class _GatedChainHandler(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def log_message(self, *_args: object) -> None:
+            return
+
+        def _send_json(self, status: int, obj: Any) -> None:
+            payload = json.dumps(obj).encode("utf-8")
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.wfile.write(payload)
+
+        def _is_forged_admin(self) -> bool:
+            return (
+                self.headers.get("Authorization", "") == f"Bearer {forged_admin_jwt}"
+                or self.headers.get("X-Auth-Token", "") == custom_auth_token
+            )
+
+        def do_POST(self) -> None:
+            parsed = urlsplit(self.path)
+            raw_len = int(self.headers.get("Content-Length") or "0")
+            raw_body = self.rfile.read(raw_len).decode("utf-8", errors="replace") if raw_len > 0 else ""
+            data = json.loads(raw_body) if raw_body else {}
+
+            if parsed.path in {"/api/admin/ssti", "/api/admin/ssti-decoy"}:
+                if not self._is_forged_admin():
+                    self._send_json(401, {"error": "admin_token_required"})
+                    return
+                tpl = str(data.get("template") or "")
+                if parsed.path == "/api/admin/ssti-decoy":
+                    self._send_json(200, {"rendered": "STATIC_TEMPLATE_OK"})
+                    return
+                rendered = "49" if "{{7*7}}" in tpl else f"ok:{tpl}"
+                self._send_json(200, {"rendered": rendered})
+                return
+
+            if parsed.path == "/api/admin/bfla-action":
+                auth = self.headers.get("Authorization", "")
+                if auth == "Bearer tok-admin" or self._is_forged_admin():
+                    self._send_json(200, {"action": "executed", "marker": "ADMIN_ACTION_OK"})
+                else:
+                    self._send_json(403, {"error": "forbidden_admin_only"})
+                return
+
+            self._send_json(404, {"error": "not_found"})
+
+        def do_GET(self) -> None:
+            parsed = urlsplit(self.path)
+            qs = parse_qs(parsed.query)
+            auth = self.headers.get("Authorization", "")
+
+            if parsed.path == "/api/admin/bypass":
+                if self._is_forged_admin():
+                    self._send_json(200, {"role": "admin", "secret": "ADMIN_BYPASS_SECRET_77"})
+                elif auth == "Bearer tok-alice":
+                    self._send_json(403, {"error": "forbidden_member"})
+                else:
+                    self._send_json(401, {"error": "unauthorized"})
+                return
+
+            if parsed.path == "/api/admin/sqli-read":
+                if not self._is_forged_admin():
+                    self._send_json(401, {"error": "admin_token_required"})
+                    return
+                q = (qs.get("sort") or [""])[0]
+                if "UNION" in q.upper():
+                    self._send_json(200, {"rows": ["SQLI_EXTRACTED_SECRET_42"]})
+                else:
+                    self._send_json(200, {"rows": ["row-1", "row-2"]})
+                return
+
+            if parsed.path == "/api/admin/oob-fetch":
+                if not self._is_forged_admin():
+                    self._send_json(401, {"error": "admin_token_required"})
+                    return
+                target_url = (qs.get("url") or [""])[0]
+                if target_url.startswith("http://127.0.0.1:"):
+                    try:
+                        requests.get(target_url, timeout=2.0)
+                    except Exception:
+                        pass
+                self._send_json(200, {"status": "fetched"})
+                return
+
+            if parsed.path == "/api/admin/debug-info":
+                if not self._is_forged_admin():
+                    self._send_json(401, {"error": "admin_token_required"})
+                    return
+                mode = (qs.get("mode") or ["basic"])[0]
+                if mode == "full":
+                    self._send_json(200, {"dump": "INTERNAL_DEBUG_SECRET_99"})
+                else:
+                    self._send_json(200, {"status": "ok"})
+                return
+
+            if parsed.path == "/api/orders/bob-1":
+                if auth == "Bearer tok-bob" or self._is_forged_admin():
+                    self._send_json(200, {"id": "bob-1", "owner": "bob", "tenant": "beta", "secret": "BOB_ORDER_SECRET"})
+                else:
+                    self._send_json(403, {"error": "forbidden_cross_tenant"})
+                return
+
+            if parsed.path == "/api/member/profile":
+                if auth == "Bearer tok-alice" and token_active["alice_valid"]:
+                    q = (qs.get("name") or ["alice"])[0]
+                    self._send_json(200, {"profile": q})
+                else:
+                    self._send_json(401, {"error": "expired"})
+                return
+
+            self._send_json(404, {"error": "not_found"})
+
+    base_url, srv = _start_server(_GatedChainHandler)
+    oob = LoopbackCallbackServer().start()
+    accounts = [
+        {"alias": "alice", "role": "member", "tenant": "alpha", "auth_header": "Bearer tok-alice"},
+        {"alias": "bob", "role": "member", "tenant": "beta", "auth_header": "Bearer tok-bob"},
+        {"alias": "admin-user", "role": "admin", "tenant": "alpha", "auth_header": "Bearer tok-admin"},
+    ]
+    store, _, client, oracle = _make_oracle_env(tmp_path, base_url, accounts=accounts, oob_server=oob)
+    actor_meta = {
+        "alice": {"role": "member", "tenant": "alpha"},
+        "bob": {"role": "member", "tenant": "beta"},
+        "admin-user": {"role": "admin", "tenant": "alpha"},
+    }
+    try:
+        # 1. Positive chained SSTI on admin-gated endpoint via forged Authorization + 200 benign control.
+        ssti_proof = client.request(
+            method="POST",
+            url="/api/admin/ssti",
+            actor="alice",
+            headers={"Authorization": f"Bearer {forged_admin_jwt}"},
+            json_body={"template": "{{7*7}}"},
+        )
+        ssti_benign_ctrl = client.request(
+            method="POST",
+            url="/api/admin/ssti",
+            actor="alice",
+            headers={"Authorization": f"Bearer {forged_admin_jwt}"},
+            json_body={"template": "VG-BENIGN-TEMPLATE"},
+        )
+        unauth_401_ctrl = client.request(
+            method="POST",
+            url="/api/admin/ssti",
+            actor="anon",
+            json_body={"template": "{{7*7}}"},
+        )
+        assert ssti_proof["status"] == 200
+        assert "<REDACTED:" in ssti_proof["request_headers"]["Authorization"]
+        assert ssti_benign_ctrl["status"] == 200
+        assert unauth_401_ctrl["status"] == 401
+
+        v_ssti_ok = oracle.verify(
+            canonical_class="ssti",
+            primary_proof=ssti_proof,
+            proof_receipts=[ssti_proof],
+            control_receipts=[ssti_benign_ctrl],
+            evidence_value="49",
+        )
+        assert v_ssti_ok.verified is True
+        assert v_ssti_ok.verdict == "VERIFIED"
+        assert v_ssti_ok.stages["stage1_control"] == "passed"
+        assert v_ssti_ok.stages["stage2_diff"] == "passed"
+        assert v_ssti_ok.stages["stage3_clean_replay"] == "passed_redacted_auth_override"
+
+        # 2. Negative guard: SSTI with overridden Authorization + ONLY a 401 unauthenticated control -> REFUTED!
+        v_ssti_401_only = oracle.verify(
+            canonical_class="ssti",
+            primary_proof=ssti_proof,
+            proof_receipts=[ssti_proof],
+            control_receipts=[unauth_401_ctrl],
+            evidence_value="49",
+        )
+        assert v_ssti_401_only.verified is False
+        assert v_ssti_401_only.verdict == "REFUTED"
+        assert v_ssti_401_only.stages["stage3_clean_replay"] == "failed_status_401"
+
+        # 3. Negative deception guard: SSTI behind overridden Authorization where 200 control returns identical output.
+        decoy_proof = client.request(
+            method="POST",
+            url="/api/admin/ssti-decoy",
+            actor="alice",
+            headers={"Authorization": f"Bearer {forged_admin_jwt}"},
+            json_body={"template": "{{7*7}}"},
+        )
+        decoy_ctrl = client.request(
+            method="POST",
+            url="/api/admin/ssti-decoy",
+            actor="alice",
+            headers={"Authorization": f"Bearer {forged_admin_jwt}"},
+            json_body={"template": "VG-BENIGN-TEMPLATE"},
+        )
+        v_ssti_decoy = oracle.verify(
+            canonical_class="ssti",
+            primary_proof=decoy_proof,
+            proof_receipts=[decoy_proof],
+            control_receipts=[decoy_ctrl],
+            evidence_value="STATIC_TEMPLATE_OK",
+        )
+        assert v_ssti_decoy.verified is False
+        assert v_ssti_decoy.verdict == "DECEPTION_DETECTED"
+        assert v_ssti_decoy.stages["stage1_control"] == "deception_identical_control"
+
+        # 4. Positive chained auth_bypass via overridden redacted Authorization header + 401/403 controls.
+        bypass_proof = client.request(
+            method="GET",
+            url="/api/admin/bypass",
+            actor="alice",
+            headers={"Authorization": f"Bearer {forged_admin_jwt}"},
+        )
+        bypass_ctrl_403 = client.request(method="GET", url="/api/admin/bypass", actor="alice")
+        bypass_ctrl_401 = client.request(method="GET", url="/api/admin/bypass", actor="anon")
+        assert bypass_proof["status"] == 200
+        assert bypass_ctrl_403["status"] == 403
+        assert bypass_ctrl_401["status"] == 401
+        v_bypass = oracle.verify(
+            canonical_class="auth_bypass",
+            primary_proof=bypass_proof,
+            proof_receipts=[bypass_proof],
+            control_receipts=[bypass_ctrl_401, bypass_ctrl_403],
+            evidence_value="ADMIN_BYPASS_SECRET_77",
+        )
+        assert v_bypass.verified is True
+        assert v_bypass.verdict == "VERIFIED"
+        assert v_bypass.stages["stage3_clean_replay"] == "passed_redacted_auth_override"
+
+        # 5. Custom X-Auth-Token override works for sqli_read and 'other' with 2xx baseline, while 401-only fails.
+        sqli_proof = client.request(
+            method="GET",
+            url="/api/admin/sqli-read?sort=id UNION SELECT secret",
+            actor="alice",
+            headers={"X-Auth-Token": custom_auth_token},
+        )
+        sqli_ctrl = client.request(
+            method="GET",
+            url="/api/admin/sqli-read?sort=id",
+            actor="alice",
+            headers={"X-Auth-Token": custom_auth_token},
+        )
+        assert "<REDACTED:" in sqli_proof["request_headers"]["X-Auth-Token"]
+        v_sqli = oracle.verify(
+            canonical_class="sqli_read",
+            primary_proof=sqli_proof,
+            proof_receipts=[sqli_proof],
+            control_receipts=[sqli_ctrl],
+            evidence_value="SQLI_EXTRACTED_SECRET_42",
+        )
+        assert v_sqli.verified is True
+        assert v_sqli.stages["stage3_clean_replay"] == "passed_redacted_auth_override"
+
+        other_proof = client.request(
+            method="GET",
+            url="/api/admin/debug-info?mode=full",
+            actor="alice",
+            headers={"X-Auth-Token": custom_auth_token},
+        )
+        other_ctrl_200 = client.request(
+            method="GET",
+            url="/api/admin/debug-info?mode=basic",
+            actor="alice",
+            headers={"X-Auth-Token": custom_auth_token},
+        )
+        other_ctrl_401 = client.request(method="GET", url="/api/admin/debug-info?mode=full", actor="anon")
+        v_other_ok = oracle.verify(
+            canonical_class="other",
+            primary_proof=other_proof,
+            proof_receipts=[other_proof],
+            control_receipts=[other_ctrl_200],
+            evidence_value="INTERNAL_DEBUG_SECRET_99",
+        )
+        assert v_other_ok.verified is True
+        assert v_other_ok.stages["stage3_clean_replay"] == "passed_redacted_auth_override"
+
+        v_other_401 = oracle.verify(
+            canonical_class="other",
+            primary_proof=other_proof,
+            proof_receipts=[other_proof],
+            control_receipts=[other_ctrl_401],
+            evidence_value="INTERNAL_DEBUG_SECRET_99",
+        )
+        assert v_other_401.verified is False
+        assert v_other_401.stages["stage3_clean_replay"] == "failed_status_401"
+
+        # 6. OOB-verified GET SSRF behind overridden Authorization header verifies cleanly.
+        tok_ssrf = oob.create_token(label="gated-ssrf")
+        ssrf_proof = client.request(
+            method="GET",
+            url=f"/api/admin/oob-fetch?url={tok_ssrf['url']}",
+            actor="alice",
+            headers={"Authorization": f"Bearer {forged_admin_jwt}"},
+        )
+        assert oob.poll(tok_ssrf["token"])["hit_count"] == 1
+        v_ssrf_oob = oracle.verify(
+            canonical_class="ssrf",
+            primary_proof=ssrf_proof,
+            proof_receipts=[ssrf_proof],
+            control_receipts=[],
+            evidence_value=tok_ssrf["token"],
+        )
+        assert v_ssrf_oob.verified is True
+        assert v_ssrf_oob.stages["stage1_control"] == "passed_oob_callback"
+        assert v_ssrf_oob.stages["stage3_clean_replay"] == "passed_redacted_auth_override"
+
+        # 7. BFLA and BOLA safety guards: forged auth overrides must NOT verify BFLA or BOLA when
+        #    the actor's own session receives 403 on clean replay, nor bypass BFLA admin check.
+        bfla_admin_200 = client.request(method="POST", url="/api/admin/bfla-action", actor="admin-user", json_body={})
+        v_bfla_admin = oracle.verify(
+            canonical_class="bfla",
+            primary_proof=bfla_admin_200,
+            proof_receipts=[bfla_admin_200],
+            control_receipts=[bypass_ctrl_403],
+            evidence_value="ADMIN_ACTION_OK",
+            actor_meta_map=actor_meta,
+        )
+        assert v_bfla_admin.verified is False
+        assert v_bfla_admin.stages["stage2_diff"] == "failed_admin_actor_for_bfla"
+
+        bfla_forged = client.request(
+            method="POST",
+            url="/api/admin/bfla-action",
+            actor="alice",
+            headers={"Authorization": f"Bearer {forged_admin_jwt}"},
+            json_body={},
+        )
+        v_bfla_forged = oracle.verify(
+            canonical_class="bfla",
+            primary_proof=bfla_forged,
+            proof_receipts=[bfla_forged],
+            control_receipts=[bfla_admin_200],
+            evidence_value="ADMIN_ACTION_OK",
+            actor_meta_map=actor_meta,
+        )
+        assert v_bfla_forged.verified is False
+        assert v_bfla_forged.verdict == "REFUTED"
+        assert v_bfla_forged.stages["stage3_clean_replay"] == "failed_status_403"
+
+        bob_owner_200 = client.request(method="GET", url="/api/orders/bob-1", actor="bob")
+        alice_forged_bola = client.request(
+            method="GET",
+            url="/api/orders/bob-1",
+            actor="alice",
+            headers={"Authorization": f"Bearer {forged_admin_jwt}"},
+        )
+        v_bola_forged = oracle.verify(
+            canonical_class="bola",
+            primary_proof=alice_forged_bola,
+            proof_receipts=[alice_forged_bola],
+            control_receipts=[bob_owner_200],
+            evidence_value="BOB_ORDER_SECRET",
+            actor_meta_map=actor_meta,
+        )
+        assert v_bola_forged.verified is False
+        assert v_bola_forged.verdict == "REFUTED"
+        assert v_bola_forged.stages["stage3_clean_replay"] == "failed_status_403"
+
+        # 8. Negative non-overridden session guard: normal alice token that later expires (401 on replay)
+        #    must NOT trigger passed_redacted_auth_override.
+        normal_proof = client.request(method="GET", url="/api/member/profile?name=ALICE_SECRET", actor="alice")
+        normal_ctrl = client.request(method="GET", url="/api/member/profile?name=benign", actor="alice")
+        token_active["alice_valid"] = False
+        v_expired = oracle.verify(
+            canonical_class="reflected_xss",
+            primary_proof=normal_proof,
+            proof_receipts=[normal_proof],
+            control_receipts=[normal_ctrl],
+            evidence_value="ALICE_SECRET",
+        )
+        assert v_expired.verified is False
+        assert v_expired.verdict == "REFUTED"
+        assert v_expired.stages["stage3_clean_replay"] == "failed_status_401"
+    finally:
+        oob.close()
+        client.close()
+        _stop_server(srv)

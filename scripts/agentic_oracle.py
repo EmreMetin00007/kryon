@@ -413,6 +413,15 @@ def _cors_header_signature(receipt: dict[str, Any]) -> tuple[str, str]:
     return acao, acac
 
 
+_OVERRIDDEN_AUTH_HEADERS = frozenset({
+    "authorization",
+    "proxy-authorization",
+    "cookie",
+    "x-auth-token",
+    "x-api-key",
+})
+
+
 def _has_overridden_redacted_auth_header(
     receipt: dict[str, Any],
     session_obj: Any,
@@ -430,10 +439,76 @@ def _has_overridden_redacted_auth_header(
     for k, v in req_headers.items():
         lk = str(k).strip().lower()
         val = str(v or "")
-        if lk in {"authorization", "cookie", "x-auth-token", "x-api-key"} and "<REDACTED" in val:
+        if lk in _OVERRIDDEN_AUTH_HEADERS and "<REDACTED" in val:
+            if val == redact_header_value(lk, ""):
+                continue
             if session_redacted.get(lk, "") != val:
                 return True
     return False
+
+
+def _can_accept_redacted_auth_override(
+    *,
+    canonical_class: str,
+    replay_target: dict[str, Any],
+    diff_controls: Sequence[dict[str, Any]],
+    eff_controls: Sequence[dict[str, Any]],
+    is_oob_verified: bool,
+    evidence_value: str,
+    ev_in_oob: bool,
+    p_status: int,
+    p_masked: str,
+    p_loc: str,
+    p_cors_sig: tuple[str, str],
+) -> bool:
+    """Return True if a 401/403 clean replay with an overridden redacted auth header may verify."""
+    if canonical_class in {"jwt_weakness", "auth_bypass"}:
+        return True
+    # Authorization-boundary classes test the actor's own session; a 401/403 clean replay
+    # with an overridden auth header means the actor's real session was properly denied.
+    if canonical_class in {"bola", "bfla", "tenant_isolation"}:
+        return False
+
+    baseline_controls = (
+        diff_controls
+        if (canonical_class in _INPUT_DIFF_CLASSES and not is_oob_verified)
+        else eff_controls
+    )
+    if is_oob_verified:
+        has_valid_baseline = True
+    elif canonical_class in _INPUT_DIFF_CLASSES:
+        has_valid_baseline = any(
+            200 <= int(c.get("status") or 0) < 300
+            and (
+                int(c.get("status") or 0) != p_status
+                or mask_dynamic_fields(str(c.get("body") or ""), preserve_values=(evidence_value,)) != p_masked
+                or urlsplit(str(c.get("redirect_location") or "")).netloc != urlsplit(p_loc).netloc
+                or (
+                    canonical_class == "cors_misconfiguration"
+                    and _cors_header_signature(c) != p_cors_sig
+                )
+            )
+            for c in baseline_controls
+        )
+    else:
+        has_valid_baseline = any(
+            200 <= int(c.get("status") or 0) < 300
+            for c in baseline_controls
+        )
+    if not has_valid_baseline:
+        return False
+
+    if evidence_value and not ev_in_oob and not _receipt_contains_evidence(replay_target, evidence_value):
+        return False
+
+    if canonical_class == "cors_misconfiguration":
+        orig_acao = _response_header_ci(replay_target, "access-control-allow-origin")
+        proof_origin = _request_header_ci(replay_target, "origin")
+        return bool(
+            orig_acao
+            and (orig_acao == "*" or (bool(proof_origin) and orig_acao.lower() == proof_origin.lower()))
+        )
+    return True
 
 
 def receipt_body_contains_verbatim(receipt: dict[str, Any], evidence_value: str) -> bool:
@@ -1572,6 +1647,65 @@ class DifferentialOracle:
 
         r_status = int(replay_rec.get("status") or 0)
         t_status = int(replay_target.get("status") or 0)
+        ev_in_oob = bool(
+            ev
+            and is_oob_verified
+            and any(
+                ev.lower() in json.dumps(h, ensure_ascii=False).lower()
+                for h in effective_oob_hits
+            )
+        )
+
+        # When a proof sent an explicit forged/overridden auth header (Authorization,
+        # Cookie, X-Auth-Token, X-Api-Key, Proxy-Authorization) that ReceiptStore
+        # redacted, clean-session replay drops it and receives 401/403 live.
+        has_redacted_auth_override = False
+        if 200 <= t_status < 300 and r_status in {401, 403}:
+            try:
+                replay_session_obj = self.http.actors.get(str(replay_target.get("actor") or "anon"))
+            except ValueError:
+                replay_session_obj = None
+            has_redacted_auth_override = (
+                replay_session_obj is not None
+                and _has_overridden_redacted_auth_header(
+                    replay_target,
+                    replay_session_obj,
+                    str(replay_target.get("method") or "GET"),
+                )
+            )
+            if has_redacted_auth_override and _can_accept_redacted_auth_override(
+                canonical_class=canonical_class,
+                replay_target=replay_target,
+                diff_controls=diff_controls,
+                eff_controls=eff_controls,
+                is_oob_verified=is_oob_verified,
+                evidence_value=ev,
+                ev_in_oob=ev_in_oob,
+                p_status=p_status,
+                p_masked=p_masked,
+                p_loc=p_loc,
+                p_cors_sig=p_cors_sig,
+            ):
+                stages["stage3_clean_replay"] = "passed_redacted_auth_override"
+                if canonical_class in {"jwt_weakness", "auth_bypass"}:
+                    reason = (
+                        f"Verified {canonical_class} via control differential and live unprivileged "
+                        "clean-session rejection (forged auth header redacted in receipt)."
+                    )
+                else:
+                    reason = (
+                        f"Verified {canonical_class} via Stage 1-2 baseline/OOB differential and live "
+                        "unprivileged clean-session rejection (overridden auth header redacted in receipt)."
+                    )
+                return OracleVerdict(
+                    verified=True,
+                    verdict="VERIFIED",
+                    reason=reason,
+                    mode=self.mode,
+                    stages=stages,
+                    clean_replay_receipt_id=replay_rec["receipt_id"],
+                    control_probe_receipt_id=ctrl_probe_rid,
+                )
 
         # Destructive DELETE persistence verification: when re-executing DELETE returns
         # 404/410 because the resource is already gone, verify an earlier 2xx GET existed
@@ -1684,7 +1818,8 @@ class DifferentialOracle:
         # specified) up to 2 distinct-tenant/admin actors from the harness roster to
         # verify the mutated state persisted in a fresh clean session.
         elif (
-            replay_target is primary_proof
+            not has_redacted_auth_override
+            and replay_target is primary_proof
             and str(primary_proof.get("method") or "").upper() in _WRITE_METHODS
             and r_status in {403, 404, 409}
             and self._has_budget(1)
@@ -1744,46 +1879,6 @@ class DifferentialOracle:
                     t_status = 200
                     replayed_via_stateful_fallback = True
                     break
-
-        # For jwt_weakness proofs sent with an explicit forged Authorization/Cookie override
-        # header that ReceiptStore redacted, clean-session replay runs without the forged header:
-        # receiving 401/403 live confirms the endpoint rejects unprivileged requests.
-        if (
-            canonical_class == "jwt_weakness"
-            and 200 <= t_status < 300
-            and r_status in {401, 403}
-        ):
-            try:
-                replay_session_obj = self.http.actors.get(str(replay_target.get("actor") or "anon"))
-            except ValueError:
-                replay_session_obj = None
-            if replay_session_obj is not None and _has_overridden_redacted_auth_header(
-                replay_target,
-                replay_session_obj,
-                str(replay_target.get("method") or "GET"),
-            ):
-                stages["stage3_clean_replay"] = "passed_redacted_auth_override"
-                return OracleVerdict(
-                    verified=True,
-                    verdict="VERIFIED",
-                    reason=(
-                        "Verified jwt_weakness via control differential and live unprivileged "
-                        "clean-session rejection (forged auth header redacted in receipt)."
-                    ),
-                    mode=self.mode,
-                    stages=stages,
-                    clean_replay_receipt_id=replay_rec["receipt_id"],
-                    control_probe_receipt_id=ctrl_probe_rid,
-                )
-
-        ev_in_oob = bool(
-            ev
-            and is_oob_verified
-            and any(
-                ev.lower() in json.dumps(h, ensure_ascii=False).lower()
-                for h in effective_oob_hits
-            )
-        )
 
         # Two-step clean replay fallback: for one-shot / stateful GET workflows whose
         # item/event was drained on the first read (e.g. POST /queue/join -> GET /queue/data,

@@ -16,12 +16,15 @@ if str(SCRIPTS_DIR) not in sys.path:
 
 from agentic_http import ActorManager, AgenticHTTPClient  # noqa: E402
 from agentic_investigator import (  # noqa: E402
+    _FRAMING_RESERVE_TOKENS,
     AgenticInvestigator,
+    _build_assistant_history_entry,
     _sanitize_messages_for_http400,
     _sanitize_text_for_http400,
+    compact_messages_for_context,
 )
 from agentic_receipts import ReceiptStore  # noqa: E402
-from full_agent_budget import BudgetError, SharedBudget  # noqa: E402
+from full_agent_budget import BudgetError, SharedBudget, completion_request  # noqa: E402
 from full_agent_provider import SessionGate  # noqa: E402
 
 
@@ -491,3 +494,372 @@ def test_http400_sanitizes_replay_read_receipt_and_unclosed_blocks() -> None:
     assert "[STATE] http_budget: 10/30 left" in sanitized[4]["content"]
     assert "[SURFACE FRONTIER] GET /api/items" in sanitized[4]["content"]
     assert len(_sanitize_text_for_http400("x" * 1000, max_chars=300)) <= 300
+
+
+def test_prepare_bounded_body_max_tokens_8192_and_headroom_scaling(tmp_path: Path) -> None:
+    """_prepare_bounded_body defaults max_tokens to 8192 when headroom >= 8192 and scales down below 8192."""
+    store, client = _make_investigator_deps(tmp_path)
+    budget = SharedBudget(http=30, tokens=100_000, seconds=120)
+
+    class _DummyTransport:
+        session_gate = SessionGate()
+        provider_responses: list[dict[str, Any]] = []
+
+    try:
+        inv = AgenticInvestigator(
+            http_client=client,
+            receipt_store=store,
+            transport=_DummyTransport(),  # type: ignore[arg-type]
+            budget=budget,
+            model="test-model",
+            root_dir=tmp_path,
+        )
+        msgs = [{"role": "user", "content": "hello"}]
+        full_body = inv._prepare_bounded_body(msgs)
+        assert full_body["max_tokens"] == 8192
+
+        admitted_req, _ = completion_request(
+            full_body,
+            models=["test-model"],
+            remaining=budget.available("tokens"),
+        )
+        assert admitted_req["max_tokens"] == 8192
+
+        serialized_bytes = len(
+            json.dumps(
+                {"messages": full_body["messages"], "tools": full_body["tools"]},
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        )
+        for target_headroom in (3500, 260):
+            budget.used["tokens"] = budget.limits["tokens"] - (
+                serialized_bytes + _FRAMING_RESERVE_TOKENS + target_headroom
+            )
+            scaled_body = inv._prepare_bounded_body(msgs)
+            assert scaled_body["max_tokens"] == target_headroom
+
+        budget.used["tokens"] = budget.limits["tokens"] - 1000
+        tight_body = inv._prepare_bounded_body(msgs)
+        assert tight_body["max_tokens"] == 2048
+    finally:
+        client.close()
+
+
+def test_build_assistant_history_entry_and_both_loops_preserve_reasoning_content(tmp_path: Path) -> None:
+    """_build_assistant_history_entry and both tool loops preserve reasoning_content only on tool-call turns."""
+    tc = [{"id": "call_1", "type": "function", "function": {"name": "notebook", "arguments": "{}"}}]
+
+    with_tools = _build_assistant_history_entry({
+        "role": "assistant",
+        "content": None,
+        "tool_calls": tc,
+        "reasoning_content": "chain-of-thought",
+    })
+    assert with_tools == {
+        "role": "assistant",
+        "content": "",
+        "tool_calls": tc,
+        "reasoning_content": "chain-of-thought",
+    }
+
+    empty_reasoning = _build_assistant_history_entry({
+        "role": "assistant",
+        "content": "ok",
+        "tool_calls": tc,
+        "reasoning_content": "",
+    })
+    assert empty_reasoning == {"role": "assistant", "content": "ok", "tool_calls": tc}
+    assert "reasoning_content" not in empty_reasoning
+
+    non_str_reasoning = _build_assistant_history_entry({
+        "role": "assistant",
+        "content": "ok",
+        "tool_calls": tc,
+        "reasoning_content": None,
+    })
+    assert "reasoning_content" not in non_str_reasoning
+
+    no_tools = _build_assistant_history_entry({
+        "role": "assistant",
+        "content": "plain answer",
+        "reasoning_content": "should-be-omitted",
+    })
+    assert no_tools == {"role": "assistant", "content": "plain answer"}
+    assert "tool_calls" not in no_tools
+    assert "reasoning_content" not in no_tools
+
+    class _LoopTransport:
+        def __init__(self, responses: list[dict[str, Any]]) -> None:
+            self.session_gate = SessionGate()
+            self.provider_responses: list[dict[str, Any]] = []
+            self.calls = 0
+            self.seen_bodies: list[dict[str, Any]] = []
+            self._responses = responses
+
+        def complete(self, body: dict[str, Any], *, minimum_output_tokens: int = 16) -> dict[str, Any]:  # noqa: ARG002
+            self.calls += 1
+            self.seen_bodies.append(copy.deepcopy(body))
+            self.provider_responses.append({"call": self.calls, "upstream_http_status": 200})
+            idx = min(self.calls - 1, len(self._responses) - 1)
+            return copy.deepcopy(self._responses[idx])
+
+    # 1. Monolithic loop preserves tool-call reasoning_content across turns and omits on non-tool turns.
+    mono_dir = tmp_path / "mono"
+    mono_dir.mkdir()
+    store_m, client_m = _make_investigator_deps(mono_dir)
+    budget_m = SharedBudget(http=30, tokens=200_000, seconds=120)
+    try:
+        mono_transport = _LoopTransport([
+            {
+                "choices": [{
+                    "message": {
+                        "role": "assistant",
+                        "content": None,
+                        "reasoning_content": "mono-step-1-reasoning",
+                        "tool_calls": [{
+                            "id": "m1",
+                            "type": "function",
+                            "function": {"name": "notebook", "arguments": '{"action":"write","surface_notes":"s1"}'},
+                        }],
+                    }
+                }],
+                "usage": {"prompt_tokens": 300, "completion_tokens": 40, "total_tokens": 340},
+            },
+            {
+                "choices": [{
+                    "message": {
+                        "role": "assistant",
+                        "content": "Thinking without tools.",
+                        "reasoning_content": "mono-no-tool-reasoning",
+                    }
+                }],
+                "usage": {"prompt_tokens": 400, "completion_tokens": 20, "total_tokens": 420},
+            },
+            {
+                "choices": [{
+                    "message": {
+                        "role": "assistant",
+                        "content": "",
+                        "reasoning_content": "mono-finish-reasoning",
+                        "tool_calls": [{
+                            "id": "m3",
+                            "type": "function",
+                            "function": {"name": "finish", "arguments": '{"summary":"done","untested_areas":[]}'},
+                        }],
+                    }
+                }],
+                "usage": {"prompt_tokens": 450, "completion_tokens": 25, "total_tokens": 475},
+            },
+        ])
+        inv_m = AgenticInvestigator(
+            http_client=client_m,
+            receipt_store=store_m,
+            transport=mono_transport,  # type: ignore[arg-type]
+            budget=budget_m,
+            model="test-model",
+            root_dir=mono_dir,
+            execution_mode="monolithic",
+            max_turns=5,
+            sleep_fn=lambda _s: None,
+        )
+        res_m = inv_m.run()
+        assert res_m["status"] == "finished"
+        turn2_msgs = mono_transport.seen_bodies[1]["messages"]
+        assert turn2_msgs[2]["reasoning_content"] == "mono-step-1-reasoning"
+        assert turn2_msgs[2]["content"] == ""
+        turn3_msgs = mono_transport.seen_bodies[2]["messages"]
+        assert turn3_msgs[2]["reasoning_content"] == "mono-step-1-reasoning"
+        assert "reasoning_content" not in turn3_msgs[4]
+        assert turn3_msgs[:4] == turn2_msgs
+    finally:
+        client_m.close()
+
+    # 2. Ephemeral loop records reasoning_content for tool-call steps and omits it on non-tool steps.
+    eph_dir = tmp_path / "eph"
+    eph_dir.mkdir()
+    store_e, client_e = _make_investigator_deps(eph_dir)
+    budget_e = SharedBudget(http=30, tokens=200_000, seconds=120)
+    try:
+        eph_transport = _LoopTransport([
+            {
+                "choices": [{
+                    "message": {
+                        "role": "assistant",
+                        "content": "",
+                        "reasoning_content": "eph-step-1-reasoning",
+                        "tool_calls": [{
+                            "id": "e1",
+                            "type": "function",
+                            "function": {"name": "notebook", "arguments": '{"action":"write","surface_notes":"e1"}'},
+                        }],
+                    }
+                }],
+                "usage": {"prompt_tokens": 250, "completion_tokens": 30, "total_tokens": 280},
+            },
+            {
+                "choices": [{
+                    "message": {
+                        "role": "assistant",
+                        "content": "Stopping worker.",
+                        "reasoning_content": "eph-no-tool-reasoning",
+                    }
+                }],
+                "usage": {"prompt_tokens": 300, "completion_tokens": 15, "total_tokens": 315},
+            },
+        ])
+        inv_e = AgenticInvestigator(
+            http_client=client_e,
+            receipt_store=store_e,
+            transport=eph_transport,  # type: ignore[arg-type]
+            budget=budget_e,
+            model="test-model",
+            root_dir=eph_dir,
+            execution_mode="ephemeral",
+            use_bsag=False,
+            max_turns=2,
+            sleep_fn=lambda _s: None,
+        )
+        captured_worker_msgs: list[list[dict[str, Any]]] = []
+        orig_save = inv_e._save_checkpoint
+
+        def _spy_save(*, turn: int, status: str, messages: list[dict[str, Any]]) -> None:
+            if messages:
+                captured_worker_msgs.append(copy.deepcopy(messages))
+            orig_save(turn=turn, status=status, messages=messages)
+
+        inv_e._save_checkpoint = _spy_save  # type: ignore[method-assign]
+        inv_e.run()
+        assert len(captured_worker_msgs) == 1
+        asst_msgs = [m for m in captured_worker_msgs[0] if m.get("role") == "assistant"]
+        assert len(asst_msgs) == 2
+        assert asst_msgs[0]["reasoning_content"] == "eph-step-1-reasoning"
+        assert "reasoning_content" not in asst_msgs[1]
+    finally:
+        client_e.close()
+
+
+def test_http400_recovery_strips_reasoning_content_from_assistant_messages(tmp_path: Path) -> None:
+    """_sanitize_messages_for_http400 and HTTP 400 retry strip reasoning_content without mutating input."""
+    store, client = _make_investigator_deps(tmp_path)
+    budget = SharedBudget(http=30, tokens=100_000, seconds=120)
+    seen_bodies: list[dict[str, Any]] = []
+
+    class _RejectReasoningContentTransport:
+        def __init__(self) -> None:
+            self.session_gate = SessionGate()
+            self.provider_responses: list[dict[str, Any]] = []
+            self.calls = 0
+
+        def complete(self, body: dict[str, Any], *, minimum_output_tokens: int = 16) -> dict[str, Any]:  # noqa: ARG002
+            self.calls += 1
+            seen_bodies.append(copy.deepcopy(body))
+            self.session_gate.require_open()
+            ticket = budget.reserve("tokens", 4_000)
+            if any("reasoning_content" in m for m in body["messages"]):
+                self.session_gate.stop_reason = "provider_http_error"
+                self.provider_responses.append({"call": self.calls, "upstream_http_status": 400})
+                try:
+                    budget.settle(ticket, None, upstream_http_status=400)
+                except BudgetError:
+                    pass
+                raise BudgetError("unsupported message field: reasoning_content", code="provider_http_error")
+
+            budget.settle(ticket, 300, upstream_http_status=200)
+            self.provider_responses.append({"call": self.calls, "upstream_http_status": 200})
+            return {
+                "choices": [{"message": {"role": "assistant", "content": "ok-after-strip"}}],
+                "usage": {"prompt_tokens": 250, "completion_tokens": 50, "total_tokens": 300},
+            }
+
+    messages: list[dict[str, Any]] = [
+        {"role": "system", "content": "sys"},
+        {"role": "user", "content": "usr"},
+        {
+            "role": "assistant",
+            "content": "",
+            "reasoning_content": "internal-cot",
+            "tool_calls": [{"id": "c1", "type": "function", "function": {"name": "http_request", "arguments": "{}"}}],
+        },
+        _tool_http_message(
+            tool_call_id="c1",
+            receipt_id="req-0001",
+            url="http://127.0.0.1:18080/",
+            body_preview="ok",
+        ),
+    ]
+    snapshot = copy.deepcopy(messages)
+
+    direct_sanitized = _sanitize_messages_for_http400(messages)
+    assert "reasoning_content" not in direct_sanitized[2]
+    assert direct_sanitized[2]["tool_calls"] == messages[2]["tool_calls"]
+    assert messages == snapshot
+
+    try:
+        transport = _RejectReasoningContentTransport()
+        inv = AgenticInvestigator(
+            http_client=client,
+            receipt_store=store,
+            transport=transport,  # type: ignore[arg-type]
+            budget=budget,
+            model="test-model",
+            root_dir=tmp_path,
+            sleep_fn=lambda _s: None,
+        )
+        resp = inv._complete_with_retry(messages)
+        assert resp["choices"][0]["message"]["content"] == "ok-after-strip"
+        assert transport.calls == 2
+        assert "reasoning_content" in seen_bodies[0]["messages"][2]
+        assert "reasoning_content" not in seen_bodies[1]["messages"][2]
+        assert messages == snapshot
+    finally:
+        client.close()
+
+
+def test_compact_messages_for_context_strips_stale_reasoning_content() -> None:
+    """Compaction drops reasoning_content on older/non-latest/tight turns while keeping latest active-turn verbatim."""
+    msgs: list[dict[str, Any]] = [
+        {"role": "system", "content": "sys"},
+        {"role": "user", "content": "init"},
+    ]
+    for turn in (1, 2, 3):
+        msgs.append({
+            "role": "assistant",
+            "content": f"Turn {turn} summary.",
+            "reasoning_content": f"R{turn}-" + ("thought " * 20),
+            "tool_calls": [{"id": f"c{turn}", "type": "function", "function": {"name": "http_request", "arguments": "{}"}}],
+        })
+        msgs.append(
+            _tool_http_message(
+                tool_call_id=f"c{turn}",
+                receipt_id=f"req-{turn:04d}",
+                url=f"http://127.0.0.1:18080/p/{turn}",
+                body_preview=f"body-{turn}",
+            )
+        )
+
+    # 1. roll_older_turns=False: older_groups and non-latest recent turn strip reasoning_content; latest keeps it.
+    inplace = compact_messages_for_context(msgs, keep_recent_turns=2, roll_older_turns=False)
+    assert "reasoning_content" not in inplace[2]
+    assert "reasoning_content" not in inplace[4]
+    assert inplace[6]["reasoning_content"] == msgs[6]["reasoning_content"]
+
+    # 2. roll_older_turns=True (default): rolled older turns dropped, non-latest recent stripped, latest kept.
+    rolled = compact_messages_for_context(msgs, keep_recent_turns=2)
+    assert "[COMPACTED HISTORY:" in rolled[1]["content"]
+    assert "reasoning_content" not in rolled[2]
+    assert rolled[4]["reasoning_content"] == msgs[6]["reasoning_content"]
+
+    # 3. Tight compaction (max_recent_tool_chars is not None): latest turn also drops reasoning_content.
+    tight = compact_messages_for_context(msgs, keep_recent_turns=2, max_recent_tool_chars=1200)
+    assert "reasoning_content" not in tight[2]
+    assert "reasoning_content" not in tight[4]
+
+    # 4. keep_recent cutoff: older assistant before cutoff drops reasoning_content even with empty content.
+    short_msgs = copy.deepcopy(msgs)
+    short_msgs[2]["content"] = ""
+    short_msgs[4]["content"] = ""
+    cutoff_compacted = compact_messages_for_context(short_msgs, keep_recent=2)
+    assert "reasoning_content" not in cutoff_compacted[2]
+    assert "reasoning_content" not in cutoff_compacted[4]
+    assert cutoff_compacted[6]["reasoning_content"] == msgs[6]["reasoning_content"]
