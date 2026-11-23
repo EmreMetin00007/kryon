@@ -795,3 +795,95 @@ def test_case_b_one_shot_post_create_conflict_positive_and_negative(tmp_path: Pa
     finally:
         client.close()
         _stop_server(srv)
+
+
+def test_empty_body_write_readback_in_store_and_json_whitespace_evidence(tmp_path: Path) -> None:
+    lock = threading.Lock()
+    state: dict[str, Any] = {}
+
+    class _SettingsHandler(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def log_message(self, *_args: object) -> None:
+            return
+
+        def _send(self, status: int, body: str, ctype: str = "application/json") -> None:
+            data = body.encode("utf-8")
+            self.send_response(status)
+            if body:
+                self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Connection", "close")
+            self.end_headers()
+            if data:
+                self.wfile.write(data)
+
+        def do_GET(self) -> None:  # noqa: N802
+            if urlsplit(self.path).path == "/settings":
+                with lock:
+                    body = json.dumps(state)
+                self._send(200, body)
+                return
+            self._send(404, '{"error": "not_found"}')
+
+        def do_POST(self) -> None:  # noqa: N802
+            if urlsplit(self.path).path == "/settings":
+                length = int(self.headers.get("Content-Length") or "0")
+                raw = self.rfile.read(length).decode("utf-8", errors="replace") if length > 0 else "{}"
+                data = json.loads(raw)
+                with lock:
+                    state.update(data)
+                self._send(200, "")
+                return
+            self._send(404, '{"error": "not_found"}')
+
+    base_url, srv = _start_server(_SettingsHandler)
+    try:
+        store = ReceiptStore(tmp_path)
+        actors = ActorManager([])
+        client = AgenticHTTPClient(
+            base_url=base_url,
+            receipt_store=store,
+            actors=actors,
+            allowed_methods=["GET", "POST"],
+            max_requests=40,
+        )
+        oracle = DifferentialOracle(http_client=client, receipt_store=store, mode="differential")
+
+        ctrl_get = client.request(method="GET", url="/settings", actor="anon")
+        post_write = client.request(
+            method="POST",
+            url="/settings",
+            actor="anon",
+            json_body={"security_level": "weak", "port": 1},
+        )
+        assert post_write["status"] == 200
+        assert post_write["body"] == ""
+
+        readback = client.request(method="GET", url="/settings", actor="anon")
+        assert '"security_level": "weak"' in readback["body"]
+
+        v_ok = oracle.verify(
+            canonical_class="mass_assignment",
+            primary_proof=post_write,
+            proof_receipts=[post_write],
+            control_receipts=[ctrl_get],
+            evidence_value='"security_level":"weak"',
+        )
+        assert v_ok.verified is True
+        assert v_ok.verdict == "VERIFIED"
+        assert v_ok.stages["stage3_clean_replay"] == "passed"
+
+        v_bad = oracle.verify(
+            canonical_class="mass_assignment",
+            primary_proof=post_write,
+            proof_receipts=[post_write],
+            control_receipts=[ctrl_get],
+            evidence_value='"nonexistent_field":"value"',
+        )
+        assert v_bad.verified is False
+        assert v_bad.verdict == "REFUTED"
+        assert v_bad.stages["stage3_clean_replay"] == "failed_missing_evidence"
+    finally:
+        client.close()
+        _stop_server(srv)

@@ -470,6 +470,12 @@ def _receipt_contains_evidence(
             return True
         if re.sub(r"\s+", " ", ev) in re.sub(r"\s+", " ", unescaped):
             return True
+    ctype = _receipt_content_type(receipt)
+    if (ctype == "application/json" or ctype.endswith("+json") or body.lstrip().startswith(("{", "["))) and body:
+        compact_body = re.sub(r"\s*([:,\[\]{}])\s*", r"\1", body).lower()
+        compact_ev = re.sub(r"\s*([:,\[\]{}])\s*", r"\1", ev)
+        if compact_ev and compact_ev in compact_body:
+            return True
     return False
 
 
@@ -817,6 +823,60 @@ def _select_mutating_get_proof(
         key=lambda r: (
             1 if (ev and _receipt_contains_evidence(r, ev, canonical_class=canonical_class)) else 0,
             1 if is_persistent_read_path_related(primary_proof, str(r.get("url") or r.get("path") or "")) else 0,
+            1 if _norm_url_path(str(r.get("url") or r.get("path") or "")) == p_path else 0,
+            1 if str(r.get("actor") or "") == p_actor else 0,
+            _receipt_seq_num(r),
+        ),
+        reverse=True,
+    )
+    return candidates[0]
+
+
+def _find_readback_get_in_store(
+    primary_proof: dict[str, Any],
+    receipt_store: ReceiptStore | None,
+    evidence_value: str,
+    *,
+    canonical_class: str = "",
+) -> dict[str, Any] | None:
+    """Find a corroborating 2xx GET readback receipt in `receipt_store` for empty/write-only mutations."""
+    if receipt_store is None:
+        return None
+    p_method = str(primary_proof.get("method") or "").upper()
+    if p_method not in {"POST", "PUT", "PATCH"}:
+        return None
+    ev = str(evidence_value or "").strip()
+    if not ev:
+        return None
+    p_path = _norm_url_path(str(primary_proof.get("url") or primary_proof.get("path") or ""))
+    p_actor = str(primary_proof.get("actor") or "")
+    try:
+        rids = list(receipt_store.list_ids())
+    except Exception:
+        return None
+    candidates: list[dict[str, Any]] = []
+    for rid in reversed(rids[-200:]):
+        try:
+            rec = receipt_store.get(rid)
+        except Exception:
+            continue
+        if not isinstance(rec, dict):
+            continue
+        if str(rec.get("method") or "").upper() != "GET":
+            continue
+        if not (200 <= int(rec.get("status") or 0) < 300):
+            continue
+        if _is_strictly_earlier_receipt(rec, primary_proof):
+            continue
+        r_path = _norm_url_path(str(rec.get("url") or rec.get("path") or ""))
+        if r_path != p_path and not is_persistent_read_path_related(primary_proof, str(rec.get("url") or rec.get("path") or "")):
+            continue
+        if _receipt_contains_evidence(rec, ev, canonical_class=canonical_class):
+            candidates.append(rec)
+    if not candidates:
+        return None
+    candidates.sort(
+        key=lambda r: (
             1 if _norm_url_path(str(r.get("url") or r.get("path") or "")) == p_path else 0,
             1 if str(r.get("actor") or "") == p_actor else 0,
             _receipt_seq_num(r),
@@ -2509,6 +2569,23 @@ class DifferentialOracle:
                 ev,
                 canonical_class=canonical_class,
             )
+            if (
+                ev
+                and not is_oob_verified
+                and not _receipt_contains_evidence(primary_proof, ev, canonical_class=canonical_class)
+                and (
+                    render_proof is None
+                    or not _receipt_contains_evidence(render_proof, ev, canonical_class=canonical_class)
+                )
+            ):
+                store_readback = _find_readback_get_in_store(
+                    primary_proof,
+                    self.receipts,
+                    ev,
+                    canonical_class=canonical_class,
+                )
+                if store_readback is not None:
+                    render_proof = store_readback
 
         diff_target = primary_proof
         if canonical_class == "stored_xss" and render_proof is not None:
