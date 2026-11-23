@@ -57,6 +57,46 @@ _AUTH_PATH_TOKENS = (
     "refresh",
     "session",
 )
+_VIRGIN_STATE_SENSITIVE_TOKENS = frozenset({
+    "claim",
+    "redeem",
+    "promo",
+    "promos",
+    "coupon",
+    "coupons",
+    "voucher",
+    "vouchers",
+    "bonus",
+    "reward",
+    "rewards",
+    "vote",
+    "checkin",
+    "check-in",
+    "withdraw",
+})
+_VIRGIN_STATE_IGNORED_SEGMENTS = frozenset({
+    "auth",
+    "login",
+    "log-in",
+    "signin",
+    "sign-in",
+    "signup",
+    "sign-up",
+    "register",
+    "logout",
+    "log-out",
+    "signout",
+    "sign-out",
+    "session",
+    "sessions",
+    "refresh",
+    "health",
+    "healthz",
+    "ready",
+    "readyz",
+    "livez",
+})
+_VIRGIN_STATIC_ASSET_EXTS = (".js", ".mjs", ".cjs", ".wasm", ".otf", ".avif", ".bmp")
 _OWNER_FIELD_KEYS = (
     "owner",
     "owner_id",
@@ -847,6 +887,28 @@ def route_template_of(url_or_path: str) -> str:
 def _is_auth_utility_path(path: str) -> bool:
     low = path.lower()
     return any(f"/{tok}" in low or low.endswith(tok) for tok in _AUTH_PATH_TOKENS)
+
+
+def is_virgin_state_sensitive_path(path_or_url: str) -> bool:
+    """Return True if URL/path contains a whole one-shot or race-sensitive action segment."""
+    raw = str(path_or_url or "").strip()
+    if not raw:
+        return False
+    try:
+        parsed = urlsplit(raw)
+    except ValueError:
+        return False
+    low_path = (parsed.path or "").strip().lower().rstrip("/")
+    if not low_path:
+        return False
+    if is_static_asset_url(low_path) or low_path.endswith(_VIRGIN_STATIC_ASSET_EXTS):
+        return False
+    segments = [seg for seg in low_path.split("/") if seg]
+    if not segments:
+        return False
+    if any(seg in _VIRGIN_STATE_IGNORED_SEGMENTS for seg in segments):
+        return False
+    return any(seg in _VIRGIN_STATE_SENSITIVE_TOKENS for seg in segments)
 
 
 class SurfaceFrontierTracker:

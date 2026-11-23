@@ -139,7 +139,7 @@ from agentic_preview import (
     prune_html_for_preview as prune_html_for_preview,
 )
 from agentic_receipts import DEFAULT_PREVIEW_CHARS, ReceiptStore
-from agentic_surface import SurfaceFrontierTracker
+from agentic_surface import SurfaceFrontierTracker, is_virgin_state_sensitive_path
 
 _SKIP_REPLAY_HEADERS = frozenset({
     "authorization",
@@ -530,6 +530,8 @@ class ToolDispatcher:
         findings_path: str | Path | None = None,
         persist_findings: bool = True,
         oob_server: LoopbackCallbackServer | None = None,
+        bootstrap_stage1_virgin_guard: bool = False,
+        http_reserve_floor: int = 0,
     ):
         self.http = http_client
         self.receipts = receipt_store
@@ -540,6 +542,8 @@ class ToolDispatcher:
         self._oob_server: LoopbackCallbackServer | None = oob_server
         self._owns_oob_server: bool = False
         self._oob_lock = threading.Lock()
+        self.bootstrap_stage1_virgin_guard: bool = bool(bootstrap_stage1_virgin_guard)
+        self.http_reserve_floor: int = max(0, int(http_reserve_floor))
         self.active_worker_id: str = ""
         self.active_node_id: str = ""
         self.active_category: str = ""
@@ -695,6 +699,21 @@ class ToolDispatcher:
         if srv is not None and owns:
             srv.close()
 
+    def _enforce_http_reserve_floor(self, needed: int = 1) -> None:
+        """Raise BudgetExhaustedError if spending `needed` requests would cross below `http_reserve_floor`."""
+        if self.http_reserve_floor <= 0:
+            return
+        lock = getattr(self.http.budget, "_lock", None)
+        if lock is not None:
+            with lock:
+                remaining = int(self.http.budget.limit - self.http.budget.used)
+        else:
+            remaining = int(self.http.budget.limit - self.http.budget.used)
+        if remaining - needed < self.http_reserve_floor:
+            raise BudgetExhaustedError(
+                f"stage-reserved HTTP floor reached ({self.http_reserve_floor} requests reserved for cross-shard synthesis)"
+            )
+
     def dispatch(self, name: str, args: dict[str, Any]) -> str:
         handlers = {
             "http_request": self._tool_http_request,
@@ -792,12 +811,34 @@ class ToolDispatcher:
         else:
             eff_method = "GET"
 
+        target_url = str(args.get("url") or "")
+        if (
+            self.bootstrap_stage1_virgin_guard
+            and eff_method in {"POST", "PUT", "PATCH", "DELETE"}
+            and not str(args.get("save_session_as") or "").strip()
+            and not bool(args.get("confirm_virgin_mutation", False))
+            and is_virgin_state_sensitive_path(target_url)
+        ):
+            return wrap_untrusted(
+                json.dumps({
+                    "blocked": True,
+                    "reason": "virgin_state_preserved_for_concurrency_or_shard",
+                    "method": eff_method,
+                    "url": target_url,
+                    "guidance": (
+                        "Sequential single writes to race/one-shot endpoints are skipped during Stage 1 "
+                        "bootstrap to avoid consuming virgin actor state; invoke concurrent_check or defer "
+                        "to the assigned Stage 2 shard."
+                    ),
+                })
+            )
+
         headers = _coerce_mapping_arg(args.get("headers"))
         query = _coerce_mapping_arg(args.get("query"))
         follow_redirects = bool(args.get("follow_redirects", False))
         request_kwargs: dict[str, Any] = {
             "method": eff_method,
-            "url": str(args.get("url") or ""),
+            "url": target_url,
             "actor": str(args.get("actor") or "anon"),
             "headers": headers,
             "query": query,
@@ -810,6 +851,7 @@ class ToolDispatcher:
         }
         if follow_redirects:
             request_kwargs["follow_redirects"] = True
+        self._enforce_http_reserve_floor(needed=1)
         receipt = self.http.request(**request_kwargs)
         self._ingest_receipt_hooks(receipt)
         preview = _format_receipt_preview(receipt)
@@ -935,6 +977,7 @@ class ToolDispatcher:
             except ValueError:
                 raw_body = base_body_str
 
+        self._enforce_http_reserve_floor(needed=1)
         current = self.http.request(
             method=method,
             url=url,
@@ -1184,6 +1227,7 @@ class ToolDispatcher:
         clean_url, _, _ = self.http._merge_query(url, query)
         session = self.http.actors.get(actor)
         has_auth_override = any(str(k).lower() in {"authorization", "cookie"} for k in (headers or {}))
+        self._enforce_http_reserve_floor(needed=count)
         if actor != "anon" and not has_auth_override and not session.authenticated:
             self.http.authenticate_actor(actor, force_login=False)
 
@@ -1192,6 +1236,7 @@ class ToolDispatcher:
             raise BudgetExhaustedError(
                 f"concurrent_check requires {count} HTTP requests, only {remaining} remaining in budget"
             )
+        self._enforce_http_reserve_floor(needed=count)
 
         barrier = threading.Barrier(count, timeout=10.0)
 

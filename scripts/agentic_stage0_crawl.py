@@ -71,6 +71,7 @@ from agentic_surface import (  # noqa: E402
     _sanitize_json_template,
     is_id_segment,
     is_non_endpoint_source_path,
+    is_virgin_state_sensitive_path,
     route_template_of,
 )
 from target_bootstrap import normalize_path  # noqa: E402
@@ -656,6 +657,19 @@ def _is_stage0_noise_path(norm_p: str) -> bool:
     if any(seg == "$defs" for seg in segments):
         return True
     return any(_ROUTE_GROUP_SEG_RE.fullmatch(seg) for seg in segments)
+
+
+def should_skip_stage0_form_submit(action_url: str, page_url: str) -> bool:
+    """Return True if submitting a Stage 0 form would mutate a virgin-state-sensitive path."""
+    raw_action = str(action_url or "").strip()
+    raw_page = str(page_url or "").strip()
+    if not raw_action or raw_action.startswith("#"):
+        target = raw_page
+    elif raw_page:
+        target = urljoin(raw_page, raw_action)
+    else:
+        target = raw_action
+    return is_virgin_state_sensitive_path(target)
 
 
 def _sanitize_param_name(raw: Any) -> str:
@@ -2044,7 +2058,11 @@ def _crawl_actor_playwright(
                 if req_method in _READONLY_METHODS:
                     pass
                 elif req_method in _FORM_ALLOWED_WRITE_METHODS:
-                    if req_method not in http_client.allowed_methods or _DESTRUCTIVE_RE.search(req_path):
+                    if (
+                        req_method not in http_client.allowed_methods
+                        or _DESTRUCTIVE_RE.search(req_path)
+                        or is_virgin_state_sensitive_path(req_path)
+                    ):
                         try:
                             route.abort("blockedbyclient")
                         except Exception:
@@ -2370,6 +2388,8 @@ def _crawl_actor_playwright(
                     str(form_item.get("text") or ""),
                 ])
                 if _DESTRUCTIVE_RE.search(haystack):
+                    continue
+                if should_skip_stage0_form_submit(resolved_action, current_page_url):
                     continue
                 has_pw_input = any(str(fld.get("type") or "").lower() == "password" for fld in raw_fields)
                 if actor != "anon" and (_AUTH_FORM_RE.search(haystack) or has_pw_input):
@@ -3015,4 +3035,5 @@ def run_stage0_crawl(
 __all__ = [
     "HAS_PLAYWRIGHT",
     "run_stage0_crawl",
+    "should_skip_stage0_form_submit",
 ]

@@ -74,7 +74,13 @@ from agentic_scheduler import (
     ArmSelection,
     LazyInterventionMonitor,
 )
-from agentic_sharding import SubsystemCluster, build_shard_prompts, cluster_discovered_surface
+from agentic_sharding import (
+    SubsystemCluster,
+    build_cross_shard_synthesis_prompts,
+    build_shard_prompts,
+    cluster_discovered_surface,
+    collect_cross_shard_synthesis_context,
+)
 from agentic_surface import SurfaceFrontierTracker
 from agentic_telemetry import TelemetryLogger, write_process_metrics
 from agentic_tools import TOOL_SCHEMAS, ToolDispatcher, canonicalize_and_deduplicate_findings
@@ -135,6 +141,7 @@ class AgenticInvestigator:
         cache_token_weight: float = 0.10,
         seed_surface: dict[str, Any] | None = None,
         oob_server: LoopbackCallbackServer | None = None,
+        enable_cross_shard_synthesis: bool = True,
     ):
         self.http = http_client
         self.receipts = receipt_store
@@ -183,6 +190,7 @@ class AgenticInvestigator:
         self.intervention_mode = str(intervention_mode or "lazy").strip().lower()
         self.micro_budget = max(2, int(micro_budget))
         self.synthesis_interval = max(1, int(synthesis_interval))
+        self.enable_cross_shard_synthesis = bool(enable_cross_shard_synthesis)
 
         use_telem = bool(enable_telemetry) if enable_telemetry is not None else (
             self.execution_mode == "ephemeral" or self.use_bsag
@@ -253,12 +261,16 @@ class AgenticInvestigator:
         self,
         turn: int,
         *,
+        dispatcher: ToolDispatcher | None = None,
         max_turns_override: int | None = None,
         shard_token_quota: int | None = None,
         shard_tokens_used: int | None = None,
     ) -> list[str]:
+        eff_disp = dispatcher if dispatcher is not None else self.dispatcher
         eff_max_turns = max_turns_override if max_turns_override is not None else self.max_turns
         http_rem = self.http.budget.limit - self.http.budget.used
+        http_reserve_floor = int(getattr(eff_disp, "http_reserve_floor", 0) or 0)
+        usable_http_rem = max(0, http_rem - http_reserve_floor)
         tok_rem = self.budget.available("tokens")
         tok_lim = self.budget.limits["tokens"]
         wrapup_reasons: list[str] = []
@@ -277,8 +289,8 @@ class AgenticInvestigator:
             wrapup_reasons.append(f"turns_left={max(0, eff_max_turns - turn)}")
         elif shard_token_quota is not None and eff_max_turns > 3 and (eff_max_turns - turn) <= 3:
             wrapup_reasons.append(f"turns_left={max(0, eff_max_turns - turn)}")
-        if self.http.budget.limit > 15 and http_rem <= 10:
-            wrapup_reasons.append(f"http_left={http_rem}/{self.http.budget.limit}")
+        if self.http.budget.limit > 15 and usable_http_rem <= 10:
+            wrapup_reasons.append(f"http_left={usable_http_rem}/{self.http.budget.limit}")
         sec_lim = float(getattr(self.budget, "seconds_limit", 0) or self.budget.limits.get("seconds") or 0)
         sec_rem = float(self.budget.remaining_seconds())
         if sec_lim > 0:
@@ -304,6 +316,7 @@ class AgenticInvestigator:
         eff_max_turns = max_turns_override if max_turns_override is not None else self.max_turns
         wrapup_reasons = self._wrapup_reasons(
             turn,
+            dispatcher=eff_disp,
             max_turns_override=eff_max_turns,
             shard_token_quota=shard_token_quota,
             shard_tokens_used=shard_tokens_used,
@@ -373,6 +386,7 @@ class AgenticInvestigator:
                 )
         wrapup_reasons = self._wrapup_reasons(
             turn,
+            dispatcher=eff_disp,
             max_turns_override=eff_max_turns,
             shard_token_quota=shard_token_quota,
             shard_tokens_used=shard_tokens_used,
@@ -1408,6 +1422,7 @@ class AgenticInvestigator:
         """Run a bounded ReAct monolithic loop over a caller-supplied dispatcher and message list."""
         status = "running"
         empty_nudges = 0
+        reserve_floor_turns = 0
         last_completed_turn = start_turn - 1
         recent_local_reads: list[tuple[int, str, str, str]] = []
         eff_model = model_name or self.model
@@ -1478,6 +1493,18 @@ class AgenticInvestigator:
                     if checkpoint_fn is not None:
                         checkpoint_fn(last_completed_turn, status, messages)
                     break
+
+                http_reserve_floor = int(getattr(dispatcher, "http_reserve_floor", 0) or 0)
+                if (
+                    http_reserve_floor > 0
+                    and (self.http.budget.limit - self.http.budget.used) <= http_reserve_floor
+                ):
+                    if reserve_floor_turns >= 1:
+                        status = "finished" if dispatcher.findings else "budget_exhausted"
+                        if checkpoint_fn is not None:
+                            checkpoint_fn(last_completed_turn, status, messages)
+                        break
+                    reserve_floor_turns += 1
 
                 self._sync_coverage_gate(
                     turn,
@@ -1588,9 +1615,12 @@ class AgenticInvestigator:
                                 and shard_token_quota > 0
                                 and cur_shard_tokens >= int(shard_token_quota * 0.80)
                             )
+                            http_rem_after = self.http.budget.limit - self.http.budget.used
+                            eff_floor = int(getattr(dispatcher, "http_reserve_floor", 0) or 0)
+                            usable_http_rem = max(0, http_rem_after - eff_floor)
                             if (
                                 turn >= max_turns - 2
-                                or (self.http.budget.limit - self.http.budget.used) <= 8
+                                or usable_http_rem <= 8
                                 or shard_wrapup_urgent
                             ):
                                 if excluded_tools and "record_finding" in excluded_tools:
@@ -1791,6 +1821,7 @@ class AgenticInvestigator:
             fallback_to_monolithic: bool,
             fallback_reason: str | None = None,
             shards: list[dict[str, Any]] | None = None,
+            stage3_synthesis: dict[str, Any] | None = None,
         ) -> dict[str, Any]:
             summary: dict[str, Any] = {
                 "bootstrap_model": boot_model,
@@ -1811,6 +1842,8 @@ class AgenticInvestigator:
             }
             if fallback_reason is not None:
                 summary["fallback_reason"] = fallback_reason
+            if stage3_synthesis is not None:
+                summary["stage3_synthesis"] = stage3_synthesis
             return summary
 
         base_sys_prompt = build_system_prompt(
@@ -1855,21 +1888,25 @@ class AgenticInvestigator:
         ]
 
         try:
-            boot_status, boot_last_turn, boot_messages = self._execute_monolithic_loop(
-                dispatcher=self.dispatcher,
-                messages=boot_messages,
-                start_turn=1,
-                max_turns=boot_max_turns,
-                epoch_state=boot_epoch_state,
-                model_name=boot_model,
-                allow_coverage_gate=boot_allow_coverage_gate,
-                allow_discovery_gate=boot_allow_discovery_gate,
-                disable_gate_last_n_turns=2 if (boot_allow_coverage_gate or boot_allow_discovery_gate) else 0,
-                checkpoint_fn=lambda t, st, msgs: self._save_checkpoint(turn=t, status=st, messages=msgs),
-                usage_sink=boot_usage,
-                calls_sink=boot_calls,
-                excluded_tools=boot_excluded_tools,
-            )
+            self.dispatcher.bootstrap_stage1_virgin_guard = True
+            try:
+                boot_status, boot_last_turn, boot_messages = self._execute_monolithic_loop(
+                    dispatcher=self.dispatcher,
+                    messages=boot_messages,
+                    start_turn=1,
+                    max_turns=boot_max_turns,
+                    epoch_state=boot_epoch_state,
+                    model_name=boot_model,
+                    allow_coverage_gate=boot_allow_coverage_gate,
+                    allow_discovery_gate=boot_allow_discovery_gate,
+                    disable_gate_last_n_turns=2 if (boot_allow_coverage_gate or boot_allow_discovery_gate) else 0,
+                    checkpoint_fn=lambda t, st, msgs: self._save_checkpoint(turn=t, status=st, messages=msgs),
+                    usage_sink=boot_usage,
+                    calls_sink=boot_calls,
+                    excluded_tools=boot_excluded_tools,
+                )
+            finally:
+                self.dispatcher.bootstrap_stage1_virgin_guard = False
             self.dispatcher.discovery_finish_gate = False
             boot_findings_snap = copy.deepcopy(self.dispatcher.findings)
 
@@ -1971,13 +2008,26 @@ class AgenticInvestigator:
 
             # Stage 2: Parallel monolithic subsystem shards
             self._active_model = self.model
-            rem_tokens = self.budget.available("tokens")
+            rem_http_after_boot = self.http.budget.limit - self.http.budget.used
+            rem_tok_after_boot = self.budget.available("tokens")
+            rem_tokens = rem_tok_after_boot
             num_shards = len(clusters)
-            eff_shard_token_quota = (
-                self.shard_token_quota
-                if self.shard_token_quota > 0
-                else max(25_000, int((rem_tokens * 0.90) / num_shards))
+            reserve_for_stage3 = bool(
+                self.enable_cross_shard_synthesis
+                and len(clusters) >= 2
+                and rem_http_after_boot >= 40
+                and rem_tok_after_boot >= 45_000
             )
+            stage3_http_reserve = (
+                min(30, max(12, int(rem_http_after_boot * 0.15)))
+                if reserve_for_stage3
+                else 0
+            )
+            if self.shard_token_quota > 0:
+                eff_shard_token_quota = self.shard_token_quota
+            else:
+                token_share = 0.85 if stage3_http_reserve > 0 else 0.90
+                eff_shard_token_quota = max(25_000, int((rem_tokens * token_share) / num_shards))
             bootstrap_surface_snap = copy.deepcopy(self.dispatcher.surface_tracker.to_dict())
             shard_base_sys_prompt = build_system_prompt(
                 base_url=self.http.base_url,
@@ -2003,6 +2053,7 @@ class AgenticInvestigator:
                     oracle=self.oracle,
                     telemetry=self.telemetry,
                     oob_server=shared_oob,
+                    http_reserve_floor=stage3_http_reserve,
                 )
                 try:
                     shard_dispatcher.surface_tracker.load_dict(copy.deepcopy(bootstrap_surface_snap))
@@ -2145,6 +2196,168 @@ class AgenticInvestigator:
                 overall_status = "budget_exhausted"
             else:
                 overall_status = shard_statuses[0] if shard_statuses else "finished"
+
+            synth_ctx = collect_cross_shard_synthesis_context(
+                shard_results=shard_results,
+                findings=self.dispatcher.findings,
+                receipts=self.receipts,
+                surface_tracker=self.dispatcher.surface_tracker,
+                actor_summaries=self.http.actors.summaries(),
+            )
+            stage3_summary: dict[str, Any] | None = None
+            if (
+                self.enable_cross_shard_synthesis
+                and synth_ctx.get("should_trigger")
+                and (self.http.budget.limit - self.http.budget.used) >= 6
+                and self.budget.available("tokens") >= 18_000
+                and self.budget.remaining_seconds() > 15
+            ):
+                stage3_dir = self.root_dir / "shards" / "stage3-synthesis"
+                stage3_dir.mkdir(parents=True, exist_ok=True)
+                shared_oob = (
+                    self._oob_server
+                    if self._oob_server is not None
+                    else getattr(self.dispatcher, "_oob_server", None)
+                )
+                stage3_dispatcher = ToolDispatcher(
+                    http_client=self.http,
+                    receipt_store=self.receipts,
+                    root_dir=stage3_dir,
+                    bsag=None,
+                    oracle=self.oracle,
+                    telemetry=self.telemetry,
+                    oob_server=shared_oob,
+                    bootstrap_stage1_virgin_guard=False,
+                    http_reserve_floor=0,
+                )
+                try:
+                    stage3_dispatcher.surface_tracker.load_dict(
+                        copy.deepcopy(self.dispatcher.surface_tracker.to_dict())
+                    )
+                    stage3_dispatcher.coverage_gate_enabled = False
+                    stage3_dispatcher.discovery_finish_gate = False
+                    stage3_dispatcher.bootstrap_stage1_virgin_guard = False
+                    stage3_dispatcher.http_reserve_floor = 0
+                    stage3_dispatcher.set_active_context(
+                        worker_id="stage3-synthesis",
+                        category="cross_shard",
+                    )
+
+                    s3_max_turns = min(12, max(6, self.max_turns // 3))
+                    s3_epoch_state: dict[str, Any] = {
+                        "turn_start": 0,
+                        "summary_text": "",
+                        "advancements": 0,
+                    }
+                    s3_usage: dict[str, int] = _new_usage_dict()
+                    s3_calls = [0]
+                    s3_http_rem = max(0, self.http.budget.limit - self.http.budget.used)
+                    s3_banner = self._state_banner(
+                        1,
+                        dispatcher=stage3_dispatcher,
+                        max_turns_override=s3_max_turns,
+                        allow_coverage_gate=False,
+                    )
+                    s3_sys, s3_usr = build_cross_shard_synthesis_prompts(
+                        base_system_prompt=shard_base_sys_prompt,
+                        synthesis_context=synth_ctx,
+                        actor_summaries=self.http.actors.summaries(),
+                        http_budget_remaining=s3_http_rem,
+                        state_banner=s3_banner,
+                    )
+                    s3_messages: list[dict[str, Any]] = [
+                        {"role": "system", "content": s3_sys},
+                        {"role": "user", "content": s3_usr},
+                    ]
+
+                    def _stage3_ckpt(t: int, st: str, _msgs: list[dict[str, Any]]) -> None:
+                        _atomic_write_json(
+                            stage3_dir / "checkpoint.json",
+                            {
+                                "schema": "agentic-shard-checkpoint/1",
+                                "shard_id": "stage3-synthesis",
+                                "families": ["cross_shard"],
+                                "turn": t,
+                                "status": st,
+                                "findings": stage3_dispatcher.findings,
+                            },
+                        )
+
+                    try:
+                        s3_status, _, _ = self._execute_monolithic_loop(
+                            dispatcher=stage3_dispatcher,
+                            messages=s3_messages,
+                            start_turn=1,
+                            max_turns=s3_max_turns,
+                            epoch_state=s3_epoch_state,
+                            model_name=self.model,
+                            allow_coverage_gate=False,
+                            allow_discovery_gate=False,
+                            checkpoint_fn=_stage3_ckpt,
+                            usage_sink=s3_usage,
+                            calls_sink=s3_calls,
+                            excluded_tools=None,
+                        )
+                    except BudgetError as exc:
+                        s3_status = self._classify_budget_error(exc, is_shard=True)
+                    except Exception as exc:
+                        s3_status = f"error:{type(exc).__name__}"
+
+                    self._merge_surface_trackers(
+                        self.dispatcher.surface_tracker,
+                        stage3_dispatcher.surface_tracker,
+                    )
+                    for row in self.http.actors.summaries():
+                        self.dispatcher.surface_tracker.actors[row["alias"]] = {
+                            "alias": row["alias"],
+                            "role": str(row.get("role") or "").strip().lower(),
+                            "tenant": str(row.get("tenant") or "").strip().lower(),
+                        }
+                    s3_actor_meta = {
+                        row["alias"]: {
+                            "alias": row["alias"],
+                            "role": str(row.get("role") or "").lower(),
+                            "tenant": str(row.get("tenant") or "").lower(),
+                        }
+                        for row in self.http.actors.summaries()
+                    }
+                    s3_findings_count = len(stage3_dispatcher.findings)
+                    if stage3_dispatcher.findings:
+                        merged_after_s3 = list(self.dispatcher.findings) + list(stage3_dispatcher.findings)
+                        self.dispatcher.findings = canonicalize_and_deduplicate_findings(
+                            merged_after_s3,
+                            actor_meta_map=s3_actor_meta,
+                            receipt_store=self.receipts,
+                        )
+                        self.dispatcher._save_findings()
+                    if stage3_dispatcher.finish_summary:
+                        prefix = (
+                            (self.dispatcher.finish_summary + " | ")
+                            if self.dispatcher.finish_summary
+                            else ""
+                        )
+                        self.dispatcher.finish_summary = (
+                            prefix + f"[stage3-synthesis] {stage3_dispatcher.finish_summary}"
+                        )
+                    for area in stage3_dispatcher.untested_areas:
+                        if area not in self.dispatcher.untested_areas:
+                            self.dispatcher.untested_areas.append(area)
+                    if overall_status != "finished" and s3_status == "finished":
+                        overall_status = "finished"
+                    stage3_summary = {
+                        "triggered": True,
+                        "status": s3_status,
+                        "calls": s3_calls[0],
+                        "tokens": s3_usage["total_tokens"],
+                        "effective_tokens": effective_tokens_from_usage(s3_usage, self.cache_token_weight),
+                        "cached_tokens": s3_usage["cached_prompt_tokens"],
+                        "uncached_tokens": s3_usage["uncached_prompt_tokens"],
+                        "reasoning_tokens": s3_usage["reasoning_tokens"],
+                        "findings": s3_findings_count,
+                    }
+                finally:
+                    self._close_dispatcher(stage3_dispatcher)
+
             self.dispatcher.finished = overall_status == "finished"
 
             self._sharding_summary = _build_sharding_summary(
@@ -2169,6 +2382,7 @@ class AgenticInvestigator:
                     }
                     for r in shard_results
                 ],
+                stage3_synthesis=stage3_summary,
             )
             self._save_checkpoint(turn=boot_last_turn, status=overall_status, messages=[])
             return self._result_summary(overall_status)

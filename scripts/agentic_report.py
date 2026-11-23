@@ -1209,6 +1209,18 @@ def render_markdown_report(artifacts: dict[str, Any]) -> str:
                 f"| `{shard.get('shard_id', 'shard')}` | `{fams}` | `{shard.get('status', 'unknown')}` | "
                 f"{shard.get('calls', 0)} | {shard.get('tokens', 0)} | {s_findings_cnt} |"
             )
+        stage3 = sharding.get("stage3_synthesis")
+        if isinstance(stage3, dict) and stage3.get("triggered"):
+            s3_findings_raw = stage3.get("findings", 0)
+            s3_findings_cnt = (
+                len(s3_findings_raw)
+                if isinstance(s3_findings_raw, list)
+                else int(s3_findings_raw or 0)
+            )
+            lines.append(
+                f"| stage3-synthesis | (cross-shard) | {stage3.get('status', 'unknown')} | "
+                f"{stage3.get('calls', 0)} | {stage3.get('tokens', 0)} | {s3_findings_cnt} |"
+            )
         lines.append("")
 
     not_tested_section_num = 5 if isinstance(sharding, dict) else 4
