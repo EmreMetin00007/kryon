@@ -21,6 +21,7 @@ from kryon_core.surface.extract import (  # noqa: E402
     extract_js,
     extract_js_calls,
     extract_spa_routes,
+    is_non_endpoint_noise_path,
 )
 
 BASE_URL = "http://127.0.0.1:8080"
@@ -332,3 +333,168 @@ def test_openwebui_style_chunk_end_to_end_tracker_preview_and_sharding() -> None
     assert not any("/_app/" in r or "/$defs" in r or "/(app)" in r for r in all_routes)
     assert "/api/v1/configs/banners" in all_routes
     assert "/api/v1/channels/{id}/messages/{id}/delete" in all_routes
+
+
+# ---------------------------------------------------------------------------
+# 4. Base64 / WASM / JS regex-fragment / hashed chunk plausibility filtering
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "blob_or_fragment",
+    [
+        "////8AAAabcdef",
+        "/////9+fXy7uvo5ohe2tjv0s",
+        "//////fwD//z8A/w==",
+        "////8AAAAAAAAAAP7",
+        "///api/v1/users",
+        "/api//v1/users",
+        "http://127.0.0.1:8080///foo",
+        "http://127.0.0.1:8080//foo/bar",
+        "/9+fxy7uvo5ohe2tjv0s",
+        "/+7b",
+        "/qw==",
+        "/38aap/w8=",
+        "/8=",
+        "/wo=",
+        "/aqaaaaaaap",
+        "/weaaaaaap",
+        "/8daaaaap",
+        "/8aaaaaaaaaap7",
+        "/g),c=u.match(",
+        "/g,gv=",
+        "/-",
+        "/---",
+        "/api/;",
+        "/api/foo*bar",
+        "/chunks/30QLxKeF.js",
+        "/chunks/vexCXLX9.js",
+        "../chunks/vexCXLX9.js",
+        "/app/chunks/AbCdEf12.mjs",
+    ],
+)
+def test_noise_path_rejects_base64_wasm_regex_and_hashed_chunks(blob_or_fragment: str) -> None:
+    assert is_non_endpoint_noise_path(blob_or_fragment) is True
+    assert is_non_endpoint_source_path(blob_or_fragment) is True
+
+
+@pytest.mark.parametrize(
+    "valid_path",
+    [
+        "/assets/app.js",
+        "/static/bundle.js",
+        "/api/v1/users",
+        "/api/files/{id}",
+        "/c/{id}",
+        "/users/id=123",
+        "/path/file=/etc/passwd",
+        "/search?q=${7*7}",
+        "/search?q=' OR 1=1--",
+        "/search?q=a+b&tok=abc==",
+        "/redirect?next=https://example.com//foo",
+        "//127.0.0.1:8080/api/v1/users",
+        "/api/v1/jobs/507f1f77bcf86cd799439011",
+        "/api/v1/jobs/00000aaaaa1234",
+        "/api/v1/records/aaaaaaaa-1111-4111-8111-111111111111",
+        "/api/v1/records/AAAAAAAA-1111-4111-8111-111111111111",
+    ],
+)
+def test_noise_path_preserves_valid_endpoints_path_kv_and_query_payloads(valid_path: str) -> None:
+    assert is_non_endpoint_noise_path(valid_path) is False
+    if "AAAAAAAA-1111" not in valid_path:
+        assert is_non_endpoint_source_path(valid_path) is False
+
+
+@pytest.mark.parametrize("short_kv_path", ["/api/items/id=", "/api/search/q="])
+def test_noise_path_preserves_known_short_path_keys(short_kv_path: str) -> None:
+    assert is_non_endpoint_noise_path(short_kv_path) is False
+
+
+def test_extract_js_noise_does_not_starve_limit_and_preserves_later_endpoints() -> None:
+    noise_literals = [
+        "/////9+fXy7uvo5ohe2tjv0s",
+        "//////fwD//z8A/w==",
+        "////8AAAAAAAAAAP7",
+        "////8AAAabcdef",
+        "///api/v1/hidden-by-triple-slash",
+        "/api//double-slash",
+        "/api/v1;eval()",
+        "/qw==",
+        "/38aap/w8=",
+        "/8=",
+        "/wo=",
+        "/9+fxy7uvo5ohe2tjv0s",
+        "/+7b",
+        "/aqaaaaaaap",
+        "/weaaaaaap",
+        "/8daaaaap",
+        "/8aaaaaaaaaap7",
+        "/g),c=u.match(",
+        "/g,gv=",
+        "/-",
+        "../chunks/vexCXLX9.js",
+        "/chunks/30QLxKeF.js",
+    ]
+    # Add enough varied base64/padding blobs (> limit=10) before real endpoints
+    extra_blobs = [f"/blob{i}w8=" for i in range(25)]
+    noise_block = "\n".join(f'const n_{i} = "{val}";' for i, val in enumerate([*noise_literals, *extra_blobs]))
+
+    real_endpoints = [
+        "/assets/app.js",
+        "/static/bundle.js",
+        "/api/v1/users",
+        "/api/v1/models",
+        "/api/v1/files",
+        "/api/v1/tools",
+        "/api/v1/prompts",
+        "/users/id=123",
+        "//127.0.0.1:8080/api/v1/health",
+        "/(app)/admin/settings",
+    ]
+    real_block = "\n".join(f'const e_{i} = "{ep}";' for i, ep in enumerate(real_endpoints))
+
+    recs = extract_js(f"{noise_block}\n{real_block}\n", "http://127.0.0.1:8080/app/main.js", limit=10)
+    urls = {rec["url"] for rec in recs}
+
+    assert len(recs) == 10
+    expected_urls = {
+        f"{BASE_URL}/assets/app.js",
+        f"{BASE_URL}/static/bundle.js",
+        f"{BASE_URL}/api/v1/users",
+        f"{BASE_URL}/api/v1/models",
+        f"{BASE_URL}/api/v1/files",
+        f"{BASE_URL}/api/v1/tools",
+        f"{BASE_URL}/api/v1/prompts",
+        f"{BASE_URL}/users/id=123",
+        f"{BASE_URL}/api/v1/health",
+        f"{BASE_URL}/admin/settings",
+    }
+    assert urls == expected_urls
+
+
+def test_extract_js_calls_and_spa_routes_reject_implausible_slashes_and_syntax() -> None:
+    js = """
+    fetch("///masked-triple");
+    fetch("/api/v1;eval()");
+    fetch("/api/files/${id}");
+    fetch("/search?q=a+b&tok=abc==");
+    const routes = [
+        { path: "/foo//bar" },
+        { path: "///triple" },
+        { path: "/g),c=u.match(" },
+        { path: "/(app)/c/[id]" },
+        { path: "/users/id=123" },
+    ];
+    """
+    call_urls = {rec["url"] for rec in extract_js_calls(js, CHUNK_URL)}
+    assert f"{BASE_URL}/api/files/{{id}}" in call_urls
+    assert any(u.startswith(f"{BASE_URL}/search?") for u in call_urls)
+    assert f"{BASE_URL}/masked-triple" not in call_urls
+    assert f"{BASE_URL}/api/v1" not in call_urls
+
+    route_urls = {rec["url"] for rec in extract_spa_routes(js, CHUNK_URL)}
+    assert f"{BASE_URL}/c/{{id}}" in route_urls
+    assert f"{BASE_URL}/users/id=123" in route_urls
+    assert f"{BASE_URL}/foo/bar" not in route_urls
+    assert f"{BASE_URL}/triple" not in route_urls
+    assert not any("u.match" in u for u in route_urls)

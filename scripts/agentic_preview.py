@@ -12,9 +12,20 @@ from urllib.parse import urljoin, urlsplit
 from agentic_http import is_static_asset_url
 from agentic_surface import is_non_endpoint_source_path
 
+_STANDALONE_SCRIPT_EXTS = (".js", ".mjs", ".cjs")
+_STANDALONE_API_PREFIX_RE = re.compile(r"(?:^|/)(?:api(?:/v\d+)?|graphql|rest|rpc)(?:/|$)", re.I)
+
+
+def _is_standalone_script_url(url_or_path: str) -> bool:
+    """Return True for standalone `.js`/`.mjs`/`.cjs` bundle URLs outside API/GraphQL or `key=val` paths."""
+    path_low = urlsplit(str(url_or_path or "").strip()).path.lower()
+    if not path_low.endswith(_STANDALONE_SCRIPT_EXTS) or "=" in path_low:
+        return False
+    return not _STANDALONE_API_PREFIX_RE.search(path_low)
+
 
 def _is_skipped_surface_url(url: str) -> bool:
-    """Return True for static media/style assets, frontend source modules, or malformed paths."""
+    """Return True for static media/style assets, frontend source modules, or malformed/noise paths."""
     return is_static_asset_url(url) or is_non_endpoint_source_path(url)
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -844,7 +855,8 @@ def _extract_surface_summary(receipt: dict[str, Any], base_url: str) -> dict[str
     if "html" in ctype or "<html" in body[:512].lower() or "<form" in body.lower() or "href=" in body.lower():
         for rec in extract_html(body, url):
             if rec.get("sources") == ["form"]:
-                if not is_non_endpoint_source_path(rec.get("url", "")):
+                form_url = rec.get("url", "")
+                if not is_non_endpoint_source_path(form_url):
                     forms.append(rec)
             elif not _is_skipped_surface_url(rec.get("url", "")):
                 links.append(rec)
@@ -873,14 +885,22 @@ def _extract_surface_summary(receipt: dict[str, Any], base_url: str) -> dict[str
             if not _is_skipped_surface_url(c.get("url", ""))
         )
         kept_js_links = 0
-        for rec in extract_js(body, url, limit=240):
-            if not _is_skipped_surface_url(rec.get("url", "")):
-                links.append(rec)
-                kept_js_links += 1
-                if kept_js_links >= 60:
-                    break
+        kept_script_links = 0
+        for rec in extract_js(body, url, limit=480):
+            rec_url = rec.get("url", "")
+            if _is_skipped_surface_url(rec_url):
+                continue
+            if _is_standalone_script_url(rec_url):
+                if kept_script_links < 60:
+                    kept_script_links += 1
+                    links.append(rec)
+                continue
+            links.append(rec)
+            kept_js_links += 1
+            if kept_js_links >= 60:
+                break
         kept_spa_routes = 0
-        for rec in extract_spa_routes(body, url, limit=160):
+        for rec in extract_spa_routes(body, url, limit=240):
             if not _is_skipped_surface_url(rec.get("url", "")):
                 spa_routes.append(rec)
                 kept_spa_routes += 1
@@ -943,13 +963,16 @@ def _extract_surface_summary(receipt: dict[str, Any], base_url: str) -> dict[str
             seen_links.add(key)
             dedup_links.append(comp)
 
-    # Sort deeper/API/parameterized links ahead of 1-segment top nav links
-    dedup_links.sort(
-        key=lambda x: (
-            0 if ("/api/" in x["url"] or "?" in x["url"] or x.get("params") or x["url"].count("/") >= 2) else 1,
-            x["url"],
-        )
-    )
+    # Sort deeper/API/parameterized links ahead of 1-segment top nav links and standalone script bundles
+    def _link_sort_key(item: dict[str, Any]) -> tuple[int, str]:
+        u = item["url"]
+        if _is_standalone_script_url(u) and "?" not in u and not item.get("params"):
+            return (2, u)
+        if "/api/" in u or "?" in u or item.get("params") or u.count("/") >= 2:
+            return (0, u)
+        return (1, u)
+
+    dedup_links.sort(key=_link_sort_key)
     compact_forms = [_compact_surface_item(f) for f in forms[:30]]
 
     summary: dict[str, Any] = {
@@ -1035,6 +1058,8 @@ def _build_surface_hints(
     for item in summary.get("links") or []:
         u = str(item.get("url") or "")
         path, _, _ = _short_same_origin(u)
+        if is_js and _is_standalone_script_url(path):
+            continue
         if is_js or "/api/" in path or path.startswith("/api") or "/graphql" in path:
             _add_api(u)
 

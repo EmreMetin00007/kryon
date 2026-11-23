@@ -33,6 +33,7 @@ from kryon_core.surface.extract import (  # noqa: E402
     extract_sitemap,
     extract_spa_routes,
     find_spec_urls,
+    has_double_slash_path,
     is_non_endpoint_noise_path,
 )
 from kryon_core.surface.openapi import LocalSchema  # noqa: E402
@@ -270,6 +271,7 @@ def _sanitize_multipart_name(raw: Any) -> str:
 
 _PATH_KV_KEY_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_-]{0,31}$")
 _URL_SCHEME_VAL_RE = re.compile(r"^[A-Za-z][A-Za-z0-9+.-]{0,15}:$")
+_MALFORMED_PATH_CHARS = frozenset(('"', "'", "`", "\\", "(", ")", ",", ";", "*"))
 _PATH_TEMPLATE_PARAM_RE = re.compile(r"^\{([A-Za-z][A-Za-z0-9_.-]{0,31})(?::([A-Za-z0-9_-]{1,16}))?\}$")
 _PLAIN_PATH_VAL_RE = re.compile(
     r"^(?:[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)?|https?://[A-Za-z0-9._:/-]+)$"
@@ -619,9 +621,14 @@ def _split_path_kv_segment(seg: str) -> tuple[str, str] | None:
         return None
     if val.startswith("="):
         return None
-    if not val and not (key.islower() and 2 <= len(key) <= 20):
+    key_low = key.lower()
+    if not val and not (
+        key_low in _PATH_INPUT_PARAM_TOKENS
+        or key_low in {"id", "q"}
+        or (key.islower() and key.isalpha() and 3 <= len(key) <= 20)
+    ):
         return None
-    return key.lower(), val
+    return key_low, val
 
 
 def _extract_path_embedded_param_pairs(path: str) -> list[tuple[str, str]]:
@@ -696,8 +703,10 @@ def _extract_path_embedded_params(path: str) -> list[str]:
 def is_malformed_url_path(url_or_path: str) -> bool:
     """Return True if a URL/path contains malformed path fragments.
 
-    Rejects backslashes, quotes, JS template-literal syntax (`${`), path whitespace,
-    and control characters while preserving valid OpenAPI/route templates like `{id}`.
+    Rejects backslashes, quotes, JS template-literal syntax (`${`), JS/regex code
+    punctuation (`(`, `)`, `,`, `;`, `*`), consecutive slashes (`//`) in the path,
+    path whitespace, and control characters while preserving valid OpenAPI/route
+    templates like `{id}`, path-embedded URL inputs, and query/fragment values.
     """
     raw_in = str(url_or_path or "")
     raw = raw_in.strip(" ")
@@ -713,12 +722,15 @@ def is_malformed_url_path(url_or_path: str) -> bool:
         parsed = urlsplit(raw)
     except ValueError:
         return True
-    path = parsed.path or ""
+    if not parsed.scheme and (raw_no_qf == "//" or raw_no_qf.startswith("///")):
+        path = raw_no_qf
+    else:
+        path = parsed.path or ""
     if not path:
         return False
-    if "\\" in path or "${" in path:
+    if has_double_slash_path(path) or "\\" in path or "${" in path:
         return True
-    if any(ch in path for ch in ('"', "'", "`")):
+    if any(ch in _MALFORMED_PATH_CHARS for ch in path):
         return True
     if any(ch.isspace() for ch in path):
         return True
@@ -1207,6 +1219,8 @@ class SurfaceFrontierTracker:
         if resolved is None:
             return
         norm_p, query = resolved
+        if is_non_endpoint_source_path(norm_p):
+            return
         tmpl = route_template_of(norm_p)
 
         q_names = [k.strip() for k, _ in parse_qsl(query, keep_blank_values=True) if k.strip()]
@@ -1263,8 +1277,12 @@ class SurfaceFrontierTracker:
         if is_non_endpoint_source_path(concrete_path):
             return
         norm_p = normalize_path(concrete_path)
+        if is_non_endpoint_source_path(norm_p):
+            return
         tmpl = route_template_of(norm_p)
-        if "{id}" not in tmpl or "{" in norm_p or norm_p.lower().endswith((".js", ".mjs")):
+        if is_non_endpoint_source_path(tmpl):
+            return
+        if "{id}" not in tmpl or "{" in norm_p or norm_p.lower().endswith((".js", ".mjs", ".html")):
             return
         clean_actor = str(actor or "").strip()
         clean_owner = str(owner_hint or "").strip()
@@ -1845,7 +1863,7 @@ class SurfaceFrontierTracker:
         out: list[str] = []
         seen_templates_in_out: set[tuple[str, str]] = set()
         for (method, norm_p), display in sorted(self.discovered_routes.items()):
-            if method not in self.allowed_methods:
+            if method not in self.allowed_methods or is_non_endpoint_source_path(norm_p):
                 continue
             tmpl = route_template_of(norm_p)
             # Skip unexpanded OpenAPI template strings `{...}` if a concrete path for that template was visited
@@ -2054,6 +2072,8 @@ class SurfaceFrontierTracker:
         # 1. Privileged/admin routes that returned 2xx for admin but have NOT been tested by a non-admin actor (BFLA frontier)
         if non_admin_actors:
             for norm_p, ok_actors in sorted(self.route_2xx_actors.items()):
+                if is_non_endpoint_source_path(norm_p):
+                    continue
                 tmpl = route_template_of(norm_p)
                 if "{id}" in tmpl or _is_auth_utility_path(norm_p):
                     continue
@@ -2067,6 +2087,8 @@ class SurfaceFrontierTracker:
         # 2. Authenticated non-object API routes that returned 2xx but have NOT been tested as 'anon' (auth_bypass frontier)
         if "anon" in self.actors:
             for norm_p, ok_actors in sorted(self.route_2xx_actors.items()):
+                if is_non_endpoint_source_path(norm_p):
+                    continue
                 tmpl = route_template_of(norm_p)
                 if "{id}" in tmpl or not norm_p.startswith("/api/") or _is_auth_utility_path(norm_p):
                     continue
@@ -2085,6 +2107,8 @@ class SurfaceFrontierTracker:
             ),
         )
         for norm_p, info in ordered_objects:
+            if is_non_endpoint_source_path(norm_p):
+                continue
             missing = self._missing_actors_for_object(info)
             if not missing:
                 continue
@@ -2112,7 +2136,12 @@ class SurfaceFrontierTracker:
         for (method, tmpl), sample_path in self.discovered_write_ops.items():
             if method not in write_allowed:
                 continue
-            if _is_auth_utility_path(sample_path) or _is_auth_utility_path(tmpl):
+            if (
+                is_non_endpoint_source_path(sample_path)
+                or is_non_endpoint_source_path(tmpl)
+                or _is_auth_utility_path(sample_path)
+                or _is_auth_utility_path(tmpl)
+            ):
                 continue
             if (method, tmpl) in self.tested_write_ops:
                 continue
@@ -2385,17 +2414,33 @@ class SurfaceFrontierTracker:
         self.discovered_routes = {
             (str(x[0]), str(x[1])): str(x[2])
             for x in (data.get("discovered_routes") or [])
-            if isinstance(x, list) and len(x) == 3
+            if isinstance(x, list) and len(x) == 3 and not is_non_endpoint_source_path(str(x[1]))
         }
         self.discovered_params = {
-            str(k): set(v) for k, v in (data.get("discovered_params") or {}).items() if isinstance(v, list)
+            str(k): set(v)
+            for k, v in (data.get("discovered_params") or {}).items()
+            if isinstance(v, list) and not is_non_endpoint_source_path(str(k))
         }
         self.discovered_objects = {}
         for k, v in (data.get("discovered_objects") or {}).items():
             if isinstance(v, dict):
-                self.discovered_objects[str(k)] = {
-                    "path": str(v.get("path") or k),
-                    "template": str(v.get("template") or route_template_of(str(k))),
+                obj_key = str(k)
+                obj_path = str(v.get("path") or obj_key)
+                if is_non_endpoint_source_path(obj_key) or is_non_endpoint_source_path(obj_path):
+                    continue
+                norm_obj = normalize_path(obj_path)
+                obj_tmpl = str(v.get("template") or route_template_of(norm_obj))
+                if (
+                    is_non_endpoint_source_path(norm_obj)
+                    or is_non_endpoint_source_path(obj_tmpl)
+                    or "{id}" not in obj_tmpl
+                    or "{" in norm_obj
+                    or norm_obj.lower().endswith((".js", ".mjs", ".html"))
+                ):
+                    continue
+                self.discovered_objects[obj_key] = {
+                    "path": obj_path,
+                    "template": obj_tmpl,
                     "owner_actor": str(v.get("owner_actor") or ""),
                     "seen_by": set(v.get("seen_by") or []),
                     "listed_by": set(v.get("listed_by") or []),
@@ -2405,30 +2450,35 @@ class SurfaceFrontierTracker:
         self.collection_listed_objects = {
             str(k): {str(a) for a in v}
             for k, v in (data.get("collection_listed_objects") or {}).items()
-            if isinstance(v, list)
+            if isinstance(v, list) and not is_non_endpoint_source_path(str(k))
         }
         self._pruned_404_objects = {str(x) for x in (data.get("pruned_404_objects") or [])}
         self.discovered_write_ops = {
             (str(x[0]), str(x[1])): str(x[2])
             for x in (data.get("discovered_write_ops") or [])
-            if isinstance(x, list) and len(x) == 3
+            if isinstance(x, list)
+            and len(x) == 3
+            and not is_non_endpoint_source_path(str(x[1]))
+            and not is_non_endpoint_source_path(str(x[2]))
         }
         self.declared_write_ops = {
             (str(x[0]), str(x[1]))
             for x in (data.get("declared_write_ops") or [])
-            if isinstance(x, list) and len(x) == 2
+            if isinstance(x, list) and len(x) == 2 and not is_non_endpoint_source_path(str(x[1]))
         }
         self.tested_write_ops = {(str(x[0]), str(x[1])) for x in (data.get("tested_write_ops") or []) if len(x) == 2}
 
         if isinstance(data.get("api_prefix_routes"), dict):
             self.api_prefix_routes = {
-                str(k): {str(p) for p in v}
+                str(k): {str(p) for p in v if not is_non_endpoint_source_path(str(p))}
                 for k, v in data["api_prefix_routes"].items()
                 if isinstance(v, list)
             }
         else:
             self.api_prefix_routes = {}
             for _, path in list(self.discovered_routes.keys()) + list(self.visited_method_paths):
+                if is_non_endpoint_source_path(path):
+                    continue
                 prefix = _extract_api_prefix(path)
                 if prefix:
                     self.api_prefix_routes.setdefault(prefix, set()).add(normalize_path(path))
@@ -2456,7 +2506,12 @@ class SurfaceFrontierTracker:
             if isinstance(row, list) and len(row) == 3 and isinstance(row[2], dict):
                 m_up = str(row[0] or "").strip().upper()
                 tmpl_key = str(row[1] or "").strip()
-                if m_up and tmpl_key and len(self.discovered_body_templates) < _MAX_BODY_TEMPLATES:
+                if (
+                    m_up
+                    and tmpl_key
+                    and not is_non_endpoint_source_path(tmpl_key)
+                    and len(self.discovered_body_templates) < _MAX_BODY_TEMPLATES
+                ):
                     sanitized = _sanitize_json_template(row[2])
                     if isinstance(sanitized, dict) and sanitized:
                         fitted = _fit_body_template_budget(sanitized, max_chars=_MAX_BODY_TEMPLATE_CHARS)
@@ -2464,7 +2519,7 @@ class SurfaceFrontierTracker:
                             self.discovered_body_templates[(m_up, tmpl_key)] = fitted
         self.discovered_schema_hints = {}
         for tmpl_key, raw_hints in (data.get("discovered_schema_hints") or {}).items():
-            if not isinstance(raw_hints, list):
+            if not isinstance(raw_hints, list) or is_non_endpoint_source_path(str(tmpl_key)):
                 continue
             cleaned = {str(h).strip() for h in raw_hints if str(h).strip()}
             if cleaned and len(self.discovered_schema_hints) < _MAX_SCHEMA_HINT_TEMPLATES:

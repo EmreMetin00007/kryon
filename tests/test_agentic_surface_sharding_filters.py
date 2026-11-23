@@ -15,6 +15,7 @@ from agentic_preview import _build_surface_hints, _extract_surface_summary  # no
 from agentic_sharding import cluster_discovered_surface, extract_resource_family  # noqa: E402
 from agentic_surface import (  # noqa: E402
     SurfaceFrontierTracker,
+    _split_path_kv_segment,
     is_malformed_url_path,
     is_non_endpoint_source_path,
 )
@@ -440,3 +441,229 @@ def test_cluster_discovered_surface_caps_static_readonly_route_bloat() -> None:
         assert cluster.families != ["docs"]
         api_in_shard = [f for f in cluster.families if f in api_families]
         assert len(api_in_shard) >= 2, f"shard {cluster.shard_id} under-allocated API families: {cluster.families}"
+
+
+# ---------------------------------------------------------------------------
+# 5. Open WebUI JS-bundle base64, regex-fragment, WASM zero-run, & chunk noise
+# ---------------------------------------------------------------------------
+
+_OPENWEBUI_NOISE_FRAGMENTS = (
+    "/////9...",
+    "////9",
+    "///wH///9//wM=",
+    "////////////////////////////////////8AAAAAAAAAAP7...",
+    "/g),c=u.match(",
+    "/g,gv=",
+    "/(app)/admin/settings",
+    "/w8=",
+    "/qw==",
+    "/wo=",
+    "/8=",
+    "/gv=",
+    "/9+fxy7uvo5ohe2tjv0s",
+    "/+7b",
+    "/-",
+    "/aqaaaaaaap",
+    "/weaaaaaap",
+    "/8daaaaap",
+    "/8aaaaaaaaaap7",
+    "/chunks/30QLxKeF.js",
+    "/chunks/30QLxKeF.mjs",
+    "/static/chunks/30QLxKeF.js",
+)
+
+
+def test_is_malformed_url_path_rejects_double_slashes_and_js_regex_punctuation() -> None:
+    for bad in (
+        "/////9...",
+        "////9",
+        "///wH///9//wM=",
+        "////////////////////////////////////8AAAAAAAAAAP7...",
+        "////foo",
+        "///9",
+        "///",
+        "http://127.0.0.1:8080//foo",
+        "http://127.0.0.1:8080/a//b",
+        "/g),c=u.match(",
+        "/g,gv=",
+        "/(app)/admin/settings",
+        "/api/foo;bar",
+        "/api/*",
+    ):
+        assert is_malformed_url_path(bad) is True, f"expected malformed path: {bad}"
+
+    for good in (
+        "http://127.0.0.1:8080/a/b",
+        "http://127.0.0.1:8080/api/files/{id}?limit=10",
+        "/search?q=${7*7}",
+        "/search?q=' OR 1=1--",
+        "/search?q=a+b&expr=(1,2);*",
+        "/api/files/{id}",
+        "/assets/app.js",
+        "/static/bundle.js",
+        "/users/id=123",
+        "/file=../../etc/passwd",
+        "/proxy=http://127.0.0.1:8080/admin",
+        "/proxy=https://example.com/a/b",
+    ):
+        assert is_malformed_url_path(good) is False, f"expected valid path: {good}"
+
+
+@pytest.mark.parametrize("noise_path", _OPENWEBUI_NOISE_FRAGMENTS)
+def test_is_non_endpoint_source_path_and_family_reject_base64_wasm_and_chunk_noise(noise_path: str) -> None:
+    assert is_non_endpoint_source_path(noise_path) is True
+    assert extract_resource_family(noise_path) == "root"
+
+
+def test_blob_filter_and_split_path_kv_preserve_valid_params_hex_ids_and_bundles() -> None:
+    for valid in (
+        "/search?q=${7*7}",
+        "/search?q=' OR 1=1--",
+        "/search?q=a+b",
+        "/assets/app.js",
+        "/static/bundle.js",
+        "/api/files/{id}",
+        "/users/id=123",
+        "/file=abc.txt",
+        "/file=/etc/passwd",
+        "/api/items/id=",
+        "/api/search/q=",
+        "/api/files/0123456789abcdef00000aaaaa123456",
+        "/api/chunks/123",
+    ):
+        assert is_non_endpoint_source_path(valid) is False, f"false positive on valid path: {valid}"
+
+    assert is_non_endpoint_source_path("/file=../../etc/passwd") is False
+    assert is_non_endpoint_source_path("/proxy=http://127.0.0.1:8080/admin") is False
+    assert is_non_endpoint_source_path("/api/v1/records/aaaaaaaa-1111-4111-8111-111111111111") is False
+
+    # Short/base64 empty-value `=` segments must NOT register as path:kv= parameters
+    for bad_kv in ("wo=", "gv=", "8=", "w8=", "w8g=", "qw==", "wM="):
+        assert _split_path_kv_segment(bad_kv) is None, f"unexpected path kv match: {bad_kv}"
+    assert is_non_endpoint_source_path("/abc=") is True
+
+    assert _split_path_kv_segment("file=") == ("file", "")
+    assert _split_path_kv_segment("url=") == ("url", "")
+    assert _split_path_kv_segment("name=") == ("name", "")
+    assert _split_path_kv_segment("id=") == ("id", "")
+    assert _split_path_kv_segment("q=") == ("q", "")
+    assert _split_path_kv_segment("id=123") == ("id", "123")
+    assert _split_path_kv_segment("item=123") == ("item", "123")
+
+
+def test_tracker_and_sharding_block_base64_wasm_chunk_leaks_and_scrub_legacy_checkpoints() -> None:
+    tracker = SurfaceFrontierTracker(
+        base_url="http://127.0.0.1:3080/",
+        allowed_methods=("GET", "POST", "PUT", "DELETE"),
+        actor_summaries=[
+            {"alias": "alice", "role": "member", "tenant": "t1"},
+            {"alias": "bob", "role": "member", "tenant": "t1"},
+        ],
+    )
+
+    js_lines = "\n".join(f'const junk_{i} = "{p}";' for i, p in enumerate(_OPENWEBUI_NOISE_FRAGMENTS))
+    tracker.ingest_receipt({
+        "url": "http://127.0.0.1:3080/assets/app.js",
+        "method": "GET",
+        "status": 200,
+        "content_type": "application/javascript",
+        "actor": "alice",
+        "body": (
+            js_lines
+            + "\n"
+            + 'fetch("/api/v1/chats");\n'
+            + 'fetch("/api/v1/chats/chat-101");\n'
+            + 'fetch("/users/id=123");\n'
+        ),
+    })
+
+    for noise in _OPENWEBUI_NOISE_FRAGMENTS:
+        tracker._register_discovered_url(noise, method="GET", actor="alice")
+        tracker._register_object_path(noise, actor="alice", verified_2xx=True)
+
+    tracker.ingest_surface(
+        {
+            "url": "http://127.0.0.1:3080/",
+            "links": [
+                *({"method": "GET", "url": noise} for noise in _OPENWEBUI_NOISE_FRAGMENTS),
+                {"method": "GET", "url": "/api/v1/files"},
+            ],
+        },
+        actor="alice",
+    )
+
+    assert "/api/v1/chats/chat-101" in tracker.discovered_objects
+    for obj_path in tracker.discovered_objects:
+        assert not is_non_endpoint_source_path(obj_path)
+    untested_objs = tracker.untested_cross_actor_objects()
+    assert any("/api/v1/chats/chat-101" in item for item in untested_objs)
+    for item in untested_objs:
+        assert "////" not in item
+        assert "wM=" not in item
+        assert "AAAAAAAAAAP" not in item
+    assert tracker.discovered_params.get("/users/id={val}") == {"path:id="}
+
+    # Verify legacy checkpoint restoration scrubs pre-existing noisy entries
+    dirty_checkpoint = tracker.to_dict()
+    dirty_checkpoint["discovered_routes"].extend([["GET", noise, noise] for noise in _OPENWEBUI_NOISE_FRAGMENTS])
+    dirty_checkpoint["discovered_objects"]["///wH///9//wM="] = {
+        "path": "///wH///9//wM=",
+        "template": "/wh/{id}/wm=",
+        "owner_actor": "alice",
+        "seen_by": ["alice"],
+        "listed_by": [],
+        "tested_by": [],
+        "verified_2xx": True,
+    }
+    dirty_checkpoint["discovered_objects"]["/api/v1/chats/w8="] = {
+        "path": "/api/v1/chats/w8=",
+        "template": "/api/v1/chats/{val}",
+        "owner_actor": "alice",
+        "seen_by": ["alice"],
+        "listed_by": [],
+        "tested_by": [],
+        "verified_2xx": True,
+    }
+    dirty_checkpoint["discovered_params"]["/g,gv="] = ["path:g,gv="]
+    dirty_checkpoint["discovered_write_ops"].append(["POST", "/chunks/30QLxKeF.js", "/chunks/30QLxKeF.js"])
+    dirty_checkpoint["declared_write_ops"].append(["POST", "/chunks/30QLxKeF.js"])
+
+    restored = SurfaceFrontierTracker.from_dict(dirty_checkpoint)
+    assert "///wH///9//wM=" not in restored.discovered_objects
+    assert "/api/v1/chats/w8=" not in restored.discovered_objects
+    assert "/g,gv=" not in restored.discovered_params
+    assert all(not is_non_endpoint_source_path(p) for _, p in restored.discovered_routes)
+    assert all(not is_non_endpoint_source_path(item.split(" ", 2)[1]) for item in restored.unvisited_routes())
+    assert all("wM=" not in item and "w8=" not in item for item in restored.untested_cross_actor_objects())
+    assert all("/chunks/" not in item for item in restored.untested_write_ops())
+
+    # Clustering with manually injected legacy noise + real API families never creates junk families
+    api_families = ("files", "users", "convos", "prompts", "tags", "roles", "presets", "keys")
+    for fam in api_families:
+        restored.discovered_routes[("GET", f"/api/{fam}")] = f"/api/{fam}"
+        restored.discovered_routes[("GET", f"/api/{fam}/{{id}}")] = f"/api/{fam}/{{id}}"
+    for noise in _OPENWEBUI_NOISE_FRAGMENTS:
+        restored.discovered_routes[("GET", noise)] = noise
+
+    clusters = cluster_discovered_surface(restored, max_shards=4, min_routes_for_sharding=8)
+    all_fams = {fam for c in clusters for fam in c.families}
+    junk_fams = {
+        "9+fxy7uvo5ohe2tjv0s",
+        "aqaaaaaaap",
+        "weaaaaaap",
+        "8daaaaap",
+        "8aaaaaaaaaap7",
+        "g,gv=",
+        "8=",
+        "wo=",
+        "w8=",
+        "qw==",
+        "gv=",
+        "chunks",
+        "(app)",
+    }
+    assert all_fams.isdisjoint(junk_fams)
+    assert set(api_families).issubset(all_fams)
+    for cluster in clusters:
+        assert all(not is_non_endpoint_source_path(r) for r in cluster.routes)
+        assert all(not is_non_endpoint_source_path(o) for o in cluster.objects)

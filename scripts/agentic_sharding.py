@@ -70,6 +70,8 @@ def extract_resource_family(path: str) -> str:
     kv = _split_path_kv_segment(first)
     if kv is not None:
         return kv[0]
+    if "=" in first:
+        return "root"
     if len(segments) == 1 and "." in first:
         return "root"
     if not any(ch.isalnum() for ch in first):
@@ -99,6 +101,8 @@ def _extract_subfamily_after(path: str, umbrella: str) -> str | None:
     kv = _split_path_kv_segment(sub)
     if kv is not None:
         return kv[0]
+    if "=" in sub:
+        return None
     if len(segments) == 2 and "." in sub:
         return None
     return sub.lower()
@@ -456,6 +460,8 @@ def build_shard_prompts(
             except Exception:
                 continue
             path_or_url = str(rec.get("path") or rec.get("url") or "/")
+            if is_non_endpoint_source_path(path_or_url):
+                continue
             if cluster_fams:
                 rec_fam = extract_resource_family(path_or_url)
                 rec_sub = _extract_subfamily_after(path_or_url, rec_fam)

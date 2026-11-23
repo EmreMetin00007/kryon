@@ -634,6 +634,20 @@ _JSON_SCHEMA_POINTER_RE = re.compile(
     r"(?:^|/)\$(?:defs|schema|ref|id|anchor|dynamicref|dynamicanchor|vocabulary|comment|_[A-Za-z0-9_-]*)(?:/|$)",
     re.IGNORECASE,
 )
+_HASHED_CHUNK_RE = re.compile(r"(?:^|/)chunks/[A-Za-z0-9_.-]{6,}\.(?:js|mjs|cjs)$", re.I)
+_NODE_CHUNK_RE = re.compile(r"/nodes/[A-Za-z0-9_-]+\.[A-Za-z0-9_-]{6,}\.(?:js|mjs|cjs)$", re.I)
+_REPEATED_LETTER_RUN_RE = re.compile(r"([A-Za-z])\1{4,}")
+_LOWER_HEX_HYPHEN_RE = re.compile(r"[0-9a-f]+(?:-[0-9a-f]+)*")
+_UUID_SEG_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", re.I)
+_PATH_TEMPLATE_SEG_RE = re.compile(r"\{[A-Za-z0-9_.:-]+\}")
+_PATH_KV_SCHEME_RE = re.compile(r"(?:(?<=^)|(?<=/))([A-Za-z][A-Za-z0-9_-]{0,31}=[A-Za-z][A-Za-z0-9+.-]{0,15}://)")
+_ALLOWED_EMPTY_RHS_KV_KEYS = frozenset({
+    "id", "q", "file", "filename", "filepath", "path", "pathname", "dir", "directory",
+    "folder", "url", "uri", "href", "redirect", "dest", "destination", "target", "goto",
+    "callback", "proxy", "forward", "upstream", "template", "tpl", "include", "src",
+    "source", "next", "return", "location",
+})
+_FORBIDDEN_PATH_CHARS = frozenset("(),;*\"'`\\")
 _LEADING_TEMPLATE_VAR_RE = re.compile(r"^(?:\$\{[^}]+\}|\{[A-Za-z_$][A-Za-z0-9_$]*\})(.*)$")
 _BARE_TEMPLATE_VAR_RE = re.compile(r"^(?:\$\{[^}]+\}|\{[A-Za-z_$][A-Za-z0-9_$]*\})$")
 _JS_LINE_COMMENT_RE = re.compile(r"(?:^|[\s;{}(),])//([^\n\r]*)")
@@ -738,34 +752,147 @@ def _top_level_keys(span: str) -> list[str]:
     return keys
 
 
-def is_non_endpoint_noise_path(url_or_path: str) -> bool:
-    """Return True for frontend source modules, bundler chunk internals, and JSON Schema pointer paths.
+def has_double_slash_path(path: str) -> bool:
+    """Return True if a URL path contains ``//`` outside a valid ``key=scheme://`` parameter."""
+    if "//" not in path:
+        return False
+    sanitized = _PATH_KV_SCHEME_RE.sub(lambda m: m.group(1)[:-1], path)
+    return "//" in sanitized
 
-    Preserves `.js` bundle URLs (e.g. `/assets/app.js`) and valid endpoints while filtering
-    SvelteKit/Next.js build internals (`/_app/immutable/`, `/_app/version.json`,
-    `/_next/static/`, `/_next/data/`) and dollar-prefixed schema refs (`/$defs/...`, `/$schema`).
+
+def _split_url_path_for_validation(url_or_path: str) -> tuple[str, str, bool] | None:
+    """Extract raw pre-query path, parsed path, and relative flag; return None if structurally invalid."""
+    raw = str(url_or_path or "").strip()
+    if not raw:
+        return "", "", False
+    try:
+        parsed = urlsplit(raw)
+    except ValueError:
+        return None
+    raw_no_qf = raw.split("#", 1)[0].split("?", 1)[0]
+    path = (parsed.path or "").strip()
+    if (not path or path == "/") and parsed.fragment.startswith("/"):
+        raw_no_qf = raw.partition("#")[2].split("?", 1)[0].strip()
+        path = parsed.fragment.strip().split("?", 1)[0]
+    if not parsed.scheme and not parsed.netloc and raw_no_qf.startswith("///"):
+        return None
+    if not parsed.scheme and raw_no_qf.startswith("//"):
+        if not parsed.netloc or ("." not in parsed.netloc and ":" not in parsed.netloc):
+            return None
+    is_unrooted_rel = not parsed.scheme and not parsed.netloc and not raw_no_qf.startswith("/")
+    return raw_no_qf, path, is_unrooted_rel
+
+
+def _is_implausible_path_parts(
+    raw_no_qf: str,
+    path: str,
+    is_unrooted_rel: bool,
+    *,
+    allow_virtual_groups: bool = False,
+) -> bool:
+    """Return True when the URL path component looks like binary/base64/code-syntax noise."""
+    if any(ch.isspace() or ord(ch) < 32 or ord(ch) == 127 or ch == "\\" for ch in raw_no_qf):
+        return True
+    if not path or path == "/":
+        return False
+    if has_double_slash_path(path) or "==" in path or "${" in path:
+        return True
+    if any(ch in _FORBIDDEN_PATH_CHARS for ch in path):
+        if not allow_virtual_groups:
+            return True
+        if any(ch in path for ch in (",", ";", "*", '"', "'", "`", "\\")):
+            return True
+    check_path = path
+    if is_unrooted_rel:
+        while check_path.startswith(("./", "../")):
+            check_path = check_path[2:] if check_path.startswith("./") else check_path[3:]
+        if not check_path or check_path in {".", ".."}:
+            return True
+    in_path_kv_tail = False
+    for seg in (s for s in check_path.split("/") if s):
+        if allow_virtual_groups and _SPA_VIRTUAL_GROUP_RE.fullmatch(seg):
+            in_path_kv_tail = False
+            continue
+        if in_path_kv_tail and seg in {".", ".."}:
+            continue
+        in_path_kv_tail = False
+        if "(" in seg or ")" in seg or "+" in seg:
+            return True
+        is_tmpl_seg = bool(_PATH_TEMPLATE_SEG_RE.fullmatch(seg))
+        if is_tmpl_seg and not any(ch.isalnum() for ch in seg[1:-1]):
+            return True
+        if not any(ch.isalnum() for ch in seg) and not is_tmpl_seg:
+            return True
+        if "=" in seg:
+            lhs, _, rhs = seg.partition("=")
+            if not lhs or seg.endswith("==") or rhs.startswith("="):
+                return True
+            is_allowed_kv = lhs in _ALLOWED_EMPTY_RHS_KV_KEYS
+            if not rhs and not is_allowed_kv:
+                return True
+            if is_allowed_kv and (rhs in {"", ".", ".."} or rhs.lower() in {"http:", "https:"}):
+                in_path_kv_tail = True
+        if (
+            not _LOWER_HEX_HYPHEN_RE.fullmatch(seg)
+            and not _UUID_SEG_RE.fullmatch(seg)
+            and not is_tmpl_seg
+            and _REPEATED_LETTER_RUN_RE.search(seg)
+        ):
+            return True
+    return False
+
+
+def _is_implausible_url_path(url_or_path: str, *, allow_virtual_groups: bool = False) -> bool:
+    """Return True if `url_or_path` has implausible path syntax, base64 blobs, or code fragments."""
+    raw = str(url_or_path or "").strip()
+    if not raw:
+        return False
+    split_res = _split_url_path_for_validation(raw)
+    if split_res is None:
+        return True
+    raw_no_qf, path, is_unrooted_rel = split_res
+    return _is_implausible_path_parts(
+        raw_no_qf,
+        path,
+        is_unrooted_rel,
+        allow_virtual_groups=allow_virtual_groups,
+    )
+
+
+def is_non_endpoint_noise_path(url_or_path: str) -> bool:
+    """Return True for frontend source modules, bundler chunk internals, schema pointers, and path noise.
+
+    Preserves `.js` bundle URLs (e.g. `/assets/app.js`), query payloads, and valid endpoints while
+    filtering SvelteKit/Next.js build internals (`/_app/immutable/`, `/_app/version.json`,
+    `/_next/static/`, `/_next/data/`, `/chunks/<hash>.js`, `/nodes/<id>.<hash>.js`), dollar-prefixed
+    schema refs, and implausible base64/WASM/JS-syntax path fragments.
     """
     raw = str(url_or_path or "").strip()
     if not raw:
         return False
-    try:
-        parsed = urlsplit(raw)
-    except ValueError:
+    split_res = _split_url_path_for_validation(raw)
+    if split_res is None:
         return True
-    path = (parsed.path or "").strip()
-    if (not path or path == "/") and parsed.fragment.startswith("/"):
-        path = parsed.fragment.strip()
+    raw_no_qf, path, is_unrooted_rel = split_res
+    if _is_implausible_path_parts(raw_no_qf, path, is_unrooted_rel):
+        return True
     if not path or path == "/":
         return False
     norm_path = path.lower()
-    while norm_path.startswith("./"):
-        norm_path = norm_path[2:]
+    if is_unrooted_rel:
+        while norm_path.startswith(("./", "../")):
+            norm_path = norm_path[2:] if norm_path.startswith("./") else norm_path[3:]
+    else:
+        while norm_path.startswith("./"):
+            norm_path = norm_path[2:]
     if norm_path and not norm_path.startswith("/"):
         norm_path = "/" + norm_path
     trimmed = norm_path.rstrip("/")
     if not trimmed:
         return False
     if trimmed.endswith(_NON_ENDPOINT_SOURCE_EXTS):
+        return True
+    if _HASHED_CHUNK_RE.search(trimmed) or _NODE_CHUNK_RE.search(trimmed):
         return True
     if trimmed in _BUNDLER_EXACT_PATHS or any(marker in norm_path for marker in _BUNDLER_PATH_MARKERS):
         return True
@@ -955,6 +1082,8 @@ def extract_js_calls(text: str, base: str, allow_subdomains: bool = False,
         if not resolved_raw:
             continue
         templated, template_names = _template_url(resolved_raw)
+        if _is_implausible_url_path(templated):
+            continue
         url = normalize_url(templated, base=call_base)
         if not url or not same_host(url, base, allow_subdomains=allow_subdomains):
             continue
@@ -1116,6 +1245,8 @@ def extract_spa_routes(
     def _emit_route(raw_path: str, source_tag: str) -> None:
         if limit is not None and len(records) >= limit:
             return
+        if _is_implausible_url_path(raw_path, allow_virtual_groups=True):
+            return
         cleaned = _normalize_spa_route_path(raw_path)
         if not cleaned or _STATIC_SPA_EXT_RE.search(cleaned):
             return
@@ -1273,6 +1404,8 @@ def extract_js(text: str, base: str, allow_subdomains: bool = False, limit: int 
     def _emit_js(candidate: str) -> bool:
         cand = (candidate or "").strip()
         if not cand or "${" in cand:
+            return False
+        if _is_implausible_url_path(cand, allow_virtual_groups=True):
             return False
         if cand.startswith("/") and not cand.startswith("//"):
             cand = _normalize_spa_route_path(cand, normalize_colon=False, drop_empty_root=True)

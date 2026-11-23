@@ -64,6 +64,7 @@ from agentic_preview import (  # noqa: E402
     _extract_surface_summary,
     _is_skipped_surface_url,
 )
+from kryon_core.surface.extract import has_double_slash_path  # noqa: E402
 from agentic_surface import (  # noqa: E402
     _extract_path_embedded_params,
     _fit_body_template_budget,
@@ -642,10 +643,13 @@ def _is_browser_script_asset(req_url: str, req_path: str = "", req: Any = None) 
 
 
 def _is_stage0_noise_path(norm_p: str) -> bool:
-    """Return True for framework virtual route groups like ``/(app)/...``, ``/$defs/...``, or bundler chunks."""
-    low = str(norm_p or "").strip().lower()
-    if not low:
+    """Return True for framework virtual route groups, /$defs/*, bundler chunks, or code/base64 path artifacts."""
+    raw = str(norm_p or "").strip()
+    if not raw:
         return False
+    if is_non_endpoint_source_path(raw):
+        return True
+    low = raw.lower()
     if any(marker in low for marker in _STAGE0_BUNDLER_NOISE_MARKERS):
         return True
     segments = [seg for seg in low.split("/") if seg]
@@ -1258,8 +1262,16 @@ def _route_priority_score(
     score += _status_priority(status)
     if low in _LOW_SIGNAL_EXACT_PATHS:
         score -= 20
-    if low.endswith((".js", ".mjs")):
-        score -= 25
+    is_api_or_dynamic = bool(
+        method in _MUTATING_METHODS
+        or has_multipart_schema
+        or has_body_template
+        or _API_PATH_RE.search(low)
+        or any(str(p).startswith("path:") for p in params)
+        or is_form
+    )
+    if low.endswith((".js", ".mjs", ".cjs")) and not is_api_or_dynamic:
+        score -= 60
     return score
 
 
@@ -1299,7 +1311,7 @@ def _select_discovery_hints(
     get_routes = [
         r for r in routes
         if str(r.get("method") or "").upper() == "GET"
-        and not str(r.get("url") or "").lower().endswith((".js", ".mjs"))
+        and not str(r.get("url") or "").lower().endswith((".js", ".mjs", ".cjs"))
         and int(r.get("status") or 0) not in {404, 410}
     ]
     if not get_routes:
@@ -1473,7 +1485,8 @@ class _Stage0Collector:
 
         path_params = _extract_path_embedded_params(norm_p)
         if (
-            (is_static_asset_url(norm_p) and not path_params)
+            has_double_slash_path(raw_path)
+            or (is_static_asset_url(norm_p) and not path_params)
             or is_non_endpoint_source_path(norm_p)
             or _is_stage0_noise_path(norm_p)
         ):
@@ -2232,7 +2245,8 @@ def _crawl_actor_playwright(
             except ValueError:
                 return
             if (
-                is_static_asset_url(norm_p)
+                has_double_slash_path(path_u)
+                or is_static_asset_url(norm_p)
                 or is_non_endpoint_source_path(norm_p)
                 or _is_stage0_noise_path(norm_p)
                 or norm_p.lower().endswith(_SCRIPT_ASSET_EXTS)

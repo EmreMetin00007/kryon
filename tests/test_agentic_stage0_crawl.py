@@ -27,6 +27,11 @@ from agentic_stage0_crawl import (
     run_stage0_crawl,
 )
 from agentic_http import ActorManager, AgenticHTTPClient
+from agentic_preview import (
+    _build_surface_hints,
+    _extract_surface_summary,
+    _is_skipped_surface_url,
+)
 from agentic_receipts import ReceiptStore
 from agentic_surface import SurfaceFrontierTracker, route_template_of
 
@@ -1183,5 +1188,298 @@ def test_stage0_captures_external_css_base_href_frame_and_inline_links(tmp_path:
         assert "/root-item.pdf" in route_paths
         assert "/app/angular/view/secret.found" in route_paths
         assert "/styles/site.css" not in route_paths
+
+
+@pytest.mark.parametrize(
+    "noise_url",
+    [
+        "//8AAAA",
+        "////8AAAA...",
+        "/foo//bar",
+        "http://127.0.0.1:18080//8AAAA",
+        "/-",
+        "/---",
+        "/api/.",
+        "/api/..",
+        "/*",
+        "/___",
+        "/g),c=u.match(",
+        "/g,gv=",
+        "/foo(bar)",
+        "/a,b",
+        "/a;b",
+        "/a*b",
+        "/qw==",
+        "/38aap/w8=",
+        "/9+fxy7uvo5ohe2tjv0s",
+        "/aqaaaaaaap",
+        "/Abc=",
+        "/x=",
+        "/zzzzz",
+        "/chunks/30QLxKeF.js",
+        "/chunks/B0utj4Io.js",
+        "/chunks/chunk-01.mjs",
+        "/nodes/2.DVl3_4LU.js",
+    ],
+)
+def test_noise_path_guards_reject_regex_base64_and_chunk_artifacts(
+    tmp_path: Path,
+    noise_url: str,
+) -> None:
+    assert _is_stage0_noise_path(noise_url) is True
+    assert _is_skipped_surface_url(noise_url) is True
+
+    http = _make_client(tmp_path, base_url="http://127.0.0.1:18080/")
+    collector = _Stage0Collector(http)
+    assert collector.record_route(method="GET", raw_url=noise_url) is False
+
+
+@pytest.mark.parametrize(
+    "valid_url",
+    [
+        "/",
+        "/api/v1/chats",
+        "/api/files/{id}",
+        "/assets/app.js",
+        "/static/bundle.js",
+        "/api/v1/plugin.js",
+        "/files/file=app.js",
+        "/search?q=${7*7}",
+        "/q=",
+        "/id=",
+        "/file=",
+        "/api/items/12345678-1234-4123-8123-123456789abc",
+        "/api/items/deadbeef0000fffff000",
+        "/proxy=http://127.0.0.1:18080/admin",
+    ],
+)
+def test_noise_path_guards_preserve_valid_endpoints_templates_and_bundles(
+    tmp_path: Path,
+    valid_url: str,
+) -> None:
+    assert _is_stage0_noise_path(valid_url) is False
+    assert _is_skipped_surface_url(valid_url) is False
+
+    http = _make_client(tmp_path, base_url="http://127.0.0.1:18080/")
+    collector = _Stage0Collector(http)
+    assert collector.record_route(method="GET", raw_url=valid_url) is True
+
+
+def test_stage0_route_priority_ranks_endpoints_above_js_bundles_while_keeping_assets_under_cap(
+    tmp_path: Path,
+) -> None:
+    http = _make_client(tmp_path, base_url="http://127.0.0.1:18080/")
+    collector = _Stage0Collector(http)
+
+    collector.record_route(method="GET", raw_url="/assets/app.js")
+    collector.record_route(method="GET", raw_url="/static/user_upload.js?v=1", status=200)
+    collector.record_route(method="GET", raw_url="/workspace")
+    collector.record_route(method="GET", raw_url="/api/v1/chats", status=200)
+    collector.record_route(method="GET", raw_url="/files/file=app.js")
+    collector.record_route(method="POST", raw_url="/api/v1/notes", params=["title"])
+
+    links, forms, _bt, _mp, _hints = _finalize_routes(collector)
+    ordered_urls = [r["url"] for r in links]
+    assert "/assets/app.js" in ordered_urls
+    assert ordered_urls.index("/api/v1/notes") < ordered_urls.index("/assets/app.js")
+    assert ordered_urls.index("/api/v1/chats") < ordered_urls.index("/assets/app.js")
+    assert ordered_urls.index("/files/file=app.js") < ordered_urls.index("/assets/app.js")
+    assert ordered_urls.index("/workspace") < ordered_urls.index("/static/user_upload.js")
+    assert ordered_urls.index("/workspace") < ordered_urls.index("/assets/app.js")
+    assert not forms
+
+    # When total routes exceed _MAX_ROUTES_RETURNED (200), standalone .js files are evicted before endpoints.
+    big_collector = _Stage0Collector(http)
+    big_collector.record_route(method="GET", raw_url="/static/loader.js?v=9", status=200)
+    big_collector.record_route(method="GET", raw_url="/assets/app.js")
+    for idx in range(210):
+        big_collector.record_route(method="GET", raw_url=f"/api/v1/resource{idx:03d}")
+    big_links, _f, _bt2, _mp2, _h2 = _finalize_routes(big_collector)
+    assert len(big_links) == 200
+    assert all(not r["url"].endswith(".js") for r in big_links)
+
+
+def test_preview_extract_surface_summary_and_hints_prevent_js_noise_exhausting_slots() -> None:
+    noise_literals = [
+        'const n1 = "/g),c=u.match(";',
+        'const n2 = "/g,gv=";',
+        'const n3 = "/-";',
+        'const n4 = "////8AAAA";',
+        'const n5 = "/qw==";',
+        'const n6 = "/38aap/w8=";',
+        'const n7 = "/9+fxy7uvo5ohe2tjv0s";',
+        'const n8 = "/aqaaaaaaap";',
+        'import { a } from "/chunks/30QLxKeF.js";',
+        'import { b } from "/chunks/B0utj4Io.js";',
+        'import { c } from "/nodes/2.DVl3_4LU.js";',
+    ]
+    extra_noise = [f'const g_{i} = "/b64_{i:02d}+xyz==";' for i in range(65)]
+    extra_loaders = [f'import "/static/loader-{i:02d}.js";' for i in range(25)]
+    js_body = "\n".join([
+        *noise_literals,
+        *extra_noise,
+        *extra_loaders,
+        'const appBundle = "/assets/app.js";',
+        'const spaLink = "/workspace";',
+        'const apiEp = "/api/v1/chats";',
+        'fetch("/api/v1/models");',
+        'fetch("/search?q=${7*7}");',
+        'fetch(`/api/files/${id}`);',
+    ])
+
+    receipt = {
+        "receipt_id": "req-noise-js",
+        "url": "http://127.0.0.1:18080/_app/immutable/nodes/2.DVl3_4LU.js",
+        "status": 200,
+        "content_type": "application/javascript; charset=utf-8",
+        "response_headers": {"Content-Type": "application/javascript"},
+        "body": js_body,
+    }
+    summary = _extract_surface_summary(receipt, "http://127.0.0.1:18080")
+    all_urls = [
+        *(item["url"] for item in summary["links"]),
+        *(item["url"] for item in summary["js_calls"]),
+        *(item["url"] for item in summary["spa_routes"]),
+    ]
+
+    assert "/api/v1/chats" in all_urls
+    assert "/api/v1/models" in all_urls
+    assert "/workspace" in all_urls
+    assert "/api/files/{id}" in all_urls
+    assert "/assets/app.js" in all_urls
+    assert "/search" in all_urls
+
+    html_receipt = {
+        "receipt_id": "req-html-keep",
+        "url": "http://127.0.0.1:18080/",
+        "status": 200,
+        "content_type": "text/html; charset=utf-8",
+        "response_headers": {"Content-Type": "text/html"},
+        "body": (
+            '<a href="/search?q=${7*7}">Search</a>'
+            '<a href="/api/files/{id}">Files</a>'
+            '<script src="/assets/app.js"></script>'
+            '<script src="/chunks/30QLxKeF.js"></script>'
+        ),
+    }
+    html_summary = _extract_surface_summary(html_receipt, "http://127.0.0.1:18080")
+    html_urls = {item["url"] for item in html_summary["links"]}
+    assert _is_skipped_surface_url("/search?q=${7*7}") is False
+    assert "/search?q=%24%7B7%2A7%7D" in html_urls
+    assert "/api/files/{id}" in html_urls
+    assert "/assets/app.js" in html_urls
+    assert "/chunks/30QLxKeF.js" not in html_urls
+
+    for emitted in all_urls:
+        assert not _is_skipped_surface_url(emitted), f"unexpected noisy URL in summary: {emitted}"
+        assert "/chunks/" not in emitted
+        assert "/nodes/2.DVl3_4LU.js" not in emitted
+        assert "qw==" not in emitted
+        assert "aqaaaaaaap" not in emitted
+
+    # Real endpoints/routes rank ahead of standalone .js links in summary["links"]
+    link_urls = [item["url"] for item in summary["links"]]
+    assert link_urls.index("/api/v1/chats") < link_urls.index("/assets/app.js")
+    assert link_urls.index("/workspace") < link_urls.index("/assets/app.js")
+
+    hints = _build_surface_hints(receipt, "http://127.0.0.1:18080")
+    assert "/api/v1/chats" in hints.get("api_endpoints", [])
+    assert "/api/v1/models" in hints.get("api_endpoints", [])
+    assert "/assets/app.js" not in hints.get("api_endpoints", [])
+
+
+@pytest.mark.skipif(not HAS_PLAYWRIGHT, reason="Playwright Chromium not available")
+def test_stage0_playwright_bundle_filters_base64_regex_and_chunk_js_noise(tmp_path: Path) -> None:
+    chunk_imports = "\n".join([
+        'const re1 = "/g),c=u.match(";',
+        'const re2 = "/g,gv=";',
+        'const sep = "/-";',
+        'const b64_1 = "////8AAAA";',
+        'const b64_2 = "/qw==";',
+        'const b64_3 = "/38aap/w8=";',
+        'const b64_4 = "/9+fxy7uvo5ohe2tjv0s";',
+        'const b64_5 = "/aqaaaaaaap";',
+        *(f'const b64_pad_{i} = "/pad_{i:02d}+x==";' for i in range(60)),
+        'const ch1 = "/chunks/30QLxKeF.js";',
+        'const ch2 = "/chunks/B0utj4Io.js";',
+        *(f'const ld_{i} = "/static/loader-{i:02d}.js";' for i in range(20)),
+        'const realLink = "/workspace";',
+        'const apiRoute = "/api/v1/chats";',
+        'export async function boot() { return fetch("/api/v1/models"); }',
+    ])
+
+    def router(_method: str, raw_path: str, _hdrs: dict[str, str], _body: bytes) -> tuple[int, str, str, dict[str, str]]:
+        path = urlsplit(raw_path).path
+        if path == "/":
+            html = """<!doctype html>
+<html>
+<head>
+  <title>Noise Filter Crawl</title>
+  <script type="module" src="/_app/immutable/nodes/2.DVl3_4LU.js"></script>
+  <script src="/assets/app.js"></script>
+</head>
+<body>
+  <a href="/workspace">Workspace</a>
+  <a href="/search?q=${7*7}">Search</a>
+</body>
+</html>"""
+            return 200, "text/html; charset=utf-8", html, {}
+        if path == "/_app/immutable/nodes/2.DVl3_4LU.js":
+            return 200, "application/javascript", chunk_imports, {}
+        if path == "/assets/app.js":
+            return 200, "application/javascript", 'fetch("/api/v1/config");\n', {}
+        if path == "/workspace":
+            return 200, "text/html; charset=utf-8", "<html><body><h1>Workspace</h1></body></html>", {}
+        if path == "/search":
+            return 200, "text/html; charset=utf-8", "<html><body><h1>Search</h1></body></html>", {}
+        if path == "/api/v1/models":
+            return 200, "application/json", json.dumps({"models": []}), {}
+        if path == "/api/v1/config":
+            return 200, "application/json", json.dumps({"ok": True}), {}
+        return 404, "application/json", json.dumps({"error": "not found"}), {}
+
+    with _start_test_server(router) as (base_url, _port, _log):
+        http = _make_client(tmp_path, base_url=base_url, allowed_methods=("GET", "HEAD"), max_requests=80)
+        seed_dir = tmp_path / "seed_noise_test"
+        res = run_stage0_crawl(
+            http,
+            output_dir=seed_dir,
+            allow_forms=False,
+            max_pages=6,
+            max_actions=4,
+            wait_ms=200,
+            max_passive_probes=0,
+        )
+
+        assert res["status"] == "ok"
+        loaded = json.loads((seed_dir / "stage0-seed.json").read_text(encoding="utf-8"))
+        link_urls = [r["url"] for r in loaded["links"]]
+
+        assert "/workspace" in link_urls
+        assert "/search" in link_urls
+        assert "/api/v1/chats" in link_urls
+        assert "/api/v1/models" in link_urls
+        assert "/api/v1/config" in link_urls
+        assert "/assets/app.js" in link_urls
+
+        for noisy in (
+            "/g),c=u.match(",
+            "/g,gv=",
+            "/-",
+            "//8AAAA",
+            "/8AAAA",
+            "/qw==",
+            "/38aap/w8=",
+            "/9+fxy7uvo5ohe2tjv0s",
+            "/aqaaaaaaap",
+            "/chunks/30QLxKeF.js",
+            "/chunks/B0utj4Io.js",
+            "/_app/immutable/nodes/2.DVl3_4LU.js",
+        ):
+            assert noisy not in link_urls
+
+        assert all(not _is_stage0_noise_path(u) for u in link_urls)
+        assert link_urls.index("/api/v1/models") < link_urls.index("/assets/app.js")
+        assert link_urls.index("/workspace") < link_urls.index("/assets/app.js")
 
 
