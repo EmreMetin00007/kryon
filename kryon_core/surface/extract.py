@@ -10,7 +10,15 @@ from html import unescape
 from typing import Any
 from urllib.parse import unquote, urljoin, urlparse, urlsplit
 
-from .normalize import normalize_url, params_from_url, safe_sample, same_host
+from .normalize import (
+    is_port_in_path_artifact,
+    is_third_party_sdk_static_route,
+    normalize_bare_hostport_url,
+    normalize_url,
+    params_from_url,
+    safe_sample,
+    same_host,
+)
 
 HREF_RE = re.compile(r"""(?:href|src)\s*=\s*['"]([^'"]+)['"]""", re.I)
 FORM_RE = re.compile(
@@ -99,16 +107,31 @@ _META_URL_KEY_HINTS = (
     "endpoint", "src", "href", "link", "redirect", "next", "starturl",
 )
 _TEXT_ABS_URL_RE = re.compile(r"""https?://[^\s<>"'`()]+""", re.I)
+_TEXT_BARE_HOSTPORT_URL_RE = re.compile(
+    r"""(?:^|[\s(\["'=,:;])((?:(?:\d{1,3}\.){3}\d{1,3}|\[[0-9a-fA-F:]+\]|localhost|(?:[A-Za-z0-9-]+\.)+[A-Za-z]{2,63}):\d{1,5}/[^\s<>"'`()]*)""",
+    re.I,
+)
 _TEXT_REL_DOT_RE = re.compile(r"""(?:^|[\s(\["'=,:;])(\.{1,2}/[^\s<>"'`(),;]+)""")
 _TEXT_DOT_PREFIX_RE = re.compile(r"^(?:\.\.?/)+")
 _TEXT_REL_FILE_RE = re.compile(
-    r"""(?:^|[\s(\["'=,:;])((?:[A-Za-z0-9_-]+(?:/[A-Za-z0-9._~-]+)+|/(?!/)[A-Za-z0-9._~-]+(?:/[A-Za-z0-9._~-]+)*)\."""
+    r"""(?:^|[\s(\["'=,;]|:(?!\d+/))((?:[A-Za-z0-9_-]+(?:/[A-Za-z0-9._~-]+)+|/(?!/)[A-Za-z0-9._~-]+(?:/[A-Za-z0-9._~-]+)*)\."""
     r"""(?:html?|xhtml|shtml|php\d?|phtml|aspx?|ashx|asmx|jspx?|do|action|cgi|pl|py|rb|"""
     r"""json|xml|txt|md|csv|ya?ml|js|mjs|ts|css|svg|pdf|zip|tar|gz|bak|old|orig|conf|"""
     r"""cfg|ini|log|sql|env|map|wasm|swf|jar|woff2?|ttf|eot|png|jpe?g|gif|webp|ico|bmp|"""
     r"""mp4|webm|mp3|wav)(?:\?[A-Za-z0-9._~:/?#\[\]@!$&'*+,;=%-]+)?)""",
     re.I,
 )
+
+
+def _mask_text_spans(text: str, spans: list[tuple[int, int]]) -> str:
+    """Replace matched character spans with spaces so secondary regexes never re-slice URLs."""
+    if not spans:
+        return text
+    chars = list(text)
+    for start, end in spans:
+        for idx in range(start, min(end, len(chars))):
+            chars[idx] = " "
+    return "".join(chars)
 
 
 def _record(url: str, method: str = "GET", source: str = "", params=None, extra=None):
@@ -304,13 +327,20 @@ def _extract_html_impl(
     no_comments = _HTML_COMMENT_RE.sub(" ", stripped_bodies)
 
     effective_base = base
+    parsed_base_origin = urlsplit(base or "")
+    base_scheme = (parsed_base_origin.scheme or "http").lower()
+    if base_scheme not in {"http", "https"}:
+        base_scheme = "http"
+    base_netloc_low = (parsed_base_origin.netloc or "").lower()
 
     def _emit_html(raw_target: str, *, resolve_base: str | None = None) -> str:
-        candidate = (raw_target or "").strip()
-        if not candidate:
+        candidate = normalize_bare_hostport_url((raw_target or "").strip(), base=resolve_base or effective_base)
+        if not candidate or is_port_in_path_artifact(candidate, origin_url=base):
             return ""
         url = normalize_url(candidate, base=resolve_base or effective_base)
         if not url or not same_host(url, base, allow_subdomains=allow_subdomains):
+            return ""
+        if is_port_in_path_artifact(url, origin_url=base):
             return ""
         if url not in seen_get:
             seen_get.add(url)
@@ -332,15 +362,30 @@ def _extract_html_impl(
     def _scan_text_segment(segment: str) -> None:
         if not segment or not segment.strip():
             return
+        abs_spans: list[tuple[int, int]] = []
         for m in _TEXT_ABS_URL_RE.finditer(segment):
             _emit_html(m.group(0).rstrip(".,;:!?]"))
-        for m in _TEXT_REL_DOT_RE.finditer(segment):
+            abs_spans.append((m.start(), m.end()))
+        residual = _mask_text_spans(segment, abs_spans)
+        hp_spans: list[tuple[int, int]] = []
+        for m in _TEXT_BARE_HOSTPORT_URL_RE.finditer(residual):
+            raw_hp = m.group(1).rstrip(".,;:!?]")
+            hp_spans.append((m.start(1), m.end(1)))
+            cand_abs = f"{base_scheme}://{raw_hp}"
+            try:
+                cand_netloc_low = urlsplit(cand_abs).netloc.lower()
+            except ValueError:
+                cand_netloc_low = ""
+            if base_netloc_low and cand_netloc_low == base_netloc_low:
+                _emit_html(cand_abs)
+        residual = _mask_text_spans(residual, hp_spans)
+        for m in _TEXT_REL_DOT_RE.finditer(residual):
             rel_text = m.group(1).rstrip(".,;:!?]")
             _emit_html(rel_text)
             stripped = _TEXT_DOT_PREFIX_RE.sub("", rel_text)
             if stripped and "/" in stripped and not stripped.startswith("/"):
                 _emit_html("/" + stripped)
-        for m in _TEXT_REL_FILE_RE.finditer(segment):
+        for m in _TEXT_REL_FILE_RE.finditer(residual):
             _emit_html(m.group(1).rstrip(".,;:!?]"))
 
     def _emit_hash_route(route_part: str) -> None:
@@ -1082,10 +1127,17 @@ def extract_js_calls(text: str, base: str, allow_subdomains: bool = False,
         if not resolved_raw:
             continue
         templated, template_names = _template_url(resolved_raw)
-        if _is_implausible_url_path(templated):
+        if is_third_party_sdk_static_route(templated):
             continue
-        url = normalize_url(templated, base=call_base)
+        templated_norm = normalize_bare_hostport_url(templated, base=call_base)
+        if not templated_norm or is_port_in_path_artifact(templated_norm, origin_url=base):
+            continue
+        if _is_implausible_url_path(templated_norm):
+            continue
+        url = normalize_url(templated_norm, base=call_base)
         if not url or not same_host(url, base, allow_subdomains=allow_subdomains):
+            continue
+        if is_third_party_sdk_static_route(url) or is_port_in_path_artifact(url, origin_url=base):
             continue
         parsed_url = urlparse(url)
         if parsed_url.path.lower().endswith((".png", ".jpg", ".jpeg", ".gif", ".css", ".ico",
@@ -1245,15 +1297,19 @@ def extract_spa_routes(
     def _emit_route(raw_path: str, source_tag: str) -> None:
         if limit is not None and len(records) >= limit:
             return
+        if is_third_party_sdk_static_route(raw_path):
+            return
         if _is_implausible_url_path(raw_path, allow_virtual_groups=True):
             return
         cleaned = _normalize_spa_route_path(raw_path)
         if not cleaned or _STATIC_SPA_EXT_RE.search(cleaned):
             return
-        if is_non_endpoint_noise_path(cleaned):
+        if is_third_party_sdk_static_route(cleaned) or is_non_endpoint_noise_path(cleaned):
             return
         url = normalize_url(cleaned, base=base)
         if not url or not same_host(url, base, allow_subdomains=allow_subdomains):
+            return
+        if is_third_party_sdk_static_route(url) or is_port_in_path_artifact(url, origin_url=base):
             return
         if urlparse(url).path == "/" and not urlparse(url).query:
             return
@@ -1401,9 +1457,17 @@ def extract_js(text: str, base: str, allow_subdomains: bool = False, limit: int 
     records: list[dict] = []
     seen: set[str] = set()
 
+    parsed_base_origin = urlsplit(base or "")
+    base_scheme = (parsed_base_origin.scheme or "http").lower()
+    if base_scheme not in {"http", "https"}:
+        base_scheme = "http"
+    base_netloc_low = (parsed_base_origin.netloc or "").lower()
+
     def _emit_js(candidate: str) -> bool:
-        cand = (candidate or "").strip()
+        cand = normalize_bare_hostport_url((candidate or "").strip(), base=base)
         if not cand or "${" in cand:
+            return False
+        if is_third_party_sdk_static_route(cand) or is_port_in_path_artifact(cand, origin_url=base):
             return False
         if _is_implausible_url_path(cand, allow_virtual_groups=True):
             return False
@@ -1417,6 +1481,8 @@ def extract_js(text: str, base: str, allow_subdomains: bool = False, limit: int 
         if not url or not same_host(url, base, allow_subdomains=allow_subdomains):
             return False
         if urlparse(url).path.lower().endswith(_JS_STATIC_EXTS):
+            return False
+        if is_third_party_sdk_static_route(url) or is_port_in_path_artifact(url, origin_url=base):
             return False
         if is_non_endpoint_noise_path(url):
             return False
@@ -1435,13 +1501,29 @@ def extract_js(text: str, base: str, allow_subdomains: bool = False, limit: int 
     for comment_re in (_JS_LINE_COMMENT_RE, _JS_BLOCK_COMMENT_RE):
         for cm in comment_re.finditer(source):
             cbody = cm.group(1) or ""
+            abs_spans: list[tuple[int, int]] = []
             for m in _TEXT_ABS_URL_RE.finditer(cbody):
+                abs_spans.append((m.start(), m.end()))
                 if _emit_js(m.group(0).rstrip(".,;:!?]")):
                     return records
-            for m in _TEXT_REL_DOT_RE.finditer(cbody):
+            residual = _mask_text_spans(cbody, abs_spans)
+            hp_spans: list[tuple[int, int]] = []
+            for m in _TEXT_BARE_HOSTPORT_URL_RE.finditer(residual):
+                raw_hp = m.group(1).rstrip(".,;:!?]")
+                hp_spans.append((m.start(1), m.end(1)))
+                cand_abs = f"{base_scheme}://{raw_hp}"
+                try:
+                    cand_netloc_low = urlsplit(cand_abs).netloc.lower()
+                except ValueError:
+                    cand_netloc_low = ""
+                if base_netloc_low and cand_netloc_low == base_netloc_low:
+                    if _emit_js(cand_abs):
+                        return records
+            residual = _mask_text_spans(residual, hp_spans)
+            for m in _TEXT_REL_DOT_RE.finditer(residual):
                 if _emit_js(m.group(1).rstrip(".,;:!?]")):
                     return records
-            for m in _JS_COMMENT_SLASH_PATH_RE.finditer(cbody):
+            for m in _JS_COMMENT_SLASH_PATH_RE.finditer(residual):
                 if _emit_js(m.group(1).rstrip(".,;:!?]")):
                     return records
 
@@ -1507,7 +1589,7 @@ def _normalize_candidate_link(
     """Resolve explicit relative/same-origin URLs without inventing links from arbitrary scalars."""
     if not isinstance(raw, str):
         return None
-    text = raw.strip()
+    text = normalize_bare_hostport_url(raw.strip(), base=base_url)
     if not text or len(text) > 2048 or text.startswith("#"):
         return None
     if any(ch.isspace() or ord(ch) < 32 for ch in text):
@@ -1516,10 +1598,14 @@ def _normalize_candidate_link(
         return None
     if text.isdigit():
         return None
+    if is_port_in_path_artifact(text, origin_url=origin_url):
+        return None
     parsed_raw = urlsplit(text)
     if parsed_raw.scheme and parsed_raw.scheme.lower() not in {"http", "https"}:
         return None
     resolved = urljoin(base_url, text)
+    if is_port_in_path_artifact(resolved, origin_url=origin_url):
+        return None
     parsed = urlsplit(resolved)
     origin = urlsplit(origin_url)
     if (

@@ -28,7 +28,7 @@ if str(_REPO_ROOT) not in sys.path:
 from agentic_receipts import ReceiptStore  # noqa: E402
 from kryon_core.protocol.grpc_web import decode_grpc_web_frames, is_grpc_web_content_type  # noqa: E402
 from kryon_core.protocol.websocket_probe import probe_websocket  # noqa: E402
-from target_bootstrap import ScopeGuard  # noqa: E402
+from target_bootstrap import ScopeGuard, match_logout_route  # noqa: E402
 from wire_budget import WireBudget  # noqa: E402
 
 DEFAULT_BROWSER_USER_AGENT = (
@@ -789,6 +789,7 @@ class AgenticHTTPClient:
         excluded_paths: Sequence[str] = (),
         max_degradation_streak: int = 5,
         max_rps: float = 0.0,
+        allow_lifecycle_routes: bool = False,
         _sleep_fn: Callable[[float], None] | None = None,
         _monotonic_fn: Callable[[], float] | None = None,
     ):
@@ -801,7 +802,12 @@ class AgenticHTTPClient:
         self.base_url = normalize_origin(base_url)
         parsed_origin = urlsplit(self.base_url)
         self._origin = (parsed_origin.scheme, parsed_origin.netloc)
-        self.scope_guard = ScopeGuard(self.base_url, tuple(excluded_paths or ()))
+        self.allow_lifecycle_routes: bool = bool(allow_lifecycle_routes)
+        self.scope_guard = ScopeGuard(
+            self.base_url,
+            tuple(excluded_paths or ()),
+            allow_lifecycle_routes=self.allow_lifecycle_routes,
+        )
         self.excluded_paths: tuple[str, ...] = self.scope_guard.excluded_paths
         self.max_degradation_streak: int = max(0, int(max_degradation_streak))
         self._degradation_streak: int = 0
@@ -872,8 +878,9 @@ class AgenticHTTPClient:
         url_or_path: str,
         *,
         allow_websocket: bool = True,
+        allow_lifecycle_routes: bool | None = None,
     ) -> tuple[str, str, str]:
-        """Resolve relative path or URL and verify exact origin match and excluded paths."""
+        """Resolve relative path or URL and verify exact origin match, excluded paths, and lifecycle guards."""
         raw = str(url_or_path or "").strip()
         if not raw:
             raise ScopeViolationError("URL is required")
@@ -881,6 +888,12 @@ class AgenticHTTPClient:
             raise ScopeViolationError(f"scheme-relative cross-origin URL blocked: {raw}")
         if any(ch in raw for ch in ("\x00", "\r", "\n")):
             raise ScopeViolationError(f"URL contains control characters: {raw!r}")
+
+        eff_allow_lifecycle = (
+            self.allow_lifecycle_routes
+            if allow_lifecycle_routes is None
+            else bool(allow_lifecycle_routes)
+        )
 
         lower_raw = raw.lower()
         if lower_raw.startswith(("ws://", "wss://")):
@@ -906,7 +919,10 @@ class AgenticHTTPClient:
             ws_path = parsed_ws.path or "/"
             equiv_http_url = urlunsplit((expected_http_scheme, self._origin[1], ws_path, parsed_ws.query, ""))
             try:
-                self.scope_guard.check_url(equiv_http_url)
+                self.scope_guard.check_url(
+                    equiv_http_url,
+                    allow_lifecycle_routes=eff_allow_lifecycle,
+                )
             except ValueError as exc:
                 raise ScopeViolationError(str(exc)) from exc
             clean_ws_url = urlunsplit((ws_scheme, parsed_ws.netloc, ws_path, parsed_ws.query, ""))
@@ -920,7 +936,10 @@ class AgenticHTTPClient:
             )
         clean_url = urlunsplit((parsed.scheme, parsed.netloc, parsed.path or "/", parsed.query, ""))
         try:
-            self.scope_guard.check_url(clean_url)
+            self.scope_guard.check_url(
+                clean_url,
+                allow_lifecycle_routes=eff_allow_lifecycle,
+            )
         except ValueError as exc:
             raise ScopeViolationError(str(exc)) from exc
         return clean_url, parsed.path or "/", parsed.query
@@ -931,10 +950,19 @@ class AgenticHTTPClient:
         query_params: dict[str, Any] | None,
         *,
         allow_websocket: bool = True,
+        allow_lifecycle_routes: bool | None = None,
     ) -> tuple[str, str, str]:
         if not query_params:
-            return self.resolve_in_scope(url, allow_websocket=allow_websocket)
-        clean_url, _, _ = self.resolve_in_scope(url, allow_websocket=allow_websocket)
+            return self.resolve_in_scope(
+                url,
+                allow_websocket=allow_websocket,
+                allow_lifecycle_routes=allow_lifecycle_routes,
+            )
+        clean_url, _, _ = self.resolve_in_scope(
+            url,
+            allow_websocket=allow_websocket,
+            allow_lifecycle_routes=allow_lifecycle_routes,
+        )
         parsed = urlsplit(clean_url)
         existing = dict(parse_qsl(parsed.query, keep_blank_values=True))
         for k, v in query_params.items():
@@ -944,7 +972,42 @@ class AgenticHTTPClient:
                 existing[str(k)] = str(v)
         new_query = urlencode(sorted(existing.items()))
         rebuilt = urlunsplit((parsed.scheme, parsed.netloc, parsed.path or "/", new_query, ""))
-        return self.resolve_in_scope(rebuilt, allow_websocket=allow_websocket)
+        return self.resolve_in_scope(
+            rebuilt,
+            allow_websocket=allow_websocket,
+            allow_lifecycle_routes=allow_lifecycle_routes,
+        )
+
+    def _check_actor_logout_guard(
+        self,
+        *,
+        path: str,
+        actor: str,
+        session: ActorSession,
+        extra_headers: dict[str, str],
+        allow_lifecycle_routes: bool,
+    ) -> None:
+        """Prevent shared authenticated actors from accidentally invalidating their own session."""
+        if allow_lifecycle_routes or actor == "anon":
+            return
+        has_explicit_auth_override = any(
+            k.strip().lower() in _AUTH_OVERRIDE_HEADERS and str(v).strip()
+            for k, v in extra_headers.items()
+        )
+        if has_explicit_auth_override:
+            return
+        with session._lock:
+            is_active_or_provisioned = bool(session.authenticated or session.login_payload)
+        if not is_active_or_provisioned:
+            return
+        matched_logout = match_logout_route(path)
+        if matched_logout is not None:
+            raise ScopeViolationError(
+                f"active authenticated actor logout route blocked: {path!r} for actor {actor!r} "
+                f"(matched segment {matched_logout!r}); invoking logout under the shared actor "
+                "session would invalidate that actor for other shards — test logout using "
+                "actor='anon' or an explicit Authorization/Cookie headers override instead"
+            )
 
     def _record_degradation_status(self, *, status: int, url: str) -> None:
         """Track consecutive degraded/unreachable responses (status=0 or 429/502/503/504) and stop gracefully."""
@@ -1438,6 +1501,7 @@ class AgenticHTTPClient:
         force: bool = False,
         save_session_as: str = "",
         follow_redirects: bool = False,
+        allow_lifecycle_routes: bool | None = None,
     ) -> dict[str, Any]:
         """Execute a scope-locked, metered, receipted HTTP or WebSocket request."""
         raw_url_str = str(url or "").strip()
@@ -1452,13 +1516,30 @@ class AgenticHTTPClient:
             raise MethodNotAllowedError(
                 f"HTTP method {norm_method!r} not allowed; permitted: {sorted(self.allowed_methods)}"
             )
-        clean_url, path, norm_query = self._merge_query(url, query, allow_websocket=is_ws)
+        eff_allow_lifecycle = (
+            self.allow_lifecycle_routes
+            if allow_lifecycle_routes is None
+            else bool(allow_lifecycle_routes)
+        )
+        clean_url, path, norm_query = self._merge_query(
+            url,
+            query,
+            allow_websocket=is_ws,
+            allow_lifecycle_routes=eff_allow_lifecycle,
+        )
         if is_ws and clean_url.lower().startswith(("http://", "https://")):
             ws_scheme = "wss://" if clean_url.lower().startswith("https://") else "ws://"
             clean_url = ws_scheme + clean_url.split("://", 1)[1]
         session = self.actors.get(actor)
 
         extra_headers = {str(k): str(v) for k, v in (headers or {}).items()}
+        self._check_actor_logout_guard(
+            path=path,
+            actor=actor,
+            session=session,
+            extra_headers=extra_headers,
+            allow_lifecycle_routes=eff_allow_lifecycle,
+        )
         has_auth_override = any(k.lower() in _AUTH_OVERRIDE_HEADERS for k in extra_headers)
         if actor != "anon" and not has_auth_override and not session.authenticated:
             self.authenticate_actor(actor, force_login=False)
@@ -1628,6 +1709,14 @@ class AgenticHTTPClient:
                 next_url, next_path, next_query = self.resolve_in_scope(
                     joined_target,
                     allow_websocket=False,
+                    allow_lifecycle_routes=eff_allow_lifecycle,
+                )
+                self._check_actor_logout_guard(
+                    path=next_path,
+                    actor=actor,
+                    session=session,
+                    extra_headers=cur_extra_headers,
+                    allow_lifecycle_routes=eff_allow_lifecycle,
                 )
                 redirect_chain.append({
                     "receipt_id": str(receipt.get("receipt_id") or ""),

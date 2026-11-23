@@ -16,6 +16,73 @@ _ADMIN_ROLES = frozenset({"platform_admin", "tenant_admin", "admin", "superadmin
 _HOST_LABEL_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
 _GLOB_CHARS = frozenset("*?[")
 
+# Executable/handler endpoint extensions stripped from the final path segment when
+# classifying operational lifecycle and logout routes (deliberately excluding static
+# asset extensions such as .css/.js/.png so assets like reboot.css never false-positive).
+_ROUTE_ENDPOINT_EXTENSIONS: frozenset[str] = frozenset({
+    ".html",
+    ".htm",
+    ".php",
+    ".json",
+    ".asp",
+    ".aspx",
+    ".jsp",
+    ".do",
+    ".action",
+    ".cgi",
+    ".shtml",
+    ".cfm",
+    ".xml",
+    ".ashx",
+    ".asmx",
+})
+
+# Exact normalized path segments (underscores normalized to hyphens) identifying
+# destructive service/database lifecycle endpoints blocked fail-closed by default.
+DESTRUCTIVE_LIFECYCLE_SEGMENTS: frozenset[str] = frozenset({
+    "reboot",
+    "restart",
+    "shutdown",
+    "shut-down",
+    "poweroff",
+    "power-off",
+    "halt",
+    "kill",
+    "terminate",
+    "stop-server",
+    "stopserver",
+    "restart-server",
+    "restartserver",
+    "reboot-server",
+    "rebootserver",
+    "factory-reset",
+    "factoryreset",
+    "reset-db",
+    "resetdb",
+    "db-reset",
+    "reset-database",
+    "drop-db",
+    "dropdb",
+    "db-drop",
+    "drop-database",
+    "wipe",
+    "wipe-db",
+    "wipedb",
+    "db-wipe",
+    "wipe-database",
+})
+
+# Exact final path segments (after optional endpoint-extension stripping) identifying
+# session-teardown endpoints guarded for shared authenticated actors.
+LOGOUT_ROUTE_SEGMENTS: frozenset[str] = frozenset({
+    "logout",
+    "signout",
+    "sign-out",
+    "log-out",
+    "sign_out",
+    "log_out",
+})
+
 
 def normalize_loopback_origin(raw_url: str) -> str:
     """Validate and normalize an explicit owned loopback origin URL."""
@@ -181,6 +248,76 @@ def _path_matches_excluded(norm_path_lower: str, pattern_lower: str) -> bool:
             return fnmatch(norm_path_lower, f"{pattern_lower}/*")
         return False
     return norm_path_lower == pattern_lower or norm_path_lower.startswith(f"{pattern_lower}/")
+
+
+def _strip_route_extension(segment: str) -> str:
+    """Strip a single known endpoint extension (e.g. .html, .php, .json) from a path segment."""
+    clean = segment.rstrip(".")
+    dot_idx = clean.rfind(".")
+    if dot_idx > 0 and clean[dot_idx:] in _ROUTE_ENDPOINT_EXTENSIONS:
+        return clean[:dot_idx]
+    return clean
+
+
+def _match_destructive_segments(norm_path_lower: str) -> str | None:
+    """Return the matched canonical destructive lifecycle segment for a normalized lowercase path."""
+    segments = [seg for seg in norm_path_lower.split("/") if seg]
+    if not segments:
+        return None
+    last_idx = len(segments) - 1
+    for idx, raw_seg in enumerate(segments):
+        seg = raw_seg.split(";", 1)[0]
+        if idx == last_idx:
+            candidate = _strip_route_extension(seg)
+        elif seg.endswith(".php"):
+            candidate = seg[:-4]
+        else:
+            candidate = seg
+        canonical = candidate.replace("_", "-")
+        if canonical in DESTRUCTIVE_LIFECYCLE_SEGMENTS:
+            return canonical
+    return None
+
+
+def _match_logout_segment(norm_path_lower: str) -> str | None:
+    """Return the matched logout segment if the final normalized path segment is a logout route."""
+    segments = [seg for seg in norm_path_lower.split("/") if seg]
+    if not segments:
+        return None
+    final_seg = _strip_route_extension(segments[-1].split(";", 1)[0])
+    if final_seg in LOGOUT_ROUTE_SEGMENTS:
+        return final_seg
+    return None
+
+
+def match_destructive_lifecycle_route(path_or_url: str) -> str | None:
+    """Match normalized path segments against destructive service/DB lifecycle routes."""
+    raw = str(path_or_url or "").strip()
+    if not raw:
+        return None
+    parsed = urlsplit(raw)
+    norm_path_lower = normalize_path(parsed.path or "/").lower()
+    return _match_destructive_segments(norm_path_lower)
+
+
+def is_destructive_lifecycle_route(path_or_url: str) -> bool:
+    """Return True when ``path_or_url`` targets a destructive service/DB lifecycle endpoint."""
+    return match_destructive_lifecycle_route(path_or_url) is not None
+
+
+def match_logout_route(path_or_url: str) -> str | None:
+    """Match the final normalized path segment against session-logout endpoints."""
+    raw = str(path_or_url or "").strip()
+    if not raw:
+        return None
+    parsed = urlsplit(raw)
+    norm_path_lower = normalize_path(parsed.path or "/").lower()
+    return _match_logout_segment(norm_path_lower)
+
+
+def is_logout_route(path_or_url: str) -> bool:
+    """Return True when ``path_or_url`` ends in a session-logout endpoint segment."""
+    return match_logout_route(path_or_url) is not None
 
 
 @dataclass(frozen=True)
@@ -440,15 +577,17 @@ def resolve_target_origin(
 
 @dataclass
 class ScopeGuard:
-    """Enforce exact target origin lock and normalized case-insensitive excluded path rules."""
+    """Enforce exact target origin lock, excluded path rules, and destructive lifecycle route guard."""
 
     base_origin: str
     excluded_paths: tuple[str, ...] = ()
+    allow_lifecycle_routes: bool = False
 
     def __post_init__(self) -> None:
         origin, scheme, host, port = _normalize_explicit_origin(self.base_origin)
         self.base_origin = origin
         self._origin_key: tuple[str, str, int] = (scheme, host, port)
+        self.allow_lifecycle_routes = bool(self.allow_lifecycle_routes)
         normalized: list[str] = []
         seen: set[str] = set()
         for pat in self.excluded_paths:
@@ -460,8 +599,8 @@ class ScopeGuard:
                 normalized.append(norm)
         self.excluded_paths = tuple(normalized)
 
-    def check_url(self, url: str) -> None:
-        """Raise ValueError if URL leaves base_origin or hits any excluded_paths rule."""
+    def check_url(self, url: str, *, allow_lifecycle_routes: bool | None = None) -> None:
+        """Raise ValueError if URL leaves base_origin, hits excluded_paths, or hits a destructive lifecycle route."""
         raw = str(url or "").strip()
         if not raw:
             raise ValueError("URL is required")
@@ -485,4 +624,18 @@ class ScopeGuard:
             if _path_matches_excluded(norm_path_lower, pattern):
                 raise ValueError(
                     f"URL path {parsed.path or '/'!r} is excluded by scope pattern {pattern!r}"
+                )
+        effective_allow_lifecycle = (
+            self.allow_lifecycle_routes
+            if allow_lifecycle_routes is None
+            else bool(allow_lifecycle_routes)
+        )
+        if not effective_allow_lifecycle:
+            matched_segment = _match_destructive_segments(norm_path_lower)
+            if matched_segment is not None:
+                raise ValueError(
+                    f"destructive service-lifecycle route blocked: {parsed.path or '/'!r} "
+                    f"(matched segment {matched_segment!r}); endpoints that reboot, restart, "
+                    "shutdown, or wipe the target service/database are blocked by default to "
+                    "avoid crashing or disrupting the target"
                 )

@@ -30,6 +30,35 @@ _GENERIC_SECRET_PATTERNS = (
     re.compile(r"(?i)\b(access_token[\"']?\s*[:=]\s*[\"'])([^\"']+)([\"'])"),
     re.compile(r"(?i)\b(csrf_token[\"']?\s*[:=]\s*[\"'])([^\"']+)([\"'])"),
 )
+_SHORT_SECRET_KEY_SUBSTRINGS = (
+    "password",
+    "passwd",
+    "secret",
+    "token",
+    "apikey",
+    "api_key",
+    "api-key",
+    "credential",
+    "session",
+    "phpsessid",
+    "jsessionid",
+    "csrf",
+    "xsrf",
+    "jwt",
+    "cookie",
+    "authorization",
+)
+_SHORT_SECRET_KEY_TOKENS = frozenset({
+    "pass",
+    "pwd",
+    "key",
+    "auth",
+    "cred",
+    "creds",
+    "sid",
+    "sig",
+    "signature",
+})
 DEFAULT_MAX_DISK_BODY_CHARS = 4 * 1024 * 1024  # 4 MiB chars max on disk
 DEFAULT_PREVIEW_CHARS = 4000
 
@@ -73,6 +102,46 @@ def redact_headers(headers: dict[str, str] | None) -> dict[str, str]:
     return {str(k): redact_header_value(str(k), str(v)) for k, v in headers.items()}
 
 
+def _is_short_plain_word(secret: str) -> bool:
+    """Return True for short pure-lowercase-alpha tokens (4 <= len < 8), e.g. 'admin', 'probe', 'test'."""
+    return 4 <= len(secret) < 8 and secret.isascii() and secret.isalpha() and secret.islower()
+
+
+def _is_sensitive_key_name(name: str) -> bool:
+    """Return True when a field/header/parameter name denotes a credential or secret carrier."""
+    low = name.strip().lower()
+    if any(sub in low for sub in _SHORT_SECRET_KEY_SUBSTRINGS):
+        return True
+    tokens = re.split(r"[_.-]+", low)
+    return any(tok in _SHORT_SECRET_KEY_TOKENS for tok in tokens)
+
+
+def _redact_short_plain_secret(text: str, secret: str, replacement: str) -> str:
+    """Redact a short pure-lowercase-alpha secret only in credential contexts.
+
+    Preserves unrelated URL path segments (e.g. ``/admin/upload/index.html``),
+    prose (``admin panel``), and larger identifiers (``administrator``, ``shard2_probe``,
+    ``probe.txt``, ``probe-value-123``) while still scrubbing credential assignments
+    (``password=admin``, ``{"password": "admin"}``, ``X-API-Key: admin``, ``Bearer admin``,
+    ``http://user:admin@host/...``).
+    """
+    escaped = re.escape(secret)
+    assign_re = re.compile(
+        rf"(?<![A-Za-z0-9_.-])([A-Za-z0-9_][A-Za-z0-9_.-]{{1,63}})(['\"]?[ \t]*[:=][ \t]*['\"]?){escaped}(?![A-Za-z0-9_./-])"
+    )
+    cleaned = assign_re.sub(
+        lambda m: f"{m.group(1)}{m.group(2)}{replacement}" if _is_sensitive_key_name(m.group(1)) else m.group(0),
+        text,
+    )
+    scheme_re = re.compile(
+        rf"((?i:\b(?:bearer|basic|token|digest|apikey))[ \t]+){escaped}(?![A-Za-z0-9_./-])"
+    )
+    cleaned = scheme_re.sub(lambda m: f"{m.group(1)}{replacement}", cleaned)
+    userinfo_re = re.compile(rf"(://[^/\s:@]+:){escaped}(?=@)")
+    cleaned = userinfo_re.sub(lambda m: f"{m.group(1)}{replacement}", cleaned)
+    return cleaned
+
+
 def redact_secrets(text: str, secret_values: Sequence[str] = ()) -> str:
     """Scrub known credential/token values and generic auth patterns from text."""
     if not text:
@@ -85,13 +154,21 @@ def redact_secrets(text: str, secret_values: Sequence[str] = ()) -> str:
         reverse=True,
     )
     for secret in unique_secrets:
-        if secret in cleaned:
-            cleaned = cleaned.replace(secret, f"<REDACTED_SECRET:sha256_8={_digest8(secret)}>")
+        if secret not in cleaned:
+            continue
+        replacement = f"<REDACTED_SECRET:sha256_8={_digest8(secret)}>"
+        if _is_short_plain_word(secret):
+            cleaned = _redact_short_plain_secret(cleaned, secret, replacement)
+        else:
+            cleaned = cleaned.replace(secret, replacement)
     for idx, pattern in enumerate(_GENERIC_SECRET_PATTERNS):
         if idx == 0:
             cleaned = pattern.sub(r"\1<REDACTED_TOKEN>", cleaned)
         else:
-            cleaned = pattern.sub(r"\1<REDACTED_SECRET>\3", cleaned)
+            cleaned = pattern.sub(
+                lambda m: m.group(0) if "<REDACTED" in m.group(2) else f"{m.group(1)}<REDACTED_SECRET>{m.group(3)}",
+                cleaned,
+            )
     return cleaned
 
 

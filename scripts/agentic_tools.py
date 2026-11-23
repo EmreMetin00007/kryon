@@ -38,6 +38,7 @@ from agentic_evidence import (
     _SENSITIVE_JSON_KEY_PREFIXES as _SENSITIVE_JSON_KEY_PREFIXES,
     _SENSITIVE_JSON_KEY_SUFFIXES as _SENSITIVE_JSON_KEY_SUFFIXES,
     _SQLI_EVIDENCE_HINTS as _SQLI_EVIDENCE_HINTS,
+    _STATE_TAMPERING_CLASS_RANK as _STATE_TAMPERING_CLASS_RANK,
     _TEMPLATE_SEG_RE as _TEMPLATE_SEG_RE,
     _TRIVIAL_EVIDENCE as _TRIVIAL_EVIDENCE,
     _UUID_FULL_RE as _UUID_FULL_RE,
@@ -60,6 +61,7 @@ from agentic_evidence import (
     _is_sensitive_json_key as _is_sensitive_json_key,
     _norm_path as _norm_path,
     _receipt_contains_value as _receipt_contains_value,
+    _resolve_cross_class_overlap as _resolve_cross_class_overlap,
     _resolve_route_auth_bypass_vs_bfla as _resolve_route_auth_bypass_vs_bfla,
     _select_stronger_evidence_from_receipts as _select_stronger_evidence_from_receipts,
     _shannon_entropy as _shannon_entropy,
@@ -1489,8 +1491,27 @@ class ToolDispatcher:
         proof_ids: list[str],
         control_ids: list[str],
         actor_meta: dict[str, dict[str, str]],
+        title: str = "",
+        summary: str = "",
     ) -> dict[str, Any] | None:
-        """Merge into an existing finding sharing `(route_template, class_type)` under `_findings_lock`."""
+        """Merge into an existing finding sharing `(route_template, class_type)` or root-cause overlap under `_findings_lock`."""
+        incoming_stub: dict[str, Any] = {
+            "class_type": canonical_class,
+            "route_template": route_template,
+            "method": method,
+            "url": raw_url,
+            "path": effective_norm_path,
+            "actor": effective_actor,
+            "actor_alias": effective_actor,
+            "proof_receipt_ids": list(proof_ids),
+            "control_receipt_ids": list(control_ids),
+        }
+
+        matched_existing: dict[str, Any] | None = None
+        matched_existing_class = ""
+        matched_resolved_class = ""
+        best_cross_rank: tuple[int, int] | None = None
+
         for existing in self.findings:
             existing_class = normalize_vuln_class(
                 str(existing.get("class_type") or ""),
@@ -1502,139 +1523,170 @@ class ToolDispatcher:
                 existing.get("route_template")
                 or normalize_route_template(str(existing.get("url") or existing.get("path") or ""))
             )
-            same_or_overlap = existing_tmpl == route_template and (
-                existing_class == canonical_class
-                or ({existing_class, canonical_class} == {"auth_bypass", "bfla"})
+            if existing_tmpl != route_template:
+                continue
+            if existing_class == canonical_class or {existing_class, canonical_class} == {"auth_bypass", "bfla"}:
+                matched_existing = existing
+                matched_existing_class = existing_class
+                matched_resolved_class = canonical_class
+                break
+
+            existing_norm = {
+                **existing,
+                "class_type": existing_class,
+                "route_template": existing_tmpl,
+            }
+            cross = _resolve_cross_class_overlap(
+                existing_norm,
+                incoming_stub,
+                receipt_store=self.receipts,
             )
-            if not same_or_overlap:
+            if cross is not None:
+                winner_cls, match_prio = cross
+                spec_rank = _STATE_TAMPERING_CLASS_RANK.get(winner_cls, -1)
+                rank = (match_prio, spec_rank)
+                if best_cross_rank is None or rank < best_cross_rank:
+                    best_cross_rank = rank
+                    matched_existing = existing
+                    matched_existing_class = existing_class
+                    matched_resolved_class = winner_cls
+
+        if matched_existing is None:
+            return None
+
+        existing = matched_existing
+        existing_class = matched_existing_class
+
+        merged_proof_ids = list(dict.fromkeys([*(existing.get("proof_receipt_ids") or []), *proof_ids]))
+        merged_ctrl_ids = list(dict.fromkeys([*(existing.get("control_receipt_ids") or []), *control_ids]))
+        all_proof_recs: list[dict[str, Any]] = []
+        for rid in merged_proof_ids:
+            try:
+                rec = self.receipts.get(rid)
+                if 200 <= int(rec.get("status", 0)) < 400:
+                    all_proof_recs.append(rec)
+            except (KeyError, ValueError):
+                continue
+        all_ctrl_recs: list[dict[str, Any]] = []
+        for rid in merged_ctrl_ids:
+            try:
+                all_ctrl_recs.append(self.receipts.get(rid))
+            except (KeyError, ValueError):
                 continue
 
-            merged_proof_ids = list(dict.fromkeys([*(existing.get("proof_receipt_ids") or []), *proof_ids]))
-            merged_ctrl_ids = list(dict.fromkeys([*(existing.get("control_receipt_ids") or []), *control_ids]))
-            all_proof_recs: list[dict[str, Any]] = []
-            for rid in merged_proof_ids:
-                try:
-                    rec = self.receipts.get(rid)
-                    if 200 <= int(rec.get("status", 0)) < 400:
-                        all_proof_recs.append(rec)
-                except (KeyError, ValueError):
-                    continue
-            all_ctrl_recs: list[dict[str, Any]] = []
-            for rid in merged_ctrl_ids:
-                try:
-                    all_ctrl_recs.append(self.receipts.get(rid))
-                except (KeyError, ValueError):
-                    continue
+        resolved_class = matched_resolved_class
+        if {existing_class, canonical_class} == {"auth_bypass", "bfla"}:
+            resolved_class = _resolve_route_auth_bypass_vs_bfla(
+                route_template,
+                all_proof_recs,
+                all_ctrl_recs,
+                actor_meta_map=actor_meta,
+                receipt_store=self.receipts,
+                exact_path=effective_norm_path,
+                method=method,
+            )
+        elif resolved_class != existing_class and resolved_class == canonical_class:
+            if title:
+                existing["title"] = title
+            if summary:
+                existing["summary"] = summary
+        existing["class_type"] = resolved_class
+        existing["route_template"] = route_template
+        existing["proof_receipt_ids"] = merged_proof_ids
+        existing["control_receipt_ids"] = merged_ctrl_ids
+        existing_ev = str(existing.get("evidence_value") or existing.get("marker") or "").strip()
+        ex_score = score_evidence_value(existing_ev)
+        in_score = score_evidence_value(evidence_value)
+        ctrl_haystacks = _build_control_haystacks(all_ctrl_recs)
+        if existing_ev and _value_in_controls(existing_ev, ctrl_haystacks) and ex_score < _HIGH_SPEC_THRESHOLD:
+            ex_score = min(ex_score, 10)
+        if evidence_value and _value_in_controls(evidence_value, ctrl_haystacks) and in_score < _HIGH_SPEC_THRESHOLD:
+            in_score = min(in_score, 10)
+        if not existing_ev or (in_score >= _HIGH_SPEC_THRESHOLD and in_score > ex_score) or (in_score >= ex_score + 15):
+            ev_str = evidence_value
+        else:
+            ev_str = existing_ev
+        if all_proof_recs and resolved_class not in {"open_redirect", "reflected_xss", "stored_xss"}:
+            eligible_all = _filter_class_eligible_proofs(
+                resolved_class,
+                all_proof_recs,
+                all_ctrl_recs,
+                actor_meta_map=actor_meta,
+                receipt_store=self.receipts,
+                route_template=route_template,
+                evidence_value=ev_str,
+            )
+            promoted_ev, _ = _select_stronger_evidence_from_receipts(
+                resolved_class,
+                ev_str,
+                eligible_all,
+                all_ctrl_recs,
+            )
+            if promoted_ev:
+                ev_str = promoted_ev
+        existing["evidence_value"] = ev_str
+        existing["marker"] = ev_str
 
-            resolved_class = canonical_class
-            if {existing_class, canonical_class} == {"auth_bypass", "bfla"}:
-                resolved_class = _resolve_route_auth_bypass_vs_bfla(
-                    route_template,
-                    all_proof_recs,
-                    all_ctrl_recs,
-                    actor_meta_map=actor_meta,
-                    receipt_store=self.receipts,
-                    exact_path=effective_norm_path,
-                    method=method,
-                )
-            existing["class_type"] = resolved_class
-            existing["route_template"] = route_template
-            existing["proof_receipt_ids"] = merged_proof_ids
-            existing["control_receipt_ids"] = merged_ctrl_ids
-            existing_ev = str(existing.get("evidence_value") or existing.get("marker") or "").strip()
-            ex_score = score_evidence_value(existing_ev)
-            in_score = score_evidence_value(evidence_value)
-            ctrl_haystacks = _build_control_haystacks(all_ctrl_recs)
-            if existing_ev and _value_in_controls(existing_ev, ctrl_haystacks) and ex_score < _HIGH_SPEC_THRESHOLD:
-                ex_score = min(ex_score, 10)
-            if evidence_value and _value_in_controls(evidence_value, ctrl_haystacks) and in_score < _HIGH_SPEC_THRESHOLD:
-                in_score = min(in_score, 10)
-            if not existing_ev or (in_score >= _HIGH_SPEC_THRESHOLD and in_score > ex_score) or (in_score >= ex_score + 15):
-                ev_str = evidence_value
-            else:
-                ev_str = existing_ev
-            if all_proof_recs and resolved_class not in {"open_redirect", "reflected_xss", "stored_xss"}:
-                eligible_all = _filter_class_eligible_proofs(
-                    resolved_class,
-                    all_proof_recs,
-                    all_ctrl_recs,
-                    actor_meta_map=actor_meta,
-                    receipt_store=self.receipts,
-                    route_template=route_template,
-                    evidence_value=ev_str,
-                )
-                promoted_ev, _ = _select_stronger_evidence_from_receipts(
-                    resolved_class,
-                    ev_str,
-                    eligible_all,
-                    all_ctrl_recs,
-                )
-                if promoted_ev:
-                    ev_str = promoted_ev
-            existing["evidence_value"] = ev_str
-            existing["marker"] = ev_str
-
-            if all_proof_recs:
-                best, ordered_actors = select_primary_proof(
-                    resolved_class,
-                    all_proof_recs,
-                    all_ctrl_recs,
-                    actor_meta_map=actor_meta,
-                    receipt_store=self.receipts,
-                    route_template=route_template,
-                    evidence_value=ev_str,
-                )
-                best_actor = str(best.get("actor") or effective_actor or "anon").strip() or "anon"
-                existing["actor"] = best_actor
-                existing["actor_alias"] = best_actor
-                resolved_best_url, clean_best_path, _ = self.http.resolve_in_scope(best["url"] or raw_url)
-                existing["observed_status"] = best["status"]
-                existing["url"] = resolved_best_url
-                existing["path"] = clean_best_path
-                existing["method"] = best["method"]
-                prior_actors = [str(a) for a in (existing.get("supporting_actors") or []) if str(a)]
-                existing["supporting_actors"] = list(dict.fromkeys([*ordered_actors, *prior_actors]))
-                existing["evidence_excerpts"] = [
-                    {
-                        "receipt_id": r["receipt_id"],
-                        "actor": r["actor"],
-                        "method": r["method"],
-                        "url": r["url"],
-                        "status": r["status"],
-                        "excerpt": build_receipt_excerpt(r, ev_str, max_chars=MAX_PROOF_EXCERPT_CHARS),
-                    }
-                    for r in all_proof_recs
-                ]
-                existing["control_excerpts"] = [
-                    {
-                        "receipt_id": c["receipt_id"],
-                        "actor": c["actor"],
-                        "method": c["method"],
-                        "url": c["url"],
-                        "status": c["status"],
-                        "excerpt": build_receipt_excerpt(c, "", max_chars=MAX_CONTROL_EXCERPT_CHARS),
-                    }
-                    for c in all_ctrl_recs
-                ]
-                existing["evidence"] = compose_finding_evidence(
-                    best,
-                    all_proof_recs,
-                    all_ctrl_recs,
-                    ev_str,
-                    max_proof_chars=MAX_PROOF_EXCERPT_CHARS,
-                    max_control_chars=MAX_CONTROL_EXCERPT_CHARS,
-                )
-            self._save_findings()
-            return {
-                "accepted": True,
-                "duplicate": True,
-                "merged": True,
-                "finding_id": existing["finding_id"],
-                "class_type": existing["class_type"],
-                "primary_actor": existing.get("actor"),
-                "supporting_actors": existing.get("supporting_actors", []),
-            }
-        return None
+        if all_proof_recs:
+            best, ordered_actors = select_primary_proof(
+                resolved_class,
+                all_proof_recs,
+                all_ctrl_recs,
+                actor_meta_map=actor_meta,
+                receipt_store=self.receipts,
+                route_template=route_template,
+                evidence_value=ev_str,
+            )
+            best_actor = str(best.get("actor") or effective_actor or "anon").strip() or "anon"
+            existing["actor"] = best_actor
+            existing["actor_alias"] = best_actor
+            resolved_best_url, clean_best_path, _ = self.http.resolve_in_scope(best["url"] or raw_url)
+            existing["observed_status"] = best["status"]
+            existing["url"] = resolved_best_url
+            existing["path"] = clean_best_path
+            existing["method"] = best["method"]
+            prior_actors = [str(a) for a in (existing.get("supporting_actors") or []) if str(a)]
+            existing["supporting_actors"] = list(dict.fromkeys([*ordered_actors, *prior_actors]))
+            existing["evidence_excerpts"] = [
+                {
+                    "receipt_id": r["receipt_id"],
+                    "actor": r["actor"],
+                    "method": r["method"],
+                    "url": r["url"],
+                    "status": r["status"],
+                    "excerpt": build_receipt_excerpt(r, ev_str, max_chars=MAX_PROOF_EXCERPT_CHARS),
+                }
+                for r in all_proof_recs
+            ]
+            existing["control_excerpts"] = [
+                {
+                    "receipt_id": c["receipt_id"],
+                    "actor": c["actor"],
+                    "method": c["method"],
+                    "url": c["url"],
+                    "status": c["status"],
+                    "excerpt": build_receipt_excerpt(c, "", max_chars=MAX_CONTROL_EXCERPT_CHARS),
+                }
+                for c in all_ctrl_recs
+            ]
+            existing["evidence"] = compose_finding_evidence(
+                best,
+                all_proof_recs,
+                all_ctrl_recs,
+                ev_str,
+                max_proof_chars=MAX_PROOF_EXCERPT_CHARS,
+                max_control_chars=MAX_CONTROL_EXCERPT_CHARS,
+            )
+        self._save_findings()
+        return {
+            "accepted": True,
+            "duplicate": True,
+            "merged": True,
+            "finding_id": existing["finding_id"],
+            "class_type": existing["class_type"],
+            "primary_actor": existing.get("actor"),
+            "supporting_actors": existing.get("supporting_actors", []),
+        }
 
     def _tool_record_finding(self, args: dict[str, Any]) -> str:
         title = str(args.get("title") or "").strip()
@@ -2160,7 +2212,7 @@ class ToolDispatcher:
 
         excerpt_by_rid = {r["receipt_id"]: ex for r, ex in valid_proof_records}
 
-        # Deduplicate & merge by route_template for auth_bypass/bfla overlap or identical canonical_class.
+        # Deduplicate & merge by route_template for exact class, auth_bypass/bfla, or cross-class root-cause overlap.
         with self._findings_lock:
             merged_resp = self._try_merge_existing_finding_locked(
                 canonical_class=canonical_class,
@@ -2173,6 +2225,8 @@ class ToolDispatcher:
                 proof_ids=proof_ids,
                 control_ids=control_ids,
                 actor_meta=actor_meta,
+                title=title,
+                summary=summary,
             )
             if merged_resp is not None:
                 return json.dumps(merged_resp)
@@ -2331,6 +2385,8 @@ class ToolDispatcher:
                 proof_ids=proof_ids,
                 control_ids=control_ids,
                 actor_meta=actor_meta,
+                title=title,
+                summary=summary,
             )
             if merged_resp is not None:
                 return json.dumps(merged_resp)

@@ -14,6 +14,7 @@ import re
 from typing import Any
 
 from .compose import MAX_SOURCE, compose_js_routes
+from kryon_core.surface.normalize import is_third_party_sdk_static_route
 from .parsers import (
     _bounded_diagnostics,
     _coverage_gap,
@@ -68,7 +69,12 @@ def _norm_path(raw: str) -> str:
     path = path.split("#", 1)[0]
     if "?" in path:
         path = path.split("?", 1)[0]
-    path = re.sub(r"/{2,}", "/", path)
+    scheme_match = re.match(r"^(https?://)", path, re.I)
+    if scheme_match:
+        prefix = scheme_match.group(1)
+        path = prefix + re.sub(r"/{2,}", "/", path[len(prefix):])
+    else:
+        path = re.sub(r"/{2,}", "/", path)
     if len(path) > 240:
         path = path[:240]
     return path
@@ -308,6 +314,8 @@ def _extract_calls(
             if SIGN_NAME_RE.search(name)
         })
         path = _norm_path(raw)
+        if is_third_party_sdk_static_route(path):
+            continue
         endpoints.append({
             "method": method,
             "path": path,

@@ -36,6 +36,10 @@ from kryon_core.surface.extract import (  # noqa: E402
     has_double_slash_path,
     is_non_endpoint_noise_path,
 )
+from kryon_core.surface.normalize import (  # noqa: E402
+    is_port_in_path_artifact,
+    normalize_bare_hostport_url,
+)
 from kryon_core.surface.openapi import LocalSchema  # noqa: E402
 
 _UUID_SEG_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.I)
@@ -1232,6 +1236,10 @@ class SurfaceFrontierTracker:
         if concrete_id:
             self._sync_ui_api_concrete_siblings(resource)
 
+    def _is_port_in_path_noise(self, url_or_path: str) -> bool:
+        """Return True if a path/URL matches a target-port-in-path artifact for this tracker's origin."""
+        return is_port_in_path_artifact(url_or_path, origin_url=self.base_url)
+
     def _resolve_same_origin(self, raw_url: str, current_url: str = "") -> tuple[str, str] | None:
         raw_input = str(raw_url or "")
         if is_non_endpoint_source_path(raw_input):
@@ -1240,6 +1248,9 @@ class SurfaceFrontierTracker:
         if not raw or raw.startswith(("#", "javascript:", "mailto:", "tel:", "data:", "//")):
             return None
         base_ref = urljoin(self.base_url, current_url) if current_url else self.base_url
+        raw = normalize_bare_hostport_url(raw, base=base_ref)
+        if not raw or self._is_port_in_path_noise(raw):
+            return None
         resolved = urljoin(base_ref, raw)
         parsed = urlsplit(resolved)
         if (parsed.scheme, parsed.netloc) != self._origin:
@@ -1247,6 +1258,8 @@ class SurfaceFrontierTracker:
         if (is_static_asset_url(parsed.path) and not _extract_path_embedded_params(parsed.path)) or is_non_endpoint_source_path(resolved):
             return None
         norm_p = normalize_path(parsed.path)
+        if self._is_port_in_path_noise(norm_p):
+            return None
         return norm_p, parsed.query
 
     def _resolve_same_origin_ws(self, raw_url: str, current_url: str = "") -> tuple[str, str] | None:
@@ -1336,10 +1349,10 @@ class SurfaceFrontierTracker:
         verified_2xx: bool = False,
         listed: bool = False,
     ) -> None:
-        if is_non_endpoint_source_path(concrete_path):
+        if is_non_endpoint_source_path(concrete_path) or self._is_port_in_path_noise(concrete_path):
             return
         norm_p = normalize_path(concrete_path)
-        if is_non_endpoint_source_path(norm_p):
+        if is_non_endpoint_source_path(norm_p) or self._is_port_in_path_noise(norm_p):
             return
         tmpl = route_template_of(norm_p)
         if is_non_endpoint_source_path(tmpl):
@@ -1925,7 +1938,7 @@ class SurfaceFrontierTracker:
         out: list[str] = []
         seen_templates_in_out: set[tuple[str, str]] = set()
         for (method, norm_p), display in sorted(self.discovered_routes.items()):
-            if method not in self.allowed_methods or is_non_endpoint_source_path(norm_p):
+            if method not in self.allowed_methods or is_non_endpoint_source_path(norm_p) or self._is_port_in_path_noise(norm_p):
                 continue
             tmpl = route_template_of(norm_p)
             # Skip unexpanded OpenAPI template strings `{...}` if a concrete path for that template was visited
@@ -2169,7 +2182,7 @@ class SurfaceFrontierTracker:
             ),
         )
         for norm_p, info in ordered_objects:
-            if is_non_endpoint_source_path(norm_p):
+            if is_non_endpoint_source_path(norm_p) or self._is_port_in_path_noise(norm_p):
                 continue
             missing = self._missing_actors_for_object(info)
             if not missing:
@@ -2201,6 +2214,8 @@ class SurfaceFrontierTracker:
             if (
                 is_non_endpoint_source_path(sample_path)
                 or is_non_endpoint_source_path(tmpl)
+                or self._is_port_in_path_noise(sample_path)
+                or self._is_port_in_path_noise(tmpl)
                 or _is_auth_utility_path(sample_path)
                 or _is_auth_utility_path(tmpl)
             ):
@@ -2476,25 +2491,36 @@ class SurfaceFrontierTracker:
         self.discovered_routes = {
             (str(x[0]), str(x[1])): str(x[2])
             for x in (data.get("discovered_routes") or [])
-            if isinstance(x, list) and len(x) == 3 and not is_non_endpoint_source_path(str(x[1]))
+            if isinstance(x, list)
+            and len(x) == 3
+            and not is_non_endpoint_source_path(str(x[1]))
+            and not self._is_port_in_path_noise(str(x[1]))
         }
         self.discovered_params = {
             str(k): set(v)
             for k, v in (data.get("discovered_params") or {}).items()
-            if isinstance(v, list) and not is_non_endpoint_source_path(str(k))
+            if isinstance(v, list)
+            and not is_non_endpoint_source_path(str(k))
+            and not self._is_port_in_path_noise(str(k))
         }
         self.discovered_objects = {}
         for k, v in (data.get("discovered_objects") or {}).items():
             if isinstance(v, dict):
                 obj_key = str(k)
                 obj_path = str(v.get("path") or obj_key)
-                if is_non_endpoint_source_path(obj_key) or is_non_endpoint_source_path(obj_path):
+                if (
+                    is_non_endpoint_source_path(obj_key)
+                    or is_non_endpoint_source_path(obj_path)
+                    or self._is_port_in_path_noise(obj_key)
+                    or self._is_port_in_path_noise(obj_path)
+                ):
                     continue
                 norm_obj = normalize_path(obj_path)
                 obj_tmpl = str(v.get("template") or route_template_of(norm_obj))
                 if (
                     is_non_endpoint_source_path(norm_obj)
                     or is_non_endpoint_source_path(obj_tmpl)
+                    or self._is_port_in_path_noise(norm_obj)
                     or "{id}" not in obj_tmpl
                     or "{" in norm_obj
                     or norm_obj.lower().endswith((".js", ".mjs", ".html"))
@@ -2512,7 +2538,9 @@ class SurfaceFrontierTracker:
         self.collection_listed_objects = {
             str(k): {str(a) for a in v}
             for k, v in (data.get("collection_listed_objects") or {}).items()
-            if isinstance(v, list) and not is_non_endpoint_source_path(str(k))
+            if isinstance(v, list)
+            and not is_non_endpoint_source_path(str(k))
+            and not self._is_port_in_path_noise(str(k))
         }
         self._pruned_404_objects = {str(x) for x in (data.get("pruned_404_objects") or [])}
         self.discovered_write_ops = {
@@ -2522,11 +2550,16 @@ class SurfaceFrontierTracker:
             and len(x) == 3
             and not is_non_endpoint_source_path(str(x[1]))
             and not is_non_endpoint_source_path(str(x[2]))
+            and not self._is_port_in_path_noise(str(x[1]))
+            and not self._is_port_in_path_noise(str(x[2]))
         }
         self.declared_write_ops = {
             (str(x[0]), str(x[1]))
             for x in (data.get("declared_write_ops") or [])
-            if isinstance(x, list) and len(x) == 2 and not is_non_endpoint_source_path(str(x[1]))
+            if isinstance(x, list)
+            and len(x) == 2
+            and not is_non_endpoint_source_path(str(x[1]))
+            and not self._is_port_in_path_noise(str(x[1]))
         }
         self.tested_write_ops = {(str(x[0]), str(x[1])) for x in (data.get("tested_write_ops") or []) if len(x) == 2}
 

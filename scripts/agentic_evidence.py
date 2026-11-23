@@ -6,9 +6,9 @@ import json
 import math
 import re
 from typing import Any
-from urllib.parse import urlsplit
+from urllib.parse import parse_qsl, urlsplit
 
-from agentic_oracle import is_html_receipt
+from agentic_oracle import is_html_receipt, is_persistent_read_path_related
 from agentic_receipts import ReceiptStore
 
 MAX_PROOF_EXCERPT_CHARS = 4096
@@ -177,6 +177,19 @@ _CLASS_ALIASES = {
 _READ_SQLI_HINTS = ("order by", "order_by", "sort", "read", "differential", "boolean", "error-based", "error based", "case when")
 _ADMIN_ROLE_TOKENS = ("admin", "superadmin", "administrator", "root", "superuser", "sysadmin", "staff")
 _READONLY_ROLES = frozenset({"viewer", "readonly", "read_only", "guest", "auditor", "observer"})
+_MUTATING_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
+_READ_METHODS = frozenset({"GET", "HEAD"})
+# Overlapping state-tampering family specificity rank (lower value = higher specificity).
+_STATE_TAMPERING_CLASS_RANK: dict[str, int] = {
+    "mass_assignment": 0,
+    "auth_bypass": 1,
+    "business_logic": 2,
+    "other": 3,
+}
+_STATE_TAMPERING_CONTROL_CLASSES = frozenset({"mass_assignment", "business_logic"})
+# Classes whose root cause is orthogonal to generic HTTP body disclosures on the same method
+# unless they explicitly share proof or control receipts.
+_OTHER_RECEIPT_ONLY_CLASSES = frozenset({"cors_misconfiguration", "race_condition"})
 
 
 def _norm_path(url_or_path: str) -> str:
@@ -1065,6 +1078,286 @@ def _resolve_route_auth_bypass_vs_bfla(
     return "bfla" if non_admin_2xx else "auth_bypass"
 
 
+def _finding_actor(
+    entry: dict[str, Any],
+    *,
+    receipt_store: ReceiptStore | None = None,
+) -> str:
+    """Return the normalized primary actor alias for a finding entry."""
+    direct = str(entry.get("actor") or entry.get("actor_alias") or "").strip()
+    if direct:
+        return direct
+    for actor in (entry.get("supporting_actors") or []):
+        clean = str(actor or "").strip()
+        if clean:
+            return clean
+    if receipt_store is not None:
+        for rid in (entry.get("proof_receipt_ids") or []):
+            try:
+                rec = receipt_store.get(str(rid))
+            except (KeyError, ValueError):
+                continue
+            rec_actor = str(rec.get("actor") or "").strip()
+            if rec_actor:
+                return rec_actor
+    for ex in (entry.get("evidence_excerpts") or []):
+        if isinstance(ex, dict):
+            ex_actor = str(ex.get("actor") or "").strip()
+            if ex_actor:
+                return ex_actor
+    return ""
+
+
+def _collect_finding_receipt_meta(
+    entry: dict[str, Any],
+    *,
+    is_control: bool,
+    receipt_store: ReceiptStore | None = None,
+) -> list[tuple[str, str, int]]:
+    """Extract `(METHOD, url_or_path, status)` tuples for proof or control receipts of a finding."""
+    id_field = "control_receipt_ids" if is_control else "proof_receipt_ids"
+    excerpt_field = "control_excerpts" if is_control else "evidence_excerpts"
+    rids = [str(r).strip() for r in (entry.get(id_field) or []) if str(r).strip()]
+    excerpts_by_id: dict[str, dict[str, Any]] = {}
+    fallback_excerpts: list[dict[str, Any]] = []
+    for ex in (entry.get(excerpt_field) or []):
+        if not isinstance(ex, dict):
+            continue
+        fallback_excerpts.append(ex)
+        ex_rid = str(ex.get("receipt_id") or "").strip()
+        if ex_rid:
+            excerpts_by_id[ex_rid] = ex
+
+    meta: list[tuple[str, str, int]] = []
+    seen_rids: set[str] = set()
+    for rid in rids:
+        if rid in seen_rids:
+            continue
+        seen_rids.add(rid)
+        rec: dict[str, Any] | None = None
+        if receipt_store is not None:
+            try:
+                rec = receipt_store.get(rid)
+            except (KeyError, ValueError):
+                rec = None
+        if rec is None:
+            rec = excerpts_by_id.get(rid)
+        if rec is None:
+            continue
+        m = str(rec.get("method") or "").strip().upper()
+        u = str(rec.get("url") or rec.get("path") or "").strip()
+        try:
+            st = int(rec.get("status") or 0)
+        except (TypeError, ValueError):
+            st = 0
+        if m or u:
+            meta.append((m, u, st))
+
+    if not meta:
+        for ex in fallback_excerpts:
+            m = str(ex.get("method") or "").strip().upper()
+            u = str(ex.get("url") or ex.get("path") or "").strip()
+            try:
+                st = int(ex.get("status") or 0)
+            except (TypeError, ValueError):
+                st = 0
+            if m or u:
+                meta.append((m, u, st))
+
+    if not meta and not is_control:
+        m = str(entry.get("method") or "").strip().upper()
+        u = str(entry.get("url") or entry.get("path") or "").strip()
+        try:
+            st = int(entry.get("observed_status") or 0)
+        except (TypeError, ValueError):
+            st = 0
+        if m or u:
+            meta.append((m, u, st))
+    return meta
+
+
+def _url_related_to_route(url_or_path: str, route_template: str) -> bool:
+    """Return True if `url_or_path` maps to `route_template` or is persistently path-related to it."""
+    if not url_or_path or not route_template:
+        return False
+    if normalize_route_template(url_or_path) == route_template:
+        return True
+    return is_persistent_read_path_related(url_or_path, route_template)
+
+
+def _extract_write_read_pairs(
+    proof_meta: list[tuple[str, str, int]],
+    route_template: str,
+) -> set[tuple[str, str]]:
+    """Return `(WRITE_METHOD, READ_METHOD)` pairs observed on `route_template` (or related paths)."""
+    write_methods = {
+        m
+        for m, u, _ in proof_meta
+        if m in _MUTATING_METHODS and (not u or _url_related_to_route(u, route_template))
+    }
+    read_methods = {
+        m
+        for m, u, _ in proof_meta
+        if m in _READ_METHODS and (not u or _url_related_to_route(u, route_template))
+    }
+    return {(w, r) for w in write_methods for r in read_methods}
+
+
+def _has_baseline_read_control(
+    ctrl_meta: list[tuple[str, str, int]],
+    route_template: str,
+) -> bool:
+    """Return True if controls include a GET/HEAD baseline receipt on `route_template`."""
+    return any(
+        m in _READ_METHODS and (not u or _url_related_to_route(u, route_template))
+        for m, u, _ in ctrl_meta
+    )
+
+
+def _has_same_http_method_surface(
+    entry_a: dict[str, Any],
+    proof_meta_a: list[tuple[str, str, int]],
+    entry_b: dict[str, Any],
+    proof_meta_b: list[tuple[str, str, int]],
+    route_template: str,
+) -> bool:
+    """Return True when two findings exercise the same underlying HTTP method or write-read surface."""
+    wr_a = _extract_write_read_pairs(proof_meta_a, route_template)
+    wr_b = _extract_write_read_pairs(proof_meta_b, route_template)
+    if wr_a or wr_b:
+        return bool(wr_a & wr_b)
+
+    methods_a = {m for m, _, _ in proof_meta_a if m}
+    if not methods_a:
+        m_a = str(entry_a.get("method") or "").strip().upper()
+        if m_a:
+            methods_a.add(m_a)
+    methods_b = {m for m, _, _ in proof_meta_b if m}
+    if not methods_b:
+        m_b = str(entry_b.get("method") or "").strip().upper()
+        if m_b:
+            methods_b.add(m_b)
+    if not methods_a or not methods_b or methods_a != methods_b:
+        return False
+
+    status_fam_a = {st // 100 for _, _, st in proof_meta_a if st >= 100}
+    status_fam_b = {st // 100 for _, _, st in proof_meta_b if st >= 100}
+    if status_fam_a and status_fam_b and not (status_fam_a & status_fam_b):
+        return False
+
+    if methods_a <= _READ_METHODS:
+        qkeys_a = frozenset(
+            k.strip().lower()
+            for _, u, _ in proof_meta_a
+            for k, _ in parse_qsl(urlsplit(u).query, keep_blank_values=True)
+            if k.strip()
+        )
+        qkeys_b = frozenset(
+            k.strip().lower()
+            for _, u, _ in proof_meta_b
+            for k, _ in parse_qsl(urlsplit(u).query, keep_blank_values=True)
+            if k.strip()
+        )
+        if qkeys_a != qkeys_b:
+            return False
+
+    return True
+
+
+def _resolve_cross_class_overlap(
+    entry_a: dict[str, Any],
+    entry_b: dict[str, Any],
+    *,
+    receipt_store: ReceiptStore | None = None,
+) -> tuple[str, int] | None:
+    """Resolve root-cause cross-class overlap on the same `(route_template, actor)`.
+
+    Returns `(winning_class, match_priority)` (lower priority = stronger match) when `entry_a`
+    and `entry_b` represent the same underlying vulnerability reported under overlapping classes,
+    or `None` when they represent distinct vulnerabilities that must remain separate.
+    """
+    cls_a = str(entry_a.get("class_type") or "").strip().lower()
+    cls_b = str(entry_b.get("class_type") or "").strip().lower()
+    if not cls_a or not cls_b or cls_a == cls_b or {cls_a, cls_b} == {"auth_bypass", "bfla"}:
+        return None
+
+    tmpl_a = str(
+        entry_a.get("route_template")
+        or normalize_route_template(str(entry_a.get("url") or entry_a.get("path") or ""))
+    )
+    tmpl_b = str(
+        entry_b.get("route_template")
+        or normalize_route_template(str(entry_b.get("url") or entry_b.get("path") or ""))
+    )
+    if not tmpl_a or tmpl_a != tmpl_b:
+        return None
+
+    actor_a = _finding_actor(entry_a, receipt_store=receipt_store)
+    actor_b = _finding_actor(entry_b, receipt_store=receipt_store)
+    if not actor_a or actor_a != actor_b:
+        return None
+
+    proof_ids_a = {str(r).strip() for r in (entry_a.get("proof_receipt_ids") or []) if str(r).strip()}
+    proof_ids_b = {str(r).strip() for r in (entry_b.get("proof_receipt_ids") or []) if str(r).strip()}
+    ctrl_ids_a = {str(r).strip() for r in (entry_a.get("control_receipt_ids") or []) if str(r).strip()}
+    ctrl_ids_b = {str(r).strip() for r in (entry_b.get("control_receipt_ids") or []) if str(r).strip()}
+    shares_proof = bool(proof_ids_a & proof_ids_b)
+    shares_control = bool(ctrl_ids_a & ctrl_ids_b)
+
+    # Rule 1: Generic `other` subsumption on the same (route_template, actor).
+    if "other" in {cls_a, cls_b}:
+        specific_cls = cls_b if cls_a == "other" else cls_a
+        if shares_proof:
+            return specific_cls, 1
+        if shares_control:
+            return specific_cls, 2
+        if specific_cls not in _OTHER_RECEIPT_ONLY_CLASSES:
+            proof_meta_a = _collect_finding_receipt_meta(entry_a, is_control=False, receipt_store=receipt_store)
+            proof_meta_b = _collect_finding_receipt_meta(entry_b, is_control=False, receipt_store=receipt_store)
+            if _has_same_http_method_surface(entry_a, proof_meta_a, entry_b, proof_meta_b, tmpl_a):
+                return specific_cls, 3
+        return None
+
+    # Rule 2a: Overlapping state-tampering family (`mass_assignment` vs `business_logic`).
+    if {cls_a, cls_b} == _STATE_TAMPERING_CONTROL_CLASSES:
+        winner = "mass_assignment"
+        if shares_proof:
+            return winner, 1
+        if shares_control:
+            return winner, 2
+        proof_meta_a = _collect_finding_receipt_meta(entry_a, is_control=False, receipt_store=receipt_store)
+        proof_meta_b = _collect_finding_receipt_meta(entry_b, is_control=False, receipt_store=receipt_store)
+        wr_a = _extract_write_read_pairs(proof_meta_a, tmpl_a)
+        wr_b = _extract_write_read_pairs(proof_meta_b, tmpl_a)
+        if wr_a & wr_b:
+            ctrl_meta_a = _collect_finding_receipt_meta(entry_a, is_control=True, receipt_store=receipt_store)
+            ctrl_meta_b = _collect_finding_receipt_meta(entry_b, is_control=True, receipt_store=receipt_store)
+            if _has_baseline_read_control(ctrl_meta_a, tmpl_a) and _has_baseline_read_control(ctrl_meta_b, tmpl_a):
+                return winner, 3
+        return None
+
+    # Rule 2b: `auth_bypass` overlapping with `mass_assignment` or `business_logic` on shared proofs
+    # (or shared control + identical HTTP method/write-read surface).
+    if "auth_bypass" in {cls_a, cls_b} and ({cls_a, cls_b} - {"auth_bypass"}) <= _STATE_TAMPERING_CONTROL_CLASSES:
+        winner = cls_a if _STATE_TAMPERING_CLASS_RANK[cls_a] < _STATE_TAMPERING_CLASS_RANK[cls_b] else cls_b
+        if shares_proof:
+            return winner, 1
+        if shares_control:
+            proof_meta_a = _collect_finding_receipt_meta(entry_a, is_control=False, receipt_store=receipt_store)
+            proof_meta_b = _collect_finding_receipt_meta(entry_b, is_control=False, receipt_store=receipt_store)
+            if _has_same_http_method_surface(entry_a, proof_meta_a, entry_b, proof_meta_b, tmpl_a):
+                return winner, 2
+        return None
+
+    # Rule 2c: `race_condition` vs `business_logic` stays distinct unless exact same proof receipts.
+    if {cls_a, cls_b} == {"race_condition", "business_logic"}:
+        if proof_ids_a and proof_ids_a == proof_ids_b:
+            return "race_condition", 1
+        return None
+
+    return None
+
+
 def canonicalize_and_deduplicate_findings(
     findings: list[dict[str, Any]],
     *,
@@ -1197,6 +1490,10 @@ def canonicalize_and_deduplicate_findings(
                 *(incoming.get("supporting_actors") or ([incoming_actor] if incoming_actor else [])),
             ]))
         existing["supporting_actors"] = [a for a in merged_actors if a]
+        if not str(existing.get("clean_replay_receipt_id") or "").strip():
+            in_replay = str(incoming.get("clean_replay_receipt_id") or "").strip()
+            if in_replay:
+                existing["clean_replay_receipt_id"] = in_replay
 
     for raw_f in findings:
         if not isinstance(raw_f, dict):
@@ -1267,6 +1564,49 @@ def canonicalize_and_deduplicate_findings(
         _merge_entries(grouped[(tmpl, winner_class)], grouped[(tmpl, loser_class)])
         del grouped[(tmpl, loser_class)]
         order = [k for k in order if k != (tmpl, loser_class)]
+
+    # Resolve cross-class root-cause duplicates on the same (route_template, actor)
+    # (Rule 1: `other` subsumption; Rule 2: state-tampering family & identical-proof race/logic overlap).
+    cross_changed = True
+    while cross_changed:
+        cross_changed = False
+        by_route: dict[str, list[tuple[str, str]]] = {}
+        for k in order:
+            by_route.setdefault(k[0], []).append(k)
+
+        for route_keys in by_route.values():
+            if len(route_keys) < 2:
+                continue
+            best_merge: tuple[int, int, tuple[str, str], tuple[str, str]] | None = None
+            for i in range(len(route_keys)):
+                k1 = route_keys[i]
+                if k1 not in grouped:
+                    continue
+                for j in range(i + 1, len(route_keys)):
+                    k2 = route_keys[j]
+                    if k2 not in grouped:
+                        continue
+                    overlap = _resolve_cross_class_overlap(
+                        grouped[k1],
+                        grouped[k2],
+                        receipt_store=receipt_store,
+                    )
+                    if overlap is None:
+                        continue
+                    winner_cls, match_prio = overlap
+                    is_other_pair = 1 if ("other" in {k1[1], k2[1]}) else 0
+                    winner_key = k1 if k1[1] == winner_cls else k2
+                    loser_key = k2 if winner_key == k1 else k1
+                    cand = (is_other_pair, match_prio, winner_key, loser_key)
+                    if best_merge is None or cand[:2] < best_merge[:2]:
+                        best_merge = cand
+            if best_merge is not None:
+                _, _, winner_key, loser_key = best_merge
+                _merge_entries(grouped[winner_key], grouped[loser_key])
+                del grouped[loser_key]
+                order = [k for k in order if k != loser_key]
+                cross_changed = True
+                break
 
     out: list[dict[str, Any]] = []
     for idx, key in enumerate(order, start=1):

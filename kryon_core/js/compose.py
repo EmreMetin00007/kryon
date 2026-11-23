@@ -12,6 +12,8 @@ from __future__ import annotations
 import re
 from typing import Any
 
+from kryon_core.surface.normalize import is_third_party_sdk_static_route
+
 MAX_SOURCE = 400_000
 MAX_RESULTS = 80
 
@@ -68,6 +70,8 @@ def _looks_path(value: str) -> bool:
     if len(value) < 2 or len(value) > 180:
         return False
     if STATIC_SKIP.search(value):
+        return False
+    if is_third_party_sdk_static_route(value):
         return False
     if value.startswith("http://") or value.startswith("https://"):
         return True
@@ -236,12 +240,19 @@ def _join_concat_line(line: str) -> list[str]:
                 or "id" in text.lower()
             ) else "{param}"
             built += slot
-    built = re.sub(r"/{2,}", "/", built)
-    if not built.startswith("/"):
-        if "/" in built:
-            built = "/" + built.split("/", 1)[-1] if not built.startswith("{") else built
-        else:
-            return []
+    scheme_match = re.match(r"^(https?://)", built, re.I)
+    if scheme_match:
+        prefix = scheme_match.group(1)
+        built = prefix + re.sub(r"/{2,}", "/", built[len(prefix):])
+    else:
+        built = re.sub(r"/{2,}", "/", built)
+        if not built.startswith("/"):
+            if "/" in built:
+                built = "/" + built.split("/", 1)[-1] if not built.startswith("{") else built
+            else:
+                return []
+    if is_third_party_sdk_static_route(built):
+        return []
     return [built] if _looks_path(built) or "{id}" in built else []
 
 
@@ -250,6 +261,8 @@ def _template_paths(source: str) -> list[str]:
     for match in TEMPLATE_RE.finditer(source):
         raw = match.group(1)
         templated = re.sub(r"\$\{[^}]+\}", "{id}", raw)
+        if is_third_party_sdk_static_route(templated):
+            continue
         if _looks_path(templated) or "{id}" in templated:
             found.append(templated)
     return found

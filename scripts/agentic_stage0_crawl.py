@@ -65,6 +65,10 @@ from agentic_preview import (  # noqa: E402
     _is_skipped_surface_url,
 )
 from kryon_core.surface.extract import has_double_slash_path  # noqa: E402
+from kryon_core.surface.normalize import (  # noqa: E402
+    is_port_in_path_artifact,
+    normalize_bare_hostport_url,
+)
 from agentic_surface import (  # noqa: E402
     _extract_path_embedded_params,
     _fit_body_template_budget,
@@ -643,12 +647,12 @@ def _is_browser_script_asset(req_url: str, req_path: str = "", req: Any = None) 
     return False
 
 
-def _is_stage0_noise_path(norm_p: str) -> bool:
-    """Return True for framework virtual route groups, /$defs/*, bundler chunks, or code/base64 path artifacts."""
+def _is_stage0_noise_path(norm_p: str, *, origin_url: str = "") -> bool:
+    """Return True for framework virtual route groups, /$defs/*, bundler chunks, port-in-path, or code/base64 path artifacts."""
     raw = str(norm_p or "").strip()
     if not raw:
         return False
-    if is_non_endpoint_source_path(raw):
+    if is_non_endpoint_source_path(raw) or is_port_in_path_artifact(raw, origin_url=origin_url):
         return True
     low = raw.lower()
     if any(marker in low for marker in _STAGE0_BUNDLER_NOISE_MARKERS):
@@ -1487,6 +1491,9 @@ class _Stage0Collector:
             return False
 
         base_ref = urljoin(self.http.base_url, current_url) if current_url else self.http.base_url
+        raw = normalize_bare_hostport_url(raw, base=base_ref)
+        if not raw or is_port_in_path_artifact(raw, origin_url=self.http.base_url):
+            return False
         resolved = urljoin(base_ref, raw)
         try:
             _clean_url, raw_path, raw_query = _check_http_scope(self.http, resolved, allow_fragment=False)
@@ -1502,7 +1509,7 @@ class _Stage0Collector:
             has_double_slash_path(raw_path)
             or (is_static_asset_url(norm_p) and not path_params)
             or is_non_endpoint_source_path(norm_p)
-            or _is_stage0_noise_path(norm_p)
+            or _is_stage0_noise_path(norm_p, origin_url=self.http.base_url)
         ):
             return False
 
@@ -2253,6 +2260,9 @@ def _crawl_actor_playwright(
                 base_for_hash = urlunsplit((cur_no_frag.scheme, cur_no_frag.netloc, cur_no_frag.path or "/", cur_no_frag.query, ""))
                 resolved_cand = f"{base_for_hash}{cand}"
             else:
+                cand = normalize_bare_hostport_url(cand, base=current_page_url)
+                if not cand or is_port_in_path_artifact(cand, origin_url=http_client.base_url):
+                    return
                 resolved_cand = urljoin(current_page_url, cand)
             try:
                 full_u, path_u, query_u = _check_http_scope(http_client, resolved_cand, allow_fragment=True)
@@ -2266,7 +2276,7 @@ def _crawl_actor_playwright(
                 has_double_slash_path(path_u)
                 or is_static_asset_url(norm_p)
                 or is_non_endpoint_source_path(norm_p)
-                or _is_stage0_noise_path(norm_p)
+                or _is_stage0_noise_path(norm_p, origin_url=http_client.base_url)
                 or norm_p.lower().endswith(_SCRIPT_ASSET_EXTS)
             ):
                 return

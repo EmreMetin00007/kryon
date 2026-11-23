@@ -92,6 +92,180 @@ _COOKIE_ATTR_WORDS = frozenset({
     "strict",
 })
 
+_COMMON_NON_SECRET_WORDS = frozenset({
+    "admin",
+    "administrator",
+    "anon",
+    "anonymous",
+    "auth",
+    "authentication",
+    "authorization",
+    "basic",
+    "bearer",
+    "blank",
+    "check",
+    "client",
+    "configuration",
+    "cookie",
+    "cred",
+    "credential",
+    "credentials",
+    "csrf",
+    "dark",
+    "data",
+    "debug",
+    "default",
+    "demo",
+    "disabled",
+    "dummy",
+    "empty",
+    "enabled",
+    "english",
+    "error",
+    "example",
+    "fake",
+    "false",
+    "file",
+    "find",
+    "foo",
+    "foobar",
+    "guest",
+    "hello",
+    "help",
+    "home",
+    "html",
+    "http",
+    "https",
+    "index",
+    "info",
+    "init",
+    "input",
+    "invalid",
+    "item",
+    "json",
+    "key",
+    "keys",
+    "lang",
+    "light",
+    "list",
+    "local",
+    "localhost",
+    "login",
+    "logout",
+    "main",
+    "manager",
+    "member",
+    "mode",
+    "name",
+    "next",
+    "none",
+    "null",
+    "open",
+    "page",
+    "panel",
+    "param",
+    "pass",
+    "passwd",
+    "password",
+    "path",
+    "ping",
+    "placeholder",
+    "post",
+    "probe",
+    "profile",
+    "public",
+    "query",
+    "read",
+    "redirect",
+    "reset",
+    "role",
+    "root",
+    "sample",
+    "search",
+    "secret",
+    "session",
+    "setting",
+    "settings",
+    "shard",
+    "show",
+    "sign",
+    "signin",
+    "signup",
+    "site",
+    "staff",
+    "start",
+    "state",
+    "status",
+    "string",
+    "submit",
+    "success",
+    "super",
+    "superuser",
+    "system",
+    "target",
+    "temp",
+    "test",
+    "testing",
+    "text",
+    "theme",
+    "time",
+    "title",
+    "token",
+    "true",
+    "type",
+    "undefined",
+    "unknown",
+    "update",
+    "upload",
+    "user",
+    "username",
+    "users",
+    "valid",
+    "value",
+    "values",
+    "verify",
+    "version",
+    "view",
+    "webhook",
+    "welcome",
+    "word",
+    "write",
+    "0000",
+    "000000",
+    "00000000",
+    "1234",
+    "12345",
+    "123456",
+    "1234567",
+    "12345678",
+    "123456789",
+    "1234567890",
+    "abcd",
+    "abcdef",
+    "qwerty",
+    "letmein",
+    "changeme",
+})
+
+_SESSION_COOKIE_KEY_HINTS = (
+    "sess",
+    "sid",
+    "token",
+    "auth",
+    "jwt",
+    "csrf",
+    "xsrf",
+    "login",
+    "remember",
+    "secret",
+    "key",
+)
+
+_FILENAME_LIKE_RE = re.compile(
+    r"^[a-z0-9_-]{1,32}\.(?:txt|html?|php|js|css|json|xml|png|jpe?g|gif|svg|pdf|csv|md|log|ya?ml|ini|conf|bak|zip)$"
+)
+_REDACTED_PLACEHOLDER_RE = re.compile(r"^<REDACTED[A-Za-z0-9_:=.-]*>$")
+
 _CURL_SKIP_HEADERS = frozenset({
     "accept-encoding",
     "connection",
@@ -341,6 +515,77 @@ def _is_already_redacted(val: str) -> bool:
     return "<REDACTED" in val
 
 
+def _is_promotable_global_secret(value: str, *, explicit_auth: bool = False) -> bool:
+    """Return True only when *value* is distinctive enough for global substring redaction.
+
+    Short low-entropy probe/dictionary values (e.g. ``admin``, ``probe``, ``test``, ``123456``)
+    are still redacted in-place at credential positions (query params, headers, JSON/KV fields),
+    but MUST NOT be promoted into global substring scrubbing where they corrupt legitimate URL
+    paths (``/admin/upload/index.html``) and prose/identifiers (``probe.txt``, ``Shard2.Probe``).
+    """
+    val = str(value or "").strip()
+    if len(val) < 4 or _is_already_redacted(val):
+        return False
+    low = val.lower()
+    if low in _COMMON_NON_SECRET_WORDS:
+        return False
+
+    if not explicit_auth:
+        if val.startswith(("http://", "https://", "../", "..\\", "/")):
+            return False
+        if any(marker in val for marker in ("<", ">", "{{", "}}")):
+            return False
+        if _FILENAME_LIKE_RE.fullmatch(low):
+            return False
+
+    if len(set(low)) < 4:
+        return False
+
+    has_lower = any(c.islower() for c in val)
+    has_upper = any(c.isupper() for c in val)
+    has_digit = any(c.isdigit() for c in val)
+    has_symbol = any(not c.isalnum() for c in val)
+    char_classes = int(has_lower) + int(has_upper) + int(has_digit) + int(has_symbol)
+
+    if val.isalpha():
+        if len(val) >= 12:
+            return True
+        if explicit_auth and len(val) >= 10:
+            return True
+        # Require genuine non-TitleCase mixed-case alpha for 8..11 char tokens.
+        return len(val) >= 8 and has_lower and has_upper and not val.istitle()
+
+    if val.isdigit():
+        return len(val) >= 12
+
+    if len(val) >= 12:
+        return True
+    if len(val) >= 8 and char_classes >= 2:
+        return True
+    if explicit_auth and len(val) >= 6 and char_classes >= 2:
+        return True
+    return False
+
+
+def _is_path_redactable_secret(value: str) -> bool:
+    """Return True only if *value* is a real opaque/high-entropy secret safe to scrub in URL paths."""
+    val = str(value or "").strip()
+    if len(val) < 12 or _is_already_redacted(val):
+        return False
+    low = val.lower()
+    if low in _COMMON_NON_SECRET_WORDS or len(set(low)) < 4:
+        return False
+    if val.isalpha():
+        if len(val) >= 16:
+            return True
+        has_lower = any(c.islower() for c in val)
+        has_upper = any(c.isupper() for c in val)
+        return has_lower and has_upper and not val.istitle()
+    if val.isdigit():
+        return len(val) >= 16
+    return True
+
+
 def _extract_secrets_from_headers(headers: Any, sink: set[str]) -> None:
     if not isinstance(headers, dict):
         return
@@ -349,27 +594,53 @@ def _extract_secrets_from_headers(headers: Any, sink: set[str]) -> None:
         val = str(raw_v or "").strip()
         if not val or _is_already_redacted(val):
             continue
-        if name in _ALL_SENSITIVE_HEADERS or any(tok in name for tok in ("token", "secret", "api-key", "apikey", "cookie", "auth")):
-            if name in {"x-actor-alias", "x-authenticated-user", "x-user"}:
-                continue
-            if len(val) >= 4:
+        if name in {"x-actor-alias", "x-authenticated-user", "x-user", "www-authenticate", "proxy-authenticate"}:
+            continue
+        is_sensitive_header = name in _ALL_SENSITIVE_HEADERS or any(
+            tok in name for tok in ("token", "secret", "api-key", "apikey", "cookie", "auth")
+        )
+        if not is_sensitive_header:
+            continue
+
+        if name in {"authorization", "proxy-authorization"}:
+            parts = val.split(None, 1)
+            if len(parts) == 2:
+                tok = parts[1].strip()
+                if tok and not _is_already_redacted(tok):
+                    if _is_promotable_global_secret(tok, explicit_auth=True):
+                        sink.add(tok)
+                        sink.add(val)
+                    elif len(tok) >= 4:
+                        # Scrub the scheme-qualified value (e.g. "Bearer admin") without promoting bare "admin".
+                        sink.add(val)
+            elif _is_promotable_global_secret(val, explicit_auth=True):
                 sink.add(val)
-            if name in {"authorization", "proxy-authorization"}:
-                parts = val.split(None, 1)
-                if len(parts) == 2 and len(parts[1].strip()) >= 4:
-                    sink.add(parts[1].strip())
-            elif name in {"cookie", "set-cookie"}:
-                for segment in val.split(";"):
-                    seg = segment.strip()
-                    if "=" not in seg:
-                        continue
-                    ck_name, ck_val = seg.split("=", 1)
-                    if ck_name.strip().lower() in _COOKIE_ATTR_WORDS:
-                        continue
-                    ck_val_clean = ck_val.strip()
-                    if len(ck_val_clean) >= 4:
-                        sink.add(ck_val_clean)
-                        sink.add(seg)
+        elif name in {"cookie", "set-cookie"}:
+            promoted_any = False
+            for segment in val.split(";"):
+                seg = segment.strip()
+                if "=" not in seg:
+                    continue
+                ck_name, ck_val = seg.split("=", 1)
+                ck_name_low = ck_name.strip().lower()
+                if ck_name_low in _COOKIE_ATTR_WORDS:
+                    continue
+                ck_val_clean = ck_val.strip()
+                if not ck_val_clean or _is_already_redacted(ck_val_clean):
+                    continue
+                is_session_cookie = any(hint in ck_name_low for hint in _SESSION_COOKIE_KEY_HINTS)
+                if _is_promotable_global_secret(ck_val_clean, explicit_auth=is_session_cookie):
+                    sink.add(ck_val_clean)
+                    sink.add(seg)
+                    promoted_any = True
+                elif is_session_cookie and len(ck_val_clean) >= 4:
+                    # Preserve contextual pair (e.g. "sid=admin") without promoting bare "admin".
+                    sink.add(seg)
+            if promoted_any and len(val) >= 8:
+                sink.add(val)
+        else:
+            if _is_promotable_global_secret(val, explicit_auth=False):
+                sink.add(val)
 
 
 def _extract_secrets_from_url(url: str, sink: set[str]) -> None:
@@ -380,14 +651,17 @@ def _extract_secrets_from_url(url: str, sink: set[str]) -> None:
         parts = urlsplit(raw)
     except ValueError:
         return
-    if parts.password and len(parts.password) >= 4 and not _is_already_redacted(parts.password):
+    if parts.password and _is_promotable_global_secret(parts.password, explicit_auth=False):
         sink.add(parts.password)
     if parts.query:
         for k, v in parse_qsl(parts.query, keep_blank_values=True):
             kl = k.strip().lower()
-            if (kl in _SENSITIVE_QUERY_KEYS or any(t in kl for t in ("token", "secret", "password", "apikey", "api_key"))) and len(v) >= 4:
-                if not _is_already_redacted(v):
-                    sink.add(v)
+            is_sensitive_key = (
+                kl in _SENSITIVE_QUERY_KEYS
+                or any(t in kl for t in ("token", "secret", "password", "passwd", "apikey", "api_key"))
+            )
+            if is_sensitive_key and _is_promotable_global_secret(v, explicit_auth=False):
+                sink.add(v)
 
 
 def _collect_secret_values(artifacts: dict[str, Any]) -> tuple[str, ...]:
@@ -409,6 +683,34 @@ def _collect_secret_values(artifacts: dict[str, Any]) -> tuple[str, ...]:
     return tuple(sorted(secrets, key=len, reverse=True))
 
 
+def _sanitize_url_path(path: str, secret_values: Sequence[str] = ()) -> str:
+    """Sanitize a URL path without mangling normal route segments via short/common words."""
+    if not path:
+        return ""
+    path_secrets = [s for s in secret_values if isinstance(s, str) and _is_path_redactable_secret(s)]
+    cleaned = redact_secrets(path, path_secrets) if path_secrets else path
+    cleaned = _JWT_RE.sub("<REDACTED_JWT>", cleaned)
+    cleaned = _KV_SECRET_RE.sub(
+        lambda m: m.group(0) if _is_already_redacted(m.group(2)) else f"{m.group(1)}=<REDACTED_SECRET>",
+        cleaned,
+    )
+    return cleaned
+
+
+def _encode_sanitized_query(pairs: Sequence[tuple[str, str]]) -> str:
+    """Encode sanitized query pairs while keeping clean `<REDACTED>` markers readable."""
+    encoded_parts: list[str] = []
+    for k, v in pairs:
+        if _REDACTED_PLACEHOLDER_RE.fullmatch(v):
+            encoded_k = urlencode([(k, "")])[:-1]
+            encoded_parts.append(f"{encoded_k}={v}")
+        elif not v and _REDACTED_PLACEHOLDER_RE.fullmatch(k):
+            encoded_parts.append(k)
+        else:
+            encoded_parts.append(urlencode([(k, v)]))
+    return "&".join(encoded_parts)
+
+
 def _sanitize_url(raw_url: str, secret_values: Sequence[str] = ()) -> str:
     text = str(raw_url or "").strip()
     if not text:
@@ -425,10 +727,12 @@ def _sanitize_url(raw_url: str, secret_values: Sequence[str] = ()) -> str:
             host_port = f"{host_port}:{parts.port}"
         netloc = f"<REDACTED_CREDENTIALS>@{host_port}" if host_port else "<REDACTED_CREDENTIALS>"
 
-    query = parts.query
-    if query:
+    safe_path = _sanitize_url_path(parts.path, secret_values)
+
+    safe_query = parts.query
+    if safe_query:
         redacted_pairs: list[tuple[str, str]] = []
-        for k, v in parse_qsl(query, keep_blank_values=True):
+        for k, v in parse_qsl(safe_query, keep_blank_values=True):
             kl = k.strip().lower()
             is_sensitive_key = (
                 kl in _SENSITIVE_QUERY_KEYS
@@ -437,11 +741,18 @@ def _sanitize_url(raw_url: str, secret_values: Sequence[str] = ()) -> str:
             if is_sensitive_key and v and not _is_already_redacted(v):
                 redacted_pairs.append((k, "<REDACTED>"))
             else:
-                redacted_pairs.append((k, _sanitize_text(v, secret_values)))
-        query = urlencode(redacted_pairs, doseq=True)
+                safe_k = _sanitize_url_path(k, secret_values) if not v else k
+                redacted_pairs.append((safe_k, _sanitize_text(v, secret_values)))
+        safe_query = _encode_sanitized_query(redacted_pairs)
 
-    rebuilt = urlunsplit((parts.scheme, netloc, parts.path, query, parts.fragment))
-    return _sanitize_text(rebuilt, secret_values)
+    safe_fragment = parts.fragment
+    if safe_fragment:
+        if safe_fragment.startswith("/"):
+            safe_fragment = _sanitize_url(safe_fragment, secret_values)
+        else:
+            safe_fragment = _sanitize_text(safe_fragment, secret_values)
+
+    return urlunsplit((parts.scheme, netloc, safe_path, safe_query, safe_fragment))
 
 
 def _sanitize_text(text: Any, secret_values: Sequence[str] = ()) -> str:

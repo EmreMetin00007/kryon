@@ -7,9 +7,26 @@ import copy
 import json
 import re
 from typing import Any
-from urllib.parse import parse_qsl, unquote, urlencode, urljoin, urlparse, urlunparse
+from urllib.parse import parse_qsl, unquote, urlencode, urljoin, urlparse, urlsplit, urlunparse
 
 SCHEMA_VERSION = "attack-surface/1.1"
+_BARE_HOSTPORT_URL_RE = re.compile(
+    r"^(?:(?:\d{1,3}\.){3}\d{1,3}|\[[0-9a-fA-F:]+\]|localhost|(?:[A-Za-z0-9-]+\.)+[A-Za-z]{2,63}):\d{1,5}(?:/|[?#]|$)",
+    re.I,
+)
+_EMBEDDED_HOSTPORT_SEG_RE = re.compile(
+    r"^(?:(?:\d{1,3}\.){3}\d{1,3}|\[[0-9a-fA-F:]+\]|localhost|(?:[A-Za-z0-9-]+\.)+[A-Za-z]{2,63}):\d{1,5}$",
+    re.I,
+)
+_PATH_KV_URL_SCHEME_SEG_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_-]{0,31}=https?:$", re.I)
+_THIRD_PARTY_CLOUD_AUTH_SDK_PATH_RE = re.compile(
+    r"^/v[12]/accounts(?:/mfa(?:enrollment|signin))?:"
+    r"(?:signup|lookup|send(?:oobcode|verificationcode)|signinwith[a-z]+|"
+    r"createauthuri|resetpassword|delete(?:account)?|update|revoketoken|"
+    r"verify[a-z]+|(?:get|set)accountinfo|getoobconfirmationcode|"
+    r"queryuserinfo|start|finalize|withdraw|\{[a-z_][a-z0-9_]*\}|)$",
+    re.I,
+)
 _SENSITIVE_NAME = re.compile(
     r"(^|[._-])(csrf|xsrf|password|passwd|secret|session|sessionid|cookie|"
     r"authorization|api[_-]?key|token|access_token|refresh_token)([._-]|$)", re.I)
@@ -161,9 +178,149 @@ def same_host(url: str, base: str, allow_subdomains: bool = False) -> bool:
     return False
 
 
+def normalize_bare_hostport_url(raw: str, base: str = "") -> str:
+    """Resolve schemeless ``host:port/path`` strings using ``base`` scheme and reject malformed ``http:/`` URLs."""
+    text = (raw or "").strip()
+    if not text:
+        return ""
+    low = text.lower()
+    if (low.startswith("http:/") and not low.startswith("http://")) or (
+        low.startswith("https:/") and not low.startswith("https://")
+    ):
+        return ""
+    if base and _BARE_HOSTPORT_URL_RE.match(text):
+        try:
+            base_scheme = urlparse(base).scheme.lower()
+        except ValueError:
+            base_scheme = ""
+        if base_scheme in ("http", "https"):
+            return f"{base_scheme}://{text}"
+    return text
+
+
+def is_port_in_path_artifact(
+    url_or_path: str,
+    *,
+    origin_url: str = "",
+    target_port: int | str | None = None,
+) -> bool:
+    """Return True if a URL/path looks like a malformed ``host:port/path`` split artifact.
+
+    Rejects:
+    - Embedded ``host:port`` segments inside a path (outside ``key=http(s)://...`` path params).
+    - Paths starting with ``/{target_port}/...`` or unrooted ``{target_port}/...`` (2+ segments).
+    - Paths repeating ``target_port`` across multiple segments (recursive port-in-path loops).
+    - Paths containing ``/{target_port}/`` followed by a duplicated prefix segment.
+
+    Preserves legitimate numeric resource ID paths such as ``/api/items/50759`` and
+    ``/orders/8080/details``.
+    """
+    raw = str(url_or_path or "").strip()
+    if not raw:
+        return False
+    try:
+        parsed = urlsplit(raw)
+    except ValueError:
+        return False
+
+    path = (parsed.path or "").strip()
+    if not path or path == "/":
+        return False
+
+    raw_segs = [seg for seg in path.split("/") if seg]
+    if not raw_segs:
+        return False
+
+    # Inspect path segments up to any valid `key=http(s):` path-embedded URL tail.
+    segs: list[str] = []
+    for seg in raw_segs:
+        if _PATH_KV_URL_SCHEME_SEG_RE.fullmatch(seg):
+            break
+        if _EMBEDDED_HOSTPORT_SEG_RE.fullmatch(seg):
+            return True
+        segs.append(seg)
+
+    clean_segs = [seg for seg in segs if seg not in {".", ".."}]
+    if not clean_segs:
+        return False
+
+    port_str = ""
+    if target_port is not None and str(target_port).strip():
+        candidate_port = str(target_port).strip()
+        if candidate_port.isdigit() and int(candidate_port) > 0:
+            port_str = str(int(candidate_port))
+    if not port_str and origin_url:
+        try:
+            o_port = urlsplit(str(origin_url).strip()).port
+            if o_port is not None and o_port > 0:
+                port_str = str(o_port)
+        except ValueError:
+            port_str = ""
+    if not port_str and parsed.netloc:
+        try:
+            u_port = parsed.port
+            if u_port is not None and u_port > 0:
+                port_str = str(u_port)
+        except ValueError:
+            port_str = ""
+
+    if not port_str:
+        return False
+
+    # 1. Path starts with `{target_port}/...` (rooted or relative) synthesized from `host:port/path`.
+    if len(clean_segs) >= 2 and clean_segs[0] == port_str:
+        return True
+
+    port_indices = [idx for idx, seg in enumerate(clean_segs) if seg == port_str]
+    if not port_indices:
+        return False
+
+    # 2. Target port appears in multiple path segments (recursive port-prefix loop).
+    if len(port_indices) >= 2:
+        return True
+
+    # 3. `/{prefix}/{target_port}/{duplicated_prefix}/...` (e.g. `/index/index/50759/index/index/search.html`).
+    idx = port_indices[0]
+    if idx >= 1 and idx + 1 < len(clean_segs):
+        before = [s.lower() for s in clean_segs[:idx]]
+        after = [s.lower() for s in clean_segs[idx + 1 :]]
+        if after[0] == before[0] and (len(before) >= 2 or len(after) >= 2):
+            return True
+        if len(after) >= 2 and after[0] in set(before):
+            return True
+
+    return False
+
+
+def is_third_party_sdk_static_route(url_or_path: str) -> bool:
+    """Return True for well-known third-party cloud auth SDK path constants from static JS bundles.
+
+    Intended strictly for static JS string/call/route extraction (e.g. embedded Firebase /
+    Google Identity Toolkit `/v1/accounts:<action>` and `/v2/accounts:<action>` constants),
+    never for live observed network traffic.
+    """
+    raw = str(url_or_path or "").strip()
+    if not raw:
+        return False
+    try:
+        parsed = urlsplit(raw)
+    except ValueError:
+        return False
+    path = (parsed.path or "").strip()
+    if not path and parsed.fragment.startswith("/"):
+        path = parsed.fragment.strip().split("?", 1)[0]
+    if not path:
+        return False
+    trimmed = path.rstrip("/")
+    return bool(_THIRD_PARTY_CLOUD_AUTH_SDK_PATH_RE.fullmatch(trimmed))
+
+
 def normalize_url(url: str, base: str = "") -> str:
     raw = (url or "").strip()
     if not raw or raw.startswith(("#", "javascript:", "mailto:", "data:")):
+        return ""
+    raw = normalize_bare_hostport_url(raw, base=base)
+    if not raw:
         return ""
     if base:
         raw = urljoin(base, raw)
