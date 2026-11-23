@@ -104,8 +104,10 @@ _FORM_ALLOWED_WRITE_METHODS = frozenset({"POST", "PUT", "PATCH"})
 _NON_HTTP_SCHEMES = ("javascript:", "mailto:", "data:", "blob:", "tel:", "about:")
 
 _DESTRUCTIVE_RE = re.compile(
-    r"delete|remove|logout|sign[-_]?out|pay|purchase|checkout|billing|"
-    r"transfer|reset|revoke|destroy|unsubscribe|cancel|deactivate|wipe|purge|drop|terminate",
+    r"delete|remove|log[-_\s]?out|sign[-_\s]?out|pay|purchase|checkout|billing|"
+    r"transfer|factory.?reset|reset|revoke|destroy|unsubscribe|cancel|deactivate|"
+    r"wipe|purge|(?<![a-z])drop(?![a-z])|terminate|"
+    r"reboot|restart|shut[-_\s]?down|power[-_\s]?off|(?<![a-z])(?:stop|kill)(?![a-z])",
     re.IGNORECASE,
 )
 _AUTH_FORM_RE = re.compile(
@@ -229,7 +231,7 @@ _BENIGN_TECH_PROBES: dict[str, tuple[str, ...]] = {
     "go": ("/api", "/metrics"),
 }
 
-_MAX_JS_CHUNKS = 64
+_MAX_JS_CHUNKS = 96
 _MAX_JS_CHUNK_BYTES = 256 * 1024
 _MAX_STAGE0_SCRIPT_ASSETS = 160
 _SCRIPT_ASSET_EXTS = (".js", ".mjs", ".cjs", ".wasm")
@@ -408,13 +410,17 @@ _COLLECT_DOM_STATE_JS = r"""() => {
     const seenCtrl = new WeakSet();
     const ctrlSelector = [
       '[role="tab"]',
+      '[role="menuitem"]',
       'button[aria-controls]',
       'button[aria-expanded]',
-      '[role="menuitem"]',
+      'button[aria-haspopup]',
+      '[role="button"]',
       'summary',
-      'button[type="button"]',
-      'button:not([type])',
+      'button',
       'input[type="button"]',
+      'nav a',
+      'aside a',
+      '[role="navigation"] a',
     ].join(', ');
     for (const el of root.querySelectorAll(ctrlSelector)) {
       if (seenCtrl.has(el)) continue;
@@ -423,28 +429,77 @@ _COLLECT_DOM_STATE_JS = r"""() => {
       if (!isVisible(el)) continue;
       const tag = String(el.tagName || '').toLowerCase();
       const role = String(el.getAttribute('role') || '').toLowerCase();
+      const btnType = tag === 'button' ? String(el.getAttribute('type') || '').toLowerCase() : '';
+      if (tag === 'button' && btnType === 'reset') continue;
       const inForm = !!(el.closest && el.closest('form'));
       const isNavControl = (
         role === 'tab'
         || role === 'menuitem'
         || el.hasAttribute('aria-controls')
         || el.hasAttribute('aria-expanded')
+        || el.hasAttribute('aria-haspopup')
         || tag === 'summary'
       );
-      if (inForm && !isNavControl) {
+      if (inForm && (!isNavControl || btnType === 'submit' || (tag === 'button' && !btnType))) {
         continue;
+      }
+      if (tag === 'a') {
+        const rawHref = String(el.getAttribute('href') || '').trim();
+        const lowHref = rawHref.toLowerCase();
+        const isNonNavHref = (
+          !rawHref
+          || (rawHref.startsWith('#') && !rawHref.startsWith('#/'))
+          || lowHref.startsWith('javascript:')
+        );
+        const hasInteractiveAttr = (
+          role === 'button'
+          || role === 'tab'
+          || role === 'menuitem'
+          || el.hasAttribute('aria-controls')
+          || el.hasAttribute('aria-expanded')
+          || el.hasAttribute('aria-haspopup')
+          || el.hasAttribute('onclick')
+        );
+        if (!isNonNavHref && !hasInteractiveAttr) {
+          continue;
+        }
       }
       if (controls.length >= 60) break;
       const idx = controlEls.length;
       controlEls.push(el);
+      const titleAttr = String(el.getAttribute('title') || '').trim();
+      const tooltipAttr = String(
+        el.getAttribute('data-tooltip')
+        || el.getAttribute('data-title')
+        || el.getAttribute('data-testid')
+        || ''
+      ).trim();
       const label = String(
         el.getAttribute('aria-label')
         || el.textContent
+        || titleAttr
+        || tooltipAttr
         || el.getAttribute('value')
         || el.id
         || el.getAttribute('name')
         || ''
       ).replace(/\s+/g, ' ').trim().slice(0, 80);
+      const classHint = typeof el.className === 'string'
+        ? el.className.replace(/\s+/g, ' ').trim().slice(0, 80)
+        : '';
+      const inNavContainer = !!(
+        el.closest && el.closest(
+          'nav, aside, header, [role="navigation"], [role="tablist"], [role="menubar"], [role="toolbar"], [class*="sidebar"], [class*="side-bar"], [class*="menu"], [class*="drawer"]'
+        )
+      );
+      const navTrigger = Boolean(
+        isNavControl
+        || role === 'button'
+        || inNavContainer
+        || /sidebar|side-bar|menu|drawer|panel|tab|manager|toggle/i.test(
+          `${label} ${titleAttr} ${tooltipAttr} ${String(el.id || '')} ${classHint}`
+        )
+      );
       controls.push({
         ctrl_index: idx,
         tag,
@@ -455,6 +510,10 @@ _COLLECT_DOM_STATE_JS = r"""() => {
         aria_selected: String(el.getAttribute('aria-selected') || '').trim().toLowerCase(),
         aria_expanded: String(el.getAttribute('aria-expanded') || '').trim().toLowerCase(),
         label,
+        title: titleAttr.slice(0, 80),
+        tooltip: tooltipAttr.slice(0, 80),
+        class_hint: classHint,
+        nav_trigger: navTrigger,
         in_form: inForm,
         onclick: String(el.getAttribute('onclick') || '').trim().slice(0, 120),
       });
@@ -2481,6 +2540,31 @@ def _crawl_actor_playwright(
             if not isinstance(dom_data, dict):
                 continue
 
+            # If a modern SPA shell (Vue/Vite/React) has not mounted links/forms/controls yet,
+            # give module scripts one bounded settle opportunity before collecting controls.
+            if (
+                not (dom_data.get("controls") or ())
+                and not (dom_data.get("links") or ())
+                and not (dom_data.get("forms") or ())
+                and not (dom_data.get("hash_routes") or ())
+            ):
+                try:
+                    page.wait_for_load_state("load", timeout=min(1500, timeout_ms))
+                except Exception:
+                    pass
+                if wait_ms > 0:
+                    try:
+                        page.wait_for_timeout(min(1000, max(wait_ms, 300)))
+                    except Exception:
+                        pass
+                try:
+                    refreshed_dom = page.evaluate(_COLLECT_DOM_STATE_JS)
+                    if isinstance(refreshed_dom, dict):
+                        dom_data = refreshed_dom
+                        final_url = str(page.url or final_url)
+                except Exception:
+                    pass
+
             try:
                 canon_path = normalize_path(urlsplit(final_url).path or "/")
             except ValueError:
@@ -2497,9 +2581,25 @@ def _crawl_actor_playwright(
             _ingest_dom_discovery(dom_data, final_url)
             _run_layer3_on_dom(dom_data, final_url)
 
+            def _prioritize_controls(raw_controls: Any) -> list[dict[str, Any]]:
+                items = [c for c in (raw_controls or ()) if isinstance(c, dict)]
+                return sorted(
+                    items,
+                    key=lambda c: (
+                        0
+                        if (
+                            c.get("nav_trigger")
+                            or str(c.get("role") or "") in {"tab", "menuitem"}
+                            or bool(c.get("aria_controls"))
+                            or bool(c.get("aria_expanded"))
+                        )
+                        else 1
+                    ),
+                )
+
             # Explore safe non-destructive controls on this page up to actor_action_limit.
             clicked_on_page: set[tuple[str, str, str, str]] = set()
-            controls_queue = list(dom_data.get("controls") or ())
+            controls_queue = _prioritize_controls(dom_data.get("controls"))
             ctrl_cursor = 0
             while (
                 ctrl_cursor < len(controls_queue)
@@ -2512,8 +2612,11 @@ def _crawl_actor_playwright(
                     continue
                 ctrl_hay = " ".join([
                     str(ctrl.get("label") or ""),
+                    str(ctrl.get("title") or ""),
+                    str(ctrl.get("tooltip") or ""),
                     str(ctrl.get("id") or ""),
                     str(ctrl.get("name") or ""),
+                    str(ctrl.get("aria_controls") or ""),
                     str(ctrl.get("onclick") or ""),
                 ])
                 if _DESTRUCTIVE_RE.search(ctrl_hay):
@@ -2523,11 +2626,17 @@ def _crawl_actor_playwright(
                 # Skip already-selected tabs so we click unselected tabs first.
                 if str(ctrl.get("role") or "") == "tab" and str(ctrl.get("aria_selected") or "") == "true":
                     continue
+                norm_label = _normalize_volatile_text(str(ctrl.get("label") or ""))
+                ctrl_id = str(ctrl.get("id") or "")
+                ctrl_ac = str(ctrl.get("aria_controls") or "")
+                disambig = norm_label or ctrl_id or ctrl_ac or (
+                    f"{str(ctrl.get('class_hint') or '')[:48]}#{int(ctrl.get('ctrl_index', -1))}"
+                )
                 ctrl_fp = (
                     str(ctrl.get("role") or ctrl.get("tag") or ""),
-                    str(ctrl.get("id") or ""),
-                    str(ctrl.get("aria_controls") or ""),
-                    _normalize_volatile_text(str(ctrl.get("label") or "")),
+                    ctrl_id,
+                    ctrl_ac,
+                    disambig,
                 )
                 if ctrl_fp in clicked_on_page:
                     continue
@@ -2541,8 +2650,14 @@ def _crawl_actor_playwright(
                         """idx => {
                           const els = window.__kryonStage0 && window.__kryonStage0.controls;
                           const el = els && els[idx];
-                          if (!el || el.disabled) return false;
-                          el.click();
+                          if (!el || !el.isConnected || el.disabled || el.getAttribute('aria-disabled') === 'true') {
+                            return false;
+                          }
+                          if (typeof el.click === 'function') {
+                            el.click();
+                            return true;
+                          }
+                          el.dispatchEvent(new MouseEvent('click', {bubbles: true, cancelable: true}));
                           return true;
                         }""",
                         c_idx,
@@ -2564,6 +2679,12 @@ def _crawl_actor_playwright(
                     break
 
                 if after_click_url != final_url:
+                    try:
+                        nav_dom = page.evaluate(_COLLECT_DOM_STATE_JS)
+                        if isinstance(nav_dom, dict):
+                            _ingest_dom_discovery(nav_dom, after_click_url)
+                    except Exception:
+                        pass
                     _enqueue_url(after_click_url, final_url)
                     # Stop clicking stale controls from previous URL; BFS will visit the new URL.
                     break
@@ -2577,7 +2698,7 @@ def _crawl_actor_playwright(
                 new_hash = _compute_dom_state_hash(new_dom)
                 new_state_key = (actor, canon_with_hash, new_hash)
                 # Refresh remaining controls indices from the latest DOM snapshot.
-                controls_queue = list(new_dom.get("controls") or ())
+                controls_queue = _prioritize_controls(new_dom.get("controls"))
                 ctrl_cursor = 0
                 if new_state_key not in seen_dom_states:
                     seen_dom_states.add(new_state_key)
@@ -2835,6 +2956,7 @@ def run_stage0_crawl(
     max_actions: int = 24,
     allow_forms: bool = False,
     actors: Sequence[str] | None = None,
+    seed_filename: str = "stage0-seed.json",
     timeout_ms: int = 12000,
     wait_ms: int = 500,
     max_passive_probes: int = 12,
@@ -2884,7 +3006,23 @@ def run_stage0_crawl(
         passive_reserve = min(eff_max_probes, max(1, stage0_cap // 5), 8, stage0_cap - 1)
     stage0_budget = _Stage0Budget(http_client, cap=stage0_cap, reserve=passive_reserve)
 
-    selected_actors = _select_crawl_actors(http_client, actors)
+    if actors is not None and len(actors) > 0:
+        actor_map = getattr(http_client.actors, "actors", {}) or {}
+        selected_actors: list[str] = []
+        for raw_a in actors:
+            alias = str(raw_a or "").strip()
+            if alias and alias in actor_map and alias not in selected_actors:
+                selected_actors.append(alias)
+        if not selected_actors:
+            return _empty_result(
+                http_client.base_url,
+                status="ok",
+                mode=mode,
+                actors_crawled=(),
+                elapsed_seconds=time.monotonic() - started,
+            )
+    else:
+        selected_actors = _select_crawl_actors(http_client, None)
     raw_starts = list(start_paths) if start_paths else ["/"]
     valid_starts: list[str] = []
     for raw_sp in raw_starts:
@@ -3035,7 +3173,8 @@ def run_stage0_crawl(
     redacted_result: dict[str, Any] = _redact_recursive(result, sorted_secrets)
 
     if output_dir is not None:
-        seed_path = Path(output_dir) / "stage0-seed.json"
+        safe_seed_name = Path(str(seed_filename or "stage0-seed.json")).name or "stage0-seed.json"
+        seed_path = Path(output_dir) / safe_seed_name
         redacted_result["seed_file"] = str(seed_path)
         _write_json_atomic(seed_path, redacted_result)
 

@@ -107,6 +107,7 @@ def test_record_finding_class_type_closed_enum_and_schema_bounds() -> None:
         "command_injection",
         "insecure_deserialization",
         "race_condition",
+        "weak_credentials",
         "business_logic",
         "other",
     ]
@@ -139,6 +140,7 @@ def test_record_finding_class_type_closed_enum_and_schema_bounds() -> None:
         "command_injection",
         "insecure_deserialization",
         "race_condition",
+        "weak_credentials",
         "business_logic",
         "other",
     ):

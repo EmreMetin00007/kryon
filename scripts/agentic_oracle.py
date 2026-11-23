@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime
+import html
 import json
 import re
 from typing import Any, Sequence
@@ -63,13 +64,37 @@ _EPHEMERAL_JSON_KEYS = frozenset({
     "exp",
     "jti",
 })
-_EPHEMERAL_REPLAY_JSON_KEYS = _EPHEMERAL_JSON_KEYS | frozenset({
-    "event_id",
+_JOB_QUEUE_ID_KEYS = frozenset({
+    "prompt_id",
     "job_id",
     "task_id",
     "run_id",
     "execution_id",
+    "queue_id",
 })
+_JOB_QUEUE_SEQ_KEYS = frozenset({
+    "number",
+    "queue_number",
+    "seq",
+})
+_EPHEMERAL_REPLAY_JSON_KEYS = _EPHEMERAL_JSON_KEYS | _JOB_QUEUE_ID_KEYS | frozenset({
+    "event_id",
+    "session_id",
+    "correlation_id",
+    "receipt_id",
+})
+_WEAK_CRED_TOKEN_KEYS = frozenset({
+    "token",
+    "access_token",
+    "auth_token",
+    "session_token",
+    "jwt",
+    "sid",
+    "session",
+    "session_id",
+    "csrf_token",
+})
+_HTML_UNESCAPE_EVIDENCE_CLASSES = frozenset({"sqli_read", "sqli", "other"})
 _ISO_TS_RE = re.compile(
     r"\b\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?\b"
 )
@@ -102,6 +127,7 @@ _INPUT_DIFF_CLASSES = frozenset({
     "xxe",
     "file_upload",
     "jwt_weakness",
+    "weak_credentials",
     "command_injection",
     "insecure_deserialization",
 })
@@ -342,14 +368,27 @@ def check_bola_false_positive(
     return None
 
 
-def _receipt_contains_evidence(receipt: dict[str, Any], evidence_value: str) -> bool:
+def _receipt_contains_evidence(
+    receipt: dict[str, Any],
+    evidence_value: str,
+    *,
+    canonical_class: str = "",
+) -> bool:
     ev = str(evidence_value or "").strip().lower()
     if not ev:
         return True
     body = str(receipt.get("body") or "")
     loc = str(receipt.get("redirect_location") or "")
     hdrs = json.dumps(receipt.get("response_headers") or {}, ensure_ascii=False)
-    return ev in f"{body}\n{loc}\n{hdrs}".lower()
+    if ev in f"{body}\n{loc}\n{hdrs}".lower():
+        return True
+    if canonical_class in _HTML_UNESCAPE_EVIDENCE_CLASSES and is_html_receipt(receipt) and body:
+        unescaped = html.unescape(body).lower()
+        if ev in unescaped:
+            return True
+        if re.sub(r"\s+", " ", ev) in re.sub(r"\s+", " ", unescaped):
+            return True
+    return False
 
 
 def _receipt_content_type(receipt: dict[str, Any]) -> str:
@@ -464,6 +503,14 @@ def _can_accept_redacted_auth_override(
     """Return True if a 401/403 clean replay with an overridden redacted auth header may verify."""
     if canonical_class in {"jwt_weakness", "auth_bypass"}:
         return True
+    if canonical_class == "weak_credentials":
+        if not eff_controls:
+            return False
+        if evidence_value and not _receipt_contains_evidence(
+            replay_target, evidence_value, canonical_class=canonical_class
+        ):
+            return False
+        return True
     # Authorization-boundary classes test the actor's own session; a 401/403 clean replay
     # with an overridden auth header means the actor's real session was properly denied.
     if canonical_class in {"bola", "bfla", "tenant_isolation"}:
@@ -498,7 +545,9 @@ def _can_accept_redacted_auth_override(
     if not has_valid_baseline:
         return False
 
-    if evidence_value and not ev_in_oob and not _receipt_contains_evidence(replay_target, evidence_value):
+    if evidence_value and not ev_in_oob and not _receipt_contains_evidence(
+        replay_target, evidence_value, canonical_class=canonical_class
+    ):
         return False
 
     if canonical_class == "cors_misconfiguration":
@@ -622,7 +671,7 @@ def find_persistent_render_get_receipt(
                 continue
             if ev and not receipt_body_contains_verbatim(r, ev):
                 continue
-        elif ev and not _receipt_contains_evidence(r, ev):
+        elif ev and not _receipt_contains_evidence(r, ev, canonical_class=canonical_class):
             continue
         matched.append(r)
 
@@ -677,12 +726,12 @@ def _select_mutating_get_proof(
     if not candidates:
         return None
     if ev:
-        ev_matching = [r for r in candidates if _receipt_contains_evidence(r, ev)]
+        ev_matching = [r for r in candidates if _receipt_contains_evidence(r, ev, canonical_class=canonical_class)]
         if ev_matching:
             candidates = ev_matching
     candidates.sort(
         key=lambda r: (
-            1 if (ev and _receipt_contains_evidence(r, ev)) else 0,
+            1 if (ev and _receipt_contains_evidence(r, ev, canonical_class=canonical_class)) else 0,
             1 if is_persistent_read_path_related(primary_proof, str(r.get("url") or r.get("path") or "")) else 0,
             1 if _norm_url_path(str(r.get("url") or r.get("path") or "")) == p_path else 0,
             1 if str(r.get("actor") or "") == p_actor else 0,
@@ -884,6 +933,13 @@ def mask_dynamic_fields(text: str, *, preserve_values: Sequence[str] = ()) -> st
             placeholders[token] = val
             working = working.replace(val, token)
 
+    def _restore_placeholders(s: str) -> str:
+        out_s = s
+        for token, orig in placeholders.items():
+            if token in out_s:
+                out_s = out_s.replace(token, orig)
+        return out_s
+
     stripped = working.lstrip()
     if stripped.startswith(("{", "[")):
         try:
@@ -894,31 +950,31 @@ def mask_dynamic_fields(text: str, *, preserve_values: Sequence[str] = ()) -> st
             def _scrub(obj: Any) -> Any:
                 if isinstance(obj, dict):
                     out: dict[str, Any] = {}
+                    restored_keys = {str(k): _restore_placeholders(str(k)).lower() for k in obj}
+                    has_job_id = any(lk in _JOB_QUEUE_ID_KEYS for lk in restored_keys.values())
                     for k, v in sorted(obj.items(), key=lambda kv: str(kv[0])):
-                        lk = str(k).lower()
-                        if lk in _EPHEMERAL_JSON_KEYS:
-                            out[str(k)] = "<MASKED>"
+                        sk = str(k)
+                        lk = restored_keys[sk]
+                        if lk in _EPHEMERAL_JSON_KEYS or (has_job_id and lk in _JOB_QUEUE_SEQ_KEYS):
+                            out[sk] = "<MASKED>"
                         else:
-                            out[str(k)] = _scrub(v)
+                            out[sk] = _scrub(v)
                     return out
                 if isinstance(obj, list):
                     return [_scrub(x) for x in obj]
                 if isinstance(obj, str):
                     s = _ISO_TS_RE.sub("<TS>", obj)
+                    s = _UUID_RE.sub("<UUID>", s)
                     return s
                 return obj
 
             working = json.dumps(_scrub(parsed), ensure_ascii=False, separators=(",", ":"), sort_keys=True)
-            for token, orig in placeholders.items():
-                working = working.replace(token, orig)
-            return working
+            return _restore_placeholders(working)
 
     working = _ISO_TS_RE.sub("<TS>", working)
     working = _UUID_RE.sub("<UUID>", working)
     working = re.sub(r"\s+", " ", working).strip()
-    for token, orig in placeholders.items():
-        working = working.replace(token, orig)
-    return working
+    return _restore_placeholders(working)
 
 
 def _try_parse_json_body(text: str) -> Any | None:
@@ -934,14 +990,22 @@ def _try_parse_json_body(text: str) -> Any | None:
 def _collect_ephemeral_json_values(
     obj: Any,
     path: tuple[str, ...] = (),
+    *,
+    extra_keys: frozenset[str] = frozenset(),
 ) -> dict[tuple[str, ...], list[str]]:
     found: dict[tuple[str, ...], list[str]] = {}
     if isinstance(obj, dict):
+        has_job_id = any(str(k).lower() in _JOB_QUEUE_ID_KEYS for k in obj)
         for k, v in obj.items():
             kl = str(k).lower()
             child_path = (*path, kl)
-            if (
+            is_ephemeral = (
                 kl in _EPHEMERAL_REPLAY_JSON_KEYS
+                or kl in extra_keys
+                or (has_job_id and kl in _JOB_QUEUE_SEQ_KEYS)
+            )
+            if (
+                is_ephemeral
                 and isinstance(v, (str, int, float))
                 and not isinstance(v, bool)
             ):
@@ -949,17 +1013,26 @@ def _collect_ephemeral_json_values(
                 if val_str:
                     found.setdefault(child_path, []).append(val_str)
             if isinstance(v, (dict, list)):
-                for sub_path, vals in _collect_ephemeral_json_values(v, child_path).items():
+                for sub_path, vals in _collect_ephemeral_json_values(
+                    v, child_path, extra_keys=extra_keys
+                ).items():
                     found.setdefault(sub_path, []).extend(vals)
     elif isinstance(obj, list):
         for item in obj[:100]:
             if isinstance(item, (dict, list)):
-                for sub_path, vals in _collect_ephemeral_json_values(item, (*path, "[]")).items():
+                for sub_path, vals in _collect_ephemeral_json_values(
+                    item, (*path, "[]"), extra_keys=extra_keys
+                ).items():
                     found.setdefault(sub_path, []).extend(vals)
     return found
 
 
-def _mask_for_ephemeral_replay_comparison(text: str, parsed_json: Any | None = None) -> str:
+def _mask_for_ephemeral_replay_comparison(
+    text: str,
+    parsed_json: Any | None = None,
+    *,
+    extra_keys: frozenset[str] = frozenset(),
+) -> str:
     """Mask UUIDs, timestamps, ephemeral JSON keys, and 24-64 char hex IDs for replay comparison."""
     raw = str(text or "")
     if not raw:
@@ -969,9 +1042,14 @@ def _mask_for_ephemeral_replay_comparison(text: str, parsed_json: Any | None = N
         def _scrub(obj: Any) -> Any:
             if isinstance(obj, dict):
                 out: dict[str, Any] = {}
+                has_job_id = any(str(k).lower() in _JOB_QUEUE_ID_KEYS for k in obj)
                 for k, v in sorted(obj.items(), key=lambda kv: str(kv[0])):
                     lk = str(k).lower()
-                    if lk in _EPHEMERAL_REPLAY_JSON_KEYS:
+                    if (
+                        lk in _EPHEMERAL_REPLAY_JSON_KEYS
+                        or lk in extra_keys
+                        or (has_job_id and lk in _JOB_QUEUE_SEQ_KEYS)
+                    ):
                         out[str(k)] = "<MASKED>"
                     else:
                         out[str(k)] = _scrub(v)
@@ -991,6 +1069,105 @@ def _mask_for_ephemeral_replay_comparison(text: str, parsed_json: Any | None = N
     working = _UUID_RE.sub("<UUID>", working)
     working = _HEX_MASK_RE.sub("<HEX>", working)
     return re.sub(r"\s+", " ", working).strip()
+
+
+def _weak_credentials_controls_equivalent(
+    proof: dict[str, Any],
+    ctrl: dict[str, Any],
+    *,
+    ev: str,
+) -> bool:
+    """Return True if a weak_credentials proof and control show no auth-state differential."""
+    if int(ctrl.get("status") or 0) != int(proof.get("status") or 0):
+        return False
+    p_loc = mask_dynamic_fields(str(proof.get("redirect_location") or ""), preserve_values=(ev,))
+    c_loc = mask_dynamic_fields(str(ctrl.get("redirect_location") or ""), preserve_values=(ev,))
+    if c_loc != p_loc:
+        return False
+    if bool(_response_header_ci(ctrl, "set-cookie")) != bool(_response_header_ci(proof, "set-cookie")):
+        return False
+    p_body = _mask_for_ephemeral_replay_comparison(
+        str(proof.get("body") or ""),
+        extra_keys=_WEAK_CRED_TOKEN_KEYS,
+    )
+    c_body = _mask_for_ephemeral_replay_comparison(
+        str(ctrl.get("body") or ""),
+        extra_keys=_WEAK_CRED_TOKEN_KEYS,
+    )
+    return c_body == p_body
+
+
+def _weak_credentials_replay_matches_evidence(
+    ev: str,
+    replay_target: dict[str, Any],
+    replay_rec: dict[str, Any],
+) -> bool:
+    """Return True if clean login replay preserves evidence or dynamic session cookie/token behavior."""
+    if not ev or _receipt_contains_evidence(replay_rec, ev, canonical_class="weak_credentials"):
+        return True
+    t_cookie = _response_header_ci(replay_target, "set-cookie")
+    r_cookie = _response_header_ci(replay_rec, "set-cookie")
+    if t_cookie and r_cookie and ev.lower() in t_cookie.lower():
+        t_masked = _mask_for_ephemeral_replay_comparison(
+            str(replay_target.get("body") or ""),
+            extra_keys=_WEAK_CRED_TOKEN_KEYS,
+        )
+        r_masked = _mask_for_ephemeral_replay_comparison(
+            str(replay_rec.get("body") or ""),
+            extra_keys=_WEAK_CRED_TOKEN_KEYS,
+        )
+        if t_masked == r_masked:
+            return True
+    if _detect_ephemeral_evidence_mismatch(ev, replay_target, replay_rec):
+        return True
+    t_body = str(replay_target.get("body") or "").strip()
+    r_body = str(replay_rec.get("body") or "").strip()
+    t_json = _try_parse_json_body(t_body)
+    r_json = _try_parse_json_body(r_body)
+    if t_json is not None and r_json is not None:
+        ev_low = ev.lower()
+        t_toks = _collect_ephemeral_json_values(t_json, extra_keys=_WEAK_CRED_TOKEN_KEYS)
+        r_toks = _collect_ephemeral_json_values(r_json, extra_keys=_WEAK_CRED_TOKEN_KEYS)
+        token_rotated = any(
+            any(v.lower() == ev_low for v in vals) and bool(r_toks.get(kp))
+            for kp, vals in t_toks.items()
+        )
+        if token_rotated:
+            t_masked = _mask_for_ephemeral_replay_comparison(
+                t_body, parsed_json=t_json, extra_keys=_WEAK_CRED_TOKEN_KEYS
+            )
+            r_masked = _mask_for_ephemeral_replay_comparison(
+                r_body, parsed_json=r_json, extra_keys=_WEAK_CRED_TOKEN_KEYS
+            )
+            if bool(t_masked) and t_masked == r_masked:
+                return True
+    return False
+
+
+def _weak_credentials_redacted_body_rejected(
+    replay_target: dict[str, Any],
+    replay_rec: dict[str, Any],
+    eff_controls: Sequence[dict[str, Any]],
+    *,
+    ev: str,
+) -> bool:
+    """Return True when replaying a login receipt with redacted credentials is rejected live."""
+    if "<REDACTED" not in str(replay_target.get("request_body") or ""):
+        return False
+    if not eff_controls:
+        return False
+    if ev and not _receipt_contains_evidence(replay_target, ev, canonical_class="weak_credentials"):
+        return False
+    r_status = int(replay_rec.get("status") or 0)
+    if r_status in {400, 401, 403, 422}:
+        return True
+    if 200 <= r_status < 400:
+        if any(
+            _weak_credentials_controls_equivalent(ctrl, replay_rec, ev=ev)
+            for ctrl in eff_controls
+        ) and not _weak_credentials_controls_equivalent(replay_target, replay_rec, ev=ev):
+            return True
+    return False
 
 
 def _detect_ephemeral_evidence_mismatch(
@@ -1290,7 +1467,7 @@ class DifferentialOracle:
             and render_proof is not None
             and (
                 not ev
-                or not _receipt_contains_evidence(primary_proof, ev)
+                or not _receipt_contains_evidence(primary_proof, ev, canonical_class=canonical_class)
                 or any(str(c.get("method") or "").upper() == "GET" for c in control_receipts)
             )
         ):
@@ -1305,7 +1482,13 @@ class DifferentialOracle:
         # --- Stage 1: Falsification / Control Baseline Check ---
         ctrl_probe_rid = ""
         eff_controls = list(control_receipts)
-        if not eff_controls and not is_oob_verified and canonical_class not in _CONCURRENCY_CLASSES and self._has_budget(2):
+        if (
+            not eff_controls
+            and not is_oob_verified
+            and canonical_class not in _CONCURRENCY_CLASSES
+            and canonical_class != "weak_credentials"
+            and self._has_budget(2)
+        ):
             try:
                 if canonical_class in _INPUT_DIFF_CLASSES:
                     ctrl_url = self._benign_control_url(str(diff_target.get("url") or "/"))
@@ -1363,6 +1546,18 @@ class DifferentialOracle:
 
         # Check benign control equivalence and stored_xss baseline absence for input/mutation classes
         if canonical_class in _INPUT_DIFF_CLASSES and not is_oob_verified:
+            if canonical_class == "weak_credentials" and not eff_controls:
+                stages["stage1_control"] = "failed_missing_control"
+                return OracleVerdict(
+                    verified=False,
+                    verdict="REFUTED",
+                    reason=(
+                        "weak_credentials requires at least one comparative control receipt "
+                        "(e.g. failed login with invalid credentials or unauthenticated denial on a protected endpoint)."
+                    ),
+                    mode=self.mode,
+                    stages=stages,
+                )
             if canonical_class == "stored_xss" and ev:
                 p_count = str(diff_target.get("body") or "").lower().count(ev.lower())
                 for ctrl in diff_controls:
@@ -1379,20 +1574,24 @@ class DifferentialOracle:
                         )
             same_actor_ctrls = [c for c in diff_controls if str(c.get("actor") or "") == p_actor]
             for ctrl in same_actor_ctrls:
-                c_masked = mask_dynamic_fields(str(ctrl.get("body") or ""), preserve_values=(ev,))
-                c_status = int(ctrl.get("status") or 0)
-                c_loc = str(ctrl.get("redirect_location") or "")
-                cors_same = (
-                    True
-                    if canonical_class != "cors_misconfiguration"
-                    else _cors_header_signature(ctrl) == p_cors_sig
-                )
-                if (
-                    c_status == p_status
-                    and c_masked == p_masked
-                    and urlsplit(c_loc).netloc == urlsplit(p_loc).netloc
-                    and cors_same
-                ):
+                if canonical_class == "weak_credentials":
+                    is_equivalent = _weak_credentials_controls_equivalent(diff_target, ctrl, ev=ev)
+                else:
+                    c_masked = mask_dynamic_fields(str(ctrl.get("body") or ""), preserve_values=(ev,))
+                    c_status = int(ctrl.get("status") or 0)
+                    c_loc = str(ctrl.get("redirect_location") or "")
+                    cors_same = (
+                        True
+                        if canonical_class != "cors_misconfiguration"
+                        else _cors_header_signature(ctrl) == p_cors_sig
+                    )
+                    is_equivalent = (
+                        c_status == p_status
+                        and c_masked == p_masked
+                        and urlsplit(c_loc).netloc == urlsplit(p_loc).netloc
+                        and cors_same
+                    )
+                if is_equivalent:
                     stages["stage1_control"] = "deception_identical_control"
                     return OracleVerdict(
                         verified=False,
@@ -1476,19 +1675,23 @@ class DifferentialOracle:
         if canonical_class in _INPUT_DIFF_CLASSES and not is_oob_verified:
             has_masked_diff = False
             for ctrl in diff_controls:
-                c_masked = mask_dynamic_fields(str(ctrl.get("body") or ""), preserve_values=(ev,))
-                c_status = int(ctrl.get("status") or 0)
-                c_loc = str(ctrl.get("redirect_location") or "")
-                cors_diff = (
-                    canonical_class == "cors_misconfiguration"
-                    and _cors_header_signature(ctrl) != p_cors_sig
-                )
-                if (
-                    c_status != p_status
-                    or c_masked != p_masked
-                    or urlsplit(c_loc).netloc != urlsplit(p_loc).netloc
-                    or cors_diff
-                ):
+                if canonical_class == "weak_credentials":
+                    ctrl_differs = not _weak_credentials_controls_equivalent(diff_target, ctrl, ev=ev)
+                else:
+                    c_masked = mask_dynamic_fields(str(ctrl.get("body") or ""), preserve_values=(ev,))
+                    c_status = int(ctrl.get("status") or 0)
+                    c_loc = str(ctrl.get("redirect_location") or "")
+                    cors_diff = (
+                        canonical_class == "cors_misconfiguration"
+                        and _cors_header_signature(ctrl) != p_cors_sig
+                    )
+                    ctrl_differs = (
+                        c_status != p_status
+                        or c_masked != p_masked
+                        or urlsplit(c_loc).netloc != urlsplit(p_loc).netloc
+                        or cors_diff
+                    )
+                if ctrl_differs:
                     has_masked_diff = True
                     break
             if diff_controls and not has_masked_diff:
@@ -1586,15 +1789,20 @@ class DifferentialOracle:
         # Prefer replaying a 2xx GET persistence proof receipt when one is present
         # (including cross-actor GETs after non-idempotent ownership/tenant transfers
         # and read/render GETs for stored_xss / ssti / mass_assignment / file_upload).
+        # For weak_credentials, replay the login request itself in a fresh isolated session.
         replay_target = (
-            render_proof
-            or _select_mutating_get_proof(
-                primary_proof,
-                proof_receipts,
-                ev,
-                canonical_class=canonical_class,
+            primary_proof
+            if canonical_class == "weak_credentials"
+            else (
+                render_proof
+                or _select_mutating_get_proof(
+                    primary_proof,
+                    proof_receipts,
+                    ev,
+                    canonical_class=canonical_class,
+                )
+                or primary_proof
             )
-            or primary_proof
         )
 
         # Do not replay compact non-binary multipart/form-data summary strings as raw_body.
@@ -1687,7 +1895,7 @@ class DifferentialOracle:
                 p_cors_sig=p_cors_sig,
             ):
                 stages["stage3_clean_replay"] = "passed_redacted_auth_override"
-                if canonical_class in {"jwt_weakness", "auth_bypass"}:
+                if canonical_class in {"jwt_weakness", "auth_bypass", "weak_credentials"}:
                     reason = (
                         f"Verified {canonical_class} via control differential and live unprivileged "
                         "clean-session rejection (forged auth header redacted in receipt)."
@@ -1706,6 +1914,33 @@ class DifferentialOracle:
                     clean_replay_receipt_id=replay_rec["receipt_id"],
                     control_probe_receipt_id=ctrl_probe_rid,
                 )
+
+        # When a weak_credentials login proof sent a JSON password field that ReceiptStore
+        # scrubbed to <REDACTED_SECRET>, clean replay sends the redacted placeholder and live
+        # rejection (400/401/403/422 or failed-login control match) confirms auth enforcement.
+        if (
+            canonical_class == "weak_credentials"
+            and 200 <= t_status < 400
+            and _weak_credentials_redacted_body_rejected(
+                replay_target,
+                replay_rec,
+                eff_controls,
+                ev=ev,
+            )
+        ):
+            stages["stage3_clean_replay"] = "passed_redacted_credential_body"
+            return OracleVerdict(
+                verified=True,
+                verdict="VERIFIED",
+                reason=(
+                    "Verified weak_credentials via Stage 1-2 login differential and live "
+                    "clean-session rejection when credential field is redacted in receipt."
+                ),
+                mode=self.mode,
+                stages=stages,
+                clean_replay_receipt_id=replay_rec["receipt_id"],
+                control_probe_receipt_id=ctrl_probe_rid,
+            )
 
         # Destructive DELETE persistence verification: when re-executing DELETE returns
         # 404/410 because the resource is already gone, verify an earlier 2xx GET existed
@@ -1873,7 +2108,9 @@ class DifferentialOracle:
                 except BudgetExhaustedError:
                     break
                 fb_status = int(fb_rec.get("status") or 0)
-                if 200 <= fb_status < 300 and _receipt_contains_evidence(fb_rec, ev):
+                if 200 <= fb_status < 300 and _receipt_contains_evidence(
+                    fb_rec, ev, canonical_class=canonical_class
+                ):
                     replay_rec = fb_rec
                     r_status = fb_status
                     t_status = 200
@@ -1896,7 +2133,10 @@ class DifferentialOracle:
                     and not ev_in_oob
                     and (
                         (canonical_class == "stored_xss" and not receipt_body_contains_verbatim(replay_rec, ev))
-                        or (canonical_class != "stored_xss" and not _receipt_contains_evidence(replay_rec, ev))
+                        or (
+                            canonical_class != "stored_xss"
+                            and not _receipt_contains_evidence(replay_rec, ev, canonical_class=canonical_class)
+                        )
                     )
                 )
             )
@@ -2010,8 +2250,51 @@ class DifferentialOracle:
                     clean_replay_receipt_id=replay_rec["receipt_id"],
                     control_probe_receipt_id=ctrl_probe_rid,
                 )
+        elif canonical_class == "weak_credentials":
+            orig_loc = str(replay_target.get("redirect_location") or "")
+            rep_loc = str(replay_rec.get("redirect_location") or "")
+            if 300 <= t_status < 400 and orig_loc:
+                if (
+                    urlsplit(rep_loc).netloc != urlsplit(orig_loc).netloc
+                    or _norm_url_path(rep_loc) != _norm_url_path(orig_loc)
+                ):
+                    stages["stage3_clean_replay"] = "failed_login_redirect_mismatch"
+                    return OracleVerdict(
+                        verified=False,
+                        verdict="REFUTED",
+                        reason="Clean-session login replay did not reproduce expected authenticated redirect destination.",
+                        mode=self.mode,
+                        stages=stages,
+                        clean_replay_receipt_id=replay_rec["receipt_id"],
+                        control_probe_receipt_id=ctrl_probe_rid,
+                    )
+            if (
+                any(_weak_credentials_controls_equivalent(ctrl, replay_rec, ev=ev) for ctrl in eff_controls)
+                and not _weak_credentials_controls_equivalent(replay_target, replay_rec, ev=ev)
+            ):
+                stages["stage3_clean_replay"] = "failed_replay_matched_control"
+                return OracleVerdict(
+                    verified=False,
+                    verdict="REFUTED",
+                    reason="Clean-session login replay matched failed-login control instead of authenticated proof.",
+                    mode=self.mode,
+                    stages=stages,
+                    clean_replay_receipt_id=replay_rec["receipt_id"],
+                    control_probe_receipt_id=ctrl_probe_rid,
+                )
+            if ev and not _weak_credentials_replay_matches_evidence(ev, replay_target, replay_rec):
+                stages["stage3_clean_replay"] = "failed_missing_evidence"
+                return OracleVerdict(
+                    verified=False,
+                    verdict="REFUTED",
+                    reason="Clean-session login replay did not reproduce claimed evidence or session behavior.",
+                    mode=self.mode,
+                    stages=stages,
+                    clean_replay_receipt_id=replay_rec["receipt_id"],
+                    control_probe_receipt_id=ctrl_probe_rid,
+                )
         else:
-            if ev and not _receipt_contains_evidence(replay_rec, ev):
+            if ev and not _receipt_contains_evidence(replay_rec, ev, canonical_class=canonical_class):
                 if not ev_in_oob:
                     if _detect_ephemeral_evidence_mismatch(ev, replay_target, replay_rec):
                         return OracleVerdict(

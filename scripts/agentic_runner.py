@@ -479,6 +479,8 @@ def run_agentic_target(
             cache_token_weight=eff_cache_weight,
             seed_surface=seed_data,
             oob_server=configured_oob,
+            stage0_post_auth_enabled=eff_auto_crawl,
+            stage0_allow_forms=eff_auto_crawl_forms,
         )
         run_info = investigator.run(resume=resume)
         manifest.update(run_info)

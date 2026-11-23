@@ -437,6 +437,17 @@ _VULN_CLASS_METADATA: dict[str, dict[str, Any]] = {
         "default_severity": "critical",
         "description": "Application deserializes untrusted input into executable functions, gadgets, or unintended objects.",
     },
+    "weak_credentials": {
+        "name": "Weak / Default Credentials",
+        "owasp": "OWASP A07:2021 (Identification and Authentication Failures)",
+        "cwe": "CWE-521",
+        "default_severity": "high",
+        "description": "Authentication endpoint accepts default, trivial, or easily guessable credentials and establishes an authenticated session.",
+        "remediation": (
+            "Remove or rotate default accounts immediately, enforce strong password complexity and "
+            "login rate limiting/lockout, and require multi-factor authentication for privileged access."
+        ),
+    },
     "info_disclosure": {
         "name": "Sensitive Information Exposure",
         "owasp": "OWASP A01:2021 / API3:2023",
@@ -445,6 +456,7 @@ _VULN_CLASS_METADATA: dict[str, dict[str, Any]] = {
         "description": "Endpoint exposes sensitive internal data or metadata to unauthorized actors.",
     },
 }
+_CLASS_METADATA = _VULN_CLASS_METADATA
 
 _GENERIC_CLASS_META: dict[str, Any] = {
     "name": "Security Control Weakness",
@@ -1294,6 +1306,7 @@ def _sorted_findings(artifacts: dict[str, Any], secret_values: Sequence[str], *,
             "cwe": meta["cwe"],
             "rule_name": meta["name"],
             "rule_description": meta["description"],
+            "remediation": str(meta.get("remediation") or ""),
             "method": method,
             "endpoint": safe_endpoint,
             "url": safe_url,
@@ -1456,6 +1469,11 @@ def render_markdown_report(artifacts: dict[str, Any]) -> str:
                 f"**Summary:** {f['summary']}",
                 "",
             ])
+            if f.get("remediation"):
+                lines.extend([
+                    f"**Remediation:** {f['remediation']}",
+                    "",
+                ])
             if f["evidence"]:
                 lines.extend([
                     "**Redacted Evidence Excerpt:**",
@@ -1596,7 +1614,7 @@ def render_sarif_report(artifacts: dict[str, Any]) -> dict[str, Any]:
         cls_meta = _class_metadata(cls_type)
         rule_id = cls_type
         rule_index_by_class[cls_type] = len(rules)
-        rules.append({
+        rule_entry: dict[str, Any] = {
             "id": rule_id,
             "name": cls_meta["name"],
             "shortDescription": {"text": cls_meta["name"]},
@@ -1614,7 +1632,12 @@ def render_sarif_report(artifacts: dict[str, Any]) -> dict[str, Any]:
                 "owasp": cls_meta["owasp"],
                 "cwe": cls_meta["cwe"],
             },
-        })
+        }
+        remediation_text = str(cls_meta.get("remediation") or "").strip()
+        if remediation_text:
+            rule_entry["help"] = {"text": remediation_text}
+            rule_entry["properties"]["remediation"] = remediation_text
+        rules.append(rule_entry)
 
     results: list[dict[str, Any]] = []
     for f in findings:

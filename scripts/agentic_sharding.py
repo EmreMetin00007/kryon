@@ -567,6 +567,12 @@ def build_shard_prompts(
             )
     scope_sections.append(f"- Already-verified bootstrap findings (DO NOT DUPLICATE):\n{findings_block}")
     scope_sections.append(
+        "- Breadth & hygiene: cover all assigned routes/sub-tabs (avoid >5 turns on one static/upload endpoint while assigned interactive routes remain unvisited); never call `/reboot`, `/restart`, `/shutdown` or overwrite active actor credentials."
+    )
+    scope_sections.append(
+        "- QA edge checks: verify `weak_credentials` (with invalid-login baseline), `.svg` upload `Content-Type` readback, `%252F` double-encoded path checks on `403`, and `%2F` percent-encoded slashes on nested `404` paths."
+    )
+    scope_sections.append(
         "- Call `record_finding` immediately as each vulnerability is confirmed, and call `finish` when your assigned subsystem slice is complete."
     )
 
@@ -1221,6 +1227,7 @@ def build_cross_shard_synthesis_prompts(
         "- Chain extracted operational keys/codes/headers, forged/elevated auth capabilities (JWT forging, SQLi extraction, auth/role bypass), and discovered internal service URLs across subsystems.",
         "- Apply extracted headers/keys/forged tokens or upgraded actor sessions to unlock `401`/`403` blocked write endpoints and multi-step `POST` workflows.",
         "- Where virgin/untested actors remain on single-use or stateful actions (`claim`, `redeem`, `promo`, `coupon`, `bonus`, `withdraw`), call `concurrent_check` (`count=3..5`) FIRST before single sequential mutations.",
+        "- Maintain breadth across unvisited routes/sub-tabs (avoid >5 turns on one static/upload endpoint), include `weak_credentials`, `.svg` upload `Content-Type` readback, `%252F` (`403`), and `%2F` (`404`) checks where relevant, and NEVER call `/reboot`, `/restart`, `/shutdown` or modify active actor credentials.",
         "- Call `record_finding` immediately as each chained or newly unlocked finding is verified with proof + control receipts, and call `finish` when Stage 3 synthesis is complete.",
         f"- Already-verified findings (DO NOT DUPLICATE):\n{findings_block}",
     ]

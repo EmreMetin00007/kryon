@@ -8,8 +8,8 @@ from pathlib import Path
 import re
 import threading
 import time
-from typing import Any, Callable
-from urllib.parse import urlsplit
+from typing import Any, Callable, Sequence
+from urllib.parse import urljoin, urlsplit
 
 from agentic_bsag import (
     NODE_ARTIFACT,
@@ -64,11 +64,16 @@ from agentic_context import (
     effective_tokens_from_usage as effective_tokens_from_usage,
     estimate_tokens as estimate_tokens,
 )
-from agentic_http import AgenticHTTPClient, ServiceDegradationError
+from agentic_http import (
+    AgenticHTTPClient,
+    ScopeViolationError,
+    ServiceDegradationError,
+    is_static_asset_url,
+)
 from agentic_oob import LoopbackCallbackServer
 from agentic_oracle import DifferentialOracle
 from agentic_receipts import ReceiptStore
-from agentic_seed import apply_seed_surface
+from agentic_seed import apply_seed_surface, merge_seed_surfaces
 from agentic_scheduler import (
     AntiBiasUCBScheduler,
     ArmSelection,
@@ -81,7 +86,7 @@ from agentic_sharding import (
     cluster_discovered_surface,
     collect_cross_shard_synthesis_context,
 )
-from agentic_surface import SurfaceFrontierTracker
+from agentic_surface import SurfaceFrontierTracker, is_non_endpoint_source_path
 from agentic_telemetry import TelemetryLogger, write_process_metrics
 from agentic_tools import TOOL_SCHEMAS, ToolDispatcher, canonicalize_and_deduplicate_findings
 from full_agent_budget import BudgetError, SharedBudget, compact_tools
@@ -142,6 +147,8 @@ class AgenticInvestigator:
         seed_surface: dict[str, Any] | None = None,
         oob_server: LoopbackCallbackServer | None = None,
         enable_cross_shard_synthesis: bool = True,
+        stage0_post_auth_enabled: bool = False,
+        stage0_allow_forms: bool = False,
     ):
         self.http = http_client
         self.receipts = receipt_store
@@ -191,6 +198,8 @@ class AgenticInvestigator:
         self.micro_budget = max(2, int(micro_budget))
         self.synthesis_interval = max(1, int(synthesis_interval))
         self.enable_cross_shard_synthesis = bool(enable_cross_shard_synthesis)
+        self.stage0_post_auth_enabled = bool(stage0_post_auth_enabled)
+        self.stage0_allow_forms = bool(stage0_allow_forms)
 
         use_telem = bool(enable_telemetry) if enable_telemetry is not None else (
             self.execution_mode == "ephemeral" or self.use_bsag
@@ -1796,6 +1805,104 @@ class AgenticInvestigator:
 
         return self._result_summary(status)
 
+    def _collect_post_auth_start_paths(
+        self,
+        new_auth_actors: Sequence[str],
+        *,
+        limit: int = 8,
+    ) -> list[str]:
+        """Collect up to ``limit`` unique in-scope start paths for newly authenticated actors."""
+        cap = max(1, int(limit))
+        starts: list[str] = ["/"]
+        seen: set[str] = {"/"}
+        new_actor_set = {str(a).strip() for a in new_auth_actors if str(a).strip()}
+        if not new_actor_set:
+            return starts
+
+        source_receipt_ids: set[str] = set()
+        for alias in new_actor_set:
+            sess = self.http.actors.actors.get(alias)
+            src_rid = str(getattr(sess, "source_receipt_id", "") or "").strip() if sess is not None else ""
+            if src_rid:
+                source_receipt_ids.add(src_rid)
+
+        def _add_candidate(raw_target: str, *, base_ref: str = "") -> None:
+            if len(starts) >= cap:
+                return
+            cand = str(raw_target or "").strip()
+            if not cand or "<REDACTED" in cand:
+                return
+            low = cand.lower()
+            if low.startswith(("javascript:", "mailto:", "data:", "blob:", "tel:", "about:", "ws://", "wss://")):
+                return
+            resolved = urljoin(base_ref or self.http.base_url, cand)
+            try:
+                _clean_url, req_path, _q = self.http.resolve_in_scope(resolved, allow_websocket=False)
+            except (ScopeViolationError, ValueError):
+                return
+            norm_path = str(req_path or "/").strip() or "/"
+            if not norm_path.startswith("/"):
+                norm_path = "/" + norm_path
+            if is_static_asset_url(norm_path) or is_non_endpoint_source_path(norm_path):
+                return
+            if norm_path not in seen:
+                seen.add(norm_path)
+                starts.append(norm_path)
+
+        # 1. Prioritize redirect_location targets from the login receipts that created the new sessions.
+        for rid in sorted(source_receipt_ids):
+            if len(starts) >= cap:
+                break
+            try:
+                rec = self.receipts.get(rid)
+            except Exception:
+                continue
+            redir = str(rec.get("redirect_location") or "").strip()
+            if redir:
+                _add_candidate(redir, base_ref=str(rec.get("url") or self.http.base_url))
+
+        # 2. Add 2xx GET paths recorded for the new actors plus any redirect targets from their or login receipts.
+        login_path_tokens = (
+            "login",
+            "log-in",
+            "signin",
+            "sign-in",
+            "auth",
+            "register",
+            "signup",
+            "sign-up",
+            "session",
+        )
+        for rid in self.receipts.list_ids():
+            if len(starts) >= cap:
+                break
+            try:
+                rec = self.receipts.get(rid)
+            except Exception:
+                continue
+            rec_actor = str(rec.get("actor") or "").strip()
+            rec_method = str(rec.get("method") or "GET").strip().upper()
+            rec_status = int(rec.get("status") or 0)
+            rec_url = str(rec.get("url") or self.http.base_url)
+            rec_redir = str(rec.get("redirect_location") or "").strip()
+
+            if rec_actor in new_actor_set:
+                if rec_method == "GET" and 200 <= rec_status < 300:
+                    _add_candidate(str(rec.get("path") or rec_url), base_ref=rec_url)
+                if rec_redir:
+                    _add_candidate(rec_redir, base_ref=rec_url)
+            elif (
+                rec_redir
+                and rid not in source_receipt_ids
+                and rec_method == "POST"
+                and 300 <= rec_status < 400
+            ):
+                rec_path_low = str(rec.get("path") or "").lower()
+                if any(tok in rec_path_low for tok in login_path_tokens):
+                    _add_candidate(rec_redir, base_ref=rec_url)
+
+        return starts[:cap]
+
     def _run_sharded(self, *, resume: bool = False) -> dict[str, Any]:
         """Run 2-stage subsystem-clustered parallel monolithic execution."""
         if resume:
@@ -1822,6 +1929,7 @@ class AgenticInvestigator:
             fallback_reason: str | None = None,
             shards: list[dict[str, Any]] | None = None,
             stage3_synthesis: dict[str, Any] | None = None,
+            post_auth_stage0_crawl: dict[str, Any] | None = None,
         ) -> dict[str, Any]:
             summary: dict[str, Any] = {
                 "bootstrap_model": boot_model,
@@ -1842,6 +1950,8 @@ class AgenticInvestigator:
             }
             if fallback_reason is not None:
                 summary["fallback_reason"] = fallback_reason
+            if post_auth_stage0_crawl is not None:
+                summary["post_auth_stage0_crawl"] = post_auth_stage0_crawl
             if stage3_synthesis is not None:
                 summary["stage3_synthesis"] = stage3_synthesis
             return summary
@@ -1887,6 +1997,12 @@ class AgenticInvestigator:
             {"role": "user", "content": init_prompt},
         ]
 
+        initial_auth_actors = {
+            alias
+            for alias, sess in list(self.http.actors.actors.items())
+            if alias != "anon" and sess.authenticated
+        }
+
         try:
             self.dispatcher.bootstrap_stage1_virgin_guard = True
             try:
@@ -1924,6 +2040,96 @@ class AgenticInvestigator:
                 )
                 final_status = boot_status if boot_status != "running" else "budget_exhausted"
                 return self._result_summary(final_status)
+
+            post_auth_stage0_summary: dict[str, Any] | None = None
+            new_auth_actors = sorted(
+                alias
+                for alias, sess in list(self.http.actors.actors.items())
+                if alias != "anon" and sess.authenticated and alias not in initial_auth_actors
+            )
+            rem_http_pre_post_auth = self.http.budget.limit - self.http.budget.used
+            if (
+                self.stage0_post_auth_enabled
+                and new_auth_actors
+                and rem_http_pre_post_auth >= 40
+                and self.budget.remaining_seconds() >= 30
+            ):
+                post_auth_starts = self._collect_post_auth_start_paths(new_auth_actors, limit=8)
+                try:
+                    import agentic_stage0_crawl  # type: ignore[import-not-found]
+
+                    stage0_post_result = agentic_stage0_crawl.run_stage0_crawl(
+                        self.http,
+                        output_dir=self.root_dir,
+                        start_paths=post_auth_starts,
+                        max_pages=8,
+                        max_actions=16,
+                        allow_forms=self.stage0_allow_forms,
+                        actors=new_auth_actors,
+                        seed_filename="stage0-post-auth-seed.json",
+                    )
+                    routes_ingested = 0
+                    stage0_stats: dict[str, Any] = {}
+                    actors_crawled: list[str] = []
+                    seed_file = ""
+                    crawl_status = "ok"
+                    if isinstance(stage0_post_result, dict):
+                        stage0_stats = dict(stage0_post_result.get("stats") or {})
+                        actors_crawled = [str(a) for a in (stage0_post_result.get("actors_crawled") or ())]
+                        seed_file = str(stage0_post_result.get("seed_file") or "")
+                        crawl_status = str(
+                            stage0_stats.get("status")
+                            or stage0_post_result.get("status")
+                            or "ok"
+                        )
+                        for row in self.http.actors.summaries():
+                            self.dispatcher.surface_tracker.actors[row["alias"]] = {
+                                "alias": row["alias"],
+                                "role": str(row.get("role") or "").strip().lower(),
+                                "tenant": str(row.get("tenant") or "").strip().lower(),
+                            }
+                        excluded_paths = tuple(getattr(self.http, "excluded_paths", ()) or ())
+                        merged_post_seed = merge_seed_surfaces(
+                            [stage0_post_result],
+                            base_url=self.http.base_url,
+                            excluded_paths=excluded_paths,
+                        )
+                        if merged_post_seed is not None:
+                            post_actor = new_auth_actors[0] if len(new_auth_actors) == 1 else "stage0-post-auth"
+                            routes_ingested = apply_seed_surface(
+                                self.dispatcher.surface_tracker,
+                                merged_post_seed,
+                                actor=post_actor,
+                            )
+                            for hint in merged_post_seed.get("discovery_hints") or []:
+                                if isinstance(hint, str) and hint.strip() and hint not in self.discovery_hints:
+                                    self.discovery_hints.append(hint)
+                    post_auth_stage0_summary = {
+                        "triggered": True,
+                        "status": crawl_status,
+                        "actors": list(new_auth_actors),
+                        "actors_crawled": actors_crawled,
+                        "start_paths": list(post_auth_starts),
+                        "pages_visited": int(stage0_stats.get("pages_visited") or 0),
+                        "ui_actions_taken": int(stage0_stats.get("ui_actions_taken") or 0),
+                        "routes_ingested": int(routes_ingested),
+                        "requests_charged": int(stage0_stats.get("requests_charged") or 0),
+                        "seed_file": seed_file,
+                    }
+                except Exception as exc:
+                    post_auth_stage0_summary = {
+                        "triggered": True,
+                        "status": "error",
+                        "actors": list(new_auth_actors),
+                        "actors_crawled": [],
+                        "start_paths": list(post_auth_starts),
+                        "pages_visited": 0,
+                        "ui_actions_taken": 0,
+                        "routes_ingested": 0,
+                        "requests_charged": 0,
+                        "seed_file": "",
+                        "error": type(exc).__name__,
+                    }
 
             clusters = cluster_discovered_surface(
                 self.dispatcher.surface_tracker,
@@ -1994,6 +2200,7 @@ class AgenticInvestigator:
                         fallback_to_monolithic=True,
                         fallback_reason=fallback_reason,
                         shards=[],
+                        post_auth_stage0_crawl=post_auth_stage0_summary,
                     )
                     return self._result_summary(cont_status)
 
@@ -2003,6 +2210,7 @@ class AgenticInvestigator:
                     fallback_to_monolithic=True,
                     fallback_reason=fallback_reason,
                     shards=[],
+                    post_auth_stage0_crawl=post_auth_stage0_summary,
                 )
                 return self._result_summary(boot_status)
 
@@ -2383,6 +2591,7 @@ class AgenticInvestigator:
                     for r in shard_results
                 ],
                 stage3_synthesis=stage3_summary,
+                post_auth_stage0_crawl=post_auth_stage0_summary,
             )
             self._save_checkpoint(turn=boot_last_turn, status=overall_status, messages=[])
             return self._result_summary(overall_status)

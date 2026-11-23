@@ -177,6 +177,7 @@ RECORD_FINDING_CLASS_ENUM: list[str] = [
     "command_injection",
     "insecure_deserialization",
     "race_condition",
+    "weak_credentials",
     "business_logic",
     "other",
 ]

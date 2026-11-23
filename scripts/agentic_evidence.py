@@ -173,6 +173,11 @@ _CLASS_ALIASES = {
     "pickle_deserialization": "insecure_deserialization",
     "java_deserialization": "insecure_deserialization",
     "php_deserialization": "insecure_deserialization",
+    "default_credentials": "weak_credentials",
+    "default_creds": "weak_credentials",
+    "default_password": "weak_credentials",
+    "weak_password": "weak_credentials",
+    "weak_creds": "weak_credentials",
 }
 _READ_SQLI_HINTS = ("order by", "order_by", "sort", "read", "differential", "boolean", "error-based", "error based", "case when")
 _ADMIN_ROLE_TOKENS = ("admin", "superadmin", "administrator", "root", "superuser", "sysadmin", "staff")
