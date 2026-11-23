@@ -34,9 +34,11 @@ from kryon_core.surface.extract import (  # noqa: E402
     extract_spa_routes,
     find_spec_urls,
     has_double_slash_path,
+    is_hashed_asset_chunk_path,
     is_non_endpoint_noise_path,
 )
 from kryon_core.surface.normalize import (  # noqa: E402
+    is_os_filesystem_path,
     is_port_in_path_artifact,
     normalize_bare_hostport_url,
 )
@@ -1938,7 +1940,14 @@ class SurfaceFrontierTracker:
         out: list[str] = []
         seen_templates_in_out: set[tuple[str, str]] = set()
         for (method, norm_p), display in sorted(self.discovered_routes.items()):
-            if method not in self.allowed_methods or is_non_endpoint_source_path(norm_p) or self._is_port_in_path_noise(norm_p):
+            if (
+                method not in self.allowed_methods
+                or is_non_endpoint_source_path(norm_p)
+                or self._is_port_in_path_noise(norm_p)
+                or is_os_filesystem_path(norm_p)
+                or is_hashed_asset_chunk_path(norm_p)
+                or (is_static_asset_url(norm_p) and not _extract_path_embedded_params(norm_p))
+            ):
                 continue
             tmpl = route_template_of(norm_p)
             # Skip unexpanded OpenAPI template strings `{...}` if a concrete path for that template was visited
@@ -2495,6 +2504,7 @@ class SurfaceFrontierTracker:
             and len(x) == 3
             and not is_non_endpoint_source_path(str(x[1]))
             and not self._is_port_in_path_noise(str(x[1]))
+            and not (is_static_asset_url(str(x[1])) and not _extract_path_embedded_params(str(x[1])))
         }
         self.discovered_params = {
             str(k): set(v)

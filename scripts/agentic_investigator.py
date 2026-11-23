@@ -86,11 +86,303 @@ from agentic_sharding import (
     cluster_discovered_surface,
     collect_cross_shard_synthesis_context,
 )
-from agentic_surface import SurfaceFrontierTracker, is_non_endpoint_source_path
+from agentic_surface import (
+    SurfaceFrontierTracker,
+    is_id_segment,
+    is_non_endpoint_source_path,
+    route_template_of,
+)
 from agentic_telemetry import TelemetryLogger, write_process_metrics
 from agentic_tools import TOOL_SCHEMAS, ToolDispatcher, canonicalize_and_deduplicate_findings
 from full_agent_budget import BudgetError, SharedBudget, compact_tools
 from full_agent_provider import MeteredProviderTransport, SessionGate
+from kryon_core.surface.extract import has_double_slash_path
+from target_bootstrap import (
+    is_destructive_lifecycle_route,
+    is_logout_route,
+    normalize_path,
+)
+
+_POST_AUTH_JSON_REDIRECT_KEYS: tuple[str, ...] = (
+    "redirect",
+    "redirect_url",
+    "redirectUrl",
+    "next",
+    "url",
+)
+_POST_AUTH_LOGIN_PATH_TOKENS: tuple[str, ...] = (
+    "login",
+    "log-in",
+    "log_in",
+    "signin",
+    "sign-in",
+    "sign_in",
+    "auth",
+    "oauth",
+    "oauth2",
+    "sso",
+    "register",
+    "signup",
+    "sign-up",
+    "sign_up",
+    "session",
+    "sessions",
+    "token",
+)
+_POST_AUTH_GENERIC_PREFIX_SEGMENTS: frozenset[str] = frozenset({
+    "api",
+    "rest",
+    "rpc",
+    "graphql",
+    "auth",
+    "oauth",
+    "oauth2",
+    "sso",
+    "login",
+    "log-in",
+    "log_in",
+    "signin",
+    "sign-in",
+    "sign_in",
+    "signup",
+    "sign-up",
+    "sign_up",
+    "register",
+    "session",
+    "sessions",
+    "token",
+    "tokens",
+    "ajax",
+    "json",
+    "static",
+    "assets",
+    "public",
+    "ws",
+    "wss",
+})
+_POST_AUTH_FRONT_CONTROLLERS: frozenset[str] = frozenset({
+    "index.php",
+    "index.cgi",
+    "index.py",
+    "app.php",
+})
+_POST_AUTH_ENDPOINT_EXTS: tuple[str, ...] = (
+    ".html",
+    ".htm",
+    ".php",
+    ".json",
+    ".asp",
+    ".aspx",
+    ".jsp",
+    ".do",
+    ".action",
+    ".cgi",
+)
+_POST_AUTH_SCRIPT_EXTS: tuple[str, ...] = (".js", ".mjs", ".cjs", ".wasm")
+_POST_AUTH_NON_HTML_CTYPES: tuple[str, ...] = (
+    "application/json",
+    "application/xml",
+    "text/xml",
+    "application/octet-stream",
+    "javascript",
+    "ecmascript",
+    "text/css",
+    "image/",
+    "font/",
+    "audio/",
+    "video/",
+    "application/pdf",
+    "application/zip",
+)
+_POST_AUTH_VERSION_SEG_RE = re.compile(r"^v\d+(?:\.\d+)?$", re.IGNORECASE)
+_POST_AUTH_API_PATH_RE = re.compile(
+    r"^/(?:(?:ajax[-_]?)?api(?:/v\d+)?|v\d+|rest|rpc|graphql)(?:/|$)",
+    re.IGNORECASE,
+)
+_POST_AUTH_DESTRUCTIVE_RE = re.compile(
+    r"delete|remove|log[-_\s]?out|sign[-_\s]?out|factory.?reset|reset|revoke|"
+    r"destroy|deactivate|wipe|purge|(?<![a-z])drop(?![a-z])|terminate|"
+    r"reboot|restart|shut[-_\s]?down|power[-_\s]?off|(?<![a-z])(?:stop|kill)(?![a-z])",
+    re.IGNORECASE,
+)
+_POST_AUTH_UNSAFE_URL_CHARS_RE = re.compile(r'[\s\x00<>"\'{}\[\]\\]')
+_MAX_POST_AUTH_GATED_SEEDS = 5
+
+
+def _strip_post_auth_endpoint_ext(segment: str) -> str:
+    low = segment.strip().lower()
+    for ext in _POST_AUTH_ENDPOINT_EXTS:
+        if low.endswith(ext) and len(low) > len(ext):
+            return low[: -len(ext)]
+    return low
+
+
+def _segment_looks_auth_like(segment: str) -> bool:
+    stem = _strip_post_auth_endpoint_ext(segment)
+    if not stem:
+        return False
+    if stem in _POST_AUTH_GENERIC_PREFIX_SEGMENTS:
+        return True
+    return any(tok in stem for tok in _POST_AUTH_LOGIN_PATH_TOKENS)
+
+
+def _extract_json_redirect_targets(body: str) -> list[str]:
+    """Extract candidate redirect URLs/paths from a JSON login response body."""
+    raw = str(body or "").strip()
+    if not raw or len(raw) > 262_144 or not raw.startswith("{"):
+        return []
+    try:
+        parsed = json.loads(raw)
+    except ValueError:
+        return []
+    if not isinstance(parsed, dict):
+        return []
+
+    containers: list[dict[str, Any]] = [parsed]
+    for nested_key in ("data", "result"):
+        nested = parsed.get(nested_key)
+        if isinstance(nested, dict):
+            containers.append(nested)
+
+    targets: list[str] = []
+    seen: set[str] = set()
+    for container in containers:
+        for key in _POST_AUTH_JSON_REDIRECT_KEYS:
+            val = container.get(key)
+            if not isinstance(val, str):
+                continue
+            cand = val.strip()
+            if (
+                not cand
+                or len(cand) > 512
+                or "<REDACTED" in cand
+                or _POST_AUTH_UNSAFE_URL_CHARS_RE.search(cand)
+            ):
+                continue
+            if cand not in seen:
+                seen.add(cand)
+                targets.append(cand)
+    return targets
+
+
+def _extract_receipt_redirect_targets(rec: dict[str, Any]) -> list[str]:
+    """Extract redirect targets from a receipt's Location header and JSON response body."""
+    targets: list[str] = []
+    seen: set[str] = set()
+
+    def _push(raw_val: Any) -> None:
+        cand = str(raw_val or "").strip()
+        if not cand or "<REDACTED" in cand or cand in seen:
+            return
+        seen.add(cand)
+        targets.append(cand)
+
+    _push(rec.get("redirect_location"))
+    resp_headers = rec.get("response_headers")
+    if isinstance(resp_headers, dict):
+        for hk, hv in resp_headers.items():
+            if str(hk or "").strip().lower() == "location":
+                _push(hv)
+    for jtarget in _extract_json_redirect_targets(str(rec.get("body") or "")):
+        _push(jtarget)
+    return targets
+
+
+def _derive_login_section_prefixes(
+    login_path: str,
+    *,
+    known_html_paths: set[str] | None = None,
+) -> list[str]:
+    """Derive non-root section root prefix(es) from a nested login URL.
+
+    Examples:
+    - ``/admin/Login/checkLogin.html`` -> ``["/admin/"]``
+    - ``/portal/auth/login`` -> ``["/portal/"]``
+    - ``/panel/login/submit`` -> ``["/panel/"]``
+    - ``/api/auth/login`` or ``/auth/login`` -> ``[]`` unless explicitly known HTML/page
+    """
+    raw = str(login_path or "").strip()
+    if not raw:
+        return []
+    try:
+        norm = normalize_path(urlsplit(raw).path or "/")
+    except ValueError:
+        return []
+    segments = [seg for seg in norm.split("/") if seg]
+    if len(segments) < 2:
+        return []
+
+    known_norm: set[str] = set()
+    for kp in known_html_paths or ():
+        try:
+            known_norm.add(normalize_path(str(kp)))
+        except ValueError:
+            continue
+
+    first = segments[0]
+    first_low = first.lower()
+    if first_low in _POST_AUTH_FRONT_CONTROLLERS:
+        if len(segments) >= 3:
+            sec = segments[1]
+            sec_low = sec.lower()
+            if (
+                sec_low not in _POST_AUTH_GENERIC_PREFIX_SEGMENTS
+                and not _POST_AUTH_VERSION_SEG_RE.fullmatch(sec_low)
+                and not is_id_segment(sec)
+                and not _segment_looks_auth_like(sec)
+            ):
+                return [f"/{first}/{sec}/"]
+        return []
+
+    if (
+        first_low in _POST_AUTH_GENERIC_PREFIX_SEGMENTS
+        or _POST_AUTH_VERSION_SEG_RE.fullmatch(first_low)
+        or is_id_segment(first)
+        or _segment_looks_auth_like(first)
+    ):
+        if f"/{first}" in known_norm or f"/{first_low}" in known_norm:
+            return [f"/{first}/"]
+        return []
+
+    prefix_segs: list[str] = [first]
+    # Walk up to one deeper non-auth, non-generic section segment before the terminal login endpoint.
+    if len(segments) >= 3:
+        second = segments[1]
+        second_low = second.lower()
+        if (
+            second_low not in _POST_AUTH_GENERIC_PREFIX_SEGMENTS
+            and not _POST_AUTH_VERSION_SEG_RE.fullmatch(second_low)
+            and not is_id_segment(second)
+            and not _segment_looks_auth_like(second)
+        ):
+            prefix_segs.append(second)
+
+    prefixes: list[str] = []
+    if len(prefix_segs) == 2:
+        prefixes.append(f"/{prefix_segs[0]}/{prefix_segs[1]}/")
+    prefixes.append(f"/{prefix_segs[0]}/")
+    return prefixes
+
+
+def _is_post_auth_html_page_candidate(norm_path: str, content_type: str, *, status: int = 0) -> bool:
+    """Return True if a path/content-type looks like an HTML/page route rather than a pure API or asset."""
+    if not norm_path or norm_path == "/":
+        return False
+    low_p = norm_path.lower()
+    if (
+        is_static_asset_url(norm_path)
+        or is_non_endpoint_source_path(norm_path)
+        or low_p.endswith(_POST_AUTH_SCRIPT_EXTS)
+    ):
+        return False
+    low_ct = str(content_type or "").lower()
+    if "html" in low_ct:
+        return True
+    if _POST_AUTH_API_PATH_RE.search(norm_path):
+        return False
+    if any(tok in low_ct for tok in _POST_AUTH_NON_HTML_CTYPES):
+        return False
+    return status in {302, 401, 403}
 
 
 def _build_assistant_history_entry(msg: dict[str, Any]) -> dict[str, Any]:
@@ -1805,19 +2097,29 @@ class AgenticInvestigator:
 
         return self._result_summary(status)
 
-    def _collect_post_auth_start_paths(
+    def _derive_post_auth_extra_seed_paths(
         self,
         new_auth_actors: Sequence[str],
         *,
-        limit: int = 8,
+        limit: int = 6,
     ) -> list[str]:
-        """Collect up to ``limit`` unique in-scope start paths for newly authenticated actors."""
-        cap = max(1, int(limit))
-        starts: list[str] = ["/"]
-        seen: set[str] = {"/"}
+        """Derive general-purpose post-auth Stage 0 entry paths for newly authenticated actors.
+
+        Sources (ordered by signal strength, bounded by ``limit``):
+        1. Each new actor's ``source_receipt_id``: same-origin ``Location`` redirect or JSON
+           ``redirect``/``redirect_url``/``next``/``url`` target, plus non-root section parent
+           prefix(es) of the login URL (e.g. ``/admin/Login/checkLogin.html`` -> ``/admin/``).
+        2. 2xx GET paths and redirect targets already observed for the new actors (and any
+           other login POST redirects).
+        3. Previously auth-gated (``302``/``401``/``403``) in-scope HTML/page routes seen by
+           ``anon`` that may now be accessible to the newly authenticated actor.
+        """
+        cap = max(0, int(limit))
+        if cap == 0:
+            return []
         new_actor_set = {str(a).strip() for a in new_auth_actors if str(a).strip()}
         if not new_actor_set:
-            return starts
+            return []
 
         source_receipt_ids: set[str] = set()
         for alias in new_actor_set:
@@ -1826,82 +2128,230 @@ class AgenticInvestigator:
             if src_rid:
                 source_receipt_ids.add(src_rid)
 
-        def _add_candidate(raw_target: str, *, base_ref: str = "") -> None:
-            if len(starts) >= cap:
-                return
+        tracker = self.dispatcher.surface_tracker
+        known_html_paths: set[str] = {
+            tmpl
+            for tmpl in tracker.html_or_form_templates
+            if isinstance(tmpl, str) and tmpl.startswith("/") and "{" not in tmpl
+        }
+        anon_2xx_paths: set[str] = set()
+        for rpath, ractors in tracker.route_2xx_actors.items():
+            if "anon" in ractors:
+                try:
+                    anon_2xx_paths.add(normalize_path(rpath))
+                except ValueError:
+                    continue
+
+        all_receipts: list[tuple[str, dict[str, Any]]] = []
+        for rid in self.receipts.list_ids():
+            try:
+                rec = self.receipts.get(rid)
+            except Exception:
+                continue
+            all_receipts.append((rid, rec))
+            rec_actor = str(rec.get("actor") or "").strip()
+            rec_status = int(rec.get("status") or 0)
+            rec_path_raw = str(rec.get("path") or urlsplit(str(rec.get("url") or "")).path or "/")
+            rec_ct = str(rec.get("content_type") or "").lower()
+            try:
+                rec_norm = normalize_path(rec_path_raw)
+            except ValueError:
+                continue
+            if rec_actor == "anon" and 200 <= rec_status < 300:
+                anon_2xx_paths.add(rec_norm)
+            if 200 <= rec_status < 400 and "html" in rec_ct and not _POST_AUTH_API_PATH_RE.search(rec_norm):
+                known_html_paths.add(rec_norm)
+
+        extras: list[str] = []
+        seen_norm: set[str] = {"/"}
+
+        def _add_candidate(
+            raw_target: str,
+            *,
+            base_ref: str = "",
+            skip_norm_path: str = "",
+        ) -> bool:
+            if len(extras) >= cap:
+                return False
             cand = str(raw_target or "").strip()
             if not cand or "<REDACTED" in cand:
-                return
+                return False
             low = cand.lower()
             if low.startswith(("javascript:", "mailto:", "data:", "blob:", "tel:", "about:", "ws://", "wss://")):
-                return
+                return False
             resolved = urljoin(base_ref or self.http.base_url, cand)
             try:
                 _clean_url, req_path, _q = self.http.resolve_in_scope(resolved, allow_websocket=False)
+                norm_key = normalize_path(req_path or "/")
             except (ScopeViolationError, ValueError):
-                return
-            norm_path = str(req_path or "/").strip() or "/"
-            if not norm_path.startswith("/"):
-                norm_path = "/" + norm_path
-            if is_static_asset_url(norm_path) or is_non_endpoint_source_path(norm_path):
-                return
-            if norm_path not in seen:
-                seen.add(norm_path)
-                starts.append(norm_path)
+                return False
+            if norm_key == "/" or (skip_norm_path and norm_key == skip_norm_path):
+                return False
+            display_path = str(req_path or "/").strip() or "/"
+            if not display_path.startswith("/"):
+                display_path = "/" + display_path
+            if (
+                has_double_slash_path(display_path)
+                or is_static_asset_url(norm_key)
+                or is_non_endpoint_source_path(norm_key)
+                or norm_key.lower().endswith(_POST_AUTH_SCRIPT_EXTS)
+                or is_logout_route(norm_key)
+                or is_destructive_lifecycle_route(norm_key)
+                or _POST_AUTH_DESTRUCTIVE_RE.search(norm_key)
+            ):
+                return False
+            if norm_key in seen_norm:
+                return False
+            seen_norm.add(norm_key)
+            extras.append(display_path)
+            return True
 
-        # 1. Prioritize redirect_location targets from the login receipts that created the new sessions.
+        # 1. Inspect each new actor's source login receipt (redirect header/JSON + parent section prefix).
         for rid in sorted(source_receipt_ids):
-            if len(starts) >= cap:
+            if len(extras) >= cap:
                 break
             try:
                 rec = self.receipts.get(rid)
             except Exception:
                 continue
-            redir = str(rec.get("redirect_location") or "").strip()
-            if redir:
-                _add_candidate(redir, base_ref=str(rec.get("url") or self.http.base_url))
+            rec_url = str(rec.get("url") or self.http.base_url)
+            login_path = str(rec.get("path") or urlsplit(rec_url).path or "/")
+            try:
+                login_norm = normalize_path(login_path)
+            except ValueError:
+                login_norm = ""
 
-        # 2. Add 2xx GET paths recorded for the new actors plus any redirect targets from their or login receipts.
-        login_path_tokens = (
-            "login",
-            "log-in",
-            "signin",
-            "sign-in",
-            "auth",
-            "register",
-            "signup",
-            "sign-up",
-            "session",
-        )
-        for rid in self.receipts.list_ids():
-            if len(starts) >= cap:
+            for redir_target in _extract_receipt_redirect_targets(rec):
+                _add_candidate(redir_target, base_ref=rec_url, skip_norm_path=login_norm)
+
+            for prefix in _derive_login_section_prefixes(login_path, known_html_paths=known_html_paths):
+                _add_candidate(prefix, base_ref=self.http.base_url, skip_norm_path=login_norm)
+
+        # 2. Add 2xx GET paths / redirects recorded for the new actors plus other login POST redirects.
+        for rid, rec in all_receipts:
+            if len(extras) >= cap:
                 break
-            try:
-                rec = self.receipts.get(rid)
-            except Exception:
-                continue
             rec_actor = str(rec.get("actor") or "").strip()
             rec_method = str(rec.get("method") or "GET").strip().upper()
             rec_status = int(rec.get("status") or 0)
             rec_url = str(rec.get("url") or self.http.base_url)
-            rec_redir = str(rec.get("redirect_location") or "").strip()
+            rec_path = str(rec.get("path") or urlsplit(rec_url).path or "/")
+            try:
+                rec_norm = normalize_path(rec_path)
+            except ValueError:
+                rec_norm = ""
 
             if rec_actor in new_actor_set:
                 if rec_method == "GET" and 200 <= rec_status < 300:
-                    _add_candidate(str(rec.get("path") or rec_url), base_ref=rec_url)
-                if rec_redir:
-                    _add_candidate(rec_redir, base_ref=rec_url)
+                    _add_candidate(rec_path, base_ref=rec_url)
+                for redir_target in _extract_receipt_redirect_targets(rec):
+                    _add_candidate(redir_target, base_ref=rec_url, skip_norm_path=rec_norm)
             elif (
-                rec_redir
-                and rid not in source_receipt_ids
+                rid not in source_receipt_ids
                 and rec_method == "POST"
-                and 300 <= rec_status < 400
+                and 200 <= rec_status < 400
             ):
-                rec_path_low = str(rec.get("path") or "").lower()
-                if any(tok in rec_path_low for tok in login_path_tokens):
-                    _add_candidate(rec_redir, base_ref=rec_url)
+                rec_path_low = rec_path.lower()
+                if any(tok in rec_path_low for tok in _POST_AUTH_LOGIN_PATH_TOKENS):
+                    for redir_target in _extract_receipt_redirect_targets(rec):
+                        _add_candidate(redir_target, base_ref=rec_url, skip_norm_path=rec_norm)
 
-        return starts[:cap]
+        # 3. Add already-discovered in-scope HTML/page routes that returned 302/401/403 to anon.
+        if len(extras) < cap:
+            gated_best: dict[str, tuple[int, int, int, str]] = {}
+            discovered_get_paths = {
+                norm_p for meth, norm_p in tracker.discovered_routes if meth == "GET"
+            }
+
+            def _consider_gated(
+                raw_path: str,
+                *,
+                priority: int,
+                base_ref: str = "",
+            ) -> None:
+                resolved = urljoin(base_ref or self.http.base_url, raw_path)
+                try:
+                    _clean, req_p, _q = self.http.resolve_in_scope(resolved, allow_websocket=False)
+                    norm_k = normalize_path(req_p or "/")
+                except (ScopeViolationError, ValueError):
+                    return
+                if norm_k == "/" or norm_k in anon_2xx_paths or norm_k in seen_norm:
+                    return
+                segs = [s for s in norm_k.split("/") if s]
+                if not segs or _segment_looks_auth_like(segs[-1]):
+                    return
+                in_surface = (
+                    0
+                    if (
+                        norm_k in discovered_get_paths
+                        or route_template_of(norm_k) in tracker.html_or_form_templates
+                    )
+                    else 1
+                )
+                depth = len(segs)
+                disp = str(req_p or "/").strip() or "/"
+                if not disp.startswith("/"):
+                    disp = "/" + disp
+                rank = (priority, in_surface, depth, disp)
+                prev = gated_best.get(norm_k)
+                if prev is None or rank < prev:
+                    gated_best[norm_k] = rank
+
+            for _rid, rec in all_receipts:
+                rec_actor = str(rec.get("actor") or "").strip()
+                rec_method = str(rec.get("method") or "GET").strip().upper()
+                rec_status = int(rec.get("status") or 0)
+                if rec_actor != "anon" or rec_method not in {"GET", "HEAD"} or rec_status not in {302, 401, 403}:
+                    continue
+                rec_url = str(rec.get("url") or self.http.base_url)
+                rec_path = str(rec.get("path") or urlsplit(rec_url).path or "/")
+                rec_ct = str(rec.get("content_type") or "")
+                try:
+                    rec_norm = normalize_path(rec_path)
+                except ValueError:
+                    continue
+                if not _is_post_auth_html_page_candidate(rec_norm, rec_ct, status=rec_status):
+                    continue
+                if rec_status == 302:
+                    redirs = _extract_receipt_redirect_targets(rec)
+                    redir_looks_auth = any(
+                        any(tok in r.lower() for tok in _POST_AUTH_LOGIN_PATH_TOKENS)
+                        for r in redirs
+                    )
+                    prio = 0 if redir_looks_auth else 2
+                else:
+                    prio = 1
+                _consider_gated(rec_path, priority=prio, base_ref=rec_url)
+
+            for resource, entry in sorted(tracker.ui_resource_families.items()):
+                if not isinstance(entry, dict):
+                    continue
+                if entry.get("collection_403") and not entry.get("collection_2xx"):
+                    _consider_gated(f"/{resource}", priority=1)
+
+            gated_added = 0
+            gated_cap = min(_MAX_POST_AUTH_GATED_SEEDS, cap - len(extras))
+            for norm_k, (_prio, _in_surf, _depth, disp) in sorted(
+                gated_best.items(),
+                key=lambda item: (item[1][0], item[1][1], item[1][2], item[0]),
+            ):
+                if gated_added >= gated_cap or len(extras) >= cap:
+                    break
+                if _add_candidate(disp, base_ref=self.http.base_url):
+                    gated_added += 1
+
+        return extras[:cap]
+
+    def _collect_post_auth_start_paths(
+        self,
+        new_auth_actors: Sequence[str],
+        *,
+        limit: int = 8,
+    ) -> list[str]:
+        """Collect up to ``limit`` unique in-scope start paths for newly authenticated actors."""
+        cap = max(1, int(limit))
+        extra_seeds = self._derive_post_auth_extra_seed_paths(new_auth_actors, limit=max(0, cap - 1))
+        return ["/", *extra_seeds][:cap]
 
     def _run_sharded(self, *, resume: bool = False) -> dict[str, Any]:
         """Run 2-stage subsystem-clustered parallel monolithic execution."""
@@ -2054,7 +2504,8 @@ class AgenticInvestigator:
                 and rem_http_pre_post_auth >= 40
                 and self.budget.remaining_seconds() >= 30
             ):
-                post_auth_starts = self._collect_post_auth_start_paths(new_auth_actors, limit=8)
+                post_auth_extra_seeds = self._derive_post_auth_extra_seed_paths(new_auth_actors, limit=6)
+                post_auth_starts = ["/", *post_auth_extra_seeds][:8]
                 try:
                     import agentic_stage0_crawl  # type: ignore[import-not-found]
 
@@ -2062,6 +2513,7 @@ class AgenticInvestigator:
                         self.http,
                         output_dir=self.root_dir,
                         start_paths=post_auth_starts,
+                        extra_seed_paths=post_auth_extra_seeds,
                         max_pages=8,
                         max_actions=16,
                         allow_forms=self.stage0_allow_forms,
@@ -2110,6 +2562,7 @@ class AgenticInvestigator:
                         "actors": list(new_auth_actors),
                         "actors_crawled": actors_crawled,
                         "start_paths": list(post_auth_starts),
+                        "extra_seed_paths": list(post_auth_extra_seeds),
                         "pages_visited": int(stage0_stats.get("pages_visited") or 0),
                         "ui_actions_taken": int(stage0_stats.get("ui_actions_taken") or 0),
                         "routes_ingested": int(routes_ingested),
@@ -2123,6 +2576,7 @@ class AgenticInvestigator:
                         "actors": list(new_auth_actors),
                         "actors_crawled": [],
                         "start_paths": list(post_auth_starts),
+                        "extra_seed_paths": list(post_auth_extra_seeds),
                         "pages_visited": 0,
                         "ui_actions_taken": 0,
                         "routes_ingested": 0,

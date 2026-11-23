@@ -49,6 +49,29 @@ _SSE_DEFAULT_MAX_DURATION_S = 1.5
 _MULTIPART_MAX_FILES = 8
 _MULTIPART_MAX_FILE_BYTES = 256 * 1024
 _MULTIPART_MAX_TOTAL_BYTES = 512 * 1024
+_LOGIN_MISSING_ROUTE_STATUS_CODES = frozenset({404, 405})
+_LOGIN_FALLBACK_MAX_CANDIDATES = 3
+_LOGIN_FALLBACK_SKIP_EXTENSIONS = STATIC_EXTENSIONS | frozenset({
+    ".js", ".mjs", ".cjs", ".ts", ".tsx", ".jsx",
+})
+_LOGIN_FALLBACK_EXCLUDE_RE = re.compile(
+    r"(?:^|[/_.-])(?:"
+    r"logout|log[-_]?out|signout|sign[-_]?out|"
+    r"register|registration|signup|sign[-_]?up|"
+    r"reset|forgot|recover|recovery|revoke|delete|destroy|refresh|"
+    r"verify|confirm|activate|unsubscribe"
+    r")(?:$|[/_.-])",
+    re.IGNORECASE,
+)
+_LOGIN_FALLBACK_STRONG_RE = re.compile(
+    r"(?:^|[/_.-])(?:login|log[-_]?in|signin|sign[-_]?in)(?:$|[/_.-])"
+    r"|(?:^|/)auth/token(?:/|$)",
+    re.IGNORECASE,
+)
+_LOGIN_FALLBACK_WEAK_RE = re.compile(
+    r"(?:^|[/_.-])sessions?(?:$|[/_.-])",
+    re.IGNORECASE,
+)
 
 
 class ScopeViolationError(ValueError):
@@ -118,6 +141,9 @@ class ActorSession:
     authenticated: bool = False
     dynamic: bool = False
     source_receipt_id: str = ""
+    last_auth_status: int | None = None
+    last_auth_path: str = ""
+    last_auth_error: str = ""
     _lock: threading.RLock = field(default_factory=threading.RLock, init=False, repr=False, compare=False)
 
     def collect_secrets(self) -> list[str]:
@@ -354,6 +380,49 @@ class ActorManager:
                 {"alias": s.alias, "role": s.role, "tenant": s.tenant}
                 for s in self.actors.values()
             ]
+
+    def authenticated_non_anon_aliases(self) -> list[str]:
+        """Return sorted non-anon actor aliases that are currently authenticated."""
+        with self._lock:
+            items = list(self.actors.items())
+        out: list[str] = []
+        for alias, sess in items:
+            if alias == "anon":
+                continue
+            with sess._lock:
+                if sess.authenticated:
+                    out.append(alias)
+        return sorted(out)
+
+    def unauthenticated_credentialed_aliases(self) -> list[str]:
+        """Return sorted non-anon actor aliases with login credentials that are not authenticated."""
+        with self._lock:
+            items = list(self.actors.items())
+        out: list[str] = []
+        for alias, sess in items:
+            if alias == "anon":
+                continue
+            with sess._lock:
+                if sess.login_payload and not sess.authenticated:
+                    out.append(alias)
+        return sorted(out)
+
+    def actors_failed_with_missing_login_route(self) -> list[str]:
+        """Return sorted credentialed actor aliases whose last login attempt returned 404 or 405."""
+        with self._lock:
+            items = list(self.actors.items())
+        out: list[str] = []
+        for alias, sess in items:
+            if alias == "anon":
+                continue
+            with sess._lock:
+                if (
+                    sess.login_payload
+                    and not sess.authenticated
+                    and sess.last_auth_status in _LOGIN_MISSING_ROUTE_STATUS_CODES
+                ):
+                    out.append(alias)
+        return sorted(out)
 
     def all_secrets(self) -> list[str]:
         with self._lock:
@@ -1302,6 +1371,10 @@ class AgenticHTTPClient:
                         record_receipt=False,
                     )
                     if 200 <= receipt["status"] < 300:
+                        with session._lock:
+                            session.last_auth_status = int(receipt["status"])
+                            session.last_auth_path = r_path
+                            session.last_auth_error = ""
                         return True
                 except (BudgetExhaustedError, ServiceDegradationError):
                     raise
@@ -1311,7 +1384,14 @@ class AgenticHTTPClient:
             if not login_payload:
                 with session._lock:
                     return session.authenticated
-            login_url, login_path, login_query = self.resolve_in_scope(self.actors.login_path)
+            try:
+                login_url, login_path, login_query = self.resolve_in_scope(self.actors.login_path)
+            except ScopeViolationError as exc:
+                with session._lock:
+                    session.last_auth_status = None
+                    session.last_auth_path = str(self.actors.login_path)
+                    session.last_auth_error = str(exc)[:200]
+                raise
             redacted_vars = {k: ("<REDACTED>" if k == "password" else v) for k, v in login_payload.items()}
             active_content_type = "application/json"
             if login_graphql_query:
@@ -1411,14 +1491,23 @@ class AgenticHTTPClient:
                             record_receipt=False,
                         )
 
-            if 200 <= receipt["status"] < 400:
+            final_status = int(receipt["status"])
+            final_error = str(receipt.get("error") or "")
+            with session._lock:
+                session.last_auth_status = final_status
+                session.last_auth_path = login_path
+                session.last_auth_error = final_error
+
+            if 200 <= final_status < 400:
                 if login_graphql_query and receipt.get("_graphql_has_errors"):
                     with session._lock:
                         has_session_mat = bool(session.cookies or session.access_token)
-                    if not has_session_mat:
-                        return False
+                        if not has_session_mat:
+                            session.last_auth_error = "graphql_errors"
+                            return False
                 with session._lock:
                     session.authenticated = True
+                    session.last_auth_error = ""
                 return True
             return False
 
@@ -1434,6 +1523,131 @@ class AgenticHTTPClient:
                 needs_login = bool(session.login_payload) and not session.authenticated
             if not needs_login:
                 continue
+            try:
+                results[alias] = bool(self.authenticate_actor(alias, force_login=False))
+            except (BudgetExhaustedError, ServiceDegradationError):
+                raise
+            except Exception:
+                results[alias] = False
+        return results
+
+    def filter_login_fallback_candidates(
+        self,
+        candidate_paths: Sequence[str],
+        *,
+        max_candidates: int = _LOGIN_FALLBACK_MAX_CANDIDATES,
+    ) -> list[str]:
+        """Filter discovered routes to bounded, safe, in-scope login-like endpoints."""
+        cap = max(0, min(int(max_candidates), 5))
+        if cap == 0 or not candidate_paths:
+            return []
+        try:
+            _, current_norm, _ = self.resolve_in_scope(self.actors.login_path, allow_websocket=False)
+        except ScopeViolationError:
+            current_norm = str(self.actors.login_path or "").strip()
+        current_cmp = current_norm.rstrip("/") or "/"
+
+        strong: list[str] = []
+        weak: list[str] = []
+        seen: set[str] = set()
+
+        for raw in candidate_paths:
+            raw_str = str(raw or "").strip()
+            if not raw_str:
+                continue
+            try:
+                _clean_url, norm_path, _ = self.resolve_in_scope(raw_str, allow_websocket=False)
+            except ScopeViolationError:
+                continue
+            path_cmp = norm_path.rstrip("/") or "/"
+            if path_cmp == current_cmp or path_cmp in seen:
+                continue
+            if "{" in norm_path or "}" in norm_path or "/:" in norm_path:
+                continue
+            path_low = norm_path.lower()
+            if any(path_low.endswith(ext) for ext in _LOGIN_FALLBACK_SKIP_EXTENSIONS):
+                continue
+            if match_logout_route(norm_path) is not None:
+                continue
+            if _LOGIN_FALLBACK_EXCLUDE_RE.search(path_low):
+                continue
+            if _LOGIN_FALLBACK_STRONG_RE.search(path_low):
+                seen.add(path_cmp)
+                strong.append(norm_path)
+            elif _LOGIN_FALLBACK_WEAK_RE.search(path_low):
+                seen.add(path_cmp)
+                weak.append(norm_path)
+
+        return [*strong, *weak][:cap]
+
+    def retry_unauthenticated_actors_with_discovered_login_paths(
+        self,
+        candidate_paths: Sequence[str],
+        *,
+        max_candidates: int = _LOGIN_FALLBACK_MAX_CANDIDATES,
+    ) -> dict[str, bool]:
+        """Retry credentialed actors whose initial login hit 404/405 against discovered login paths.
+
+        Fail-closed: never activates when initial login returned 401/403 or other non-404/405
+        responses (which indicate a valid endpoint), and caps probes to ``max_candidates`` safe
+        in-scope routes.
+        """
+        eligible_aliases = self.actors.actors_failed_with_missing_login_route()
+        if not eligible_aliases:
+            return {}
+
+        try:
+            _, current_login_norm, _ = self.resolve_in_scope(self.actors.login_path, allow_websocket=False)
+        except ScopeViolationError:
+            current_login_norm = str(self.actors.login_path or "").strip()
+        current_cmp = current_login_norm.rstrip("/") or "/"
+        with self.actors._lock:
+            all_sessions = list(self.actors.actors.items())
+        for alias, sess in all_sessions:
+            if alias == "anon":
+                continue
+            with sess._lock:
+                if not sess.login_payload:
+                    continue
+                last_cmp = (sess.last_auth_path or "").rstrip("/") or "/"
+                if (
+                    sess.last_auth_status is not None
+                    and last_cmp == current_cmp
+                    and sess.last_auth_status not in _LOGIN_MISSING_ROUTE_STATUS_CODES
+                ):
+                    return {}
+
+        filtered = self.filter_login_fallback_candidates(
+            candidate_paths,
+            max_candidates=max_candidates,
+        )
+        if not filtered:
+            return {}
+
+        original_login_path = self.actors.login_path
+        probe_alias = eligible_aliases[0]
+        winning_path: str | None = None
+        results: dict[str, bool] = {}
+
+        for cand_path in filtered:
+            self.actors.login_path = cand_path
+            try:
+                ok = bool(self.authenticate_actor(probe_alias, force_login=False))
+            except (BudgetExhaustedError, ServiceDegradationError):
+                self.actors.login_path = original_login_path
+                raise
+            except Exception:
+                ok = False
+            if ok:
+                winning_path = cand_path
+                results[probe_alias] = True
+                break
+
+        if winning_path is None:
+            self.actors.login_path = original_login_path
+            return {alias: False for alias in eligible_aliases}
+
+        for alias in eligible_aliases[1:]:
             try:
                 results[alias] = bool(self.authenticate_actor(alias, force_login=False))
             except (BudgetExhaustedError, ServiceDegradationError):

@@ -38,6 +38,109 @@ from full_agent_budget import SharedBudget  # noqa: E402
 from full_agent_provider import MeteredProviderTransport, SessionGate, dump  # noqa: E402
 
 SCHEMA = "agentic-target-run/1"
+DEFAULT_LOGIN_PATH = "/api/v1/access/sign-in"
+DEFAULT_SESSION_CHECK_PATH = "/api/v1/access/session"
+
+
+def _extract_bundle_auth_path(bundle: dict[str, Any], key: str) -> str:
+    """Extract an optional non-empty auth path from top-level or nested ``auth`` in credentials bundle."""
+    top = bundle.get(key)
+    if isinstance(top, str) and top.strip():
+        return top.strip()
+    nested = bundle.get("auth")
+    if isinstance(nested, dict):
+        sub = nested.get(key)
+        if isinstance(sub, str) and sub.strip():
+            return sub.strip()
+    return ""
+
+
+def _resolve_auth_paths(
+    *,
+    login_path: str,
+    session_check_path: str,
+    bundle: dict[str, Any],
+) -> tuple[str, str, str]:
+    """Resolve effective (login_path, session_check_path, login_path_source).
+
+    Explicit non-default CLI/caller arguments take precedence over credentials.json,
+    which in turn overrides the built-in defaults.
+    """
+    clean_login = str(login_path or "").strip() or DEFAULT_LOGIN_PATH
+    bundle_login = _extract_bundle_auth_path(bundle, "login_path")
+    if clean_login != DEFAULT_LOGIN_PATH:
+        eff_login_path = clean_login
+        login_path_source = "cli"
+    elif bundle_login:
+        eff_login_path = bundle_login
+        login_path_source = "credentials_file"
+    else:
+        eff_login_path = DEFAULT_LOGIN_PATH
+        login_path_source = "default"
+
+    clean_session = str(session_check_path or "").strip() or DEFAULT_SESSION_CHECK_PATH
+    bundle_session = _extract_bundle_auth_path(bundle, "session_check_path")
+    if clean_session != DEFAULT_SESSION_CHECK_PATH:
+        eff_session_check_path = clean_session
+    elif bundle_session:
+        eff_session_check_path = bundle_session
+    else:
+        eff_session_check_path = DEFAULT_SESSION_CHECK_PATH
+
+    return eff_login_path, eff_session_check_path, login_path_source
+
+
+def _extract_stage0_login_candidates(stage0_result: dict[str, Any]) -> list[str]:
+    """Extract candidate login endpoints from Stage 0 output, prioritizing POST forms and POST links."""
+    post_forms: list[str] = []
+    post_links: list[str] = []
+    other_routes: list[str] = []
+    seen: set[str] = set()
+
+    def _add(bucket: list[str], raw_url: Any) -> None:
+        val = str(raw_url or "").strip()
+        if val and val not in seen:
+            seen.add(val)
+            bucket.append(val)
+
+    for entry in stage0_result.get("forms") or ():
+        if isinstance(entry, dict):
+            method = str(entry.get("method") or "POST").strip().upper()
+            raw_url = entry.get("url") or entry.get("action") or entry.get("path") or ""
+            if method == "POST":
+                _add(post_forms, raw_url)
+            else:
+                _add(other_routes, raw_url)
+        elif isinstance(entry, str):
+            _add(post_forms, entry)
+
+    for entry in stage0_result.get("links") or ():
+        if isinstance(entry, dict):
+            method = str(entry.get("method") or "").strip().upper()
+            raw_url = entry.get("url") or entry.get("path") or ""
+            if method == "POST":
+                _add(post_links, raw_url)
+            else:
+                _add(other_routes, raw_url)
+        elif isinstance(entry, str):
+            _add(other_routes, entry)
+
+    return [*post_forms, *post_links, *other_routes]
+
+
+def _build_auth_metadata(
+    actors: ActorManager,
+    *,
+    login_path_source: str,
+) -> dict[str, Any]:
+    """Build strictly non-secret operational auth metadata for manifest/plan artifacts."""
+    return {
+        "login_path": str(actors.login_path),
+        "session_check_path": str(actors.session_check_path),
+        "login_path_source": str(login_path_source),
+        "authenticated_actors": actors.authenticated_non_anon_aliases(),
+        "unauthenticated_credentialed_actors": actors.unauthenticated_credentialed_aliases(),
+    }
 
 
 def _parse_bool_flag(raw: Any) -> bool:
@@ -87,8 +190,8 @@ def run_agentic_target(
     seconds_budget: int = 900,
     allowed_methods: Sequence[str] | None = None,
     discovery_hints: Sequence[str] | None = None,
-    login_path: str = "/api/v1/access/sign-in",
-    session_check_path: str = "/api/v1/access/session",
+    login_path: str = DEFAULT_LOGIN_PATH,
+    session_check_path: str = DEFAULT_SESSION_CHECK_PATH,
     max_member_accounts: int = 6,
     max_admin_accounts: int = 2,
     max_turns: int = 75,
@@ -149,6 +252,11 @@ def run_agentic_target(
             bundle = loaded_vault
     else:
         bundle = {}
+    eff_login_path, eff_session_check_path, login_path_source = _resolve_auth_paths(
+        login_path=login_path,
+        session_check_path=session_check_path,
+        bundle=bundle,
+    )
     base, scope_meta = target_bootstrap.resolve_target_origin(
         target or str(bundle.get("target_url") or ""),
         scope_file=scope_file,
@@ -306,6 +414,11 @@ def run_agentic_target(
 
     if not execute:
         plan_path = output / "agentic-plan.json"
+        plan_actors = ActorManager(
+            accounts,
+            login_path=eff_login_path,
+            session_check_path=eff_session_check_path,
+        )
         plan = {
             "schema": SCHEMA,
             "mode": "plan_only",
@@ -325,6 +438,7 @@ def run_agentic_target(
             "seed_surface": dict(seed_data.get("stats") or {}) if seed_data is not None else None,
             "stage0_crawl": dict(stage0_cfg),
             "oob_listener": dict(oob_summary),
+            "auth": _build_auth_metadata(plan_actors, login_path_source=login_path_source),
             "ablation": ablation_cfg,
             "sharding": sharding_cfg,
             "selected_accounts": [
@@ -367,8 +481,8 @@ def run_agentic_target(
     receipt_store = ReceiptStore(output)
     actors = ActorManager(
         accounts,
-        login_path=login_path,
-        session_check_path=session_check_path,
+        login_path=eff_login_path,
+        session_check_path=eff_session_check_path,
     )
     http_client = AgenticHTTPClient(
         base_url=base,
@@ -401,6 +515,7 @@ def run_agentic_target(
         "seed_surface": dict(seed_data.get("stats") or {}) if seed_data is not None else None,
         "stage0_crawl": dict(stage0_cfg),
         "oob_listener": dict(oob_summary),
+        "auth": _build_auth_metadata(actors, login_path_source=login_path_source),
         "ablation": ablation_cfg,
         "sharding": sharding_cfg,
         "limits": limits,
@@ -416,6 +531,7 @@ def run_agentic_target(
                 for alias, sess in actors.actors.items()
             ):
                 http_client.authenticate_all_actors()
+                manifest["auth"] = _build_auth_metadata(actors, login_path_source=login_path_source)
             if eff_auto_crawl:
                 import agentic_stage0_crawl  # type: ignore[import-not-found]
 
@@ -448,6 +564,15 @@ def run_agentic_target(
                                 eff_discovery_hints.append(hint)
                         manifest["discovery_hints"] = list(eff_discovery_hints)
                         manifest["seed_surface"] = dict(seed_data.get("stats") or {})
+                    if actors.actors_failed_with_missing_login_route():
+                        fallback_candidates = _extract_stage0_login_candidates(stage0_result)
+                        if fallback_candidates:
+                            fallback_results = http_client.retry_unauthenticated_actors_with_discovered_login_paths(
+                                fallback_candidates
+                            )
+                            if any(fallback_results.values()):
+                                login_path_source = "stage0_fallback"
+                    manifest["auth"] = _build_auth_metadata(actors, login_path_source=login_path_source)
                     dump(manifest_path, manifest)
 
         worker_model_id = models["worker"].split("/", 1)[1]
@@ -526,6 +651,7 @@ def run_agentic_target(
             manifest["process_metrics_md"] = str(m_md)
             manifest["process_metrics"] = metrics_doc
         manifest.update(
+            auth=_build_auth_metadata(actors, login_path_source=login_path_source),
             budget=snap,
             llm_calls=transport.calls,
             target_requests=http_client.budget.used,
@@ -567,8 +693,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--seconds-budget", type=int, default=900)
     parser.add_argument("--allowed-methods", action="append", default=None, help="Allowed HTTP methods (e.g. GET,POST,PUT)")
     parser.add_argument("--discovery-hint", action="append", dest="discovery_hints", default=None, help="Initial discovery entry path(s)")
-    parser.add_argument("--login-path", default="/api/v1/access/sign-in")
-    parser.add_argument("--session-check-path", default="/api/v1/access/session")
+    parser.add_argument("--login-path", default=DEFAULT_LOGIN_PATH)
+    parser.add_argument("--session-check-path", default=DEFAULT_SESSION_CHECK_PATH)
     parser.add_argument("--max-member-accounts", type=int, default=6)
     parser.add_argument("--max-admin-accounts", type=int, default=2)
     parser.add_argument("--max-turns", type=int, default=75)

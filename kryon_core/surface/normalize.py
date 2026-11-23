@@ -20,12 +20,60 @@ _EMBEDDED_HOSTPORT_SEG_RE = re.compile(
 )
 _PATH_KV_URL_SCHEME_SEG_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_-]{0,31}=https?:$", re.I)
 _THIRD_PARTY_CLOUD_AUTH_SDK_PATH_RE = re.compile(
-    r"^/v[12]/accounts(?:/mfa(?:enrollment|signin))?:"
+    r"^(?:"
+    r"/v[12]/accounts(?:/mfa(?:enrollment|signin))?:"
     r"(?:signup|lookup|send(?:oobcode|verificationcode)|signinwith[a-z]+|"
     r"createauthuri|resetpassword|delete(?:account)?|update|revoketoken|"
     r"verify[a-z]+|(?:get|set)accountinfo|getoobconfirmationcode|"
-    r"queryuserinfo|start|finalize|withdraw|\{[a-z_][a-z0-9_]*\}|)$",
+    r"queryuserinfo|start|finalize|withdraw|\{[a-z_][a-z0-9_]*\}|)"
+    r"|/v2/(?:recaptchaconfig|passwordpolicy|projectconfig)"
+    r"|/v1/(?:recaptchaparams|getrecaptchaparam)"
+    r"|/v1/projects/[^/]+/(?:accounts:[a-z0-9_{}-]*|databases/.*|installations(?:/.*)?|tenants/.*|namespaces/.*|messages:send|(?:android|ios|web)apps/.*)"
+    r")$",
     re.I,
+)
+_GOOGLE_IDENTITY_SDK_CONTEXT_RE = re.compile(
+    r"(?:identitytoolkit\.googleapis\.com|securetoken\.googleapis\.com|"
+    r"/v[12]/accounts:(?:signInWithPassword|signUp|lookup|sendOobCode|revokeToken)|"
+    r"/v2/(?:recaptchaConfig|passwordPolicy))",
+    re.I,
+)
+_GOOGLE_SECURE_TOKEN_PATH_RE = re.compile(r"^/v1/token$", re.I)
+
+_WIN_DRIVE_RAW_RE = re.compile(r"^[A-Za-z]:[/\\]")
+_WIN_DRIVE_PATH_RE = re.compile(r"^/[A-Za-z]:(?:[/\\]|$)")
+_UNIX_VAR_SUBDIRS = frozenset({
+    "www", "log", "tmp", "run", "lib", "cache", "spool", "opt", "mail",
+    "backups", "lock", "local", "snap", "empty", "db", "folders", "containers",
+})
+_UNIX_USR_SUBDIRS = frozenset({
+    "local", "lib", "lib64", "lib32", "libexec", "share", "bin", "sbin",
+    "include", "src", "games", "etc", "var", "opt",
+})
+_UNIX_PROC_SUBDIRS = frozenset({
+    "self", "thread-self", "sys", "net", "fs", "bus", "driver", "irq", "tty",
+    "acpi", "scsi", "cpuinfo", "meminfo", "version", "cmdline", "mounts",
+    "stat", "uptime", "loadavg", "filesystems", "modules", "cgroups",
+    "environ", "maps", "status", "fd", "cwd", "exe", "root", "limits", "sched",
+})
+_UNIX_SYS_SUBDIRS = frozenset({
+    "class", "devices", "fs", "kernel", "module", "bus", "block",
+    "firmware", "power", "hypervisor", "dev",
+})
+_UNIX_PRIVATE_SUBDIRS = frozenset({"var", "tmp", "etc"})
+_UNIX_HOME_SUBDIRS = frozenset({
+    "desktop", "documents", "downloads", "library", "applications", "pictures",
+    "movies", "music", "public", "sites", "appdata", "projects", "project",
+    "workspace", "workspaces", "repos", "repo", "src", "code", "dev", "app",
+    "apps", "www", "web", "html", "venv", "conda", "miniconda3", "anaconda3",
+    "bin", "lib", "var", "tmp", "cache", "config", "local", "share",
+    "node_modules", "site-packages",
+})
+_OS_SERVER_CODE_EXTS = (
+    ".py", ".pyc", ".pyo", ".rb", ".go", ".java", ".class", ".jar",
+    ".c", ".cc", ".cpp", ".h", ".hpp", ".rs", ".so", ".dylib", ".dll",
+    ".exe", ".ini", ".conf", ".cfg", ".cnf", ".log", ".sh", ".bash",
+    ".pid", ".sock",
 )
 _SENSITIVE_NAME = re.compile(
     r"(^|[._-])(csrf|xsrf|password|passwd|secret|session|sessionid|cookie|"
@@ -75,6 +123,8 @@ def discovery_link_skip_reason(url: str) -> str:
         if any("\\" in value or any(ord(char) < 32 or ord(char) == 127 for char in value)
                for value in [path, *(item for pair in decoded_pairs for item in pair)]):
             return "invalid_discovery_url"
+        if is_os_filesystem_path(url) or is_os_filesystem_path(path):
+            return "os_filesystem_path"
         if _DISCOVERY_MUTATING_WORD.search(path) or any(
                 _DISCOVERY_MUTATING_WORD.search(name) or _DISCOVERY_MUTATING_WORD.search(value)
                 for name, value in decoded_pairs):
@@ -292,12 +342,93 @@ def is_port_in_path_artifact(
     return False
 
 
-def is_third_party_sdk_static_route(url_or_path: str) -> bool:
+def is_os_filesystem_path(url_or_path: str) -> bool:
+    """Return True when the URL path itself is a local OS filesystem path (Unix or Windows).
+
+    Inspects only the path component (never query parameters like ``/api/download?file=/etc/passwd``)
+    and preserves legitimate web routes such as ``/users``, ``/users/42``, ``/home``, ``/home/feed``,
+    and path-embedded parameters like ``/file=../../etc/passwd``.
+    """
+    raw = str(url_or_path or "").strip()
+    if not raw:
+        return False
+    raw_no_qf = raw.split("#", 1)[0].split("?", 1)[0].strip()
+    if _WIN_DRIVE_RAW_RE.match(raw_no_qf):
+        return True
+    try:
+        parsed = urlsplit(raw)
+    except ValueError:
+        return False
+    path = (parsed.path or "").strip()
+    if not path:
+        return False
+    if _WIN_DRIVE_PATH_RE.match(path) or _WIN_DRIVE_PATH_RE.match(unquote(path)):
+        return True
+    if path == "/":
+        return False
+    check_path = path
+    while check_path.startswith("./"):
+        check_path = check_path[2:]
+    segs = [seg for seg in check_path.split("/") if seg]
+    if len(segs) < 2:
+        return False
+    if "=" in segs[0]:
+        return False
+    low_segs = [seg.lower() for seg in segs]
+    first = low_segs[0]
+    second = low_segs[1]
+    last = low_segs[-1]
+
+    if first == "var":
+        return second in _UNIX_VAR_SUBDIRS or last.endswith(_OS_SERVER_CODE_EXTS)
+    if first == "usr":
+        return second in _UNIX_USR_SUBDIRS or last.endswith(_OS_SERVER_CODE_EXTS)
+    if first in {"etc", "opt", "root", "tmp", "srv", "mnt"}:
+        return True
+    if first == "private":
+        return second in _UNIX_PRIVATE_SUBDIRS
+    if first == "proc":
+        return second in _UNIX_PROC_SUBDIRS or second.isdigit()
+    if first == "sys":
+        return second in _UNIX_SYS_SUBDIRS
+    if segs[0] == "System" and segs[1] == "Library":
+        return True
+    if segs[0] == "Users":
+        return (
+            len(segs) >= 3
+            and not segs[1].isdigit()
+            and not segs[1].startswith("{")
+        )
+    if first == "home":
+        return (
+            len(segs) >= 3
+            and not second.isdigit()
+            and not segs[1].startswith("{")
+            and (
+                low_segs[2] in _UNIX_HOME_SUBDIRS
+                or low_segs[2].startswith(".")
+                or last.endswith(_OS_SERVER_CODE_EXTS)
+            )
+        )
+    return False
+
+
+def has_google_identity_sdk_context(text: str) -> bool:
+    """Return True when static JS text contains Google Identity Toolkit / Firebase Auth SDK markers."""
+    if not text:
+        return False
+    return bool(_GOOGLE_IDENTITY_SDK_CONTEXT_RE.search(text))
+
+
+def is_third_party_sdk_static_route(url_or_path: str, *, sdk_context: bool = False) -> bool:
     """Return True for well-known third-party cloud auth SDK path constants from static JS bundles.
 
     Intended strictly for static JS string/call/route extraction (e.g. embedded Firebase /
-    Google Identity Toolkit `/v1/accounts:<action>` and `/v2/accounts:<action>` constants),
-    never for live observed network traffic.
+    Google Identity Toolkit `/v1/accounts:<action>`, `/v2/accounts:<action>`,
+    `/v2/recaptchaConfig`, `/v2/passwordPolicy` constants), never for live observed network traffic.
+    When ``sdk_context=True`` (Google Identity SDK markers present in the same JS source),
+    bare ``/v1/token`` (Google Secure Token Service) is also filtered while preserving
+    ``/api/v1/token`` and non-SDK OAuth ``/v1/token`` routes.
     """
     raw = str(url_or_path or "").strip()
     if not raw:
@@ -312,7 +443,11 @@ def is_third_party_sdk_static_route(url_or_path: str) -> bool:
     if not path:
         return False
     trimmed = path.rstrip("/")
-    return bool(_THIRD_PARTY_CLOUD_AUTH_SDK_PATH_RE.fullmatch(trimmed))
+    if _THIRD_PARTY_CLOUD_AUTH_SDK_PATH_RE.fullmatch(trimmed):
+        return True
+    if sdk_context and _GOOGLE_SECURE_TOKEN_PATH_RE.fullmatch(trimmed):
+        return True
+    return False
 
 
 def normalize_url(url: str, base: str = "") -> str:

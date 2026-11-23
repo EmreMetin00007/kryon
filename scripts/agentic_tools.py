@@ -37,6 +37,7 @@ from agentic_evidence import (
     _SENSITIVE_JSON_EXACT_KEYS as _SENSITIVE_JSON_EXACT_KEYS,
     _SENSITIVE_JSON_KEY_PREFIXES as _SENSITIVE_JSON_KEY_PREFIXES,
     _SENSITIVE_JSON_KEY_SUFFIXES as _SENSITIVE_JSON_KEY_SUFFIXES,
+    _SEVERITY_RANK as _SEVERITY_RANK,
     _SQLI_EVIDENCE_HINTS as _SQLI_EVIDENCE_HINTS,
     _STATE_TAMPERING_CLASS_RANK as _STATE_TAMPERING_CLASS_RANK,
     _TEMPLATE_SEG_RE as _TEMPLATE_SEG_RE,
@@ -47,6 +48,7 @@ from agentic_evidence import (
     _actor_priority_key as _actor_priority_key,
     _best_secret_for_receipt as _best_secret_for_receipt,
     _build_control_haystacks as _build_control_haystacks,
+    _canonical_entry_rank as _canonical_entry_rank,
     _extract_receipt_secret_candidates as _extract_receipt_secret_candidates,
     _extract_record_owner_and_tenant as _extract_record_owner_and_tenant,
     _filter_class_eligible_proofs as _filter_class_eligible_proofs,
@@ -61,9 +63,12 @@ from agentic_evidence import (
     _is_sensitive_json_key as _is_sensitive_json_key,
     _norm_path as _norm_path,
     _receipt_contains_value as _receipt_contains_value,
+    _record_route_aliases as _record_route_aliases,
+    _resolve_alias_or_family_overlap as _resolve_alias_or_family_overlap,
     _resolve_cross_class_overlap as _resolve_cross_class_overlap,
     _resolve_route_auth_bypass_vs_bfla as _resolve_route_auth_bypass_vs_bfla,
     _select_stronger_evidence_from_receipts as _select_stronger_evidence_from_receipts,
+    _severity_rank as _severity_rank,
     _shannon_entropy as _shannon_entropy,
     _value_in_controls as _value_in_controls,
     build_receipt_excerpt as build_receipt_excerpt,
@@ -73,6 +78,7 @@ from agentic_evidence import (
     normalize_vuln_class as normalize_vuln_class,
     score_evidence_value as score_evidence_value,
     select_primary_proof as select_primary_proof,
+    strip_single_api_prefix as strip_single_api_prefix,
 )
 from agentic_browser import (
     inspect_rendered_page as inspect_rendered_page,
@@ -1494,8 +1500,10 @@ class ToolDispatcher:
         actor_meta: dict[str, dict[str, str]],
         title: str = "",
         summary: str = "",
+        severity: str = "",
     ) -> dict[str, Any] | None:
-        """Merge into an existing finding sharing `(route_template, class_type)` or root-cause overlap under `_findings_lock`."""
+        """Merge into an existing finding sharing `(route_template, class_type)`, cross-class overlap, or alias/family root cause under `_findings_lock`."""
+        norm_sev = str(severity or "").strip().lower()
         incoming_stub: dict[str, Any] = {
             "class_type": canonical_class,
             "route_template": route_template,
@@ -1504,14 +1512,20 @@ class ToolDispatcher:
             "path": effective_norm_path,
             "actor": effective_actor,
             "actor_alias": effective_actor,
+            "evidence_value": evidence_value,
+            "marker": evidence_value,
             "proof_receipt_ids": list(proof_ids),
             "control_receipt_ids": list(control_ids),
         }
+        if norm_sev in _SEVERITY_RANK:
+            incoming_stub["severity"] = norm_sev
 
         matched_existing: dict[str, Any] | None = None
         matched_existing_class = ""
+        matched_existing_tmpl = ""
         matched_resolved_class = ""
-        best_cross_rank: tuple[int, int] | None = None
+        matched_kind = ""
+        best_match_rank: tuple[int, int, int] | None = None
 
         for existing in self.findings:
             existing_class = normalize_vuln_class(
@@ -1524,39 +1538,67 @@ class ToolDispatcher:
                 existing.get("route_template")
                 or normalize_route_template(str(existing.get("url") or existing.get("path") or ""))
             )
-            if existing_tmpl != route_template:
-                continue
-            if existing_class == canonical_class or {existing_class, canonical_class} == {"auth_bypass", "bfla"}:
-                matched_existing = existing
-                matched_existing_class = existing_class
-                matched_resolved_class = canonical_class
-                break
-
             existing_norm = {
                 **existing,
                 "class_type": existing_class,
                 "route_template": existing_tmpl,
             }
-            cross = _resolve_cross_class_overlap(
+            if existing_tmpl == route_template:
+                if existing_class == canonical_class or {existing_class, canonical_class} == {"auth_bypass", "bfla"}:
+                    matched_existing = existing
+                    matched_existing_class = existing_class
+                    matched_existing_tmpl = existing_tmpl
+                    matched_resolved_class = canonical_class
+                    matched_kind = "exact"
+                    break
+
+                cross = _resolve_cross_class_overlap(
+                    existing_norm,
+                    incoming_stub,
+                    receipt_store=self.receipts,
+                )
+                if cross is not None:
+                    winner_cls, match_prio = cross
+                    spec_rank = _STATE_TAMPERING_CLASS_RANK.get(winner_cls, -1)
+                    rank = (0, match_prio, spec_rank)
+                    if best_match_rank is None or rank < best_match_rank:
+                        best_match_rank = rank
+                        matched_existing = existing
+                        matched_existing_class = existing_class
+                        matched_existing_tmpl = existing_tmpl
+                        matched_resolved_class = winner_cls
+                        matched_kind = "cross_class"
+                continue
+
+            alias_overlap = _resolve_alias_or_family_overlap(
                 existing_norm,
                 incoming_stub,
                 receipt_store=self.receipts,
             )
-            if cross is not None:
-                winner_cls, match_prio = cross
+            if alias_overlap is not None:
+                winner_cls, match_prio, alias_kind = alias_overlap
+                kind_tier = 1 if alias_kind == "api_alias" else 2
                 spec_rank = _STATE_TAMPERING_CLASS_RANK.get(winner_cls, -1)
-                rank = (match_prio, spec_rank)
-                if best_cross_rank is None or rank < best_cross_rank:
-                    best_cross_rank = rank
+                rank = (kind_tier, match_prio, spec_rank)
+                if best_match_rank is None or rank < best_match_rank:
+                    best_match_rank = rank
                     matched_existing = existing
                     matched_existing_class = existing_class
+                    matched_existing_tmpl = existing_tmpl
                     matched_resolved_class = winner_cls
+                    matched_kind = alias_kind
 
         if matched_existing is None:
             return None
 
         existing = matched_existing
         existing_class = matched_existing_class
+        existing_tmpl = matched_existing_tmpl
+        existing_norm_for_rank = {
+            **existing,
+            "class_type": existing_class,
+            "route_template": existing_tmpl,
+        }
 
         merged_proof_ids = list(dict.fromkeys([*(existing.get("proof_receipt_ids") or []), *proof_ids]))
         merged_ctrl_ids = list(dict.fromkeys([*(existing.get("control_receipt_ids") or []), *control_ids]))
@@ -1576,7 +1618,7 @@ class ToolDispatcher:
                 continue
 
         resolved_class = matched_resolved_class
-        if {existing_class, canonical_class} == {"auth_bypass", "bfla"}:
+        if matched_kind == "exact" and {existing_class, canonical_class} == {"auth_bypass", "bfla"}:
             resolved_class = _resolve_route_auth_bypass_vs_bfla(
                 route_template,
                 all_proof_recs,
@@ -1586,13 +1628,43 @@ class ToolDispatcher:
                 exact_path=effective_norm_path,
                 method=method,
             )
-        elif resolved_class != existing_class and resolved_class == canonical_class:
-            if title:
-                existing["title"] = title
-            if summary:
-                existing["summary"] = summary
+
+        incoming_higher_sev = _severity_rank(incoming_stub) < _severity_rank(existing)
+        if incoming_higher_sev and norm_sev in _SEVERITY_RANK:
+            existing["severity"] = norm_sev
+
+        if matched_kind in {"api_alias", "route_family"}:
+            ex_canon_rank = _canonical_entry_rank(existing_norm_for_rank, preferred_class=resolved_class)
+            in_canon_rank = _canonical_entry_rank(incoming_stub, preferred_class=resolved_class)
+            if in_canon_rank < ex_canon_rank:
+                canonical_route_template = route_template
+                secondary_route = existing_tmpl
+                if title:
+                    existing["title"] = title
+                if summary:
+                    existing["summary"] = summary
+            else:
+                canonical_route_template = existing_tmpl
+                secondary_route = route_template
+                if resolved_class != existing_class and resolved_class == canonical_class:
+                    if title:
+                        existing["title"] = title
+                    if summary:
+                        existing["summary"] = summary
+            existing["route_template"] = canonical_route_template
+            _record_route_aliases(existing, secondary_route)
+        else:
+            canonical_route_template = route_template
+            existing["route_template"] = canonical_route_template
+            if (resolved_class != existing_class and resolved_class == canonical_class) or (
+                incoming_higher_sev and resolved_class == canonical_class
+            ):
+                if title:
+                    existing["title"] = title
+                if summary:
+                    existing["summary"] = summary
+
         existing["class_type"] = resolved_class
-        existing["route_template"] = route_template
         existing["proof_receipt_ids"] = merged_proof_ids
         existing["control_receipt_ids"] = merged_ctrl_ids
         existing_ev = str(existing.get("evidence_value") or existing.get("marker") or "").strip()
@@ -1614,7 +1686,7 @@ class ToolDispatcher:
                 all_ctrl_recs,
                 actor_meta_map=actor_meta,
                 receipt_store=self.receipts,
-                route_template=route_template,
+                route_template=canonical_route_template,
                 evidence_value=ev_str,
             )
             promoted_ev, _ = _select_stronger_evidence_from_receipts(
@@ -1635,7 +1707,7 @@ class ToolDispatcher:
                 all_ctrl_recs,
                 actor_meta_map=actor_meta,
                 receipt_store=self.receipts,
-                route_template=route_template,
+                route_template=canonical_route_template,
                 evidence_value=ev_str,
             )
             best_actor = str(best.get("actor") or effective_actor or "anon").strip() or "anon"
@@ -2213,7 +2285,8 @@ class ToolDispatcher:
 
         excerpt_by_rid = {r["receipt_id"]: ex for r, ex in valid_proof_records}
 
-        # Deduplicate & merge by route_template for exact class, auth_bypass/bfla, or cross-class root-cause overlap.
+        # Deduplicate & merge by route_template, cross-class overlap, or alias/family root cause.
+        norm_severity = severity if severity in {"critical", "high", "medium", "low"} else "high"
         with self._findings_lock:
             merged_resp = self._try_merge_existing_finding_locked(
                 canonical_class=canonical_class,
@@ -2228,6 +2301,7 @@ class ToolDispatcher:
                 actor_meta=actor_meta,
                 title=title,
                 summary=summary,
+                severity=norm_severity,
             )
             if merged_resp is not None:
                 return json.dumps(merged_resp)
@@ -2388,6 +2462,7 @@ class ToolDispatcher:
                 actor_meta=actor_meta,
                 title=title,
                 summary=summary,
+                severity=norm_severity,
             )
             if merged_resp is not None:
                 return json.dumps(merged_resp)

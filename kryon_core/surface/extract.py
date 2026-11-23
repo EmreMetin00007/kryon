@@ -11,6 +11,8 @@ from typing import Any
 from urllib.parse import unquote, urljoin, urlparse, urlsplit
 
 from .normalize import (
+    has_google_identity_sdk_context,
+    is_os_filesystem_path,
     is_port_in_path_artifact,
     is_third_party_sdk_static_route,
     normalize_bare_hostport_url,
@@ -110,6 +112,9 @@ _TEXT_ABS_URL_RE = re.compile(r"""https?://[^\s<>"'`()]+""", re.I)
 _TEXT_BARE_HOSTPORT_URL_RE = re.compile(
     r"""(?:^|[\s(\["'=,:;])((?:(?:\d{1,3}\.){3}\d{1,3}|\[[0-9a-fA-F:]+\]|localhost|(?:[A-Za-z0-9-]+\.)+[A-Za-z]{2,63}):\d{1,5}/[^\s<>"'`()]*)""",
     re.I,
+)
+_TEXT_WIN_DRIVE_PATH_RE = re.compile(
+    r"""(?:^|[\s(\["'=,;])([A-Za-z]:[/\\][^\s<>"'`()]+)"""
 )
 _TEXT_REL_DOT_RE = re.compile(r"""(?:^|[\s(\["'=,:;])(\.{1,2}/[^\s<>"'`(),;]+)""")
 _TEXT_DOT_PREFIX_RE = re.compile(r"^(?:\.\.?/)+")
@@ -335,12 +340,16 @@ def _extract_html_impl(
 
     def _emit_html(raw_target: str, *, resolve_base: str | None = None) -> str:
         candidate = normalize_bare_hostport_url((raw_target or "").strip(), base=resolve_base or effective_base)
-        if not candidate or is_port_in_path_artifact(candidate, origin_url=base):
+        if (
+            not candidate
+            or is_port_in_path_artifact(candidate, origin_url=base)
+            or is_os_filesystem_path(candidate)
+        ):
             return ""
         url = normalize_url(candidate, base=resolve_base or effective_base)
         if not url or not same_host(url, base, allow_subdomains=allow_subdomains):
             return ""
-        if is_port_in_path_artifact(url, origin_url=base):
+        if is_port_in_path_artifact(url, origin_url=base) or is_os_filesystem_path(url):
             return ""
         if url not in seen_get:
             seen_get.add(url)
@@ -379,6 +388,8 @@ def _extract_html_impl(
             if base_netloc_low and cand_netloc_low == base_netloc_low:
                 _emit_html(cand_abs)
         residual = _mask_text_spans(residual, hp_spans)
+        win_spans = [(m.start(1), m.end(1)) for m in _TEXT_WIN_DRIVE_PATH_RE.finditer(residual)]
+        residual = _mask_text_spans(residual, win_spans)
         for m in _TEXT_REL_DOT_RE.finditer(residual):
             rel_text = m.group(1).rstrip(".,;:!?]")
             _emit_html(rel_text)
@@ -681,6 +692,15 @@ _JSON_SCHEMA_POINTER_RE = re.compile(
 )
 _HASHED_CHUNK_RE = re.compile(r"(?:^|/)chunks/[A-Za-z0-9_.-]{6,}\.(?:js|mjs|cjs)$", re.I)
 _NODE_CHUNK_RE = re.compile(r"/nodes/[A-Za-z0-9_-]+\.[A-Za-z0-9_-]{6,}\.(?:js|mjs|cjs)$", re.I)
+_HASHED_ASSET_API_PREFIX_RE = re.compile(r"(?:^|/)(?:api(?:/v\d+)?|graphql|rest|rpc)(?:/|$)", re.I)
+_HASHED_ASSET_FILENAME_RE = re.compile(
+    r"^[A-Za-z0-9_.-]+[-.]([A-Za-z0-9_]{7,32})(?:\.(?:chunk|min|bundle))?\.(?:js|mjs|cjs|css)$",
+    re.I,
+)
+_WORD_TRAILING_DIGITS_RE = re.compile(r"^[A-Za-z]+\d{1,4}$")
+_VERSION_TOKEN_RE = re.compile(r"^v\d+(?:[._-]\d+)*$", re.I)
+_HEX_CHARS_SET = frozenset("0123456789abcdefABCDEF")
+_CAMEL_WORD_RUN_RE = re.compile(r"^(?:[A-Z][a-z]{2,})+$")
 _REPEATED_LETTER_RUN_RE = re.compile(r"([A-Za-z])\1{4,}")
 _LOWER_HEX_HYPHEN_RE = re.compile(r"[0-9a-f]+(?:-[0-9a-f]+)*")
 _UUID_SEG_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", re.I)
@@ -904,17 +924,74 @@ def _is_implausible_url_path(url_or_path: str, *, allow_virtual_groups: bool = F
     )
 
 
-def is_non_endpoint_noise_path(url_or_path: str) -> bool:
-    """Return True for frontend source modules, bundler chunk internals, schema pointers, and path noise.
+def _is_content_hash_token(token: str) -> bool:
+    """Return True when a filename suffix token looks like a bundler content hash (Vite/Rollup/Webpack)."""
+    if len(token) < 7 or len(token) > 32:
+        return False
+    has_digit = any(ch.isdigit() for ch in token)
+    has_alpha = any(ch.isalpha() for ch in token)
+    if len(token) >= 8 and has_digit and has_alpha and all(ch in _HEX_CHARS_SET for ch in token):
+        return True
+    if has_digit and has_alpha:
+        if _WORD_TRAILING_DIGITS_RE.fullmatch(token) or _VERSION_TOKEN_RE.fullmatch(token):
+            return False
+        return True
+    # Pure-letter 8-char Rollup/Vite base64url hashes (mixed case with non-word transitions or `_`)
+    if len(token) == 8 and any(ch.isupper() for ch in token) and any(ch.islower() for ch in token):
+        if "_" in token:
+            return True
+        if _CAMEL_WORD_RUN_RE.fullmatch(token):
+            return False
+        has_consec_upper = any(a.isupper() and b.isupper() for a, b in zip(token, token[1:]))
+        lower_to_upper = sum(1 for a, b in zip(token, token[1:]) if a.islower() and b.isupper())
+        if has_consec_upper or lower_to_upper >= 3:
+            return True
+    return False
 
-    Preserves `.js` bundle URLs (e.g. `/assets/app.js`), query payloads, and valid endpoints while
-    filtering SvelteKit/Next.js build internals (`/_app/immutable/`, `/_app/version.json`,
-    `/_next/static/`, `/_next/data/`, `/chunks/<hash>.js`, `/nodes/<id>.<hash>.js`), dollar-prefixed
-    schema refs, and implausible base64/WASM/JS-syntax path fragments.
+
+def is_hashed_asset_chunk_path(url_or_path: str) -> bool:
+    """Return True for content-hashed frontend JS/CSS asset chunks (e.g. ``/assets/Panel-D6a37zVp.js``).
+
+    Preserves unhashed entry bundles (``/assets/app.js``, ``/static/bundle.js``), API paths
+    (``/api/...``), and path-embedded parameter routes (``/files/file=foo.js``).
     """
     raw = str(url_or_path or "").strip()
     if not raw:
         return False
+    try:
+        parsed = urlsplit(raw)
+    except ValueError:
+        return False
+    path = (parsed.path or "").strip()
+    if not path or "=" in path:
+        return False
+    trimmed = path.rstrip("/")
+    low_trimmed = trimmed.lower()
+    if _HASHED_ASSET_API_PREFIX_RE.search(low_trimmed):
+        return False
+    if _HASHED_CHUNK_RE.search(low_trimmed) or _NODE_CHUNK_RE.search(low_trimmed):
+        return True
+    filename = trimmed.rsplit("/", 1)[-1]
+    match = _HASHED_ASSET_FILENAME_RE.fullmatch(filename)
+    if not match:
+        return False
+    return _is_content_hash_token(match.group(1))
+
+
+def is_non_endpoint_noise_path(url_or_path: str) -> bool:
+    """Return True for frontend source modules, bundler chunk internals, OS filesystem paths, schema pointers, and path noise.
+
+    Preserves unhashed `.js` bundle URLs (e.g. `/assets/app.js`), query payloads, and valid endpoints while
+    filtering SvelteKit/Next.js/Vite build internals (`/_app/immutable/`, `/_app/version.json`,
+    `/_next/static/`, `/_next/data/`, `/chunks/<hash>.js`, `/nodes/<id>.<hash>.js`,
+    `/assets/Panel-<hash>.js`), OS filesystem paths (`/var/www/...`, `/Users/<user>/...`,
+    `/etc/...`, `C:/...`), dollar-prefixed schema refs, and implausible base64/WASM/JS-syntax fragments.
+    """
+    raw = str(url_or_path or "").strip()
+    if not raw:
+        return False
+    if is_os_filesystem_path(raw):
+        return True
     split_res = _split_url_path_for_validation(raw)
     if split_res is None:
         return True
@@ -923,6 +1000,8 @@ def is_non_endpoint_noise_path(url_or_path: str) -> bool:
         return True
     if not path or path == "/":
         return False
+    if is_os_filesystem_path(path) or is_hashed_asset_chunk_path(path):
+        return True
     norm_path = path.lower()
     if is_unrooted_rel:
         while norm_path.startswith(("./", "../")):
@@ -1043,6 +1122,7 @@ def extract_js_calls(text: str, base: str, allow_subdomains: bool = False,
     değişkenleri parametre sayılır. Değerlendirme yok; sınırlı regex taraması.
     """
     source = text or ""
+    sdk_ctx = has_google_identity_sdk_context(source)
     symtab = _collect_js_string_symtab(source)
     parsed_base = urlparse(base or "")
     if (
@@ -1127,17 +1207,25 @@ def extract_js_calls(text: str, base: str, allow_subdomains: bool = False,
         if not resolved_raw:
             continue
         templated, template_names = _template_url(resolved_raw)
-        if is_third_party_sdk_static_route(templated):
+        if is_third_party_sdk_static_route(templated, sdk_context=sdk_ctx) or is_os_filesystem_path(templated):
             continue
         templated_norm = normalize_bare_hostport_url(templated, base=call_base)
-        if not templated_norm or is_port_in_path_artifact(templated_norm, origin_url=base):
+        if (
+            not templated_norm
+            or is_port_in_path_artifact(templated_norm, origin_url=base)
+            or is_os_filesystem_path(templated_norm)
+        ):
             continue
         if _is_implausible_url_path(templated_norm):
             continue
         url = normalize_url(templated_norm, base=call_base)
         if not url or not same_host(url, base, allow_subdomains=allow_subdomains):
             continue
-        if is_third_party_sdk_static_route(url) or is_port_in_path_artifact(url, origin_url=base):
+        if (
+            is_third_party_sdk_static_route(url, sdk_context=sdk_ctx)
+            or is_port_in_path_artifact(url, origin_url=base)
+            or is_os_filesystem_path(url)
+        ):
             continue
         parsed_url = urlparse(url)
         if parsed_url.path.lower().endswith((".png", ".jpg", ".jpeg", ".gif", ".css", ".ico",
@@ -1282,6 +1370,7 @@ def extract_spa_routes(
 ) -> list[dict]:
     """Extract SPA hash routes (#/path?q=1) and client router route definitions."""
     source = text or ""
+    sdk_ctx = has_google_identity_sdk_context(source)
     records: list[dict] = []
     seen: set[str] = set()
 
@@ -1297,19 +1386,23 @@ def extract_spa_routes(
     def _emit_route(raw_path: str, source_tag: str) -> None:
         if limit is not None and len(records) >= limit:
             return
-        if is_third_party_sdk_static_route(raw_path):
+        if is_third_party_sdk_static_route(raw_path, sdk_context=sdk_ctx) or is_os_filesystem_path(raw_path):
             return
         if _is_implausible_url_path(raw_path, allow_virtual_groups=True):
             return
         cleaned = _normalize_spa_route_path(raw_path)
         if not cleaned or _STATIC_SPA_EXT_RE.search(cleaned):
             return
-        if is_third_party_sdk_static_route(cleaned) or is_non_endpoint_noise_path(cleaned):
+        if is_third_party_sdk_static_route(cleaned, sdk_context=sdk_ctx) or is_non_endpoint_noise_path(cleaned):
             return
         url = normalize_url(cleaned, base=base)
         if not url or not same_host(url, base, allow_subdomains=allow_subdomains):
             return
-        if is_third_party_sdk_static_route(url) or is_port_in_path_artifact(url, origin_url=base):
+        if (
+            is_third_party_sdk_static_route(url, sdk_context=sdk_ctx)
+            or is_port_in_path_artifact(url, origin_url=base)
+            or is_os_filesystem_path(url)
+        ):
             return
         if urlparse(url).path == "/" and not urlparse(url).query:
             return
@@ -1454,6 +1547,7 @@ def extract_js(text: str, base: str, allow_subdomains: bool = False, limit: int 
     if limit is not None and limit <= 0:
         return []
     source = text or ""
+    sdk_ctx = has_google_identity_sdk_context(source)
     records: list[dict] = []
     seen: set[str] = set()
 
@@ -1467,7 +1561,11 @@ def extract_js(text: str, base: str, allow_subdomains: bool = False, limit: int 
         cand = normalize_bare_hostport_url((candidate or "").strip(), base=base)
         if not cand or "${" in cand:
             return False
-        if is_third_party_sdk_static_route(cand) or is_port_in_path_artifact(cand, origin_url=base):
+        if (
+            is_third_party_sdk_static_route(cand, sdk_context=sdk_ctx)
+            or is_port_in_path_artifact(cand, origin_url=base)
+            or is_os_filesystem_path(cand)
+        ):
             return False
         if _is_implausible_url_path(cand, allow_virtual_groups=True):
             return False
@@ -1482,7 +1580,11 @@ def extract_js(text: str, base: str, allow_subdomains: bool = False, limit: int 
             return False
         if urlparse(url).path.lower().endswith(_JS_STATIC_EXTS):
             return False
-        if is_third_party_sdk_static_route(url) or is_port_in_path_artifact(url, origin_url=base):
+        if (
+            is_third_party_sdk_static_route(url, sdk_context=sdk_ctx)
+            or is_port_in_path_artifact(url, origin_url=base)
+            or is_os_filesystem_path(url)
+        ):
             return False
         if is_non_endpoint_noise_path(url):
             return False
@@ -1520,6 +1622,8 @@ def extract_js(text: str, base: str, allow_subdomains: bool = False, limit: int 
                     if _emit_js(cand_abs):
                         return records
             residual = _mask_text_spans(residual, hp_spans)
+            win_spans = [(m.start(1), m.end(1)) for m in _TEXT_WIN_DRIVE_PATH_RE.finditer(residual)]
+            residual = _mask_text_spans(residual, win_spans)
             for m in _TEXT_REL_DOT_RE.finditer(residual):
                 if _emit_js(m.group(1).rstrip(".,;:!?]")):
                     return records
@@ -1598,13 +1702,13 @@ def _normalize_candidate_link(
         return None
     if text.isdigit():
         return None
-    if is_port_in_path_artifact(text, origin_url=origin_url):
+    if is_port_in_path_artifact(text, origin_url=origin_url) or is_os_filesystem_path(text):
         return None
     parsed_raw = urlsplit(text)
     if parsed_raw.scheme and parsed_raw.scheme.lower() not in {"http", "https"}:
         return None
     resolved = urljoin(base_url, text)
-    if is_port_in_path_artifact(resolved, origin_url=origin_url):
+    if is_port_in_path_artifact(resolved, origin_url=origin_url) or is_os_filesystem_path(resolved):
         return None
     parsed = urlsplit(resolved)
     origin = urlsplit(origin_url)

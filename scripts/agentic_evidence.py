@@ -6,7 +6,7 @@ import json
 import math
 import re
 from typing import Any
-from urllib.parse import parse_qsl, urlsplit
+from urllib.parse import parse_qsl, unquote, urlsplit
 
 from agentic_oracle import is_html_receipt, is_persistent_read_path_related
 from agentic_receipts import ReceiptStore
@@ -195,6 +195,37 @@ _STATE_TAMPERING_CONTROL_CLASSES = frozenset({"mass_assignment", "business_logic
 # Classes whose root cause is orthogonal to generic HTTP body disclosures on the same method
 # unless they explicitly share proof or control receipts.
 _OTHER_RECEIPT_ONLY_CLASSES = frozenset({"cors_misconfiguration", "race_condition"})
+_SEVERITY_RANK: dict[str, int] = {
+    "critical": 0,
+    "high": 1,
+    "medium": 2,
+    "low": 3,
+    "info": 4,
+}
+_GENERIC_ROUTE_PREFIX_SEGMENTS = frozenset({"api", "rest", "rpc"})
+_API_VERSION_SEG_RE = re.compile(r"^v\d+$", re.I)
+_TARGET_FILE_QUERY_KEYS = frozenset({
+    "file",
+    "filename",
+    "filepath",
+    "path",
+    "dir",
+    "directory",
+    "folder",
+    "subfolder",
+    "target",
+    "doc",
+    "document",
+    "name",
+    "template",
+    "page",
+    "src",
+    "include",
+})
+_FILE_BASENAME_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{1,80}\.[a-z0-9]{1,10}$", re.I)
+_PLAIN_FILENAME_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{2,64}$", re.I)
+_TRIVIAL_BODY_STRINGS = frozenset({"", "{}", "[]", "null", "ok", "true", "false"})
+_ALIAS_NOTE_PREFIX = "Also observed via alias route(s): "
 
 
 def _norm_path(url_or_path: str) -> str:
@@ -906,7 +937,7 @@ def select_primary_proof(
     ctrl_haystacks = _build_control_haystacks(control_receipts)
     ev_low_spec = score_evidence_value(ev_clean) < _HIGH_SPEC_THRESHOLD
 
-    def _rank_key(r: dict[str, Any]) -> tuple[int, int, int, int, tuple[int, int, str]]:
+    def _rank_key(r: dict[str, Any]) -> tuple[int, int, int, int, tuple[int, int, str], int]:
         actor = str(r.get("actor") or "")
         meta = actor_meta_map.get(actor) or {}
         role = str(meta.get("role") or ("anonymous" if actor == "anon" else "member")).lower()
@@ -937,6 +968,15 @@ def select_primary_proof(
         else:
             spec_rank = 0
 
+        route_match_rank = (
+            0
+            if (
+                not route_template
+                or normalize_route_template(str(r.get("url") or r.get("path") or "")) == route_template
+            )
+            else 1
+        )
+
         return (
             elig_tier,
             render_tier,
@@ -948,6 +988,7 @@ def select_primary_proof(
                 actor_meta_map=actor_meta_map,
                 owner_actor=owner_actor,
             ),
+            route_match_rank,
         )
 
     ranked = sorted(candidates, key=_rank_key)
@@ -1225,10 +1266,12 @@ def _has_same_http_method_surface(
     entry_b: dict[str, Any],
     proof_meta_b: list[tuple[str, str, int]],
     route_template: str,
+    *,
+    route_template_b: str | None = None,
 ) -> bool:
     """Return True when two findings exercise the same underlying HTTP method or write-read surface."""
     wr_a = _extract_write_read_pairs(proof_meta_a, route_template)
-    wr_b = _extract_write_read_pairs(proof_meta_b, route_template)
+    wr_b = _extract_write_read_pairs(proof_meta_b, route_template_b or route_template)
     if wr_a or wr_b:
         return bool(wr_a & wr_b)
 
@@ -1269,13 +1312,423 @@ def _has_same_http_method_surface(
     return True
 
 
+def strip_single_api_prefix(route_template: str) -> str:
+    """Strip a single leading `/api` segment when followed by a non-empty sub-path."""
+    raw = str(route_template or "").strip()
+    if not raw:
+        return ""
+    tmpl = normalize_route_template(raw) if ("://" in raw or "?" in raw) else raw
+    if not tmpl.startswith("/"):
+        tmpl = "/" + tmpl
+    if len(tmpl) > 1:
+        tmpl = tmpl.rstrip("/")
+    low = tmpl.lower()
+    if low.startswith("/api/") and len(low) > 5:
+        return low[4:]
+    return low
+
+
+def _is_api_prefix_alias(tmpl_a: str, tmpl_b: str) -> bool:
+    """Return True when two distinct route templates differ only by a single leading `/api` prefix."""
+    a = str(tmpl_a or "").strip().lower()
+    b = str(tmpl_b or "").strip().lower()
+    if not a or not b or a == b:
+        return False
+    return strip_single_api_prefix(a) == strip_single_api_prefix(b)
+
+
+def _has_resource_prefix(segs: list[str]) -> bool:
+    """Return True if `segs` contains at least one concrete resource segment (not solely api/version prefixes)."""
+    return any(
+        s and s not in _GENERIC_ROUTE_PREFIX_SEGMENTS and not _API_VERSION_SEG_RE.fullmatch(s)
+        for s in segs
+    )
+
+
+def _is_variant_leaf_segment(seg: str) -> bool:
+    """Return True when a final path segment represents a parameterized ID, encoded path, or filename variant."""
+    s = str(seg or "").strip().lower()
+    if not s:
+        return False
+    return (
+        s == "{id}"
+        or _TEMPLATE_SEG_RE.fullmatch(s) is not None
+        or "%" in s
+        or "." in s
+        or s.isdigit()
+    )
+
+
+def _routes_same_family(tmpl_a: str, tmpl_b: str) -> bool:
+    """Return True when two distinct non-alias routes belong to the same endpoint prefix/family."""
+    a = strip_single_api_prefix(tmpl_a)
+    b = strip_single_api_prefix(tmpl_b)
+    if not a or not b or a == b:
+        return False
+    segs_a = [s for s in a.split("/") if s]
+    segs_b = [s for s in b.split("/") if s]
+    if not segs_a or not segs_b:
+        return False
+    if len(segs_a) != len(segs_b):
+        shorter, longer = (segs_a, segs_b) if len(segs_a) < len(segs_b) else (segs_b, segs_a)
+        return longer[: len(shorter)] == shorter and _has_resource_prefix(shorter)
+    if len(segs_a) >= 2 and segs_a[:-1] == segs_b[:-1] and _has_resource_prefix(segs_a[:-1]):
+        return _is_variant_leaf_segment(segs_a[-1]) or _is_variant_leaf_segment(segs_b[-1])
+    return False
+
+
+def _severity_rank(entry: dict[str, Any]) -> int:
+    """Return severity rank (lower = higher severity; 5 when unspecified)."""
+    sev = str(entry.get("severity") or "").strip().lower()
+    return _SEVERITY_RANK.get(sev, 5)
+
+
+def _route_cleanliness_key(route_template: str) -> tuple[int, int, str]:
+    """Rank route templates by cleanliness (lower = cleaner/more direct endpoint)."""
+    tmpl = str(route_template or "").strip().lower()
+    has_encoded_or_traversal = 1 if ("%" in tmpl or ".." in tmpl) else 0
+    seg_count = len([s for s in tmpl.split("/") if s])
+    return (has_encoded_or_traversal, seg_count, tmpl)
+
+
+def _canonical_entry_rank(
+    entry: dict[str, Any],
+    *,
+    preferred_class: str = "",
+) -> tuple[int, int, int, int, int, int, str, str]:
+    """Return a deterministic, permutation-invariant canonical rank for a finding (lower = better canonical)."""
+    cls_name = str(entry.get("class_type") or "").strip().lower()
+    cls_penalty = 0 if (not preferred_class or cls_name == preferred_class) else 1
+    sev_r = _severity_rank(entry)
+    ev = str(entry.get("evidence_value") or entry.get("marker") or "").strip()
+    ev_score = score_evidence_value(ev)
+    tmpl = str(
+        entry.get("route_template")
+        or normalize_route_template(str(entry.get("url") or entry.get("path") or ""))
+    )
+    dirty_route, seg_count, norm_tmpl = _route_cleanliness_key(tmpl)
+    proof_cnt = len(entry.get("proof_receipt_ids") or [])
+    url_str = str(entry.get("url") or entry.get("path") or "")
+    return (
+        cls_penalty,
+        sev_r,
+        -ev_score,
+        dirty_route,
+        seg_count,
+        -proof_cnt,
+        norm_tmpl,
+        url_str,
+    )
+
+
+def _record_route_aliases(
+    target: dict[str, Any],
+    *candidate_routes: str,
+    extra_aliases: list[str] | None = None,
+) -> None:
+    """Merge secondary route templates onto `target['route_aliases']` and `target['notes']` deterministically."""
+    canon_tmpl = str(
+        target.get("route_template")
+        or normalize_route_template(str(target.get("url") or target.get("path") or ""))
+    ).strip()
+    alias_set: set[str] = set()
+    for raw in [*(target.get("route_aliases") or []), *(extra_aliases or []), *candidate_routes]:
+        clean = str(raw or "").strip()
+        if clean and clean != canon_tmpl:
+            alias_set.add(clean)
+    if not alias_set:
+        return
+    aliases = sorted(alias_set)
+    target["route_aliases"] = aliases
+    alias_line = f"{_ALIAS_NOTE_PREFIX}{', '.join(aliases)}"
+    existing_notes = str(target.get("notes") or "").strip()
+    if existing_notes:
+        non_alias_lines = [
+            line for line in existing_notes.splitlines()
+            if line.strip() and not line.strip().startswith(_ALIAS_NOTE_PREFIX)
+        ]
+        non_alias_lines.append(alias_line)
+        target["notes"] = "\n".join(non_alias_lines)
+    else:
+        target["notes"] = alias_line
+
+
+def _double_unquote(text: str) -> str:
+    """Decode up to two layers of percent-encoding (e.g. `%252F` -> `%2F` -> `/`)."""
+    return unquote(unquote(str(text or "")))
+
+
+def _is_substantive_evidence_token(val: str) -> bool:
+    """Return True if `val` is concrete enough to identify a shared leaked artifact or evidence."""
+    clean = str(val or "").strip()
+    if not clean or len(clean) < 4 or clean.lower() in _TRIVIAL_EVIDENCE:
+        return False
+    if _ISO_TIMESTAMP_RE.fullmatch(clean):
+        return False
+    if score_evidence_value(clean) >= 25:
+        return True
+    if _FILE_BASENAME_RE.fullmatch(clean):
+        return True
+    if clean.isalpha() and len(clean) < 12:
+        return False
+    return True
+
+
+def _artifact_in_text(artifact: str, text_low: str) -> bool:
+    """Return True if `artifact` appears as a bounded filename/path token inside `text_low`."""
+    if not artifact or not text_low or len(artifact) < 4:
+        return False
+    pat = re.compile(rf"(?<![a-z0-9_]){re.escape(artifact)}(?![a-z0-9_])")
+    return bool(pat.search(text_low))
+
+
+def _extract_finding_param_names(
+    entry: dict[str, Any],
+    proof_meta: list[tuple[str, str, int]],
+    *,
+    receipt_store: ReceiptStore | None = None,
+) -> set[str]:
+    """Extract normalized query and JSON/form request body parameter names from a finding's proofs."""
+    params: set[str] = set()
+
+    def _collect_url_query(url_str: str) -> None:
+        if not url_str:
+            return
+        for k, _ in parse_qsl(urlsplit(url_str).query, keep_blank_values=True):
+            clean = k.strip().lower()
+            if clean:
+                params.add(clean)
+
+    _collect_url_query(str(entry.get("url") or ""))
+    for _, u, _ in proof_meta:
+        _collect_url_query(u)
+
+    if receipt_store is not None:
+        for rid in (entry.get("proof_receipt_ids") or []):
+            try:
+                rec = receipt_store.get(str(rid))
+            except (KeyError, ValueError):
+                continue
+            _collect_url_query(str(rec.get("url") or ""))
+            req_body = str(rec.get("request_body") or "").strip()
+            if not req_body:
+                continue
+            if req_body.startswith("{"):
+                try:
+                    parsed = json.loads(req_body)
+                    if isinstance(parsed, dict):
+                        for k in parsed:
+                            ck = str(k).strip().lower()
+                            if ck:
+                                params.add(ck)
+                except ValueError:
+                    pass
+            elif "=" in req_body and "<" not in req_body[:16] and not req_body.startswith("["):
+                for k, _ in parse_qsl(req_body, keep_blank_values=True):
+                    ck = k.strip().lower()
+                    if ck and len(ck) <= 64 and not any(ch.isspace() for ch in ck):
+                        params.add(ck)
+    return params
+
+
+def _extract_response_fingerprints(
+    entry: dict[str, Any],
+    *,
+    receipt_store: ReceiptStore | None = None,
+) -> tuple[set[str], list[str]]:
+    """Return `(non_trivial_sha256_set, normalized_non_trivial_bodies)` for a finding's proof receipts."""
+    shas: set[str] = set()
+    bodies: list[str] = []
+    seen_bodies: set[str] = set()
+
+    def _add_body(body_text: str, sha: str = "") -> None:
+        clean = str(body_text or "").strip()
+        if clean.lower() in _TRIVIAL_BODY_STRINGS or len(clean) < 16:
+            return
+        if sha:
+            shas.add(sha)
+        norm = " ".join(clean.lower().split())
+        if len(norm) >= 24 and norm not in seen_bodies:
+            seen_bodies.add(norm)
+            bodies.append(norm[:1024])
+
+    if receipt_store is not None:
+        for rid in (entry.get("proof_receipt_ids") or []):
+            try:
+                rec = receipt_store.get(str(rid))
+            except (KeyError, ValueError):
+                continue
+            if not (200 <= int(rec.get("status") or 0) < 400):
+                continue
+            _add_body(str(rec.get("body") or ""), str(rec.get("response_sha256") or "").strip())
+
+    for ex in (entry.get("evidence_excerpts") or []):
+        if isinstance(ex, dict):
+            _add_body(str(ex.get("excerpt") or ""))
+
+    if not bodies and entry.get("evidence"):
+        _add_body(str(entry.get("evidence") or ""))
+
+    return shas, bodies
+
+
+def _extract_target_artifacts(
+    entry: dict[str, Any],
+    proof_meta: list[tuple[str, str, int]],
+) -> set[str]:
+    """Extract normalized target filenames/relative artifact paths referenced in proof URLs."""
+    artifacts: set[str] = set()
+    urls: list[str] = []
+    entry_url = str(entry.get("url") or entry.get("path") or "").strip()
+    if entry_url:
+        urls.append(entry_url)
+    for _, u, _ in proof_meta:
+        if u:
+            urls.append(u)
+
+    def _add_candidate(raw_val: str) -> None:
+        decoded = _double_unquote(raw_val).strip().replace("\\", "/")
+        if not decoded:
+            return
+        base = decoded.rsplit("/", 1)[-1].strip().lower()
+        if base and base not in {".", ".."}:
+            if _FILE_BASENAME_RE.fullmatch(base) or (
+                len(base) >= 4
+                and _PLAIN_FILENAME_RE.fullmatch(base)
+                and base not in _TRIVIAL_EVIDENCE
+            ):
+                artifacts.add(base)
+        if "/" in decoded:
+            rel_parts = [p for p in decoded.lower().split("/") if p and p not in {".", ".."}]
+            if len(rel_parts) >= 2:
+                rel = "/".join(rel_parts[-2:])
+                if len(rel) >= 5:
+                    artifacts.add(rel)
+
+    for u in urls:
+        parsed = urlsplit(u)
+        for k, v in parse_qsl(parsed.query, keep_blank_values=False):
+            if k.strip().lower() in _TARGET_FILE_QUERY_KEYS:
+                _add_candidate(v)
+        for seg in (parsed.path or "").split("/"):
+            if not seg:
+                continue
+            if "%" in seg or _FILE_BASENAME_RE.fullmatch(_double_unquote(seg).strip()):
+                _add_candidate(seg)
+    return artifacts
+
+
+def _extract_finding_secret_tokens(
+    entry: dict[str, Any],
+    *,
+    receipt_store: ReceiptStore | None = None,
+) -> set[str]:
+    """Extract high-specificity secret tokens from proof receipts absent from control receipts."""
+    if receipt_store is None:
+        return set()
+    ctrl_recs: list[dict[str, Any]] = []
+    for rid in (entry.get("control_receipt_ids") or []):
+        try:
+            ctrl_recs.append(receipt_store.get(str(rid)))
+        except (KeyError, ValueError):
+            continue
+    ctrl_haystacks = _build_control_haystacks(ctrl_recs)
+    tokens: set[str] = set()
+    for rid in (entry.get("proof_receipt_ids") or []):
+        try:
+            rec = receipt_store.get(str(rid))
+        except (KeyError, ValueError):
+            continue
+        if not (200 <= int(rec.get("status") or 0) < 400):
+            continue
+        for sc, tok in _extract_receipt_secret_candidates(rec, ctrl_haystacks):
+            if sc >= _HIGH_SPEC_THRESHOLD and tok:
+                tokens.add(tok.strip().lower())
+    return tokens
+
+
+def _has_matching_target_evidence_or_fingerprint(
+    entry_a: dict[str, Any],
+    proof_meta_a: list[tuple[str, str, int]],
+    entry_b: dict[str, Any],
+    proof_meta_b: list[tuple[str, str, int]],
+    *,
+    receipt_store: ReceiptStore | None = None,
+) -> bool:
+    """Return True when two findings share concrete leaked evidence, target file artifact, or response fingerprint."""
+    ev_a = str(entry_a.get("evidence_value") or entry_a.get("marker") or "").strip()
+    ev_b = str(entry_b.get("evidence_value") or entry_b.get("marker") or "").strip()
+    ev_a_low = ev_a.lower()
+    ev_b_low = ev_b.lower()
+    subst_a = _is_substantive_evidence_token(ev_a)
+    subst_b = _is_substantive_evidence_token(ev_b)
+
+    if subst_a and subst_b:
+        if ev_a_low == ev_b_low:
+            return True
+        if min(len(ev_a_low), len(ev_b_low)) >= 8 and (ev_a_low in ev_b_low or ev_b_low in ev_a_low):
+            return True
+
+    shas_a, bodies_a = _extract_response_fingerprints(entry_a, receipt_store=receipt_store)
+    shas_b, bodies_b = _extract_response_fingerprints(entry_b, receipt_store=receipt_store)
+    if shas_a and shas_b and (shas_a & shas_b):
+        return True
+    if bodies_a and bodies_b and (set(bodies_a) & set(bodies_b)):
+        return True
+    if subst_a and subst_b and bodies_a and bodies_b:
+        if any(ev_a_low in b for b in bodies_b) and any(ev_b_low in a for a in bodies_a):
+            return True
+
+    secrets_a = _extract_finding_secret_tokens(entry_a, receipt_store=receipt_store)
+    secrets_b = _extract_finding_secret_tokens(entry_b, receipt_store=receipt_store)
+    if secrets_a and secrets_b and (secrets_a & secrets_b):
+        return True
+
+    artifacts_a = _extract_target_artifacts(entry_a, proof_meta_a)
+    artifacts_b = _extract_target_artifacts(entry_b, proof_meta_b)
+    if artifacts_a and artifacts_b and (artifacts_a & artifacts_b):
+        return True
+    if artifacts_b and ev_a_low and any(_artifact_in_text(art, ev_a_low) for art in artifacts_b):
+        return True
+    if artifacts_a and ev_b_low and any(_artifact_in_text(art, ev_b_low) for art in artifacts_a):
+        return True
+    return False
+
+
+def _methods_compatible(
+    entry_a: dict[str, Any],
+    proof_meta_a: list[tuple[str, str, int]],
+    entry_b: dict[str, Any],
+    proof_meta_b: list[tuple[str, str, int]],
+) -> bool:
+    """Return True when two findings share the same effective HTTP method family (mutating vs read-only)."""
+    methods_a = {m for m, _, _ in proof_meta_a if m}
+    if not methods_a:
+        m_a = str(entry_a.get("method") or "").strip().upper()
+        if m_a:
+            methods_a.add(m_a)
+    methods_b = {m for m, _, _ in proof_meta_b if m}
+    if not methods_b:
+        m_b = str(entry_b.get("method") or "").strip().upper()
+        if m_b:
+            methods_b.add(m_b)
+    if not methods_a or not methods_b:
+        return False
+    mut_a = methods_a & _MUTATING_METHODS
+    mut_b = methods_b & _MUTATING_METHODS
+    if mut_a or mut_b:
+        return bool(mut_a & mut_b)
+    return bool(methods_a & methods_b)
+
+
 def _resolve_cross_class_overlap(
     entry_a: dict[str, Any],
     entry_b: dict[str, Any],
     *,
     receipt_store: ReceiptStore | None = None,
+    allow_api_alias: bool = False,
 ) -> tuple[str, int] | None:
-    """Resolve root-cause cross-class overlap on the same `(route_template, actor)`.
+    """Resolve root-cause cross-class overlap on the same `(route_template, actor)` (or API-prefix alias).
 
     Returns `(winning_class, match_priority)` (lower priority = stronger match) when `entry_a`
     and `entry_b` represent the same underlying vulnerability reported under overlapping classes,
@@ -1294,7 +1747,9 @@ def _resolve_cross_class_overlap(
         entry_b.get("route_template")
         or normalize_route_template(str(entry_b.get("url") or entry_b.get("path") or ""))
     )
-    if not tmpl_a or tmpl_a != tmpl_b:
+    if not tmpl_a or not tmpl_b:
+        return None
+    if tmpl_a != tmpl_b and not (allow_api_alias and _is_api_prefix_alias(tmpl_a, tmpl_b)):
         return None
 
     actor_a = _finding_actor(entry_a, receipt_store=receipt_store)
@@ -1319,7 +1774,14 @@ def _resolve_cross_class_overlap(
         if specific_cls not in _OTHER_RECEIPT_ONLY_CLASSES:
             proof_meta_a = _collect_finding_receipt_meta(entry_a, is_control=False, receipt_store=receipt_store)
             proof_meta_b = _collect_finding_receipt_meta(entry_b, is_control=False, receipt_store=receipt_store)
-            if _has_same_http_method_surface(entry_a, proof_meta_a, entry_b, proof_meta_b, tmpl_a):
+            if _has_same_http_method_surface(
+                entry_a,
+                proof_meta_a,
+                entry_b,
+                proof_meta_b,
+                tmpl_a,
+                route_template_b=tmpl_b,
+            ):
                 return specific_cls, 3
         return None
 
@@ -1333,11 +1795,11 @@ def _resolve_cross_class_overlap(
         proof_meta_a = _collect_finding_receipt_meta(entry_a, is_control=False, receipt_store=receipt_store)
         proof_meta_b = _collect_finding_receipt_meta(entry_b, is_control=False, receipt_store=receipt_store)
         wr_a = _extract_write_read_pairs(proof_meta_a, tmpl_a)
-        wr_b = _extract_write_read_pairs(proof_meta_b, tmpl_a)
+        wr_b = _extract_write_read_pairs(proof_meta_b, tmpl_b)
         if wr_a & wr_b:
             ctrl_meta_a = _collect_finding_receipt_meta(entry_a, is_control=True, receipt_store=receipt_store)
             ctrl_meta_b = _collect_finding_receipt_meta(entry_b, is_control=True, receipt_store=receipt_store)
-            if _has_baseline_read_control(ctrl_meta_a, tmpl_a) and _has_baseline_read_control(ctrl_meta_b, tmpl_a):
+            if _has_baseline_read_control(ctrl_meta_a, tmpl_a) and _has_baseline_read_control(ctrl_meta_b, tmpl_b):
                 return winner, 3
         return None
 
@@ -1350,7 +1812,14 @@ def _resolve_cross_class_overlap(
         if shares_control:
             proof_meta_a = _collect_finding_receipt_meta(entry_a, is_control=False, receipt_store=receipt_store)
             proof_meta_b = _collect_finding_receipt_meta(entry_b, is_control=False, receipt_store=receipt_store)
-            if _has_same_http_method_surface(entry_a, proof_meta_a, entry_b, proof_meta_b, tmpl_a):
+            if _has_same_http_method_surface(
+                entry_a,
+                proof_meta_a,
+                entry_b,
+                proof_meta_b,
+                tmpl_a,
+                route_template_b=tmpl_b,
+            ):
                 return winner, 2
         return None
 
@@ -1359,6 +1828,173 @@ def _resolve_cross_class_overlap(
         if proof_ids_a and proof_ids_a == proof_ids_b:
             return "race_condition", 1
         return None
+
+    return None
+
+
+def _shares_route_related_control(
+    entry_a: dict[str, Any],
+    entry_b: dict[str, Any],
+    shared_ctrl_ids: set[str],
+    tmpl_a: str,
+    tmpl_b: str,
+    *,
+    receipt_store: ReceiptStore | None = None,
+) -> bool:
+    """Return True when a shared control receipt targets the alias route pair (not an unrelated generic path)."""
+    if not shared_ctrl_ids:
+        return False
+    excerpts_by_id: dict[str, dict[str, Any]] = {}
+    for entry in (entry_a, entry_b):
+        for ex in (entry.get("control_excerpts") or []):
+            if isinstance(ex, dict):
+                rid = str(ex.get("receipt_id") or "").strip()
+                if rid:
+                    excerpts_by_id[rid] = ex
+    urls_found: list[str] = []
+    for rid in shared_ctrl_ids:
+        rec: dict[str, Any] | None = None
+        if receipt_store is not None:
+            try:
+                rec = receipt_store.get(rid)
+            except (KeyError, ValueError):
+                rec = None
+        if rec is None:
+            rec = excerpts_by_id.get(rid)
+        if rec is not None:
+            u = str(rec.get("url") or rec.get("path") or "").strip()
+            if u:
+                urls_found.append(u)
+                if _url_related_to_route(u, tmpl_a) or _url_related_to_route(u, tmpl_b):
+                    return True
+    return not urls_found
+
+
+def _resolve_alias_or_family_overlap(
+    entry_a: dict[str, Any],
+    entry_b: dict[str, Any],
+    *,
+    receipt_store: ReceiptStore | None = None,
+) -> tuple[str, int, str] | None:
+    """Resolve evidence-backed API-prefix alias (`/api/<path>` <-> `/<path>`) or same-family route overlap.
+
+    Returns `(winning_class, match_priority, match_kind)` where `match_kind` is `"api_alias"` or
+    `"route_family"`, or `None` when the two findings must remain separate.
+    """
+    cls_a = str(entry_a.get("class_type") or "").strip().lower()
+    cls_b = str(entry_b.get("class_type") or "").strip().lower()
+    if not cls_a or not cls_b:
+        return None
+
+    tmpl_a = str(
+        entry_a.get("route_template")
+        or normalize_route_template(str(entry_a.get("url") or entry_a.get("path") or ""))
+    )
+    tmpl_b = str(
+        entry_b.get("route_template")
+        or normalize_route_template(str(entry_b.get("url") or entry_b.get("path") or ""))
+    )
+    if not tmpl_a or not tmpl_b or tmpl_a == tmpl_b:
+        return None
+
+    actor_a = _finding_actor(entry_a, receipt_store=receipt_store)
+    actor_b = _finding_actor(entry_b, receipt_store=receipt_store)
+    if not actor_a or actor_a != actor_b:
+        return None
+
+    is_alias = _is_api_prefix_alias(tmpl_a, tmpl_b)
+    is_family = (not is_alias) and _routes_same_family(tmpl_a, tmpl_b)
+    if not is_alias and not is_family:
+        return None
+
+    proof_ids_a = {str(r).strip() for r in (entry_a.get("proof_receipt_ids") or []) if str(r).strip()}
+    proof_ids_b = {str(r).strip() for r in (entry_b.get("proof_receipt_ids") or []) if str(r).strip()}
+    ctrl_ids_a = {str(r).strip() for r in (entry_a.get("control_receipt_ids") or []) if str(r).strip()}
+    ctrl_ids_b = {str(r).strip() for r in (entry_b.get("control_receipt_ids") or []) if str(r).strip()}
+    shares_proof = bool(proof_ids_a & proof_ids_b)
+    shared_ctrl_ids = ctrl_ids_a & ctrl_ids_b
+
+    if is_alias:
+        if cls_a != cls_b:
+            cross = _resolve_cross_class_overlap(
+                entry_a,
+                entry_b,
+                receipt_store=receipt_store,
+                allow_api_alias=True,
+            )
+            if cross is None:
+                return None
+            winner_cls, prio = cross
+            return winner_cls, prio, "api_alias"
+
+        if shares_proof:
+            return cls_a, 1, "api_alias"
+
+        proof_meta_a = _collect_finding_receipt_meta(entry_a, is_control=False, receipt_store=receipt_store)
+        proof_meta_b = _collect_finding_receipt_meta(entry_b, is_control=False, receipt_store=receipt_store)
+        if not _methods_compatible(entry_a, proof_meta_a, entry_b, proof_meta_b):
+            return None
+
+        st_a = {st // 100 for _, _, st in proof_meta_a if st >= 100}
+        st_b = {st // 100 for _, _, st in proof_meta_b if st >= 100}
+        if st_a and st_b and not (st_a & st_b):
+            return None
+
+        if _shares_route_related_control(
+            entry_a,
+            entry_b,
+            shared_ctrl_ids,
+            tmpl_a,
+            tmpl_b,
+            receipt_store=receipt_store,
+        ):
+            return cls_a, 2, "api_alias"
+
+        if _has_matching_target_evidence_or_fingerprint(
+            entry_a,
+            proof_meta_a,
+            entry_b,
+            proof_meta_b,
+            receipt_store=receipt_store,
+        ):
+            return cls_a, 2, "api_alias"
+
+        params_a = _extract_finding_param_names(entry_a, proof_meta_a, receipt_store=receipt_store)
+        params_b = _extract_finding_param_names(entry_b, proof_meta_b, receipt_store=receipt_store)
+        if params_a and params_b and (params_a & params_b):
+            return cls_a, 3, "api_alias"
+
+        wr_a = _extract_write_read_pairs(proof_meta_a, tmpl_a)
+        wr_b = _extract_write_read_pairs(proof_meta_b, tmpl_b)
+        if wr_a and wr_b and (wr_a & wr_b):
+            return cls_a, 3, "api_alias"
+
+        return None
+
+    # Same-family route collapse requires identical class_type + actor + shared proof or concrete evidence/artifact.
+    if cls_a != cls_b:
+        return None
+    if shares_proof:
+        return cls_a, 1, "route_family"
+
+    proof_meta_a = _collect_finding_receipt_meta(entry_a, is_control=False, receipt_store=receipt_store)
+    proof_meta_b = _collect_finding_receipt_meta(entry_b, is_control=False, receipt_store=receipt_store)
+    if not _methods_compatible(entry_a, proof_meta_a, entry_b, proof_meta_b):
+        return None
+
+    st_a = {st // 100 for _, _, st in proof_meta_a if st >= 100}
+    st_b = {st // 100 for _, _, st in proof_meta_b if st >= 100}
+    if st_a and st_b and not (st_a & st_b):
+        return None
+
+    if _has_matching_target_evidence_or_fingerprint(
+        entry_a,
+        proof_meta_a,
+        entry_b,
+        proof_meta_b,
+        receipt_store=receipt_store,
+    ):
+        return cls_a, 2, "route_family"
 
     return None
 
@@ -1406,7 +2042,12 @@ def canonicalize_and_deduplicate_findings(
                 return rec
         return recs[0] if recs else None
 
-    def _merge_entries(existing: dict[str, Any], incoming: dict[str, Any]) -> None:
+    def _merge_entries(
+        existing: dict[str, Any],
+        incoming: dict[str, Any],
+        *,
+        preserve_winner_route: bool = False,
+    ) -> None:
         for list_field in ("proof_receipt_ids", "control_receipt_ids"):
             merged_ids = list(dict.fromkeys([
                 *(existing.get(list_field) or []),
@@ -1423,6 +2064,20 @@ def canonicalize_and_deduplicate_findings(
                 if isinstance(ex, dict) and (ex.get("receipt_id"), ex.get("actor")) not in seen_ex:
                     existing.setdefault(excerpt_field, []).append(ex)
                     seen_ex.add((ex.get("receipt_id"), ex.get("actor")))
+
+        if _severity_rank(incoming) < _severity_rank(existing):
+            existing["severity"] = str(incoming.get("severity") or "").strip().lower()
+            if not preserve_winner_route and str(incoming.get("class_type") or "") == str(existing.get("class_type") or ""):
+                if incoming.get("title"):
+                    existing["title"] = incoming["title"]
+                if incoming.get("summary"):
+                    existing["summary"] = incoming["summary"]
+
+        ex_tmpl = str(existing.get("route_template") or "").strip()
+        in_tmpl = str(incoming.get("route_template") or "").strip()
+        in_aliases = [str(a) for a in (incoming.get("route_aliases") or []) if str(a).strip()]
+        if (in_tmpl and ex_tmpl and in_tmpl != ex_tmpl) or in_aliases:
+            _record_route_aliases(existing, in_tmpl, extra_aliases=in_aliases)
 
         existing_actor = str(existing.get("actor") or existing.get("actor_alias") or "").strip()
         incoming_actor = str(incoming.get("actor") or incoming.get("actor_alias") or "").strip()
@@ -1477,7 +2132,8 @@ def canonicalize_and_deduplicate_findings(
             if incoming_actor:
                 existing["actor"] = incoming_actor
                 existing["actor_alias"] = incoming_actor
-            for field in ("url", "path", "observed_status", "method", "evidence"):
+            promote_fields = ("evidence",) if preserve_winner_route else ("url", "path", "observed_status", "method", "evidence")
+            for field in promote_fields:
                 val = incoming.get(field)
                 if val is not None and val != "":
                     existing[field] = val
@@ -1612,6 +2268,58 @@ def canonicalize_and_deduplicate_findings(
                 order = [k for k in order if k != loser_key]
                 cross_changed = True
                 break
+
+    # Resolve evidence-backed API-prefix alias (`/api/<path>` <-> `/<path>`) and same-family
+    # route variants deterministically and permutation-invariantly.
+    alias_changed = True
+    while alias_changed:
+        alias_changed = False
+        best_alias_merge: tuple[
+            tuple[
+                int,
+                int,
+                tuple[int, int, int, int, int, int, str, str],
+                tuple[int, int, int, int, int, int, str, str],
+            ],
+            tuple[str, str],
+            tuple[str, str],
+            str,
+        ] | None = None
+        for i in range(len(order)):
+            k1 = order[i]
+            if k1 not in grouped:
+                continue
+            for j in range(i + 1, len(order)):
+                k2 = order[j]
+                if k2 not in grouped:
+                    continue
+                alias_overlap = _resolve_alias_or_family_overlap(
+                    grouped[k1],
+                    grouped[k2],
+                    receipt_store=receipt_store,
+                )
+                if alias_overlap is None:
+                    continue
+                winner_cls, match_prio, match_kind = alias_overlap
+                rank1 = _canonical_entry_rank(grouped[k1], preferred_class=winner_cls)
+                rank2 = _canonical_entry_rank(grouped[k2], preferred_class=winner_cls)
+                if rank1 <= rank2:
+                    winner_key, loser_key = k1, k2
+                    winner_rank, loser_rank = rank1, rank2
+                else:
+                    winner_key, loser_key = k2, k1
+                    winner_rank, loser_rank = rank2, rank1
+                kind_prio = 0 if match_kind == "api_alias" else 1
+                cand_prio = (kind_prio, match_prio, winner_rank, loser_rank)
+                if best_alias_merge is None or cand_prio < best_alias_merge[0]:
+                    best_alias_merge = (cand_prio, winner_key, loser_key, winner_cls)
+        if best_alias_merge is not None:
+            _, winner_key, loser_key, winner_cls = best_alias_merge
+            grouped[winner_key]["class_type"] = winner_cls
+            _merge_entries(grouped[winner_key], grouped[loser_key], preserve_winner_route=True)
+            del grouped[loser_key]
+            order = [k for k in order if k != loser_key]
+            alias_changed = True
 
     out: list[dict[str, Any]] = []
     for idx, key in enumerate(order, start=1):

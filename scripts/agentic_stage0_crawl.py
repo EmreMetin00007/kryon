@@ -78,7 +78,11 @@ from agentic_surface import (  # noqa: E402
     is_virgin_state_sensitive_path,
     route_template_of,
 )
-from target_bootstrap import normalize_path  # noqa: E402
+from target_bootstrap import (  # noqa: E402
+    is_destructive_lifecycle_route,
+    is_logout_route,
+    normalize_path,
+)
 from tech_routes import detect_tech  # noqa: E402
 
 try:
@@ -2337,6 +2341,8 @@ def _crawl_actor_playwright(
                 or is_non_endpoint_source_path(norm_p)
                 or _is_stage0_noise_path(norm_p, origin_url=http_client.base_url)
                 or norm_p.lower().endswith(_SCRIPT_ASSET_EXTS)
+                or is_logout_route(norm_p)
+                or is_destructive_lifecycle_route(norm_p)
             ):
                 return
             if actor != "anon" and _DESTRUCTIVE_RE.search(norm_p):
@@ -2947,11 +2953,57 @@ def _finalize_routes(
     return links, forms, body_templates_map, multipart_schemas_map, discovery_hints
 
 
+def _normalize_stage0_seed_urls(
+    http_client: AgenticHTTPClient,
+    raw_paths: Sequence[str] | None,
+    *,
+    seen_keys: set[tuple[str, str, str]] | None = None,
+    block_destructive: bool = False,
+) -> list[str]:
+    """Normalize, scope-check, filter, and deduplicate Stage 0 crawl entry URLs."""
+    if not raw_paths:
+        return []
+    dedup_keys = seen_keys if seen_keys is not None else set()
+    accepted: list[str] = []
+    for raw_sp in raw_paths:
+        cand = str(raw_sp or "").strip()
+        if not cand or "<REDACTED" in cand:
+            continue
+        low = cand.lower()
+        if low.startswith(_NON_HTTP_SCHEMES) or low.startswith(("ws://", "wss://")):
+            continue
+        try:
+            full_s, path_u, query_u = _check_http_scope(http_client, cand, allow_fragment=True)
+            norm_p = normalize_path(path_u or "/")
+        except (ScopeViolationError, ValueError):
+            continue
+        if (
+            has_double_slash_path(path_u)
+            or (is_static_asset_url(norm_p) and not _extract_path_embedded_params(norm_p))
+            or is_non_endpoint_source_path(norm_p)
+            or _is_stage0_noise_path(norm_p, origin_url=http_client.base_url)
+            or norm_p.lower().endswith(_SCRIPT_ASSET_EXTS)
+            or is_logout_route(norm_p)
+            or is_destructive_lifecycle_route(norm_p)
+        ):
+            continue
+        if block_destructive and _DESTRUCTIVE_RE.search(norm_p):
+            continue
+        frag = urlsplit(full_s).fragment
+        canon_key = (norm_p, query_u, frag)
+        if canon_key in dedup_keys:
+            continue
+        dedup_keys.add(canon_key)
+        accepted.append(full_s)
+    return accepted
+
+
 def run_stage0_crawl(
     http_client: AgenticHTTPClient,
     *,
     output_dir: Path | str | None = None,
     start_paths: Sequence[str] | None = None,
+    extra_seed_paths: Sequence[str] | None = None,
     max_pages: int = 12,
     max_actions: int = 24,
     allow_forms: bool = False,
@@ -3023,27 +3075,38 @@ def run_stage0_crawl(
             )
     else:
         selected_actors = _select_crawl_actors(http_client, None)
+    seen_seed_keys: set[tuple[str, str, str]] = set()
     raw_starts = list(start_paths) if start_paths else ["/"]
-    valid_starts: list[str] = []
-    for raw_sp in raw_starts:
-        try:
-            full_s, _p, _q = _check_http_scope(http_client, str(raw_sp), allow_fragment=True)
-            if full_s not in valid_starts:
-                valid_starts.append(full_s)
-        except ScopeViolationError:
-            continue
+    valid_starts = _normalize_stage0_seed_urls(
+        http_client,
+        raw_starts,
+        seen_keys=seen_seed_keys,
+        block_destructive=False,
+    )
     if not valid_starts:
-        try:
-            root_u, _p, _q = _check_http_scope(http_client, "/", allow_fragment=False)
-            valid_starts = [root_u]
-        except ScopeViolationError:
-            return _empty_result(
-                http_client.base_url,
-                status="ok",
-                mode=mode,
-                actors_crawled=selected_actors,
-                elapsed_seconds=time.monotonic() - started,
+        valid_starts = _normalize_stage0_seed_urls(
+            http_client,
+            ["/"],
+            seen_keys=seen_seed_keys,
+            block_destructive=False,
+        )
+    if extra_seed_paths:
+        valid_starts.extend(
+            _normalize_stage0_seed_urls(
+                http_client,
+                extra_seed_paths,
+                seen_keys=seen_seed_keys,
+                block_destructive=True,
             )
+        )
+    if not valid_starts:
+        return _empty_result(
+            http_client.base_url,
+            status="ok",
+            mode=mode,
+            actors_crawled=selected_actors,
+            elapsed_seconds=time.monotonic() - started,
+        )
 
     collector = _Stage0Collector(http_client)
     collected_secrets: set[str] = set()

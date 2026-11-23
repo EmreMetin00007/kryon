@@ -139,6 +139,20 @@ _WRITE_METHODS = frozenset({"POST", "PUT", "PATCH"})
 _PERSISTENT_CLASSES = frozenset({"stored_xss", "mass_assignment", "ssti"})
 _API_PREFIX_SEGMENTS = frozenset({"api", "v1", "v2", "v3", "v4"})
 _API_VERSION_SEG_RE = re.compile(r"^v\d+$", re.I)
+_CREATE_CONFLICT_INDICATOR_RE = re.compile(
+    r"(?<![a-z0-9])(?:already[\s_-]+exists?|already[\s_-]+taken|"
+    r"already[\s_-]+registered|already[\s_-]+in[\s_-]+use|"
+    r"duplicate|conflict)(?![a-z0-9])",
+    re.IGNORECASE,
+)
+_UNRELATED_ROUTE_ERROR_RE = re.compile(
+    r"(?:cannot\s+(?:get|post|put|patch|delete|head|options)\s+|"
+    r"\bno\s+route\b|\broute\s+not\s+found\b|\bunknown\s+route\b|"
+    r"\bunknown\s+endpoint\b|\bendpoint\s+not\s+found\b|"
+    r"requested\s+url\s+was\s+not\s+found|\bno\s+handler\b|"
+    r"\b404\s+page\s+not\s+found\b)",
+    re.IGNORECASE,
+)
 _TRIVIAL_CORRELATION_TOKENS = frozenset({
     "0",
     "1",
@@ -721,7 +735,9 @@ def _select_mutating_get_proof(
     candidates = [
         r
         for r in proof_receipts
-        if str(r.get("method") or "").upper() == "GET" and 200 <= int(r.get("status") or 0) < 300
+        if str(r.get("method") or "").upper() == "GET"
+        and 200 <= int(r.get("status") or 0) < 300
+        and not (p_method == "DELETE" and _is_strictly_earlier_receipt(r, primary_proof))
     ]
     if not candidates:
         return None
@@ -1167,6 +1183,143 @@ def _weak_credentials_redacted_body_rejected(
             for ctrl in eff_controls
         ) and not _weak_credentials_controls_equivalent(replay_target, replay_rec, ev=ev):
             return True
+    return False
+
+
+def _is_unrelated_route_not_found(receipt: dict[str, Any], method: str = "") -> bool:
+    """Return True if a 404/410 response body indicates a missing route rather than a deleted resource."""
+    body = str(receipt.get("body") or "")
+    if not body:
+        return False
+    if method and f"cannot {method.strip().lower()} " in body.lower():
+        return True
+    return bool(_UNRELATED_ROUTE_ERROR_RE.search(body))
+
+
+def _is_one_shot_create_conflict(replay_rec: dict[str, Any]) -> bool:
+    """Return True if a POST clean replay returned 409 Conflict or 400 with an explicit duplicate/conflict indicator."""
+    r_status = int(replay_rec.get("status") or 0)
+    if r_status == 409:
+        return True
+    if r_status == 400:
+        return bool(_CREATE_CONFLICT_INDICATOR_RE.search(str(replay_rec.get("body") or "")))
+    return False
+
+
+def _receipt_observes_resource_before_delete(
+    cand: dict[str, Any],
+    target_norm_path: str,
+) -> bool:
+    """Return True if an earlier 2xx receipt observed or created the resource at `target_norm_path`."""
+    c_method = str(cand.get("method") or "").upper()
+    c_path = _norm_url_path(str(cand.get("url") or cand.get("path") or ""))
+    if c_path == target_norm_path and c_method in {"GET", "POST", "PUT", "PATCH"}:
+        return True
+
+    parts = [seg for seg in target_norm_path.split("/") if seg]
+    if len(parts) < 2:
+        return False
+    concrete_key = parts[-1].lower()
+    if concrete_key in _API_PREFIX_SEGMENTS or _API_VERSION_SEG_RE.fullmatch(concrete_key):
+        return False
+    parent_path = "/" + "/".join(parts[:-1])
+    resource_family = parts[-2].lower()
+    if not (
+        c_path == parent_path
+        or c_path == f"/{resource_family}"
+        or c_path.endswith(f"/{resource_family}")
+    ):
+        return False
+
+    if c_method in {"POST", "PUT"}:
+        loc = str(cand.get("redirect_location") or _response_header_ci(cand, "location") or "").strip()
+        if loc and _norm_url_path(loc) == target_norm_path:
+            return True
+
+    body = str(cand.get("body") or "")
+    if not body:
+        return False
+
+    singular = resource_family[:-1] if len(resource_family) > 2 and resource_family.endswith("s") else resource_family
+    short_singular = singular.replace("-", "_").split("_")[-1]
+    id_keys = {"id", "uuid", "slug", "key", "name", "username", f"{singular}_id", f"{short_singular}_id"}
+
+    stripped = body.lstrip()
+    if stripped.startswith(("{", "[")):
+        try:
+            parsed = json.loads(body)
+        except ValueError:
+            parsed = None
+        if c_method in {"POST", "PUT"} and isinstance(parsed, dict):
+            dicts_to_check: list[dict[str, Any]] = [parsed]
+            for v in parsed.values():
+                if isinstance(v, dict):
+                    dicts_to_check.append(v)
+            for item in dicts_to_check:
+                for k, v in item.items():
+                    if str(k).lower() in id_keys and isinstance(v, (str, int)) and not isinstance(v, bool):
+                        if str(v).strip().lower() == concrete_key:
+                            return True
+        elif c_method == "GET" and "{id}" not in route_template_of(c_path):
+            items: list[dict[str, Any]] = []
+            if isinstance(parsed, list):
+                items = [x for x in parsed[:100] if isinstance(x, dict)]
+            elif isinstance(parsed, dict):
+                for v in parsed.values():
+                    if isinstance(v, list):
+                        items.extend(x for x in v[:100] if isinstance(x, dict))
+            for item in items:
+                for k, v in item.items():
+                    if str(k).lower() in id_keys and isinstance(v, (str, int)) and not isinstance(v, bool):
+                        if str(v).strip().lower() == concrete_key:
+                            return True
+
+    if c_method == "GET":
+        ctype = str(cand.get("content_type") or "").lower()
+        html_link_re = re.compile(
+            rf"""(?:{re.escape(parent_path)}|/{re.escape(resource_family)})/{re.escape(concrete_key)}(?:["'/?#\s>]|$)""",
+            re.IGNORECASE,
+        )
+        if ("html" in ctype or "href=" in body.lower()) and html_link_re.search(body):
+            return True
+    return False
+
+
+def _delete_original_evidence_ok(
+    *,
+    primary_proof: dict[str, Any],
+    evidence_value: str,
+    ev_in_oob: bool,
+    canonical_class: str,
+    prior_observations: Sequence[dict[str, Any]],
+    eff_controls: Sequence[dict[str, Any]],
+    has_same_path_denied_control: bool,
+) -> bool:
+    """Return True if `evidence_value` is corroborated by the original 2xx DELETE (or 204 + prior/control state)."""
+    ev = str(evidence_value or "").strip()
+    if not ev or ev_in_oob:
+        return True
+    if _receipt_contains_evidence(primary_proof, ev, canonical_class=canonical_class):
+        return True
+    t_status = int(primary_proof.get("status") or 0)
+    if t_status == 204 and not str(primary_proof.get("body") or "").strip():
+        if any(
+            _receipt_contains_evidence(obs, ev, canonical_class=canonical_class)
+            for obs in prior_observations
+        ):
+            return True
+        if (prior_observations or has_same_path_denied_control) and any(
+            int(c.get("status") or 0) != 204 for c in eff_controls
+        ):
+            p_norm_path = _norm_url_path(str(primary_proof.get("url") or primary_proof.get("path") or ""))
+            status_desc = f"http 204 no content delete {p_norm_path} deleted"
+            ev_low = ev.lower()
+            if (
+                ev_low in status_desc
+                or ev_low in p_norm_path
+                or ev_low in str(primary_proof.get("url") or "").lower()
+            ):
+                return True
     return False
 
 
@@ -1942,16 +2095,23 @@ class DifferentialOracle:
                 control_probe_receipt_id=ctrl_probe_rid,
             )
 
-        # Destructive DELETE persistence verification: when re-executing DELETE returns
-        # 404/410 because the resource is already gone, verify an earlier 2xx GET existed
-        # on the same normalized path prior to primary_proof and confirm a fresh clean-session
-        # GET now returns 404/410.
+        # Case A — Destructive / one-shot DELETE state-transition verification:
+        # When re-executing a 2xx DELETE returns 404/410 because the resource was
+        # removed, verify original evidence_value and confirm removal via either:
+        #   (1) an earlier 2xx GET on the exact path + fresh clean-session GET
+        #       returning 404/410 (`passed_delete_persistence`), or
+        #   (2) an earlier 2xx resource observation (GET/POST/PUT/collection listing)
+        #       or a same-path denied control (401/403/404), confirmed by clean-session
+        #       GET readback returning 404/410 (or 405/501 when GET is unsupported, or
+        #       when GET budget/method is unavailable) while rejecting any 2xx "still
+        #       alive" readback or unrelated route errors
+        #       (`passed_one_shot_delete_state_transition`).
         if (
             replay_target is primary_proof
             and str(primary_proof.get("method") or "").upper() == "DELETE"
             and 200 <= t_status < 300
             and r_status in {404, 410}
-            and self._has_budget(1)
+            and not _is_unrelated_route_not_found(replay_rec, "DELETE")
         ):
             p_norm_path = _norm_url_path(str(primary_proof.get("url") or primary_proof.get("path") or ""))
             p_rid = str(primary_proof.get("receipt_id") or "")
@@ -1979,13 +2139,24 @@ class DifferentialOracle:
                     eff_owner = str(obj_entry.get("owner_actor") or "").strip()
 
             prior_gets: list[dict[str, Any]] = []
+            prior_observations: list[dict[str, Any]] = []
             seen_prior_rids: set[str] = set()
+            cand_pool: list[dict[str, Any]] = []
             for rid in self.receipts.list_ids():
-                if rid in seen_prior_rids or rid in {p_rid, r_rid}:
+                if rid in {p_rid, r_rid}:
                     continue
                 try:
-                    cand = self.receipts.get(rid)
+                    cand_pool.append(self.receipts.get(rid))
                 except (KeyError, ValueError):
+                    continue
+            for extra_rec in (*proof_receipts, *eff_controls):
+                if isinstance(extra_rec, dict):
+                    cand_pool.append(extra_rec)
+
+            for cand in cand_pool:
+                c_rid = str(cand.get("receipt_id") or "")
+                dedup_key = c_rid or f"obj:{id(cand)}"
+                if dedup_key in seen_prior_rids or (c_rid and c_rid in {p_rid, r_rid}) or cand is primary_proof:
                     continue
                 c_seq = _receipt_seq_num(cand)
                 c_ts = str(cand.get("timestamp") or "")
@@ -1997,56 +2168,205 @@ class DifferentialOracle:
                         continue
                 elif r_seq > 0 and c_seq >= r_seq:
                     continue
-                if str(cand.get("method") or "").upper() != "GET":
-                    continue
                 if not (200 <= int(cand.get("status") or 0) < 300):
                     continue
-                if _norm_url_path(str(cand.get("url") or cand.get("path") or "")) != p_norm_path:
-                    continue
-                seen_prior_rids.add(rid)
-                prior_gets.append(cand)
-                if not eff_owner:
-                    cand_owner, _ = _extract_owner_and_tenant_from_receipt(cand, meta_map)
-                    if cand_owner:
-                        eff_owner = cand_owner
+                c_method = str(cand.get("method") or "").upper()
+                c_norm_path = _norm_url_path(str(cand.get("url") or cand.get("path") or ""))
+                if c_method == "GET" and c_norm_path == p_norm_path:
+                    seen_prior_rids.add(dedup_key)
+                    prior_gets.append(cand)
+                    prior_observations.append(cand)
+                    if not eff_owner:
+                        cand_owner, _ = _extract_owner_and_tenant_from_receipt(cand, meta_map)
+                        if cand_owner:
+                            eff_owner = cand_owner
+                elif _receipt_observes_resource_before_delete(cand, p_norm_path):
+                    seen_prior_rids.add(dedup_key)
+                    prior_observations.append(cand)
+                    if not eff_owner:
+                        cand_owner, _ = _extract_owner_and_tenant_from_receipt(cand, meta_map)
+                        if cand_owner:
+                            eff_owner = cand_owner
 
-            if prior_gets:
-                prior_gets.sort(
-                    key=lambda rec: (
-                        1 if str(rec.get("actor") or "").strip() in known_actors else 0,
-                        1 if (eff_owner and str(rec.get("actor") or "").strip() == eff_owner) else 0,
-                        1 if (
-                            str(rec.get("actor") or "").strip() in ctrl_actors
-                            and str(rec.get("actor") or "").strip() != p_actor
-                        ) else 0,
-                        1 if str(rec.get("actor") or "").strip() not in {"", "anon", p_actor} else 0,
-                        1 if str(rec.get("actor") or "").strip() not in {"", p_actor} else 0,
-                        _receipt_seq_num(rec),
-                    ),
-                    reverse=True,
-                )
-                chosen_actor = str(prior_gets[0].get("actor") or "").strip()
-                if not chosen_actor or chosen_actor not in known_actors:
-                    chosen_actor = p_actor
-                try:
-                    fresh_get_rec = self._run_clean_session_request(
-                        actor=chosen_actor,
-                        method="GET",
-                        url=str(primary_proof.get("url") or "/"),
+            same_path_denied_controls = [
+                c
+                for c in eff_controls
+                if int(c.get("status") or 0) in {401, 403, 404}
+                and _norm_url_path(str(c.get("url") or c.get("path") or "")) == p_norm_path
+            ]
+            has_same_path_denied_control = bool(same_path_denied_controls)
+
+            if _delete_original_evidence_ok(
+                primary_proof=primary_proof,
+                evidence_value=ev,
+                ev_in_oob=ev_in_oob,
+                canonical_class=canonical_class,
+                prior_observations=prior_observations,
+                eff_controls=eff_controls,
+                has_same_path_denied_control=has_same_path_denied_control,
+            ):
+                delete_readback_alive = False
+                readback_attempted = False
+
+                if prior_gets and self._has_budget(1):
+                    prior_gets.sort(
+                        key=lambda rec: (
+                            1 if str(rec.get("actor") or "").strip() in known_actors else 0,
+                            1 if (eff_owner and str(rec.get("actor") or "").strip() == eff_owner) else 0,
+                            1 if (
+                                str(rec.get("actor") or "").strip() in ctrl_actors
+                                and str(rec.get("actor") or "").strip() != p_actor
+                            ) else 0,
+                            1 if str(rec.get("actor") or "").strip() not in {"", "anon", p_actor} else 0,
+                            1 if str(rec.get("actor") or "").strip() not in {"", p_actor} else 0,
+                            _receipt_seq_num(rec),
+                        ),
+                        reverse=True,
                     )
-                except BudgetExhaustedError:
-                    fresh_get_rec = None
-                if fresh_get_rec is not None and int(fresh_get_rec.get("status") or 0) in {404, 410}:
-                    stages["stage3_clean_replay"] = "passed_delete_persistence"
-                    return OracleVerdict(
-                        verified=True,
-                        verdict="VERIFIED",
-                        reason="Verified destructive DELETE persistence: resource returned 2xx before DELETE and 404/410 on fresh clean-session GET afterward.",
-                        mode=self.mode,
-                        stages=stages,
-                        clean_replay_receipt_id=fresh_get_rec["receipt_id"],
-                        control_probe_receipt_id=ctrl_probe_rid,
-                    )
+                    chosen_actor = str(prior_gets[0].get("actor") or "").strip()
+                    if not chosen_actor or chosen_actor not in known_actors:
+                        chosen_actor = p_actor
+                    readback_attempted = True
+                    try:
+                        fresh_get_rec = self._run_clean_session_request(
+                            actor=chosen_actor,
+                            method="GET",
+                            url=str(primary_proof.get("url") or "/"),
+                        )
+                    except BudgetExhaustedError:
+                        fresh_get_rec = None
+                    if fresh_get_rec is not None:
+                        fg_status = int(fresh_get_rec.get("status") or 0)
+                        if fg_status in {404, 410} and not _is_unrelated_route_not_found(fresh_get_rec, "GET"):
+                            stages["stage3_clean_replay"] = "passed_delete_persistence"
+                            return OracleVerdict(
+                                verified=True,
+                                verdict="VERIFIED",
+                                reason=(
+                                    "Verified destructive DELETE persistence: resource returned 2xx before "
+                                    "DELETE and 404/410 on fresh clean-session GET afterward."
+                                ),
+                                mode=self.mode,
+                                stages=stages,
+                                clean_replay_receipt_id=fresh_get_rec["receipt_id"],
+                                control_probe_receipt_id=ctrl_probe_rid,
+                            )
+                        if 200 <= fg_status < 300:
+                            delete_readback_alive = True
+
+                if (
+                    not delete_readback_alive
+                    and (bool(prior_observations) or has_same_path_denied_control)
+                ):
+                    if (
+                        not readback_attempted
+                        and self._has_budget(1)
+                        and "GET" in self.http.allowed_methods
+                    ):
+                        rb_candidates: list[str] = []
+                        if eff_owner and eff_owner in known_actors:
+                            rb_candidates.append(eff_owner)
+                        for obs in prior_observations:
+                            obs_actor = str(obs.get("actor") or "").strip()
+                            if obs_actor and obs_actor in known_actors and obs_actor not in rb_candidates:
+                                rb_candidates.append(obs_actor)
+                        if p_actor and p_actor not in rb_candidates:
+                            rb_candidates.append(p_actor)
+                        for ca in sorted(ctrl_actors):
+                            if ca in known_actors and ca not in {"", "anon"} and ca not in rb_candidates:
+                                rb_candidates.append(ca)
+
+                        rb_confirmed_absent = False
+                        rb_unsupported_get = False
+                        rb_receipt_id = replay_rec["receipt_id"]
+                        for rb_actor in rb_candidates[:2]:
+                            if not self._has_budget(1):
+                                break
+                            try:
+                                rb_rec = self._run_clean_session_request(
+                                    actor=rb_actor,
+                                    method="GET",
+                                    url=str(primary_proof.get("url") or "/"),
+                                )
+                            except BudgetExhaustedError:
+                                break
+                            rb_status = int(rb_rec.get("status") or 0)
+                            if 200 <= rb_status < 300:
+                                delete_readback_alive = True
+                                break
+                            if rb_status in {404, 410} and not _is_unrelated_route_not_found(rb_rec, "GET"):
+                                rb_confirmed_absent = True
+                                rb_receipt_id = rb_rec["receipt_id"]
+                                break
+                            if rb_status in {405, 501}:
+                                rb_unsupported_get = True
+                                break
+
+                        if not delete_readback_alive and (rb_confirmed_absent or rb_unsupported_get):
+                            stages["stage3_clean_replay"] = "passed_one_shot_delete_state_transition"
+                            if rb_confirmed_absent:
+                                stages["stage3_delete_replay_receipt_id"] = replay_rec["receipt_id"]
+                            return OracleVerdict(
+                                verified=True,
+                                verdict="VERIFIED",
+                                reason=(
+                                    "Verified one-shot DELETE state transition: original 2xx DELETE "
+                                    "returned 404/410 on clean replay and clean GET readback confirmed "
+                                    "resource absence."
+                                    if rb_confirmed_absent
+                                    else "Verified one-shot DELETE state transition: original 2xx DELETE "
+                                    "returned 404/410 on clean replay with corroborating prior/control "
+                                    "state (GET unsupported on target route)."
+                                ),
+                                mode=self.mode,
+                                stages=stages,
+                                clean_replay_receipt_id=rb_receipt_id,
+                                control_probe_receipt_id=ctrl_probe_rid,
+                            )
+                    elif not readback_attempted:
+                        stages["stage3_clean_replay"] = "passed_one_shot_delete_state_transition"
+                        return OracleVerdict(
+                            verified=True,
+                            verdict="VERIFIED",
+                            reason=(
+                                "Verified one-shot DELETE state transition: original 2xx DELETE "
+                                "returned 404/410 on clean replay with corroborating prior/control state."
+                            ),
+                            mode=self.mode,
+                            stages=stages,
+                            clean_replay_receipt_id=replay_rec["receipt_id"],
+                            control_probe_receipt_id=ctrl_probe_rid,
+                        )
+        # Case B — Single-use POST create conflict verification:
+        # When re-executing a 200/201 POST returns 409 Conflict (or 400 Bad Request
+        # with an explicit duplicate/conflict indicator) because the resource already
+        # exists from the original request, verify after Stages 1-2 passed.
+        elif (
+            not has_redacted_auth_override
+            and replay_target is primary_proof
+            and str(primary_proof.get("method") or "").upper() == "POST"
+            and t_status in {200, 201}
+            and canonical_class not in {"open_redirect", "cors_misconfiguration", "weak_credentials"}
+            and _is_one_shot_create_conflict(replay_rec)
+            and (
+                not ev
+                or ev_in_oob
+                or _receipt_contains_evidence(primary_proof, ev, canonical_class=canonical_class)
+            )
+        ):
+            stages["stage3_clean_replay"] = "passed_one_shot_create_conflict"
+            return OracleVerdict(
+                verified=True,
+                verdict="VERIFIED",
+                reason=(
+                    f"Verified one-shot POST create state transition: original {t_status} POST "
+                    f"returned {r_status} conflict/duplicate on clean-session replay."
+                ),
+                mode=self.mode,
+                stages=stages,
+                clean_replay_receipt_id=replay_rec["receipt_id"],
+                control_probe_receipt_id=ctrl_probe_rid,
+            )
         # Stateful persistence fallback: when re-executing a non-idempotent write as
         # the original actor returns 403/404/409 (e.g. ownership/tenant already moved),
         # check previously-denied control actors on the same path and (when evidence is

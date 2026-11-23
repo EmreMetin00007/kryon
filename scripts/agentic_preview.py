@@ -70,8 +70,11 @@ from kryon_core.surface.extract import (  # noqa: E402
     extract_sitemap,
     extract_spa_routes,
     find_spec_urls,
+    is_hashed_asset_chunk_path,
 )
 from kryon_core.surface.normalize import (  # noqa: E402
+    has_google_identity_sdk_context,
+    is_os_filesystem_path,
     is_port_in_path_artifact,
     is_third_party_sdk_static_route,
     normalize_bare_hostport_url,
@@ -707,11 +710,16 @@ def _extract_js_client_logic(
         for fn_name in signing_meta.get("functions") or []:
             _add_unique(signing_indicators, str(fn_name)[:80], 20)
 
+    sdk_ctx = has_google_identity_sdk_context(body)
     seen_ep_keys: set[tuple[str, str]] = set()
     for ep in raw_endpoints:
         method = str(ep.get("method") or "GET").strip().upper() or "GET"
         path = normalize_bare_hostport_url(str(ep.get("path") or "").strip()[:240], base=url)
-        if is_third_party_sdk_static_route(path) or is_port_in_path_artifact(path, origin_url=url):
+        if (
+            is_third_party_sdk_static_route(path, sdk_context=sdk_ctx)
+            or is_port_in_path_artifact(path, origin_url=url)
+            or is_os_filesystem_path(path)
+        ):
             continue
         q_params = [str(p)[:64] for p in (ep.get("query_params") or []) if p][:15]
         b_fields = [str(f)[:64] for f in (ep.get("body_fields") or []) if f][:20]
@@ -739,7 +747,11 @@ def _extract_js_client_logic(
 
         if path.startswith(("/", "http://", "https://")) and not _is_skipped_surface_url(path, base_url=url):
             resolved = urljoin(url, path)
-            if not _is_skipped_surface_url(resolved, base_url=url) and not is_third_party_sdk_static_route(resolved):
+            if (
+                not _is_skipped_surface_url(resolved, base_url=url)
+                and not is_third_party_sdk_static_route(resolved, sdk_context=sdk_ctx)
+                and not is_os_filesystem_path(resolved)
+            ):
                 all_params = list(dict.fromkeys([*q_params, *b_fields]))[:15]
                 merged_calls.append({
                     "method": method,
@@ -1051,10 +1063,17 @@ def _build_surface_hints(
     def _add_api(raw_u: str) -> None:
         if len(api_endpoints) >= 8:
             return
-        if _is_skipped_surface_url(raw_u, base_url=base_url):
+        if _is_skipped_surface_url(raw_u, base_url=base_url) or is_hashed_asset_chunk_path(raw_u):
             return
         path, _, same_origin = _short_same_origin(raw_u)
-        if not same_origin or not path or path == "/" or _is_skipped_surface_url(path, base_url=base_url):
+        if (
+            not same_origin
+            or not path
+            or path == "/"
+            or _is_skipped_surface_url(path, base_url=base_url)
+            or is_hashed_asset_chunk_path(path)
+            or _is_standalone_script_url(path)
+        ):
             return
         if path not in api_path_set:
             api_path_set.add(path)
@@ -1091,7 +1110,13 @@ def _build_surface_hints(
             break
         raw_u = str(item.get("url") or "")
         path, short, same_origin = _short_same_origin(raw_u)
-        if not same_origin or _is_skipped_surface_url(raw_u, base_url=base_url) or _is_skipped_surface_url(path, base_url=base_url):
+        if (
+            not same_origin
+            or _is_skipped_surface_url(raw_u, base_url=base_url)
+            or _is_skipped_surface_url(path, base_url=base_url)
+            or is_hashed_asset_chunk_path(path)
+            or (is_js and _is_standalone_script_url(path))
+        ):
             continue
         if path == "/" and "?" not in short:
             continue
