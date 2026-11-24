@@ -27,7 +27,7 @@ import re
 import sys
 import threading
 import time
-from typing import Any, Sequence
+from typing import Any, Iterable, Sequence
 from urllib.parse import parse_qsl, urljoin, urlsplit, urlunsplit
 
 _SCRIPTS_DIR = Path(__file__).resolve().parent
@@ -71,11 +71,19 @@ from kryon_core.surface.normalize import (  # noqa: E402
 )
 from agentic_surface import (  # noqa: E402
     _extract_path_embedded_params,
+    _extract_single_label_url_host,
     _fit_body_template_budget,
     _sanitize_json_template,
+    apply_openapi_path_prefix,
+    detect_internal_canonical_hosts,
+    infer_openapi_mount_prefix,
     is_id_segment,
+    is_loopback_or_private_base_url,
     is_non_endpoint_source_path,
+    is_single_label_internal_host,
     is_virgin_state_sensitive_path,
+    rewrite_internal_canonical_url,
+    rewrite_internal_canonical_urls_in_text,
     route_template_of,
 )
 from target_bootstrap import (  # noqa: E402
@@ -215,14 +223,25 @@ _HIGH_SIGNAL_PARAM_NAMES = frozenset({
     "id",
 })
 
-_STANDARD_MANIFEST_PROBES: tuple[str, ...] = (
+_ROOT_SPEC_PROBES: tuple[str, ...] = (
     "/openapi.json",
     "/swagger.json",
     "/v3/api-docs",
     "/api-docs",
+)
+_API_PREFIXED_SPEC_PROBES: tuple[str, ...] = (
+    "/api/v3/api-docs",
+    "/api/openapi.json",
+    "/api/swagger.json",
+)
+_STANDARD_NON_SPEC_MANIFEST_PROBES: tuple[str, ...] = (
     "/robots.txt",
     "/sitemap.xml",
     "/info",
+)
+_STANDARD_MANIFEST_PROBES: tuple[str, ...] = (
+    *_ROOT_SPEC_PROBES,
+    *_STANDARD_NON_SPEC_MANIFEST_PROBES,
 )
 _BENIGN_TECH_PROBES: dict[str, tuple[str, ...]] = {
     "django": ("/api/schema", "/graphql"),
@@ -277,6 +296,7 @@ _COLLECT_DOM_STATE_JS = r"""() => {
   const standaloneFiles = [];
   const standaloneFileEls = [];
   const links = [];
+  const canonicalLinks = [];
   const hashRoutes = [];
   const headings = [];
   const visibleLinks = [];
@@ -319,6 +339,13 @@ _COLLECT_DOM_STATE_JS = r"""() => {
   const walk = (root) => {
     if (!root || !root.querySelectorAll) return;
 
+    for (const el of root.querySelectorAll('link[rel][href]')) {
+      const rel = String(el.getAttribute('rel') || '').toLowerCase().split(/\s+/);
+      if (rel.includes('canonical') && canonicalLinks.length < 4) {
+        const chref = String(el.getAttribute('href') || '').trim();
+        if (chref) canonicalLinks.push(chref);
+      }
+    }
     for (const el of root.querySelectorAll('a[href], area[href]')) {
       const href = el.getAttribute('href');
       pushHref(href);
@@ -534,9 +561,13 @@ _COLLECT_DOM_STATE_JS = r"""() => {
     forms: formEls,
     standaloneFiles: standaloneFileEls,
   };
+  const baseEl = document.querySelector('base[href]');
+  const baseHref = baseEl ? String(baseEl.getAttribute('href') || '').trim() : '';
   return {
     url: String(window.location.href || ''),
     base_uri: String(document.baseURI || window.location.href || ''),
+    base_href: baseHref,
+    canonical_links: canonicalLinks,
     pathname: String(window.location.pathname || '/'),
     hash: String(window.location.hash || ''),
     title: String(document.title || '').slice(0, 120),
@@ -1188,6 +1219,8 @@ def _synthesize_schema_value(resolver: Any, raw_schema: Any, *, depth: int = 0) 
 
 def _extract_openapi_templates(
     spec: dict[str, Any],
+    *,
+    path_prefix: str = "",
 ) -> tuple[
     dict[tuple[str, str], dict[str, Any]],
     dict[tuple[str, str], dict[str, list[str]]],
@@ -1206,6 +1239,7 @@ def _extract_openapi_templates(
             continue
         if not raw_path.startswith("/"):
             continue
+        eff_path = apply_openapi_path_prefix(raw_path, path_prefix) if path_prefix else raw_path
         for method_low in ("get", "post", "put", "patch", "delete", "head", "options"):
             op = path_item.get(method_low)
             if not isinstance(op, dict):
@@ -1228,7 +1262,7 @@ def _extract_openapi_templates(
                             if isinstance(san, dict) and san:
                                 fitted = _fit_body_template_budget(san)
                                 if fitted:
-                                    templates[(method, raw_path)] = fitted
+                                    templates[(method, eff_path)] = fitted
                                     op_params.extend(_extract_json_param_names(fitted))
                     elif pname and pin in {"query", "formData"}:
                         op_params.append(pname)
@@ -1254,7 +1288,7 @@ def _extract_openapi_templates(
                             if isinstance(san, dict) and san:
                                 fitted = _fit_body_template_budget(san)
                                 if fitted:
-                                    templates[(method, raw_path)] = fitted
+                                    templates[(method, eff_path)] = fitted
                                     op_params.extend(_extract_json_param_names(fitted))
 
                     mp_media = content.get("multipart/form-data")
@@ -1279,14 +1313,14 @@ def _extract_openapi_templates(
                                 else:
                                     mp_fields.append(clean_pk)
                             if mp_fields or mp_files:
-                                multipart_map[(method, raw_path)] = {
+                                multipart_map[(method, eff_path)] = {
                                     "fields": sorted(set(mp_fields)),
                                     "files": sorted(set(mp_files)),
                                 }
                                 op_params.extend(mp_fields)
                                 op_params.extend(mp_files)
 
-            ops_meta.append((method, raw_path, list(dict.fromkeys(op_params))[:_MAX_PARAMS_PER_ROUTE]))
+            ops_meta.append((method, eff_path, list(dict.fromkeys(op_params))[:_MAX_PARAMS_PER_ROUTE]))
             if len(ops_meta) >= 120:
                 return templates, multipart_map, ops_meta
 
@@ -1469,6 +1503,8 @@ class _Stage0Collector:
 
     def __init__(self, http_client: AgenticHTTPClient) -> None:
         self.http = http_client
+        self._allow_canonical_host_aliases = is_loopback_or_private_base_url(http_client.base_url)
+        self.internal_canonical_hosts: set[str] = set()
         self.routes: dict[tuple[str, str], _RouteRecord] = {}
         self.ws_endpoints: dict[tuple[str, str], dict[str, str]] = {}
         self.captured_html: dict[str, dict[str, Any]] = {}
@@ -1528,6 +1564,39 @@ class _Stage0Collector:
                 self.ws_endpoints[key] = {"url": clean_ws, "path": norm_ws_path}
         return True
 
+    def register_canonical_hosts(self, hosts: Iterable[str]) -> None:
+        """Record validated single-label internal canonical host aliases (loopback/private targets only)."""
+        if not self._allow_canonical_host_aliases:
+            return
+        valid = {
+            h.strip().lower()
+            for h in hosts
+            if isinstance(h, str) and is_single_label_internal_host(h)
+        }
+        if not valid:
+            return
+        with self._lock:
+            self.internal_canonical_hosts.update(valid)
+
+    def canonical_hosts_snapshot(self) -> set[str]:
+        if not self._allow_canonical_host_aliases:
+            return set()
+        with self._lock:
+            return set(self.internal_canonical_hosts)
+
+    def rewrite_canonical_url(self, raw_url: str) -> str:
+        """Rewrite a validated internal single-label canonical host URL to ``self.http.base_url``."""
+        if not self._allow_canonical_host_aliases:
+            return raw_url
+        aliases = self.canonical_hosts_snapshot()
+        if not aliases:
+            return raw_url
+        return rewrite_internal_canonical_url(
+            raw_url,
+            base_url=self.http.base_url,
+            canonical_hosts=aliases,
+        )
+
     def record_route(
         self,
         *,
@@ -1546,6 +1615,8 @@ class _Stage0Collector:
         if norm_method not in _VALID_HTTP_METHODS:
             norm_method = "GET"
         raw = str(raw_url or "").strip()
+        if raw and self._allow_canonical_host_aliases:
+            raw = self.rewrite_canonical_url(raw)
         if not raw or raw.startswith(("#", "//")) or raw.lower().startswith(_NON_HTTP_SCHEMES):
             return False
         if raw.lower().startswith(("ws://", "wss://")):
@@ -1706,7 +1777,13 @@ class _Stage0Collector:
             if store_key not in store and len(store) < cap:
                 store[store_key] = entry
 
-    def ingest_surface_summary(self, summary: dict[str, Any], *, source_url: str) -> None:
+    def ingest_surface_summary(
+        self,
+        summary: dict[str, Any],
+        *,
+        source_url: str,
+        openapi_path_prefix: str = "",
+    ) -> None:
         """Ingest routes extracted by ``agentic_preview._extract_surface_summary``."""
         if not isinstance(summary, dict):
             return
@@ -1743,9 +1820,12 @@ class _Stage0Collector:
                 elif isinstance(p, str):
                     pnames.append(p)
             pnames.extend(str(f) for f in (op.get("body_fields") or ()) if f)
+            raw_op_url = str(op.get("path") or op.get("url") or "")
+            if openapi_path_prefix and raw_op_url:
+                raw_op_url = apply_openapi_path_prefix(urlsplit(raw_op_url).path or raw_op_url, openapi_path_prefix)
             self.record_route(
                 method=str(op.get("method") or "GET"),
-                raw_url=str(op.get("path") or op.get("url") or ""),
+                raw_url=raw_op_url,
                 current_url=self.http.base_url,
                 params=pnames,
             )
@@ -1787,11 +1867,54 @@ class _Stage0Collector:
                         self.discovered_spec_urls.append(norm_sp)
 
 
+def _detect_canonical_hosts_from_dom(
+    dom_data: dict[str, Any],
+    *,
+    base_url: str,
+) -> set[str]:
+    """Detect single-label internal canonical hostnames from a Playwright DOM snapshot."""
+    if not is_loopback_or_private_base_url(base_url) or not isinstance(dom_data, dict):
+        return set()
+    base_host = (urlsplit(base_url).hostname or "").strip().lower()
+    detected: set[str] = set()
+
+    for chref in dom_data.get("canonical_links") or ():
+        cand = _extract_single_label_url_host(str(chref or ""))
+        if cand and cand != base_host:
+            detected.add(cand)
+
+    for b_key in ("base_href", "base_uri"):
+        cand = _extract_single_label_url_host(str(dom_data.get(b_key) or ""))
+        if cand and cand != base_host:
+            detected.add(cand)
+
+    counts: dict[str, int] = {}
+    for link_raw in dom_data.get("links") or ():
+        cand = _extract_single_label_url_host(str(link_raw or ""))
+        if cand and cand != base_host:
+            counts[cand] = counts.get(cand, 0) + 1
+    for form_item in dom_data.get("forms") or ():
+        if not isinstance(form_item, dict):
+            continue
+        cand = _extract_single_label_url_host(str(form_item.get("action") or ""))
+        if cand and cand != base_host:
+            counts[cand] = counts.get(cand, 0) + 1
+    if counts:
+        max_count = max(counts.values())
+        if max_count >= 3:
+            for host, cnt in counts.items():
+                if cnt == max_count:
+                    detected.add(host)
+
+    return detected
+
+
 def _fill_and_submit_form(
     page: Any,
     form_info: dict[str, Any],
     *,
     timeout_ms: int,
+    rewritten_action: str = "",
 ) -> tuple[bool, bool]:
     """Fill a benign visible form with synthetic data and click its safe submit trigger.
 
@@ -1809,6 +1932,14 @@ def _fill_and_submit_form(
         return False, False
     if form_handle is None:
         return False, False
+    if rewritten_action:
+        try:
+            form_handle.evaluate(
+                "(el, act) => { if (el && typeof el.setAttribute === 'function') el.setAttribute('action', act); }",
+                rewritten_action,
+            )
+        except Exception:
+            pass
 
     attached_file = False
     seen_radio_groups: set[str] = set()
@@ -2052,6 +2183,7 @@ def _crawl_actor_playwright(
     )
     session_dropped = False
     form_submitting_flag = [False]
+    pending_redirect_urls: list[tuple[str, str]] = []
 
     try:
         ls_init_script = _build_origin_localstorage_init_script(http_client.base_url, local_storage)
@@ -2256,6 +2388,19 @@ def _crawl_actor_playwright(
                 ):
                     session_dropped = True
 
+            if loc_hdr and collector._allow_canonical_host_aliases:
+                loc_hosts = detect_internal_canonical_hosts(
+                    "",
+                    base_url=http_client.base_url,
+                    location_header=loc_hdr,
+                )
+                if loc_hosts:
+                    collector.register_canonical_hosts(loc_hosts)
+                rewritten_loc = collector.rewrite_canonical_url(loc_hdr)
+                if rewritten_loc != loc_hdr:
+                    collector.record_route(method="GET", raw_url=rewritten_loc, current_url=resp_url)
+                    pending_redirect_urls.append((rewritten_loc, resp_url))
+
             is_script_asset = req_method in {"GET", "HEAD"} and _is_browser_script_asset(
                 resp_url,
                 resp_path,
@@ -2288,6 +2433,14 @@ def _crawl_actor_playwright(
             if not raw_body:
                 return
             text_body = bytes(raw_body[:max_bytes]).decode("utf-8", errors="replace")
+            if is_html and collector._allow_canonical_host_aliases:
+                collector.register_canonical_hosts(
+                    detect_internal_canonical_hosts(
+                        text_body,
+                        base_url=http_client.base_url,
+                        location_header=loc_hdr,
+                    )
+                )
             collector.record_document(
                 url=resp_url,
                 content_type=ctype,
@@ -2318,6 +2471,7 @@ def _crawl_actor_playwright(
             cand = str(raw_candidate or "").strip()
             if not cand or cand.lower().startswith(_NON_HTTP_SCHEMES):
                 return
+            cand = collector.rewrite_canonical_url(cand)
             if cand.startswith("#/"):
                 cur_no_frag = urlsplit(current_page_url)
                 base_for_hash = urlunsplit((cur_no_frag.scheme, cur_no_frag.netloc, cur_no_frag.path or "/", cur_no_frag.query, ""))
@@ -2364,6 +2518,7 @@ def _crawl_actor_playwright(
             raw_base_uri = str(dom_data.get("base_uri") or "").strip()
             if not raw_base_uri:
                 return current_page_url
+            raw_base_uri = collector.rewrite_canonical_url(raw_base_uri)
             try:
                 clean_b, _bp, _bq = _check_http_scope(http_client, raw_base_uri, allow_fragment=False)
                 return clean_b
@@ -2371,18 +2526,24 @@ def _crawl_actor_playwright(
                 return current_page_url
 
         def _ingest_dom_discovery(dom_data: dict[str, Any], current_page_url: str) -> None:
+            if collector._allow_canonical_host_aliases:
+                collector.register_canonical_hosts(
+                    _detect_canonical_hosts_from_dom(dom_data, base_url=http_client.base_url)
+                )
             link_base = _dom_link_base(dom_data, current_page_url)
             for link_raw in dom_data.get("links") or ():
-                collector.record_route(method="GET", raw_url=str(link_raw), current_url=link_base)
-                _enqueue_url(str(link_raw), link_base)
+                rewritten_link = collector.rewrite_canonical_url(str(link_raw))
+                collector.record_route(method="GET", raw_url=rewritten_link, current_url=link_base)
+                _enqueue_url(rewritten_link, link_base)
             for h_raw in dom_data.get("hash_routes") or ():
                 _enqueue_url(str(h_raw), current_page_url)
             for form_item in dom_data.get("forms") or ():
                 if not isinstance(form_item, dict):
                     continue
                 raw_action = str(form_item.get("action") or "").strip()
-                f_action = raw_action or current_page_url
-                f_base = link_base if raw_action else current_page_url
+                rewritten_action = collector.rewrite_canonical_url(raw_action) if raw_action else ""
+                f_action = rewritten_action or current_page_url
+                f_base = link_base if rewritten_action else current_page_url
                 f_method = str(form_item.get("method") or "GET").upper()
                 f_fields = [
                     str(fld.get("name") or "")
@@ -2396,6 +2557,12 @@ def _crawl_actor_playwright(
                     params=f_fields,
                     is_form=True,
                 )
+                if (
+                    f_method == "GET"
+                    and rewritten_action
+                    and not _DESTRUCTIVE_RE.search(rewritten_action)
+                ):
+                    _enqueue_url(f_action, f_base)
 
         def _run_layer3_on_dom(dom_data: dict[str, Any], current_page_url: str) -> None:
             nonlocal session_dropped
@@ -2442,7 +2609,9 @@ def _crawl_actor_playwright(
                 if session_dropped or not stage0_budget.can_spend():
                     break
                 raw_action = str(form_item.get("action") or "").strip()
-                resolved_action = urljoin(link_base, raw_action) if raw_action else current_page_url
+                rewritten_raw_action = collector.rewrite_canonical_url(raw_action) if raw_action else ""
+                was_rewritten_action = bool(raw_action and rewritten_raw_action != raw_action)
+                resolved_action = urljoin(link_base, rewritten_raw_action) if rewritten_raw_action else current_page_url
                 try:
                     _a_url, a_path, _a_q = _check_http_scope(http_client, resolved_action, allow_fragment=False)
                     norm_action_path = normalize_path(a_path or "/")
@@ -2484,7 +2653,12 @@ def _crawl_actor_playwright(
                 before_url = str(page.url or current_page_url)
                 form_submitting_flag[0] = True
                 try:
-                    submitted, uploaded = _fill_and_submit_form(page, form_item, timeout_ms=timeout_ms)
+                    submitted, uploaded = _fill_and_submit_form(
+                        page,
+                        form_item,
+                        timeout_ms=timeout_ms,
+                        rewritten_action=_a_url if was_rewritten_action else "",
+                    )
                     if submitted:
                         collector.forms_submitted += 1
                         if uploaded:
@@ -2526,11 +2700,20 @@ def _crawl_actor_playwright(
             actor_pages_visited += 1
             collector.pages_visited += 1
 
+            goto_failed = False
             try:
                 page.goto(target_url, wait_until="domcontentloaded", timeout=timeout_ms)
                 if wait_ms > 0:
                     page.wait_for_timeout(wait_ms)
             except Exception:
+                goto_failed = True
+
+            if pending_redirect_urls:
+                for redir_u, redir_ref in pending_redirect_urls:
+                    _enqueue_url(redir_u, redir_ref)
+                pending_redirect_urls.clear()
+
+            if goto_failed:
                 continue
 
             final_url = str(page.url or target_url)
@@ -2732,6 +2915,19 @@ def _run_layer4_passive_fusion(
     max_passive_probes: int,
 ) -> None:
     """Fuse captured HTML, JS chunks, and CSS via ``_extract_surface_summary`` and run bounded manifest probes."""
+    if collector._allow_canonical_host_aliases:
+        for doc in list(collector.captured_html.values()):
+            hdrs = doc.get("headers") or {}
+            loc_hdr = str(hdrs.get("location") or hdrs.get("Location") or "")
+            collector.register_canonical_hosts(
+                detect_internal_canonical_hosts(
+                    str(doc.get("body") or ""),
+                    base_url=http_client.base_url,
+                    location_header=loc_hdr,
+                )
+            )
+    canonical_hosts = collector.canonical_hosts_snapshot()
+
     idx = 0
     for docs, prefix, default_ctype, is_js_batch in (
         (list(collector.captured_html.values()), "html", "text/html", False),
@@ -2742,11 +2938,18 @@ def _run_layer4_passive_fusion(
             idx += 1
             if is_js_batch:
                 collector.js_chunks_parsed += 1
+            doc_body = str(doc.get("body") or "")
+            if canonical_hosts and doc_body:
+                doc_body = rewrite_internal_canonical_urls_in_text(
+                    doc_body,
+                    base_url=http_client.base_url,
+                    canonical_hosts=canonical_hosts,
+                )
             fake_rec = {
                 "receipt_id": f"stage0-{prefix}-{idx}",
                 "url": doc["url"],
                 "content_type": doc["content_type"] or default_ctype,
-                "body": doc["body"],
+                "body": doc_body,
                 "response_headers": doc["headers"],
                 "redirect_location": "",
             }
@@ -2770,77 +2973,152 @@ def _run_layer4_passive_fusion(
             if tpath not in tech_probes and len(tech_probes) < 3:
                 tech_probes.append(tpath)
 
-    probe_candidates: list[str] = []
     seen_probes: set[str] = set()
-    for raw_p in [*collector.discovered_spec_urls, *_STANDARD_MANIFEST_PROBES, *tech_probes]:
-        try:
-            _u, clean_p, _q = _check_http_scope(http_client, raw_p, allow_fragment=False)
-            norm_p = normalize_path(clean_p)
-        except (ScopeViolationError, ValueError):
-            continue
-        low_p = norm_p.lower()
-        if any(sens in low_p for sens in _SENSITIVE_PROBE_SEGMENTS):
-            continue
-        if norm_p in seen_probes or norm_p in collector.fetched_2xx_paths:
-            continue
-        seen_probes.add(norm_p)
-        probe_candidates.append(norm_p)
+    found_openapi_spec = False
+    stop_probing = False
 
-    for probe_path in probe_candidates:
+    def _prepare_probe_candidates(raw_paths: Sequence[str]) -> list[str]:
+        candidates: list[str] = []
+        for raw_p in raw_paths:
+            try:
+                _u, clean_p, _q = _check_http_scope(http_client, raw_p, allow_fragment=False)
+                norm_p = normalize_path(clean_p)
+            except (ScopeViolationError, ValueError):
+                continue
+            low_p = norm_p.lower()
+            if any(sens in low_p for sens in _SENSITIVE_PROBE_SEGMENTS):
+                continue
+            if norm_p in seen_probes or norm_p in collector.fetched_2xx_paths:
+                continue
+            seen_probes.add(norm_p)
+            candidates.append(norm_p)
+        return candidates
+
+    def _execute_probe(probe_path: str) -> bool:
+        nonlocal stop_probing
         if collector.passive_probes_sent >= max_passive_probes:
-            break
+            stop_probing = True
+            return False
         if not stage0_budget.can_spend(include_reserve=True):
-            break
+            stop_probing = True
+            return False
         before_used = int(http_client.budget.used)
         try:
             rec = http_client.request(actor=primary_actor, method="GET", url=probe_path)
         except BudgetExhaustedError:
             stage0_budget.global_exhausted = True
-            break
+            stop_probing = True
+            return False
         except ServiceDegradationError:
-            break
+            stop_probing = True
+            return False
         except (ScopeViolationError, MethodNotAllowedError):
-            continue
+            return False
         except Exception:
             after_used = int(http_client.budget.used)
             stage0_budget.account_external(max(0, after_used - before_used))
-            continue
+            return False
 
         after_used = int(http_client.budget.used)
         stage0_budget.account_external(max(0, after_used - before_used))
         collector.passive_probes_sent += 1
 
         status = int(rec.get("status") or 0)
-        if not (200 <= status < 300):
-            continue
-
         rec_url = str(rec.get("url") or urljoin(http_client.base_url, probe_path))
+        loc_hdr = str(rec.get("redirect_location") or "").strip()
+        if loc_hdr and collector._allow_canonical_host_aliases:
+            collector.register_canonical_hosts(
+                detect_internal_canonical_hosts(
+                    "",
+                    base_url=http_client.base_url,
+                    location_header=loc_hdr,
+                )
+            )
+            collector.record_route(method="GET", raw_url=loc_hdr, current_url=rec_url)
+        if not (200 <= status < 300):
+            return False
+
         collector.record_route(method="GET", raw_url=rec_url, status=status)
-        try:
-            summary = _extract_surface_summary(rec, http_client.base_url)
-            collector.ingest_surface_summary(summary, source_url=rec_url)
-        except Exception:
-            pass
 
         body_text = str(rec.get("body") or "")
         stripped = body_text.lstrip()
+        parsed_spec: dict[str, Any] | None = None
         if stripped.startswith("{"):
             try:
                 parsed = json.loads(body_text)
             except ValueError:
                 parsed = None
-            if isinstance(parsed, dict) and "paths" in parsed and ("openapi" in parsed or "swagger" in parsed):
-                oa_templates, oa_multipart, oa_ops = _extract_openapi_templates(parsed)
-                for op_method, op_path, op_params in oa_ops:
-                    collector.record_route(
-                        method=op_method,
-                        raw_url=op_path,
-                        current_url=http_client.base_url,
-                        params=op_params,
-                        body_template=oa_templates.get((op_method, op_path)),
-                        body_template_observed=False,
-                        multipart_schema=oa_multipart.get((op_method, op_path)),
-                    )
+            if (
+                isinstance(parsed, dict)
+                and isinstance(parsed.get("paths"), dict)
+                and ("openapi" in parsed or "swagger" in parsed)
+            ):
+                parsed_spec = parsed
+
+        oa_prefix = infer_openapi_mount_prefix(parsed_spec, rec_url) if parsed_spec is not None else ""
+        try:
+            summary_rec = rec
+            cur_aliases = collector.canonical_hosts_snapshot()
+            if cur_aliases and body_text and parsed_spec is None:
+                summary_rec = dict(rec)
+                summary_rec["body"] = rewrite_internal_canonical_urls_in_text(
+                    body_text,
+                    base_url=http_client.base_url,
+                    canonical_hosts=cur_aliases,
+                )
+            summary = _extract_surface_summary(summary_rec, http_client.base_url)
+            collector.ingest_surface_summary(
+                summary,
+                source_url=rec_url,
+                openapi_path_prefix=oa_prefix,
+            )
+        except Exception:
+            pass
+
+        if parsed_spec is not None:
+            oa_templates, oa_multipart, oa_ops = _extract_openapi_templates(
+                parsed_spec,
+                path_prefix=oa_prefix,
+            )
+            for op_method, op_path, op_params in oa_ops:
+                collector.record_route(
+                    method=op_method,
+                    raw_url=op_path,
+                    current_url=http_client.base_url,
+                    params=op_params,
+                    body_template=oa_templates.get((op_method, op_path)),
+                    body_template_observed=False,
+                    multipart_schema=oa_multipart.get((op_method, op_path)),
+                )
+            return True
+        return False
+
+    for probe_path in _prepare_probe_candidates(collector.discovered_spec_urls):
+        if _execute_probe(probe_path):
+            found_openapi_spec = True
+        if stop_probing:
+            return
+
+    if not found_openapi_spec:
+        for probe_path in _prepare_probe_candidates(_ROOT_SPEC_PROBES):
+            if _execute_probe(probe_path):
+                found_openapi_spec = True
+                break
+            if stop_probing:
+                return
+
+    if not found_openapi_spec:
+        for probe_path in _prepare_probe_candidates(_API_PREFIXED_SPEC_PROBES):
+            if _execute_probe(probe_path):
+                found_openapi_spec = True
+                break
+            if stop_probing:
+                return
+
+    for probe_path in _prepare_probe_candidates([*_STANDARD_NON_SPEC_MANIFEST_PROBES, *tech_probes]):
+        _execute_probe(probe_path)
+        if stop_probing:
+            return
 
 
 def _finalize_routes(

@@ -5,13 +5,15 @@ write operations, and actor coverage from every HTTP receipt at 0 extra HTTP cos
 """
 from __future__ import annotations
 
+from html import unescape
+import ipaddress
 import json
 import math
 from pathlib import Path
 import re
 import sys
-from typing import Any, Sequence
-from urllib.parse import parse_qsl, urljoin, urlsplit
+from typing import Any, Iterable, Sequence
+from urllib.parse import parse_qsl, urljoin, urlsplit, urlunsplit
 
 from agentic_http import is_static_asset_url, normalize_origin
 
@@ -1001,6 +1003,335 @@ def route_template_of(url_or_path: str) -> str:
     return "/" + "/".join(segments)
 
 
+_RFC1918_NETWORKS: tuple[ipaddress.IPv4Network, ...] = (
+    ipaddress.IPv4Network("10.0.0.0/8"),
+    ipaddress.IPv4Network("172.16.0.0/12"),
+    ipaddress.IPv4Network("192.168.0.0/16"),
+)
+_SINGLE_LABEL_HOST_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,62}$")
+_HEX_INT_HOST_RE = re.compile(r"^0x[0-9a-f]+$")
+_CANONICAL_SCRIPT_STYLE_RE = re.compile(
+    r"<(?:script|style)\b[^>]*>[\s\S]*?</(?:script|style)>",
+    re.IGNORECASE,
+)
+_CANONICAL_TAG_RE = re.compile(r"<(link|base|a|form)\b([^>]*)>", re.IGNORECASE)
+_CANONICAL_ATTR_RE = re.compile(
+    r"""([A-Za-z_:][A-Za-z0-9_.:-]*)\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'=<>`]+))"""
+)
+_OPENAPI_SPEC_SUFFIXES: tuple[str, ...] = (
+    "/swagger/v1/swagger.json",
+    "/v3/api-docs",
+    "/v2/api-docs",
+    "/openapi.json",
+    "/swagger.json",
+    "/api-docs",
+)
+
+
+def is_loopback_or_private_base_url(base_url: str) -> bool:
+    """Return True strictly when ``base_url`` targets loopback or an RFC1918 private IP."""
+    raw = str(base_url or "").strip()
+    if not raw:
+        return False
+    try:
+        parsed = urlsplit(raw)
+    except ValueError:
+        return False
+    if parsed.scheme.lower() not in {"http", "https"}:
+        return False
+    host = (parsed.hostname or "").strip().lower().rstrip(".")
+    if not host:
+        return False
+    if host == "localhost":
+        return True
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    if ip.is_loopback:
+        return True
+    if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped is not None:
+        ip = ip.ipv4_mapped
+        if ip.is_loopback:
+            return True
+    if isinstance(ip, ipaddress.IPv4Address):
+        return any(ip in net for net in _RFC1918_NETWORKS)
+    return False
+
+
+def is_single_label_internal_host(host: str) -> bool:
+    """Return True only for a single-label internal hostname (no dots, not localhost/IP)."""
+    raw = str(host or "").strip().lower()
+    if not raw or "." in raw or ":" in raw or "/" in raw:
+        return False
+    if raw == "localhost" or raw.isdigit() or _HEX_INT_HOST_RE.fullmatch(raw):
+        return False
+    if not _SINGLE_LABEL_HOST_RE.fullmatch(raw):
+        return False
+    try:
+        ipaddress.ip_address(raw)
+    except ValueError:
+        return True
+    return False
+
+
+def _extract_single_label_url_host(raw_url: str) -> str:
+    """Extract a validated single-label hostname from an http(s) or protocol-relative URL."""
+    val = unescape(str(raw_url or "").strip())
+    if not val:
+        return ""
+    if val.startswith("//"):
+        if val.startswith("///"):
+            return ""
+        candidate = f"http:{val}"
+    elif val.lower().startswith(("http://", "https://")):
+        candidate = val
+    else:
+        return ""
+    try:
+        parsed = urlsplit(candidate)
+    except ValueError:
+        return ""
+    if parsed.username is not None or parsed.password is not None:
+        return ""
+    host = (parsed.hostname or "").strip().lower()
+    if is_single_label_internal_host(host):
+        return host
+    return ""
+
+
+def detect_internal_canonical_hosts(
+    html_text: str,
+    *,
+    base_url: str,
+    location_header: str = "",
+) -> set[str]:
+    """Detect single-label internal canonical hostnames for loopback/RFC1918 targets only.
+
+    Sources checked (strictly single-label hostnames, never dotted/external domains):
+    1. ``<link rel="canonical" href="...">`` and ``<base href="...">``
+    2. Same-app ``Location`` redirect header
+    3. Dominant single-label host appearing in ``>= 3`` ``<a href>`` / ``<form action>`` tags
+    """
+    if not is_loopback_or_private_base_url(base_url):
+        return set()
+    base_host = (urlsplit(base_url).hostname or "").strip().lower()
+    detected: set[str] = set()
+
+    if location_header:
+        loc_host = _extract_single_label_url_host(location_header)
+        if loc_host and loc_host != base_host:
+            detected.add(loc_host)
+
+    text = str(html_text or "")
+    if not text:
+        return detected
+
+    cleaned = _CANONICAL_SCRIPT_STYLE_RE.sub(" ", text)
+    link_form_counts: dict[str, int] = {}
+
+    for match in _CANONICAL_TAG_RE.finditer(cleaned):
+        tag = match.group(1).lower()
+        attrs_raw = match.group(2) or ""
+        attrs: dict[str, str] = {}
+        for attr_m in _CANONICAL_ATTR_RE.finditer(attrs_raw):
+            aname = attr_m.group(1).lower()
+            aval = attr_m.group(2) if attr_m.group(2) is not None else (
+                attr_m.group(3) if attr_m.group(3) is not None else (attr_m.group(4) or "")
+            )
+            if aname not in attrs:
+                attrs[aname] = aval
+
+        if tag == "link":
+            rel_tokens = {tok for tok in attrs.get("rel", "").lower().split() if tok}
+            if "canonical" in rel_tokens and "href" in attrs:
+                cand_host = _extract_single_label_url_host(attrs["href"])
+                if cand_host and cand_host != base_host:
+                    detected.add(cand_host)
+        elif tag == "base":
+            if "href" in attrs:
+                cand_host = _extract_single_label_url_host(attrs["href"])
+                if cand_host and cand_host != base_host:
+                    detected.add(cand_host)
+        elif tag == "a":
+            href = attrs.get("href", "")
+            cand_host = _extract_single_label_url_host(href)
+            if cand_host and cand_host != base_host:
+                link_form_counts[cand_host] = link_form_counts.get(cand_host, 0) + 1
+        elif tag == "form":
+            action = attrs.get("action", "")
+            cand_host = _extract_single_label_url_host(action)
+            if cand_host and cand_host != base_host:
+                link_form_counts[cand_host] = link_form_counts.get(cand_host, 0) + 1
+
+    if link_form_counts:
+        max_count = max(link_form_counts.values())
+        if max_count >= 3:
+            for host, count in link_form_counts.items():
+                if count == max_count:
+                    detected.add(host)
+
+    return detected
+
+
+def rewrite_internal_canonical_url(
+    raw_url: str,
+    *,
+    base_url: str,
+    canonical_hosts: Iterable[str],
+) -> str:
+    """Rewrite ``http(s)://<alias>[:port]/path?q`` or ``//<alias>[:port]/path?q`` to ``base_url``.
+
+    Strictly inactive unless ``base_url`` is loopback/RFC1918 and ``<alias>`` is a
+    validated single-label hostname present in ``canonical_hosts``.
+    """
+    raw = str(raw_url or "")
+    stripped = raw.strip()
+    if not stripped or not is_loopback_or_private_base_url(base_url):
+        return raw
+    allowed_aliases = {
+        h.strip().lower()
+        for h in canonical_hosts
+        if isinstance(h, str) and is_single_label_internal_host(h)
+    }
+    if not allowed_aliases:
+        return raw
+
+    if stripped.startswith("//"):
+        if stripped.startswith("///"):
+            return raw
+        candidate = f"http:{stripped}"
+    elif stripped.lower().startswith(("http://", "https://")):
+        candidate = stripped
+    else:
+        return raw
+
+    try:
+        parsed = urlsplit(candidate)
+        parsed_base = urlsplit(base_url)
+    except ValueError:
+        return raw
+    if parsed.username is not None or parsed.password is not None:
+        return raw
+    host = (parsed.hostname or "").strip().lower()
+    if host not in allowed_aliases:
+        return raw
+    if not parsed_base.scheme or not parsed_base.netloc:
+        return raw
+    return urlunsplit((
+        parsed_base.scheme,
+        parsed_base.netloc,
+        parsed.path or "/",
+        parsed.query,
+        parsed.fragment,
+    ))
+
+
+def rewrite_internal_canonical_urls_in_text(
+    text: str,
+    *,
+    base_url: str,
+    canonical_hosts: Iterable[str],
+) -> str:
+    """Rewrite validated single-label canonical host URLs inside HTML/JS text to ``base_url``."""
+    if not text or not is_loopback_or_private_base_url(base_url):
+        return text
+    allowed_aliases = sorted(
+        {
+            h.strip().lower()
+            for h in canonical_hosts
+            if isinstance(h, str) and is_single_label_internal_host(h)
+        },
+        key=len,
+        reverse=True,
+    )
+    if not allowed_aliases:
+        return text
+    parsed_base = urlsplit(base_url)
+    if not parsed_base.scheme or not parsed_base.netloc:
+        return text
+    target_origin = f"{parsed_base.scheme}://{parsed_base.netloc}"
+    hosts_alt = "|".join(re.escape(h) for h in allowed_aliases)
+    abs_re = re.compile(
+        rf"""\bhttps?://(?:{hosts_alt})(?::\d{{1,5}})?(?=[/?#"'\s<>)]|$)""",
+        re.IGNORECASE,
+    )
+    rel_re = re.compile(
+        rf"""(?<![A-Za-z0-9:._/-])//(?:{hosts_alt})(?::\d{{1,5}})?(?=[/?#"'\s<>)]|$)""",
+        re.IGNORECASE,
+    )
+    rewritten = abs_re.sub(target_origin, text)
+    return rel_re.sub(target_origin, rewritten)
+
+
+def infer_openapi_mount_prefix(spec: dict[str, Any], spec_url: str = "") -> str:
+    """Infer an OpenAPI/Swagger mount prefix from ``servers``/``basePath`` or a proxied spec URL."""
+    if not isinstance(spec, dict):
+        return ""
+    server_prefix = ""
+    servers = spec.get("servers")
+    if isinstance(servers, list):
+        for srv in servers:
+            if not isinstance(srv, dict):
+                continue
+            srv_url = str(srv.get("url") or "").strip()
+            if not srv_url:
+                continue
+            try:
+                srv_path = urlsplit(srv_url).path or ""
+            except ValueError:
+                continue
+            if srv_path and srv_path != "/" and srv_path.startswith("/") and "{" not in srv_path:
+                norm_srv = normalize_path(srv_path)
+                if norm_srv != "/":
+                    server_prefix = norm_srv
+                    break
+    if not server_prefix:
+        raw_base_path = str(spec.get("basePath") or "").strip()
+        if raw_base_path and raw_base_path != "/" and raw_base_path.startswith("/") and "{" not in raw_base_path:
+            norm_bp = normalize_path(raw_base_path)
+            if norm_bp != "/":
+                server_prefix = norm_bp
+    if server_prefix:
+        return server_prefix
+
+    raw_spec = str(spec_url or "").strip()
+    if not raw_spec:
+        return ""
+    try:
+        norm_spec = normalize_path(urlsplit(raw_spec).path or "/")
+    except ValueError:
+        return ""
+    low_spec = norm_spec.lower()
+    for suffix in _OPENAPI_SPEC_SUFFIXES:
+        if low_spec == suffix:
+            return ""
+        if low_spec.endswith(suffix) and len(norm_spec) > len(suffix):
+            prefix = norm_spec[: len(norm_spec) - len(suffix)].rstrip("/")
+            if prefix.startswith("/") and prefix != "/":
+                return prefix
+    return ""
+
+
+def apply_openapi_path_prefix(raw_path: str, prefix: str) -> str:
+    """Prepend ``prefix`` to ``raw_path`` without double-prefixing paths that already carry it."""
+    path = str(raw_path or "").strip()
+    if not path:
+        return path
+    if not path.startswith("/"):
+        path = "/" + path
+    clean_prefix = str(prefix or "").strip().rstrip("/")
+    if not clean_prefix or clean_prefix == "/":
+        return path
+    if not clean_prefix.startswith("/"):
+        clean_prefix = "/" + clean_prefix
+    low_path = path.lower()
+    low_prefix = clean_prefix.lower()
+    if low_path == low_prefix or low_path.startswith(low_prefix + "/"):
+        return path
+    return f"{clean_prefix}{path}"
+
+
 def _is_auth_utility_path(path: str) -> bool:
     low = path.lower()
     return any(f"/{tok}" in low or low.endswith(tok) for tok in _AUTH_PATH_TOKENS)
@@ -1260,6 +1591,8 @@ class SurfaceFrontierTracker:
         self.base_url = normalize_origin(base_url)
         parsed_origin = urlsplit(self.base_url)
         self._origin = (parsed_origin.scheme, parsed_origin.netloc)
+        self._allow_canonical_host_aliases = is_loopback_or_private_base_url(self.base_url)
+        self.internal_canonical_hosts: set[str] = set()
         self.allowed_methods = frozenset(
             str(m).strip().upper() for m in allowed_methods if str(m).strip()
         ) or frozenset({"GET"})
@@ -1579,6 +1912,12 @@ class SurfaceFrontierTracker:
         if is_non_endpoint_source_path(raw_input):
             return None
         raw = raw_input.strip()
+        if self._allow_canonical_host_aliases and self.internal_canonical_hosts and raw:
+            raw = rewrite_internal_canonical_url(
+                raw,
+                base_url=self.base_url,
+                canonical_hosts=self.internal_canonical_hosts,
+            )
         if not raw or raw.startswith(("#", "javascript:", "mailto:", "tel:", "data:", "//")):
             return None
         base_ref = urljoin(self.base_url, current_url) if current_url else self.base_url
@@ -1942,11 +2281,47 @@ class SurfaceFrontierTracker:
 
         # Follow same-origin redirect Location
         loc = str(receipt.get("redirect_location") or "").strip()
+        if not loc:
+            resp_hdrs = receipt.get("response_headers")
+            if isinstance(resp_hdrs, dict):
+                loc = str(resp_hdrs.get("Location") or resp_hdrs.get("location") or "").strip()
+
+        if self._allow_canonical_host_aliases:
+            low_body_hint = body.lower() if body else ""
+            html_for_canonical = (
+                body
+                if (
+                    is_html_resp
+                    or "href=" in low_body_hint
+                    or "action=" in low_body_hint
+                    or "<link" in low_body_hint
+                    or "<base" in low_body_hint
+                )
+                else ""
+            )
+            detected_aliases = detect_internal_canonical_hosts(
+                html_for_canonical,
+                base_url=self.base_url,
+                location_header=loc,
+            )
+            if detected_aliases:
+                self.internal_canonical_hosts.update(detected_aliases)
+
         if loc:
             self._register_discovered_url(loc, method="GET", actor=actor, current_url=url)
 
         if not body or status >= 500:
             return
+
+        extract_body = (
+            rewrite_internal_canonical_urls_in_text(
+                body,
+                base_url=self.base_url,
+                canonical_hosts=self.internal_canonical_hosts,
+            )
+            if (self._allow_canonical_host_aliases and self.internal_canonical_hosts)
+            else body
+        )
 
         is_collection_2xx = (200 <= status < 300) and ("{id}" not in tmpl) and norm_p != "/"
         col_prefix = f"{norm_p}/"
@@ -1962,7 +2337,7 @@ class SurfaceFrontierTracker:
                 if status in {400, 422}:
                     self._ingest_validation_hints(tmpl, parsed, method=method)
                 if isinstance(parsed, dict) and "paths" in parsed and ("openapi" in parsed or "swagger" in parsed):
-                    self._ingest_openapi_spec(parsed)
+                    self._ingest_openapi_spec(parsed, spec_url=url)
                 hypermedia, _ = extract_json_hypermedia(parsed, url, origin_url=self.base_url)
                 for item in hypermedia:
                     raw_hm_url = str(item.get("url") or "")
@@ -1982,11 +2357,11 @@ class SurfaceFrontierTracker:
                     )
                 if 200 <= status < 300:
                     self._extract_collection_item_paths(norm_p, parsed, actor)
-                for spec_u in find_spec_urls(body, url):
+                for spec_u in find_spec_urls(extract_body, url):
                     self._register_discovered_url(spec_u, method="GET", actor=actor, current_url=url)
 
-        if is_html_resp or "href=" in body.lower():
-            for rec in extract_html(body, url):
+        if is_html_resp or "href=" in body.lower() or "action=" in body.lower():
+            for rec in extract_html(extract_body, url):
                 raw_h_url = str(rec.get("url") or "")
                 h_resolved = self._resolve_same_origin(raw_h_url, current_url=url)
                 h_listed = bool(
@@ -2003,7 +2378,7 @@ class SurfaceFrontierTracker:
                     is_form=(rec.get("sources") == ["form"]),
                     listed_from_collection=h_listed,
                 )
-            for script in extract_inline_scripts(body):
+            for script in extract_inline_scripts(extract_body):
                 for jc in extract_js_calls(script, url, limit=40):
                     self._register_discovered_url(
                         str(jc.get("url") or ""),
@@ -2023,7 +2398,7 @@ class SurfaceFrontierTracker:
                     self._register_discovered_url(spec_u, method="GET", actor=actor, current_url=url)
 
         if "javascript" in ctype or norm_p.lower().endswith((".js", ".mjs")):
-            for jc in extract_js_calls(body, url, limit=80):
+            for jc in extract_js_calls(extract_body, url, limit=80):
                 self._register_discovered_url(
                     str(jc.get("url") or ""),
                     method=str(jc.get("method") or "GET"),
@@ -2032,7 +2407,7 @@ class SurfaceFrontierTracker:
                     current_url=url,
                 )
             kept_js = 0
-            for rec in extract_js(body, url, limit=240):
+            for rec in extract_js(extract_body, url, limit=240):
                 cand_u = str(rec.get("url") or "")
                 if is_non_endpoint_source_path(cand_u):
                     continue
@@ -2047,7 +2422,7 @@ class SurfaceFrontierTracker:
                 if kept_js >= 60:
                     break
             kept_spa = 0
-            for sr in extract_spa_routes(body, url, limit=160):
+            for sr in extract_spa_routes(extract_body, url, limit=160):
                 cand_u = str(sr.get("url") or "")
                 if is_non_endpoint_source_path(cand_u):
                     continue
@@ -2060,24 +2435,26 @@ class SurfaceFrontierTracker:
                 kept_spa += 1
                 if kept_spa >= 60:
                     break
-            for spec_u in find_spec_urls(body, url):
+            for spec_u in find_spec_urls(extract_body, url):
                 self._register_discovered_url(spec_u, method="GET", actor=actor, current_url=url)
 
         if norm_p.lower().endswith("/robots.txt"):
             for rec in extract_robots(body, url):
                 self._register_discovered_url(str(rec.get("url") or ""), method="GET", actor=actor, current_url=url)
         if "xml" in ctype or "<urlset" in body[:512].lower() or "<sitemapindex" in body[:512].lower():
-            for rec in extract_sitemap(body, url):
+            for rec in extract_sitemap(extract_body, url):
                 self._register_discovered_url(str(rec.get("url") or ""), method="GET", actor=actor, current_url=url)
 
-    def _ingest_openapi_spec(self, spec: dict[str, Any]) -> None:
+    def _ingest_openapi_spec(self, spec: dict[str, Any], *, spec_url: str = "") -> None:
         resolver = LocalSchema(spec)
         paths = spec.get("paths")
         if not isinstance(paths, dict):
             return
+        mount_prefix = infer_openapi_mount_prefix(spec, spec_url)
         for raw_path, path_item in paths.items():
             if not isinstance(raw_path, str) or not isinstance(path_item, dict):
                 continue
+            eff_path = apply_openapi_path_prefix(raw_path, mount_prefix)
             raw_path_params = path_item.get("parameters")
             path_params = raw_path_params if isinstance(raw_path_params, list) else []
             for method_low in ("get", "post", "put", "patch", "delete", "head"):
@@ -2095,7 +2472,7 @@ class SurfaceFrontierTracker:
                     if pname and pin == "query":
                         q_params.append(str(pname))
                 self._register_discovered_url(
-                    raw_path,
+                    eff_path,
                     method=m_up,
                     params=q_params,
                     current_url=self.base_url,

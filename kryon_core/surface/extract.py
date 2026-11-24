@@ -12,6 +12,8 @@ from urllib.parse import unquote, urljoin, urlparse, urlsplit
 
 from .normalize import (
     has_google_identity_sdk_context,
+    is_js_property_dot_path,
+    is_known_web_extension,
     is_os_filesystem_path,
     is_port_in_path_artifact,
     is_third_party_sdk_static_route,
@@ -928,6 +930,9 @@ def _is_content_hash_token(token: str) -> bool:
     """Return True when a filename suffix token looks like a bundler content hash (Vite/Rollup/Webpack)."""
     if len(token) < 7 or len(token) > 32:
         return False
+    # Vite/Rollup epoch-timestamp asset chunks (10-16 digit Unix s/ms/us timestamps)
+    if 10 <= len(token) <= 16 and token.isascii() and token.isdigit():
+        return True
     has_digit = any(ch.isdigit() for ch in token)
     has_alpha = any(ch.isalpha() for ch in token)
     if len(token) >= 8 and has_digit and has_alpha and all(ch in _HEX_CHARS_SET for ch in token):
@@ -978,6 +983,99 @@ def is_hashed_asset_chunk_path(url_or_path: str) -> bool:
     return _is_content_hash_token(match.group(1))
 
 
+_KNOWN_SHORT_UPPER_ROUTES = frozenset({
+    "API", "SSO", "JWT", "MFA", "OTP", "APP", "DOC", "DOCS", "AUTH", "HOME",
+    "MENU", "USER", "INFO", "HELP", "BLOG", "SHOP", "CART", "TEST", "PING",
+    "LOGS", "SAML", "OIDC", "REST", "SOAP", "GRPC", "JSON", "HTML", "HTTP",
+    "CORS", "CSRF", "CMS", "CRM", "ERP", "RPC", "SQL", "XML", "CSV", "PDF",
+    "RSS", "CDN", "WAF", "DNS", "FTP", "SSH", "OAUTH",
+})
+_UPPER_VERSION_TOKEN_RE = re.compile(r"^V\d{1,2}$")
+_VOWEL_CHARS = frozenset("aeiouyAEIOUY")
+_BARE_JS_IDENT_PART_RE = re.compile(r"^[A-Za-z_$][A-Za-z0-9_$]*$")
+
+
+def _is_minified_js_noise_path(path: str, *, is_unrooted_rel: bool = False) -> bool:
+    """Return True for minified Webpack module-ID tokens and 1-char/1-char JS fragment pairs.
+
+    Filters:
+    - Multi-segment paths where every segment has length 1 (e.g. ``/i/W``, ``/a/B``).
+    - Single-segment 2-4 char alphanumeric tokens containing uppercase letters with digits
+      (``/86O``, ``/99E``, ``/I4U``), internal mixed case (``/bQp``), consonant-only TitleCase,
+      or 3-4 letter all-uppercase non-route tokens (``/ZBO``, ``/BOW``).
+
+    Preserves explicit known routes (``/API``, ``/SSO``, ``/JWT``, ``/OAuth``, ``/V1``),
+    vowel-bearing TitleCase routes (``/Home``, ``/User``, ``/Auth``), and ALL lowercase routes
+    (``/api``, ``/app``, ``/v1``, ``/v2``, ``/ui``, ``/ws``, ``/doc``, ``/docs``, etc.).
+    """
+    check_path = (path or "").strip()
+    if not check_path or check_path == "/":
+        return False
+    if is_unrooted_rel:
+        while check_path.startswith(("./", "../")):
+            check_path = check_path[2:] if check_path.startswith("./") else check_path[3:]
+    else:
+        while check_path.startswith("./"):
+            check_path = check_path[2:]
+    segs = [seg for seg in check_path.split("/") if seg]
+    if not segs:
+        return False
+    if len(segs) >= 2 and all(len(seg) == 1 for seg in segs):
+        return True
+    if len(segs) != 1:
+        return False
+    seg = segs[0]
+    if not (2 <= len(seg) <= 4) or not (seg.isascii() and seg.isalnum()):
+        return False
+    has_upper = any(ch.isupper() for ch in seg)
+    if not has_upper:
+        return False
+    if seg.upper() in _KNOWN_SHORT_UPPER_ROUTES or _UPPER_VERSION_TOKEN_RE.fullmatch(seg):
+        return False
+    has_digit = any(ch.isdigit() for ch in seg)
+    if has_digit:
+        return True
+    has_lower = any(ch.islower() for ch in seg)
+    if has_lower:
+        if any(ch.isupper() for ch in seg[1:]):
+            return True
+        if len(seg) >= 3 and not any(ch in _VOWEL_CHARS for ch in seg):
+            return True
+        return False
+    return len(seg) >= 3
+
+
+def _is_bare_numeric_root_path(url_or_path: str) -> bool:
+    """Return True for bare single-segment numeric root paths like ``/1``, ``/2``, ``/42``."""
+    raw = str(url_or_path or "").strip()
+    if not raw:
+        return False
+    try:
+        parsed = urlsplit(raw)
+    except ValueError:
+        return False
+    if parsed.query:
+        return False
+    path = (parsed.path or "").strip()
+    if not path or path == "/":
+        return False
+    segs = [seg for seg in path.split("/") if seg]
+    return len(segs) == 1 and segs[0].isascii() and segs[0].isdigit()
+
+
+def _is_bare_js_property_token(raw_candidate: str) -> bool:
+    """Return True for bare relative dot-property chains like ``lineStyle.color`` (no slash/scheme)."""
+    cand = (raw_candidate or "").strip().split("#", 1)[0].split("?", 1)[0]
+    if not cand or "/" in cand or "://" in cand or "." not in cand:
+        return False
+    if cand.startswith(".") or cand.endswith("."):
+        return False
+    parts = cand.split(".")
+    if len(parts) < 2 or not all(_BARE_JS_IDENT_PART_RE.fullmatch(part) for part in parts):
+        return False
+    return not is_known_web_extension(parts[-1])
+
+
 def is_non_endpoint_noise_path(url_or_path: str) -> bool:
     """Return True for frontend source modules, bundler chunk internals, OS filesystem paths, schema pointers, and path noise.
 
@@ -985,7 +1083,9 @@ def is_non_endpoint_noise_path(url_or_path: str) -> bool:
     filtering SvelteKit/Next.js/Vite build internals (`/_app/immutable/`, `/_app/version.json`,
     `/_next/static/`, `/_next/data/`, `/chunks/<hash>.js`, `/nodes/<id>.<hash>.js`,
     `/assets/Panel-<hash>.js`), OS filesystem paths (`/var/www/...`, `/Users/<user>/...`,
-    `/etc/...`, `C:/...`), dollar-prefixed schema refs, and implausible base64/WASM/JS-syntax fragments.
+    `/etc/...`, `C:/...`), JS object-property dot paths under script/asset dirs (`/static/js/lineStyle.color`),
+    minified Webpack module-ID tokens (`/86O`, `/99E`, `/bQp`, `/ZBO`) and 1-char/1-char JS fragment pairs
+    (`/i/W`, `/a/B`), dollar-prefixed schema refs, and implausible base64/WASM/JS-syntax fragments.
     """
     raw = str(url_or_path or "").strip()
     if not raw:
@@ -1000,7 +1100,12 @@ def is_non_endpoint_noise_path(url_or_path: str) -> bool:
         return True
     if not path or path == "/":
         return False
-    if is_os_filesystem_path(path) or is_hashed_asset_chunk_path(path):
+    if (
+        is_os_filesystem_path(path)
+        or is_hashed_asset_chunk_path(path)
+        or is_js_property_dot_path(path)
+        or _is_minified_js_noise_path(path, is_unrooted_rel=is_unrooted_rel)
+    ):
         return True
     norm_path = path.lower()
     if is_unrooted_rel:
@@ -1212,6 +1317,8 @@ def extract_js_calls(text: str, base: str, allow_subdomains: bool = False,
         templated_norm = normalize_bare_hostport_url(templated, base=call_base)
         if (
             not templated_norm
+            or (templated_norm.isascii() and templated_norm.isdigit())
+            or _is_bare_js_property_token(templated_norm)
             or is_port_in_path_artifact(templated_norm, origin_url=base)
             or is_os_filesystem_path(templated_norm)
         ):
@@ -1225,6 +1332,7 @@ def extract_js_calls(text: str, base: str, allow_subdomains: bool = False,
             is_third_party_sdk_static_route(url, sdk_context=sdk_ctx)
             or is_port_in_path_artifact(url, origin_url=base)
             or is_os_filesystem_path(url)
+            or _is_bare_numeric_root_path(url)
         ):
             continue
         parsed_url = urlparse(url)
@@ -1402,6 +1510,7 @@ def extract_spa_routes(
             is_third_party_sdk_static_route(url, sdk_context=sdk_ctx)
             or is_port_in_path_artifact(url, origin_url=base)
             or is_os_filesystem_path(url)
+            or _is_bare_numeric_root_path(url)
         ):
             return
         if urlparse(url).path == "/" and not urlparse(url).query:
@@ -1473,7 +1582,8 @@ def _looks_js_url_or_path(val: str) -> bool:
         return True
     if re.fullmatch(r"[A-Za-z0-9._~-]+(?:/[A-Za-z0-9._~-]+)+(?:\?[^\s]*)?", val):
         return True
-    return bool(re.fullmatch(r"[A-Za-z0-9._~-]+\.[A-Za-z][A-Za-z0-9]{1,5}(?:\?[^\s]*)?", val))
+    match = re.fullmatch(r"[A-Za-z0-9._~-]+\.([A-Za-z][A-Za-z0-9]{1,7})(?:\?[^\s]*)?", val)
+    return bool(match and is_known_web_extension(match.group(1)))
 
 
 def _eval_js_template_literal(raw_tmpl: str, symtab: dict[str, str]) -> str | None:
@@ -1561,6 +1671,8 @@ def extract_js(text: str, base: str, allow_subdomains: bool = False, limit: int 
         cand = normalize_bare_hostport_url((candidate or "").strip(), base=base)
         if not cand or "${" in cand:
             return False
+        if (cand.isascii() and cand.isdigit()) or _is_bare_js_property_token(cand):
+            return False
         if (
             is_third_party_sdk_static_route(cand, sdk_context=sdk_ctx)
             or is_port_in_path_artifact(cand, origin_url=base)
@@ -1584,6 +1696,7 @@ def extract_js(text: str, base: str, allow_subdomains: bool = False, limit: int 
             is_third_party_sdk_static_route(url, sdk_context=sdk_ctx)
             or is_port_in_path_artifact(url, origin_url=base)
             or is_os_filesystem_path(url)
+            or _is_bare_numeric_root_path(url)
         ):
             return False
         if is_non_endpoint_noise_path(url):

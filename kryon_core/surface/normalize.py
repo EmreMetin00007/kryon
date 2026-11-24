@@ -125,6 +125,8 @@ def discovery_link_skip_reason(url: str) -> str:
             return "invalid_discovery_url"
         if is_os_filesystem_path(url) or is_os_filesystem_path(path):
             return "os_filesystem_path"
+        if is_js_property_dot_path(url) or is_js_property_dot_path(path):
+            return "js_property_dot_path"
         if _DISCOVERY_MUTATING_WORD.search(path) or any(
                 _DISCOVERY_MUTATING_WORD.search(name) or _DISCOVERY_MUTATING_WORD.search(value)
                 for name, value in decoded_pairs):
@@ -411,6 +413,81 @@ def is_os_filesystem_path(url_or_path: str) -> bool:
             )
         )
     return False
+
+
+_KNOWN_WEB_FILE_EXTENSIONS = frozenset({
+    "html", "htm", "xhtml", "shtml", "php", "php5", "php7", "phtml",
+    "jsp", "jspx", "asp", "aspx", "ashx", "asmx", "axd", "svc", "cfm", "cfc",
+    "do", "action", "cgi", "pl", "py", "rb", "sh",
+    "json", "xml", "yaml", "yml", "toml", "txt", "md", "csv", "rss", "atom",
+    "js", "mjs", "cjs", "ts", "tsx", "jsx", "vue", "svelte",
+    "css", "scss", "sass", "less", "styl", "map", "wasm", "webmanifest",
+    "ico", "svg", "png", "jpg", "jpeg", "gif", "webp", "bmp", "avif",
+    "woff", "woff2", "ttf", "otf", "eot",
+    "mp4", "mp3", "webm", "wav",
+    "pdf", "doc", "docx", "xls", "xlsx", "ppt", "pptx",
+    "zip", "tar", "gz", "tgz", "bz2", "xz", "7z", "rar", "jar", "war",
+    "sql", "sqlite", "db", "bak", "old", "orig",
+    "env", "ini", "conf", "cfg", "config", "properties", "log",
+    "pem", "crt", "key",
+    "graphql", "gql", "wsdl", "wadl",
+})
+_JS_SCRIPT_ASSET_DIRS = frozenset({
+    "js", "javascript", "scripts", "script", "assets", "static",
+    "dist", "build", "chunks", "chunk", "bundles", "bundle",
+})
+_JS_PROP_API_PREFIX_RE = re.compile(r"(?:^|/)(?:api(?:/v\d+)?|graphql|rest|rpc)(?:/|$)", re.I)
+_JS_IDENT_PART_RE = re.compile(r"^[A-Za-z_$][A-Za-z0-9_$]*$")
+
+
+def is_known_web_extension(ext: str) -> bool:
+    """Return True when ``ext`` (with or without leading dot) is a known web/document/code/archive extension."""
+    cleaned = str(ext or "").strip().lstrip(".").lower()
+    return bool(cleaned) and cleaned in _KNOWN_WEB_FILE_EXTENSIONS
+
+
+def is_js_property_dot_path(url_or_path: str) -> bool:
+    """Return True when a URL path under a script/asset dir looks like a JS property-access string.
+
+    Filters relative JS property strings resolved under script/asset directories such as
+    ``/static/js/lineStyle.color``, ``/js/itemStyle.borderColor``, and ``/assets/tooltip.formatter``
+    where the trailing segment is a dot-joined JS identifier chain whose final suffix is not a
+    known web/document/code/archive/media extension.
+
+    Preserves legitimate dotted endpoints such as ``/index/Article/info.html``,
+    ``/api/v1/users.json``, ``/admin/config.ini``, ``/api/v2.1/orders``, and
+    ``/.well-known/openid-configuration``.
+    """
+    raw = str(url_or_path or "").strip()
+    if not raw:
+        return False
+    try:
+        parsed = urlsplit(raw)
+    except ValueError:
+        return False
+    path = (parsed.path or "").strip()
+    if not path or path == "/" or "=" in path:
+        return False
+    check_path = path
+    while check_path.startswith(("./", "../")):
+        check_path = check_path[2:] if check_path.startswith("./") else check_path[3:]
+    segs = [seg for seg in check_path.split("/") if seg]
+    if len(segs) < 2:
+        return False
+    if any(seg.startswith(".") for seg in segs):
+        return False
+    if _JS_PROP_API_PREFIX_RE.search("/" + "/".join(segs).lower()):
+        return False
+    dir_segs = [seg.lower() for seg in segs[:-1]]
+    if not any(seg in _JS_SCRIPT_ASSET_DIRS for seg in dir_segs):
+        return False
+    last = segs[-1]
+    if "." not in last or last.startswith(".") or last.endswith("."):
+        return False
+    parts = last.split(".")
+    if len(parts) < 2 or not all(_JS_IDENT_PART_RE.fullmatch(part) for part in parts):
+        return False
+    return parts[-1].lower() not in _KNOWN_WEB_FILE_EXTENSIONS
 
 
 def has_google_identity_sdk_context(text: str) -> bool:

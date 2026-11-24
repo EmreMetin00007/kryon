@@ -547,6 +547,219 @@ _OVERRIDDEN_AUTH_HEADERS = frozenset({
     "x-auth-token",
     "x-api-key",
 })
+_CREDENTIAL_BODY_KEY_EXACT = frozenset({
+    "password",
+    "passwd",
+    "pwd",
+    "pass",
+    "passcode",
+    "passphrase",
+    "secret",
+    "credential",
+    "credentials",
+    "cred",
+    "creds",
+    "pin",
+    "pincode",
+    "otp",
+    "totp",
+    "mfa",
+    "code",
+    "verifycode",
+    "verificationcode",
+    "authcode",
+    "clientsecret",
+    "appsecret",
+})
+_CREDENTIAL_BODY_KEY_TOKENS = frozenset({
+    "password",
+    "passwd",
+    "pwd",
+    "pass",
+    "passcode",
+    "passphrase",
+    "secret",
+    "credential",
+    "credentials",
+    "cred",
+    "creds",
+    "pin",
+    "otp",
+    "totp",
+    "mfa",
+})
+_CREDENTIAL_CODE_PREFIX_TOKENS = frozenset({
+    "verify",
+    "verification",
+    "auth",
+    "authentication",
+    "login",
+    "signin",
+    "mfa",
+    "2fa",
+    "twofa",
+    "sms",
+    "security",
+    "access",
+    "otp",
+    "totp",
+    "pin",
+    "pass",
+})
+_CAMEL_BOUNDARY_RE = re.compile(r"([a-z0-9])([A-Z])")
+_REDACTED_CRED_JSON_PAIR_RE = re.compile(
+    r"""["']([A-Za-z0-9_.-]{1,64})["']\s*:\s*["']([^"']*<(?:REDACTED_SECRET[^"']*|REDACTED)>[^"']*)["']"""
+)
+_AUTH_ENDPOINT_PATH_RE = re.compile(
+    r"/(?:login|log[-_]?in|signin|sign[-_]?in|auth(?:enticate|entication|orize|orization)?|"
+    r"tokens?|oauth2?|jwt|sessions?|sso|oidc|mfa|2fa|otp)(?:/|$)",
+    re.IGNORECASE,
+)
+_AUTH_REJECTION_BODY_RE = re.compile(
+    r"(?<![a-z0-9])(?:"
+    r"(?:illegal|invalid|wrong|bad|incorrect|missing|expired|failed|mismatch(?:ed)?)[_\s-]*"
+    r"(?:password|passwd|pwd|passcode|passphrase|credentials?|secret|pin|otp|totp|token|login|auth(?:entication)?|grant|client|code)"
+    r"|(?:password|passwd|pwd|passcode|passphrase|credentials?|login|signin|sign[-_]?in|auth(?:entication|orization)?|unauthenticated|unauthorized|otp|totp|mfa|pin)[_\s-]*"
+    r"(?:error|fail(?:ed|ure)?|invalid|illegal|incorrect|wrong|denied|reject(?:ed)?|mismatch(?:ed)?|required|expired|validation|check)"
+    r"|illegal_password|bad_credentials|invalid_grant|access_denied|unauthorized|unauthenticated|authentication|credential"
+    r"|password|passwd|passcode"
+    r")(?![a-z0-9])",
+    re.IGNORECASE,
+)
+
+
+def _has_redacted_credential_placeholder(value: str) -> bool:
+    """Return True if a value contains a ReceiptStore redacted credential placeholder."""
+    return "<REDACTED_SECRET" in value or "<REDACTED>" in value
+
+
+def _is_credential_body_key(raw_key: str) -> bool:
+    """Return True if a JSON or form field key denotes a password/secret/credential input."""
+    clean = str(raw_key or "").strip()
+    if not clean:
+        return False
+    low = clean.lower()
+    if low in _CREDENTIAL_BODY_KEY_EXACT:
+        return True
+    normalized = _CAMEL_BOUNDARY_RE.sub(r"\1_\2", clean).lower()
+    tokens = [tok for tok in re.split(r"[^a-z0-9]+", normalized) if tok]
+    if not tokens:
+        return False
+    if any(tok in _CREDENTIAL_BODY_KEY_TOKENS for tok in tokens):
+        return True
+    if "code" in tokens and any(tok in _CREDENTIAL_CODE_PREFIX_TOKENS for tok in tokens):
+        return True
+    return False
+
+
+def _contains_redacted_placeholder_in_obj(obj: Any, *, max_nodes: int = 100) -> bool:
+    stack: list[Any] = [obj]
+    visited = 0
+    while stack and visited < max_nodes:
+        cur = stack.pop()
+        visited += 1
+        if isinstance(cur, str):
+            if _has_redacted_credential_placeholder(cur):
+                return True
+        elif isinstance(cur, dict):
+            stack.extend(cur.values())
+        elif isinstance(cur, list):
+            stack.extend(cur[:50])
+    return False
+
+
+def _has_redacted_credential_body(receipt: dict[str, Any]) -> bool:
+    """Return True if `receipt`'s saved request_body has a redacted placeholder on a credential key."""
+    raw_body = str(receipt.get("request_body") or "").strip()
+    if not raw_body or "REDACTED" not in raw_body:
+        return False
+
+    parsed_json = _try_parse_json_body(raw_body)
+    if parsed_json is not None:
+        stack: list[Any] = [parsed_json]
+        visited = 0
+        while stack and visited < 200:
+            cur = stack.pop()
+            visited += 1
+            if isinstance(cur, dict):
+                for k, v in cur.items():
+                    if _is_credential_body_key(str(k)):
+                        if isinstance(v, str) and _has_redacted_credential_placeholder(v):
+                            return True
+                        if isinstance(v, (dict, list)) and _contains_redacted_placeholder_in_obj(v):
+                            return True
+                    if isinstance(v, (dict, list)):
+                        stack.append(v)
+            elif isinstance(cur, list):
+                for item in cur[:50]:
+                    if isinstance(item, (dict, list)):
+                        stack.append(item)
+        return False
+
+    if "=" in raw_body and not raw_body.startswith("<") and "\n" not in raw_body[:256]:
+        for k, v in parse_qsl(raw_body, keep_blank_values=True):
+            if _is_credential_body_key(k) and _has_redacted_credential_placeholder(v):
+                return True
+        return False
+
+    # Fallback for truncated JSON bodies where ReceiptStore clipped the preview before closing braces.
+    if raw_body.lstrip().startswith(("{", "[")):
+        for match in _REDACTED_CRED_JSON_PAIR_RE.finditer(raw_body):
+            if _is_credential_body_key(match.group(1)):
+                return True
+    return False
+
+
+def _can_accept_redacted_credential_body_replay(
+    replay_target: dict[str, Any],
+    replay_rec: dict[str, Any],
+    *,
+    evidence_value: str,
+    canonical_class: str,
+) -> bool:
+    """Fail-closed Stage 3 guard when clean replay fails solely due to a redacted body credential.
+
+    Returns True ONLY when:
+    1. `replay_target` is a mutating (`POST`/`PUT`/`PATCH`) request with 2xx/3xx status.
+    2. `replay_target`'s saved `request_body` explicitly contains a redacted credential placeholder
+       (`<REDACTED_SECRET...>` or `<REDACTED>`) associated with a credential/password/secret key.
+    3. `replay_rec` returned an auth/validation rejection status (`400`, `401`, or `403`).
+    4. When `replay_rec` status is `400`, either its response body contains an auth/credential/
+       password/login rejection indicator or `replay_target` targets a login/auth/token/session endpoint.
+    5. Non-empty `evidence_value` is corroborated in the original `replay_target` receipt.
+    """
+    method = str(replay_target.get("method") or "").upper()
+    if method not in _WRITE_METHODS:
+        return False
+    orig_status = int(replay_target.get("status") or 0)
+    if not (200 <= orig_status < 400):
+        return False
+    if not _has_redacted_credential_body(replay_target):
+        return False
+
+    replay_status = int(replay_rec.get("status") or 0)
+    if replay_status not in {400, 401, 403}:
+        return False
+
+    if replay_status == 400:
+        replay_body = str(replay_rec.get("body") or "")
+        target_path = _norm_url_path(str(replay_target.get("url") or replay_target.get("path") or ""))
+        if not (_AUTH_REJECTION_BODY_RE.search(replay_body) or _AUTH_ENDPOINT_PATH_RE.search(target_path)):
+            return False
+
+    ev = str(evidence_value or "").strip()
+    if ev and not _receipt_contains_evidence(replay_target, ev, canonical_class=canonical_class):
+        return False
+
+    if canonical_class == "cors_misconfiguration":
+        orig_acao = _response_header_ci(replay_target, "access-control-allow-origin")
+        proof_origin = _request_header_ci(replay_target, "origin")
+        return bool(
+            orig_acao
+            and (orig_acao == "*" or (bool(proof_origin) and orig_acao.lower() == proof_origin.lower()))
+        )
+
+    return True
 
 
 def _has_overridden_redacted_auth_header(
@@ -2942,7 +3155,13 @@ class DifferentialOracle:
         # --- Stage 3: Clean-Session Replay in fresh isolated requests.Session() ---
         if canonical_class == "race_condition" or (
             canonical_class == "business_logic"
-            and (str(primary_proof.get("method") or "").upper() in _MUTATING_METHODS or len(proof_receipts) >= 2)
+            and (
+                len(proof_receipts) >= 2
+                or (
+                    str(primary_proof.get("method") or "").upper() in _MUTATING_METHODS
+                    and not _has_redacted_credential_body(primary_proof)
+                )
+            )
         ):
             stages["stage3_clean_replay"] = "skipped_non_idempotent_concurrency"
             return OracleVerdict(
@@ -3128,6 +3347,36 @@ class DifferentialOracle:
                 reason=(
                     "Verified weak_credentials via Stage 1-2 login differential and live "
                     "clean-session rejection when credential field is redacted in receipt."
+                ),
+                mode=self.mode,
+                stages=stages,
+                clean_replay_receipt_id=replay_rec["receipt_id"],
+                control_probe_receipt_id=ctrl_probe_rid,
+            )
+
+        # Generalized fail-closed redacted-credential body replay guard for non-weak_credentials
+        # classes (e.g. mass_assignment / business_logic / session_management on login endpoints):
+        # Stage 1 control and Stage 2 masked diff already passed, and clean replay could not
+        # resend the redacted credential body verbatim, triggering a live 400/401/403 rejection.
+        if (
+            canonical_class != "weak_credentials"
+            and not has_redacted_auth_override
+            and (bool(eff_controls) or is_oob_verified)
+            and _can_accept_redacted_credential_body_replay(
+                replay_target,
+                replay_rec,
+                evidence_value=ev,
+                canonical_class=canonical_class,
+            )
+        ):
+            stages["stage3_clean_replay"] = "passed_redacted_credential_replay_exempt"
+            return OracleVerdict(
+                verified=True,
+                verdict="VERIFIED",
+                reason=(
+                    f"Verified {canonical_class} via Stage 1-2 differential; Stage 3 clean replay "
+                    f"returned {r_status} because the saved request body's credential field is "
+                    "redacted and could not be resent verbatim."
                 ),
                 mode=self.mode,
                 stages=stages,
