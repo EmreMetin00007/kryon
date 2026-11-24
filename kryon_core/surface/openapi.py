@@ -5,7 +5,9 @@ request satisfies every constraint. External references never cause I/O.
 """
 from __future__ import annotations
 
+from collections.abc import Mapping
 import math
+import re
 from typing import Any
 from urllib.parse import unquote
 
@@ -13,6 +15,57 @@ from .normalize import safe_sample
 
 _MISSING = object()
 _TYPES = {"string", "integer", "number", "boolean", "object", "array", "null"}
+_HEADER_NAME_RE = re.compile(r"^[!#$%&'*+\-.^_`|~0-9A-Za-z]{1,128}$")
+_MAX_OPENAPI_AUTH_HEADER_NAMES = 16
+_IGNORED_NON_AUTH_HEADERS = frozenset({
+    "accept",
+    "accept-charset",
+    "accept-encoding",
+    "accept-language",
+    "cache-control",
+    "connection",
+    "content-disposition",
+    "content-encoding",
+    "content-language",
+    "content-length",
+    "content-type",
+    "cookie",
+    "date",
+    "expect",
+    "forwarded",
+    "from",
+    "host",
+    "if-match",
+    "if-modified-since",
+    "if-none-match",
+    "if-range",
+    "if-unmodified-since",
+    "origin",
+    "pragma",
+    "range",
+    "referer",
+    "set-cookie",
+    "te",
+    "traceparent",
+    "tracestate",
+    "trailer",
+    "transfer-encoding",
+    "upgrade",
+    "user-agent",
+    "via",
+    "warning",
+    "x-correlation-id",
+    "x-csrf-token",
+    "x-csrf-token-next",
+    "x-csrftoken",
+    "x-forwarded-for",
+    "x-forwarded-host",
+    "x-forwarded-proto",
+    "x-real-ip",
+    "x-request-id",
+    "x-trace-id",
+    "x-xsrf-token",
+})
 
 
 def _properties(node):
@@ -299,3 +352,61 @@ def openapi_parameters(document: dict, operation: dict, inherited=None) -> list[
         if ("json", "$body") in params:
             params[("json", "$body")]["body_root"] = True
     return list(params.values())
+
+
+def extract_openapi_header_auth_names(spec: Mapping[str, Any]) -> list[str]:
+    """Extract deduplicated header auth names from OpenAPI 3 securitySchemes and Swagger 2 securityDefinitions."""
+    if not isinstance(spec, Mapping):
+        return []
+
+    scheme_maps: list[Mapping[str, Any]] = []
+    components = spec.get("components")
+    if isinstance(components, Mapping):
+        sec_schemes = components.get("securitySchemes")
+        if isinstance(sec_schemes, Mapping):
+            scheme_maps.append(sec_schemes)
+    sec_defs = spec.get("securityDefinitions")
+    if isinstance(sec_defs, Mapping):
+        scheme_maps.append(sec_defs)
+
+    if not scheme_maps:
+        return []
+
+    resolver = LocalSchema(spec) if isinstance(spec, dict) else None
+    api_key_headers: list[str] = []
+    seen_lower: set[str] = set()
+    has_http_bearer = False
+
+    for scheme_map in scheme_maps:
+        for raw_scheme in list(scheme_map.values())[:64]:
+            if not isinstance(raw_scheme, Mapping):
+                continue
+            scheme: Mapping[str, Any] = (
+                resolver.resolve(dict(raw_scheme))
+                if resolver is not None and "$ref" in raw_scheme
+                else raw_scheme
+            )
+            scheme_type = str(scheme.get("type") or "").strip().lower()
+            if scheme_type == "apikey":
+                location = str(scheme.get("in") or "").strip().lower()
+                if location != "header":
+                    continue
+                header_name = str(scheme.get("name") or "").strip()
+                if not header_name or not _HEADER_NAME_RE.fullmatch(header_name):
+                    continue
+                header_low = header_name.lower()
+                if header_low in _IGNORED_NON_AUTH_HEADERS or header_low in seen_lower:
+                    continue
+                seen_lower.add(header_low)
+                api_key_headers.append(header_name)
+                if len(api_key_headers) >= _MAX_OPENAPI_AUTH_HEADER_NAMES:
+                    return api_key_headers
+            elif scheme_type == "http":
+                http_scheme = str(scheme.get("scheme") or "").strip().lower()
+                if http_scheme == "bearer":
+                    has_http_bearer = True
+
+    if has_http_bearer and "authorization" not in seen_lower and len(api_key_headers) < _MAX_OPENAPI_AUTH_HEADER_NAMES:
+        api_key_headers.append("Authorization")
+
+    return api_key_headers[:_MAX_OPENAPI_AUTH_HEADER_NAMES]

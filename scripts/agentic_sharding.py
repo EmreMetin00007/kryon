@@ -130,9 +130,146 @@ _SYNTHESIS_BLOCKER_KEYWORDS = (
     "budget exhausted",
 )
 _WRITE_HTTP_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
+_METHOD_DISPLAY_ORDER: dict[str, int] = {
+    "POST": 0,
+    "PUT": 1,
+    "PATCH": 2,
+    "DELETE": 3,
+    "GET": 4,
+    "HEAD": 5,
+    "OPTIONS": 6,
+}
+_SECURITY_BUCKET_TIER1_TOKENS = frozenset({
+    "auth",
+    "login",
+    "signin",
+    "signup",
+    "register",
+    "password",
+    "passwd",
+    "reset",
+    "role",
+    "roles",
+    "permission",
+    "permissions",
+    "admin",
+    "user",
+    "users",
+    "account",
+    "accounts",
+    "token",
+    "secret",
+    "upload",
+    "uploads",
+    "import",
+    "script",
+    "scripts",
+    "exec",
+    "eval",
+    "command",
+    "cmd",
+    "shell",
+    "proxy",
+    "webhook",
+    "webhooks",
+})
+_SECURITY_BUCKET_TIER2_TOKENS = frozenset({
+    "file",
+    "files",
+    "download",
+    "export",
+    "query",
+    "search",
+    "callback",
+    "fetch",
+    "redirect",
+    "forward",
+})
+_LOW_RISK_METADATA_TOKENS = frozenset({
+    "dictionary",
+    "dict",
+    "count",
+    "counts",
+    "stat",
+    "stats",
+    "metadata",
+    "meta",
+    "health",
+    "healthz",
+    "ready",
+    "readyz",
+    "livez",
+    "version",
+    "ping",
+    "enum",
+    "enums",
+    "tree",
+    "about",
+    "help",
+    "faq",
+    "changelog",
+    "license",
+})
 _TEXT_KV_RE = re.compile(
     r"(?i)\b([A-Za-z][A-Za-z0-9_.-]{1,48})\s*[:=]\s*([\"']?)([^\s\"'`,;}{\\]{2,120})\2"
 )
+
+
+def _method_sort_key(method: str) -> tuple[int, str]:
+    """Sort mutating methods before safe methods using canonical HTTP display order."""
+    m = str(method or "").strip().upper()
+    return (_METHOD_DISPLAY_ORDER.get(m, 9), m)
+
+
+def _route_path_tokens(route_template: str) -> set[str]:
+    """Extract normalized alphanumeric path tokens, ignoring `{param}` placeholders."""
+    tokens: set[str] = set()
+    for seg in str(route_template or "").lower().split("/"):
+        if not seg or seg.startswith("{"):
+            continue
+        stem = seg.rsplit(".", 1)[0] if "." in seg else seg
+        for tok in _KEY_TOKEN_SPLIT_RE.split(stem):
+            if tok:
+                tokens.add(tok)
+    return tokens
+
+
+def _adjust_route_risk_score(
+    tmpl: str,
+    *,
+    base_score: int,
+    methods: Sequence[str],
+    params: Sequence[str],
+    is_form: bool = False,
+    has_body_template: bool = False,
+) -> int:
+    """Apply security-bucket, path-ID BOLA, and metadata risk adjustments to base score."""
+    score = int(base_score)
+    if is_logout_or_destructive_route(tmpl):
+        return score
+
+    norm_methods = [str(m or "").strip().upper() for m in methods if str(m or "").strip()]
+    mutating_count = sum(1 for m in norm_methods if m in _WRITE_HTTP_METHODS)
+    has_mutating = mutating_count > 0
+    has_path_id = "{id}" in tmpl or "{val}" in tmpl
+    has_interactive = has_mutating or bool(params) or has_path_id or is_form or has_body_template
+
+    tokens = _route_path_tokens(tmpl)
+    tier1_hit = bool(tokens & _SECURITY_BUCKET_TIER1_TOKENS)
+    tier2_hit = bool(tokens & _SECURITY_BUCKET_TIER2_TOKENS)
+
+    if tier1_hit:
+        score += 12 if has_interactive else 8
+    if tier2_hit:
+        score += 6 if has_interactive else 5
+    if "{id}" in tmpl:
+        score += 4
+    if mutating_count > 1:
+        score += min(4, (mutating_count - 1) * 2)
+
+    if not has_interactive and not tier1_hit and not tier2_hit and (tokens & _LOW_RISK_METADATA_TOKENS):
+        score = max(0, score - 2)
+    return score
 
 
 def _is_virgin_state_action_path(path_or_url: str) -> bool:
@@ -163,6 +300,7 @@ class SubsystemCluster:
     params: dict[str, list[str]]
     body_templates: dict[str, Any] = field(default_factory=dict)
     schema_hints: dict[str, list[str]] = field(default_factory=dict)
+    methods_by_route: dict[str, list[str]] = field(default_factory=dict)
 
 
 def extract_resource_family(path: str) -> str:
@@ -314,20 +452,27 @@ def _rank_routes_by_input_risk(
         if not mset:
             mset = {"GET"}
 
-        ordered_methods = sorted(
-            mset,
-            key=lambda m: (0 if m in _WRITE_HTTP_METHODS else 1, m),
-        )
+        ordered_methods = sorted(mset, key=_method_sort_key)
         p_raw = list(params_map.get(tmpl) or ())
         ordered_params = _order_params_by_risk(p_raw)
         hints = [str(h).strip() for h in (schema_map.get(tmpl) or ()) if str(h).strip()]
-        risk_score, reason = score_route_input_risk(
+        is_form = tmpl in forms_set
+        has_bt = tmpl in body_template_routes
+        base_score, reason = score_route_input_risk(
             tmpl,
             methods=ordered_methods,
             params=ordered_params,
             schema_hints=hints,
-            is_form=(tmpl in forms_set),
-            has_body_template=(tmpl in body_template_routes),
+            is_form=is_form,
+            has_body_template=has_bt,
+        )
+        risk_score = _adjust_route_risk_score(
+            tmpl,
+            base_score=base_score,
+            methods=ordered_methods,
+            params=ordered_params,
+            is_form=is_form,
+            has_body_template=has_bt,
         )
         actively_probed = False
         if callable(tracker_probed_fn):
@@ -346,6 +491,193 @@ def _rank_routes_by_input_risk(
 
     ranked.sort(key=lambda item: (-int(item["risk_score"]), str(item["route_template"])))
     return ranked
+
+
+def _is_low_risk_metadata_entry(entry: Mapping[str, Any], *, single_family: str | None) -> bool:
+    """Return True for parameterless read-only dictionary/count/metadata routes."""
+    if int(entry.get("risk_score") or 0) >= 8:
+        return False
+    methods = [str(m or "").strip().upper() for m in (entry.get("methods") or ())]
+    if any(m in _WRITE_HTTP_METHODS for m in methods):
+        return False
+    if entry.get("params"):
+        return False
+    tmpl = str(entry.get("route_template") or "")
+    if "{id}" in tmpl or "{val}" in tmpl:
+        return False
+    tokens = _route_path_tokens(tmpl)
+    if tokens & _LOW_RISK_METADATA_TOKENS:
+        return True
+    return single_family is not None
+
+
+def _select_diverse_top_entries(
+    entries: Sequence[dict[str, Any]],
+    *,
+    limit: int = 35,
+    max_per_family_pass1: int = 3,
+    route_key: str = "route_template",
+    tie_key: str | None = None,
+) -> list[dict[str, Any]]:
+    """Select top items via family-diverse risk-bucketed round-robin, then descending risk."""
+    eff_limit = max(0, int(limit))
+    eff_pass1 = max(0, int(max_per_family_pass1))
+    if eff_limit == 0 or not entries:
+        return []
+
+    def _entry_sort_key(item: dict[str, Any]) -> tuple[int, int, str]:
+        return (
+            -int(item.get("risk_score") or 0),
+            int(item.get("method_rank") or 0),
+            str(item.get(tie_key or route_key) or ""),
+        )
+
+    sorted_all = sorted(entries, key=_entry_sort_key)
+    max_global_score = max(int(item.get("risk_score") or 0) for item in sorted_all)
+
+    top_families = {
+        extract_resource_family(str(item.get(route_key) or "/"))
+        for item in sorted_all
+    }
+    single_family = next(iter(top_families)) if len(top_families) == 1 else None
+
+    buckets: dict[str, list[tuple[int, dict[str, Any]]]] = {}
+    for idx, item in enumerate(sorted_all):
+        tmpl = str(item.get(route_key) or "/")
+        bkey = extract_resource_family(tmpl)
+        if single_family is not None:
+            sub = _extract_subfamily_after(tmpl, single_family)
+            if sub is not None:
+                bkey = sub
+        buckets.setdefault(bkey, []).append((idx, item))
+
+    ordered_bucket_keys = sorted(
+        buckets,
+        key=lambda bkey: (
+            -int(buckets[bkey][0][1].get("risk_score") or 0),
+            -sum(int(entry.get("risk_score") or 0) for _, entry in buckets[bkey][: max(1, eff_pass1)]),
+            bkey,
+        ),
+    )
+
+    selected: list[dict[str, Any]] = []
+    selected_indices: set[int] = set()
+
+    # Pass 1: round-robin up to `eff_pass1` highest-risk entries per bucket,
+    # keeping low-risk metadata GET routes out of Pass 1 when high-risk routes exist.
+    for round_idx in range(eff_pass1):
+        if len(selected) >= eff_limit:
+            break
+        progressed = False
+        for bkey in ordered_bucket_keys:
+            bucket = buckets[bkey]
+            if round_idx >= len(bucket):
+                continue
+            cand_idx, cand = bucket[round_idx]
+            if max_global_score >= 20 and _is_low_risk_metadata_entry(cand, single_family=single_family):
+                continue
+            selected.append(cand)
+            selected_indices.add(cand_idx)
+            progressed = True
+            if len(selected) >= eff_limit:
+                break
+        if not progressed:
+            break
+
+    # Pass 2: fill remaining slots strictly by descending risk_score
+    if len(selected) < eff_limit:
+        for idx, item in enumerate(sorted_all):
+            if idx in selected_indices:
+                continue
+            selected.append(item)
+            selected_indices.add(idx)
+            if len(selected) >= eff_limit:
+                break
+
+    return selected
+
+
+def _select_diverse_top_routes(
+    ranked_entries: Sequence[dict[str, Any]],
+    *,
+    limit: int = 35,
+    max_per_family_pass1: int = 3,
+) -> list[dict[str, Any]]:
+    """Select top routes ensuring every active family is represented before filling by risk."""
+    return _select_diverse_top_entries(
+        ranked_entries,
+        limit=limit,
+        max_per_family_pass1=max_per_family_pass1,
+        route_key="route_template",
+    )
+
+
+def _format_assigned_route_line(item: Mapping[str, Any]) -> str:
+    """Format an assigned route with compact method tags (e.g. `/api/role/{id} [PUT, DELETE, GET]`)."""
+    tmpl = str(item.get("route_template") or "")
+    methods = [str(m).strip().upper() for m in (item.get("methods") or ()) if str(m).strip()]
+    if methods:
+        return f"{tmpl} [{', '.join(methods)}]"
+    return tmpl
+
+
+def _rank_and_select_write_ops(
+    write_ops: Sequence[str],
+    *,
+    cluster_params: Mapping[str, Sequence[str]],
+    cluster_schema_hints: Mapping[str, Sequence[str]],
+    cluster_body_templates: Mapping[str, Any],
+    form_templates: set[str],
+    limit: int = 25,
+) -> list[str]:
+    """Score write operations individually and select a family-diverse high-risk slice."""
+    write_entries: list[dict[str, Any]] = []
+    for raw_op in write_ops:
+        op_str = str(raw_op or "").strip()
+        if not op_str:
+            continue
+        parts = op_str.split(None, 1)
+        if len(parts) == 2:
+            op_method, op_path = parts[0].strip().upper(), parts[1].strip()
+        else:
+            op_method, op_path = "POST", op_str
+        op_tmpl = route_template_of(op_path)
+        op_params = _order_params_by_risk(list(cluster_params.get(op_tmpl) or ()))
+        op_hints = [str(h).strip() for h in (cluster_schema_hints.get(op_tmpl) or ()) if str(h).strip()]
+        is_form = op_tmpl in form_templates
+        has_bt = f"{op_method} {op_tmpl}" in cluster_body_templates
+        base_score, _ = score_route_input_risk(
+            op_tmpl,
+            methods=[op_method],
+            params=op_params,
+            schema_hints=op_hints,
+            is_form=is_form,
+            has_body_template=has_bt,
+        )
+        score = _adjust_route_risk_score(
+            op_tmpl,
+            base_score=base_score,
+            methods=[op_method],
+            params=op_params,
+            is_form=is_form,
+            has_body_template=has_bt,
+        )
+        write_entries.append({
+            "route_template": op_tmpl,
+            "op": op_str,
+            "methods": [op_method],
+            "params": op_params,
+            "method_rank": _method_sort_key(op_method)[0],
+            "risk_score": score,
+        })
+    selected = _select_diverse_top_entries(
+        write_entries,
+        limit=limit,
+        max_per_family_pass1=3,
+        route_key="route_template",
+        tie_key="op",
+    )
+    return [str(item["op"]) for item in selected]
 
 
 def cluster_discovered_surface(
@@ -547,6 +879,10 @@ def cluster_discovered_surface(
                 params=dict(sorted(all_params.items())),
                 body_templates=dict(sorted(all_body_templates.items())),
                 schema_hints=dict(sorted(all_schema_hints.items())),
+                methods_by_route={
+                    tmpl: sorted(mset, key=_method_sort_key)
+                    for tmpl, mset in sorted(all_methods.items())
+                },
             )
         ]
 
@@ -632,6 +968,10 @@ def cluster_discovered_surface(
                 params=dict(sorted(c_params.items())),
                 body_templates=dict(sorted(c_body_templates.items())),
                 schema_hints=dict(sorted(c_schema_hints.items())),
+                methods_by_route={
+                    tmpl: sorted(mset, key=_method_sort_key)
+                    for tmpl, mset in sorted(c_methods.items())
+                },
             )
         )
     return clusters
@@ -659,27 +999,93 @@ def build_shard_prompts(
         )
     findings_block = "\n".join(findings_lines) if findings_lines else "  (none yet)"
 
+    methods_map: dict[str, set[str]] = {
+        str(tmpl): {str(m).strip().upper() for m in mlist if str(m).strip()}
+        for tmpl, mlist in (getattr(cluster, "methods_by_route", {}) or {}).items()
+        if mlist
+    }
     ranked_entries = _rank_routes_by_input_risk(
         cluster.routes,
         write_ops=cluster.write_ops,
         params=cluster.params,
         body_templates=cluster.body_templates,
         schema_hints=cluster.schema_hints,
+        methods_by_route=methods_map or None,
         surface_tracker=surface_tracker,
     )
     risk_score_by_route = {
         str(item["route_template"]): int(item["risk_score"])
         for item in ranked_entries
     }
+    methods_by_tmpl: dict[str, list[str]] = {
+        str(item["route_template"]): list(item.get("methods") or ())
+        for item in ranked_entries
+    }
     ordered_routes = [str(item["route_template"]) for item in ranked_entries]
+    selected_route_entries = _select_diverse_top_routes(
+        ranked_entries,
+        limit=35,
+        max_per_family_pass1=3,
+    )
+    route_lines = [_format_assigned_route_line(item) for item in selected_route_entries]
+    if len(ordered_routes) > len(selected_route_entries):
+        omitted_count = len(ordered_routes) - len(selected_route_entries)
+        route_lines.append(
+            f"(+{omitted_count} of {len(ordered_routes)} total lower-priority routes omitted; "
+            "prioritize high-risk mutating/auth/ID routes above first)"
+        )
+
+    is_large_shard = len(ordered_routes) > 35
+    form_templates: set[str] = {
+        str(t)
+        for t in (getattr(surface_tracker, "discovered_form_templates", ()) or ())
+        if str(t).strip()
+    }
+    if cluster.write_ops and (is_large_shard or len(cluster.write_ops) > 25):
+        selected_write_ops = _rank_and_select_write_ops(
+            cluster.write_ops,
+            cluster_params=cluster.params,
+            cluster_schema_hints=cluster.schema_hints,
+            cluster_body_templates=cluster.body_templates,
+            form_templates=form_templates,
+            limit=25,
+        )
+    else:
+        selected_write_ops = list(cluster.write_ops[:25])
 
     ordered_param_items = sorted(
         cluster.params.items(),
         key=lambda kv: (-risk_score_by_route.get(route_template_of(kv[0]), 0), kv[0]),
     )
+    if ordered_param_items and (is_large_shard or len(ordered_param_items) > 20):
+        param_entries = [
+            {
+                "route_template": route_template_of(tmpl),
+                "raw_tmpl": tmpl,
+                "pnames": pnames,
+                "methods": methods_by_tmpl.get(route_template_of(tmpl), []),
+                "params": list(pnames),
+                "risk_score": risk_score_by_route.get(route_template_of(tmpl), 0),
+            }
+            for tmpl, pnames in ordered_param_items
+        ]
+        selected_param_entries = _select_diverse_top_entries(
+            param_entries,
+            limit=20,
+            max_per_family_pass1=3,
+            route_key="route_template",
+            tie_key="raw_tmpl",
+        )
+        selected_param_items = [
+            (str(entry["raw_tmpl"]), entry["pnames"])
+            for entry in selected_param_entries
+        ]
+    else:
+        selected_param_items = ordered_param_items[:20]
+
     params_lines = [
         f"  - {tmpl}: {', '.join(_order_params_by_risk(pnames)[:10])}"
-        for tmpl, pnames in ordered_param_items[:20]
+        for tmpl, pnames in selected_param_items
     ]
     has_path_params = any(
         str(p).startswith("path:")
@@ -691,10 +1097,10 @@ def build_shard_prompts(
         f"- Assigned resource families: {', '.join(cluster.families) or '(all)'}",
         "- Focus strictly on testing your assigned routes, concrete objects, parameters, and write operations thoroughly. "
         "Do NOT duplicate work on unrelated subsystems or already-verified bootstrap findings.",
-        "- Assigned routes:\n  " + ("\n  ".join(ordered_routes[:35]) if ordered_routes else "(none)"),
+        "- Assigned routes:\n  " + ("\n  ".join(route_lines) if route_lines else "(none)"),
     ]
-    if cluster.write_ops:
-        scope_sections.append("- Assigned write operations:\n  " + "\n  ".join(cluster.write_ops[:25]))
+    if selected_write_ops:
+        scope_sections.append("- Assigned write operations:\n  " + "\n  ".join(selected_write_ops))
     if any(_is_virgin_state_action_path(r) for r in (*ordered_routes, *cluster.write_ops)):
         scope_sections.append(
             "- Virgin-state race priority: run concurrent_check BEFORE sequential single mutations on primary actors "
@@ -769,15 +1175,15 @@ def build_shard_prompts(
             or (bool(item["params"]) and int(item["risk_score"]) >= 18)
         )
     ]
-    must_test_candidates.sort(
-        key=lambda item: (
-            1 if item.get("actively_probed") else 0,
-            -int(item["risk_score"]),
-            str(item["route_template"]),
+    unprobed_must = [item for item in must_test_candidates if not item.get("actively_probed")]
+    probed_must = [item for item in must_test_candidates if item.get("actively_probed")]
+    selected_must = _select_diverse_top_routes(unprobed_must, limit=6, max_per_family_pass1=2)
+    if len(selected_must) < 6 and probed_must:
+        selected_must.extend(
+            _select_diverse_top_routes(probed_must, limit=6 - len(selected_must), max_per_family_pass1=2)
         )
-    )
     must_test_lines: list[str] = []
-    for item in must_test_candidates[:6]:
+    for item in selected_must[:6]:
         methods_str = ",".join(item.get("methods") or ["GET"])
         route_str = str(item["route_template"])
         p_list = list(item.get("params") or [])[:6]

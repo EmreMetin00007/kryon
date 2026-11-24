@@ -207,6 +207,93 @@ _POST_AUTH_DESTRUCTIVE_RE = re.compile(
 )
 _POST_AUTH_UNSAFE_URL_CHARS_RE = re.compile(r'[\s\x00<>"\'{}\[\]\\]')
 _MAX_POST_AUTH_GATED_SEEDS = 5
+_POST_AUTH_PASSIVE_EXACT_PATHS: frozenset[str] = frozenset({
+    "/openapi.json",
+    "/openapi.yaml",
+    "/openapi.yml",
+    "/swagger.json",
+    "/swagger.yaml",
+    "/swagger.yml",
+    "/swagger-ui",
+    "/swagger-ui.html",
+    "/v2/api-docs",
+    "/v3/api-docs",
+    "/api-docs",
+    "/api/openapi.json",
+    "/api/openapi.yaml",
+    "/api/openapi.yml",
+    "/api/swagger.json",
+    "/api/swagger.yaml",
+    "/api/swagger.yml",
+    "/api/v2/api-docs",
+    "/api/v3/api-docs",
+    "/api/api-docs",
+    "/api/schema",
+    "/swagger/v1/swagger.json",
+    "/robots.txt",
+    "/sitemap.xml",
+    "/graphql",
+    "/api/graphql",
+    "/actuator/info",
+})
+_POST_AUTH_PASSIVE_PREFIXES: tuple[str, ...] = (
+    "/.well-known/",
+    "/swagger-ui/",
+    "/v2/api-docs/",
+    "/v3/api-docs/",
+    "/api-docs/",
+    "/api/v2/api-docs/",
+    "/api/v3/api-docs/",
+    "/api/api-docs/",
+    "/actuator/",
+)
+_POST_AUTH_PASSIVE_SUFFIXES: tuple[str, ...] = (
+    "/openapi.json",
+    "/openapi.yaml",
+    "/openapi.yml",
+    "/swagger.json",
+    "/swagger.yaml",
+    "/swagger.yml",
+    "/api-docs",
+    "/swagger-ui",
+    "/swagger-ui.html",
+    "/robots.txt",
+    "/sitemap.xml",
+)
+_PASSIVE_SPEC_PROBE_PATHS: frozenset[str] = frozenset({
+    "/openapi.json",
+    "/openapi.yaml",
+    "/openapi.yml",
+    "/swagger.json",
+    "/swagger.yaml",
+    "/swagger.yml",
+    "/v2/api-docs",
+    "/v3/api-docs",
+    "/api-docs",
+    "/api/v3/api-docs",
+    "/api/v2/api-docs",
+    "/api/openapi.json",
+    "/api/openapi.yaml",
+    "/api/openapi.yml",
+    "/api/swagger.json",
+    "/api/swagger.yaml",
+    "/api/swagger.yml",
+    "/api/api-docs",
+    "/api/schema",
+    "/swagger/v1/swagger.json",
+})
+_PASSIVE_NON_SPEC_PROBE_PATHS: frozenset[str] = frozenset({
+    "/robots.txt",
+    "/sitemap.xml",
+    "/info",
+    "/wp-json",
+    "/actuator/info",
+    "/rails/info",
+    "/graphql",
+    "/api",
+    "/metrics",
+})
+_ALL_KNOWN_PASSIVE_PROBE_PATHS: frozenset[str] = _PASSIVE_SPEC_PROBE_PATHS | _PASSIVE_NON_SPEC_PROBE_PATHS
 
 
 def _strip_post_auth_endpoint_ext(segment: str) -> str:
@@ -364,9 +451,94 @@ def _derive_login_section_prefixes(
     return prefixes
 
 
+def _is_post_auth_passive_discovery_path(norm_path: str) -> bool:
+    """Return True if ``norm_path`` is a passive spec/discovery/metadata probe path."""
+    raw = str(norm_path or "").strip()
+    if not raw:
+        return False
+    low = raw.lower()
+    trimmed = low.rstrip("/") or "/"
+    if trimmed in _POST_AUTH_PASSIVE_EXACT_PATHS or trimmed == "/.well-known":
+        return True
+    if any(low.startswith(prefix) for prefix in _POST_AUTH_PASSIVE_PREFIXES):
+        return True
+    if any(trimmed.endswith(suffix) for suffix in _POST_AUTH_PASSIVE_SUFFIXES):
+        return True
+    return False
+
+
+def _looks_like_spec_probe_path(norm_path: str) -> bool:
+    """Return True if ``norm_path`` looks like an OpenAPI/Swagger specification path."""
+    low = str(norm_path or "").strip().lower().rstrip("/")
+    if not low:
+        return False
+    if low in _PASSIVE_SPEC_PROBE_PATHS:
+        return True
+    return any(
+        tok in low
+        for tok in ("openapi.json", "openapi.yaml", "openapi.yml", "swagger.json", "swagger.yaml", "swagger.yml", "api-docs")
+    )
+
+
+def _compute_stage3_synthesis_max_turns(
+    *,
+    investigator_max_turns: int,
+    remaining_http: int,
+    remaining_tokens: int,
+    remaining_seconds: float,
+    synthesis_context: dict[str, Any] | None = None,
+) -> int:
+    """Compute Stage 3 synthesis turn cap (base 6..12, scaling up to 18 when budgets and signals are rich)."""
+    eff_max = max(1, int(investigator_max_turns))
+    base_cap = min(eff_max, min(12, max(6, eff_max // 3)))
+    if (
+        int(remaining_http) < 80
+        or int(remaining_tokens) < 120_000
+        or float(remaining_seconds) < 90.0
+    ):
+        return base_cap
+
+    ctx = synthesis_context if isinstance(synthesis_context, dict) else {}
+    findings_cnt = len(ctx.get("findings") or ())
+    artifacts_cnt = (
+        len(ctx.get("internal_urls") or ())
+        + len(ctx.get("extracted_values") or ())
+        + len(ctx.get("auth_capabilities") or ())
+    )
+    targets_cnt = (
+        len(ctx.get("blockers") or ())
+        + len(ctx.get("untested_writes_and_blocked") or ())
+        + len(ctx.get("high_risk_unprobed_routes") or ())
+    )
+    signal_score = findings_cnt + artifacts_cnt + targets_cnt
+    if not (findings_cnt >= 1 or artifacts_cnt >= 1 or targets_cnt >= 2):
+        return base_cap
+
+    bonus = 2
+    if (
+        int(remaining_http) >= 95
+        and int(remaining_tokens) >= 180_000
+        and float(remaining_seconds) >= 120.0
+        and (signal_score >= 3 or (findings_cnt >= 1 and (artifacts_cnt + targets_cnt) >= 1))
+    ):
+        bonus = 4
+    if (
+        int(remaining_http) >= 100
+        and int(remaining_tokens) >= 220_000
+        and float(remaining_seconds) >= 120.0
+        and (signal_score >= 5 or (findings_cnt >= 1 and (artifacts_cnt + targets_cnt) >= 3) or findings_cnt >= 2)
+    ):
+        bonus = 6
+
+    ceiling = min(18, eff_max, max(base_cap, eff_max // 2))
+    return min(ceiling, base_cap + bonus)
+
+
 def _is_post_auth_html_page_candidate(norm_path: str, content_type: str, *, status: int = 0) -> bool:
     """Return True if a path/content-type looks like an HTML/page route rather than a pure API or asset."""
     if not norm_path or norm_path == "/":
+        return False
+    if _is_post_auth_passive_discovery_path(norm_path):
         return False
     low_p = norm_path.lower()
     if (
@@ -2304,6 +2476,7 @@ class AgenticInvestigator:
                 has_double_slash_path(display_path)
                 or is_static_asset_url(norm_key)
                 or is_non_endpoint_source_path(norm_key)
+                or _is_post_auth_passive_discovery_path(norm_key)
                 or norm_key.lower().endswith(_POST_AUTH_SCRIPT_EXTS)
                 or is_logout_route(norm_key)
                 or is_destructive_lifecycle_route(norm_key)
@@ -2387,6 +2560,8 @@ class AgenticInvestigator:
                     return
                 if norm_k == "/" or norm_k in anon_2xx_paths or norm_k in seen_norm:
                     return
+                if _is_post_auth_passive_discovery_path(norm_k):
+                    return
                 segs = [s for s in norm_k.split("/") if s]
                 if not segs or _segment_looks_auth_like(segs[-1]):
                     return
@@ -2462,6 +2637,79 @@ class AgenticInvestigator:
         cap = max(1, int(limit))
         extra_seeds = self._derive_post_auth_extra_seed_paths(new_auth_actors, limit=max(0, cap - 1))
         return ["/", *extra_seeds][:cap]
+
+    def _collect_post_auth_probe_dedup_args(
+        self,
+        new_auth_actors: Sequence[str],
+    ) -> tuple[list[str], int]:
+        """Collect already-probed passive paths to skip and determine post-auth passive probe cap.
+
+        Avoids repeating pre-auth 404/200 passive probes (`robots.txt`, `sitemap.xml`,
+        `info`, `openapi.json`, etc.), while permitting up to 2 passive probes ONLY if an
+        OpenAPI/Swagger spec endpoint returned 401/403 pre-auth and has not yet returned 2xx
+        to the newly authenticated actors.
+        """
+        new_actor_set = {str(a).strip() for a in new_auth_actors if str(a).strip()}
+
+        seed_probed_paths: set[str] = set()
+        seed_path = self.root_dir / "stage0-seed.json"
+        if seed_path.is_file():
+            try:
+                seed_doc = json.loads(seed_path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                seed_doc = None
+            if isinstance(seed_doc, dict):
+                raw_stats = seed_doc.get("stats")
+                if isinstance(raw_stats, dict):
+                    for raw_p in raw_stats.get("probed_paths") or ():
+                        try:
+                            seed_probed_paths.add(normalize_path(str(raw_p or "/")))
+                        except ValueError:
+                            continue
+
+        paths_200_any: set[str] = set()
+        paths_200_new_auth: set[str] = set()
+        paths_404_or_410: set[str] = set()
+        paths_401_403_spec: set[str] = set()
+
+        for rid in self.receipts.list_ids():
+            try:
+                rec = self.receipts.get(rid)
+            except Exception:
+                continue
+            if not isinstance(rec, dict):
+                continue
+            rec_method = str(rec.get("method") or "GET").strip().upper()
+            if rec_method not in {"GET", "HEAD"}:
+                continue
+            rec_status = int(rec.get("status") or 0)
+            rec_actor = str(rec.get("actor") or "").strip()
+            rec_path_raw = str(rec.get("path") or urlsplit(str(rec.get("url") or "")).path or "/")
+            try:
+                norm_p = normalize_path(rec_path_raw)
+            except ValueError:
+                continue
+
+            is_known_passive = norm_p in _ALL_KNOWN_PASSIVE_PROBE_PATHS or norm_p in seed_probed_paths
+            is_spec_path = _looks_like_spec_probe_path(norm_p)
+
+            if 200 <= rec_status < 300:
+                paths_200_any.add(norm_p)
+                if rec_actor in new_actor_set:
+                    paths_200_new_auth.add(norm_p)
+            elif rec_status in {404, 410} and is_known_passive:
+                paths_404_or_410.add(norm_p)
+            elif rec_status in {401, 403} and is_spec_path:
+                paths_401_403_spec.add(norm_p)
+
+        auth_gated_specs = {p for p in paths_401_403_spec if p not in paths_200_new_auth}
+        skip_set = (
+            seed_probed_paths
+            | paths_404_or_410
+            | (paths_200_any & (_ALL_KNOWN_PASSIVE_PROBE_PATHS | seed_probed_paths))
+        ) - auth_gated_specs
+        max_probes = 2 if auth_gated_specs else 0
+        return sorted(skip_set), max_probes
 
     def _run_sharded(self, *, resume: bool = False) -> dict[str, Any]:
         """Run 2-stage subsystem-clustered parallel monolithic execution."""
@@ -2616,6 +2864,9 @@ class AgenticInvestigator:
             ):
                 post_auth_extra_seeds = self._derive_post_auth_extra_seed_paths(new_auth_actors, limit=6)
                 post_auth_starts = ["/", *post_auth_extra_seeds][:8]
+                post_auth_skip_probes, post_auth_max_probes = self._collect_post_auth_probe_dedup_args(
+                    new_auth_actors
+                )
                 try:
                     import agentic_stage0_crawl  # type: ignore[import-not-found]
 
@@ -2629,6 +2880,8 @@ class AgenticInvestigator:
                         allow_forms=self.stage0_allow_forms,
                         actors=new_auth_actors,
                         seed_filename="stage0-post-auth-seed.json",
+                        max_passive_probes=post_auth_max_probes,
+                        skip_probe_paths=post_auth_skip_probes,
                     )
                     routes_ingested = 0
                     stage0_stats: dict[str, Any] = {}
@@ -3016,7 +3269,14 @@ class AgenticInvestigator:
                         category="cross_shard",
                     )
 
-                    s3_max_turns = min(12, max(6, self.max_turns // 3))
+                    s3_http_rem = max(0, self.http.budget.limit - self.http.budget.used)
+                    s3_max_turns = _compute_stage3_synthesis_max_turns(
+                        investigator_max_turns=self.max_turns,
+                        remaining_http=s3_http_rem,
+                        remaining_tokens=self.budget.available("tokens"),
+                        remaining_seconds=float(self.budget.remaining_seconds()),
+                        synthesis_context=synth_ctx,
+                    )
                     s3_epoch_state: dict[str, Any] = {
                         "turn_start": 0,
                         "summary_text": "",
@@ -3024,7 +3284,6 @@ class AgenticInvestigator:
                     }
                     s3_usage: dict[str, int] = _new_usage_dict()
                     s3_calls = [0]
-                    s3_http_rem = max(0, self.http.budget.limit - self.http.budget.used)
                     s3_banner = self._state_banner(
                         1,
                         dispatcher=stage3_dispatcher,
@@ -3120,6 +3379,7 @@ class AgenticInvestigator:
                     stage3_summary = {
                         "triggered": True,
                         "status": s3_status,
+                        "max_turns": s3_max_turns,
                         "calls": s3_calls[0],
                         "tokens": s3_usage["total_tokens"],
                         "effective_tokens": effective_tokens_from_usage(s3_usage, self.cache_token_weight),

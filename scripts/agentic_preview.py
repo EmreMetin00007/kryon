@@ -826,6 +826,12 @@ def _extract_surface_summary(receipt: dict[str, Any], base_url: str) -> dict[str
     url = receipt["url"]
     ctype = (receipt.get("content_type") or "").lower()
     base = base_url
+    parsed_doc_url = urlsplit(str(url or ""))
+    origin_base = (
+        f"{parsed_doc_url.scheme}://{parsed_doc_url.netloc}/"
+        if parsed_doc_url.scheme in {"http", "https"} and parsed_doc_url.netloc
+        else base
+    )
 
     links: list[dict[str, Any]] = []
     forms: list[dict[str, Any]] = []
@@ -889,7 +895,7 @@ def _extract_surface_summary(receipt: dict[str, Any], base_url: str) -> dict[str
                 if not _is_skipped_surface_url(c.get("url", ""), base_url=base)
             )
             spa_routes.extend(
-                r for r in extract_spa_routes(script, url, limit=40)
+                r for r in extract_spa_routes(script, origin_base, limit=40)
                 if not _is_skipped_surface_url(r.get("url", ""), base_url=base)
             )
             spec_urls.extend(u for u in find_spec_urls(script, url) if not _is_skipped_surface_url(u, base_url=base))
@@ -904,12 +910,12 @@ def _extract_surface_summary(receipt: dict[str, Any], base_url: str) -> dict[str
 
     if "javascript" in ctype or "ecmascript" in ctype or urlsplit(url).path.lower().endswith((".js", ".mjs")):
         js_calls.extend(
-            c for c in extract_js_calls(body, url, limit=80)
+            c for c in extract_js_calls(body, origin_base, limit=80)
             if not _is_skipped_surface_url(c.get("url", ""), base_url=base)
         )
         kept_js_links = 0
         kept_script_links = 0
-        for rec in extract_js(body, url, limit=480):
+        for rec in extract_js(body, origin_base, limit=480):
             rec_url = rec.get("url", "")
             if _is_skipped_surface_url(rec_url, base_url=base):
                 continue
@@ -923,7 +929,7 @@ def _extract_surface_summary(receipt: dict[str, Any], base_url: str) -> dict[str
             if kept_js_links >= 60:
                 break
         kept_spa_routes = 0
-        for rec in extract_spa_routes(body, url, limit=240):
+        for rec in extract_spa_routes(body, origin_base, limit=240):
             if not _is_skipped_surface_url(rec.get("url", ""), base_url=base):
                 spa_routes.append(rec)
                 kept_spa_routes += 1

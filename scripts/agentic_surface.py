@@ -286,6 +286,7 @@ _ROUTE_API_PATH_RE = re.compile(
 _BENIGN_QUERY_VAL_RE = re.compile(r"^[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)?$")
 _BENIGN_EMAIL_VAL_RE = re.compile(r"^[A-Za-z0-9._+-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+$")
 _API_PREFIX_RE = re.compile(r"^/(api(?:/v\d+)?|v\d+)(?=/|$)", re.IGNORECASE)
+_NUMERIC_SLUG_CATEGORY_RE = re.compile(r"^\d+-[a-z]", re.IGNORECASE)
 _NON_RESOURCE_UI_SEGMENTS = frozenset({
     "login",
     "logout",
@@ -378,6 +379,20 @@ _MAX_SCHEMA_HINTS_PER_TEMPLATE = 24
 _MAX_SCHEMA_HINT_TEMPLATES = 60
 _MAX_PARAMS_PER_TEMPLATE = 32
 _MAX_PATH_PARAMS_PER_ROUTE = 6
+_MAX_ERROR_DELTA_PARAMS = 40
+_MAX_ERROR_DELTA_VALUE_TRACKED = 120
+_ROTATING_META_PARAMS: frozenset[str] = frozenset({
+    "csrf",
+    "csrf_token",
+    "_csrf",
+    "xsrf",
+    "xsrf_token",
+    "_",
+    "ts",
+    "timestamp",
+})
+_SPA_ONLY_SOURCE_TAGS: frozenset[str] = frozenset({"spa-route", "spa-hash"})
+_SPA_CRAWL_SOURCE_TAGS: frozenset[str] = frozenset({"spa-route", "spa-hash", "crawl"})
 
 _SECRET_KEY_SUBSTRINGS = (
     "password",
@@ -930,7 +945,7 @@ def _is_non_resource_api_subpath(api_prefix: str, path: str) -> bool:
 
 def _extract_ui_resource_info(path: str) -> tuple[str, bool, str] | None:
     """Extract `(resource, is_collection, concrete_id)` from a non-API UI route, or None."""
-    if is_non_endpoint_source_path(path):
+    if is_non_endpoint_source_path(path) or _is_passive_spec_path(path):
         return None
     norm_p = normalize_path(path)
     if norm_p == "/" or _extract_api_prefix(norm_p) or is_static_asset_url(norm_p) or is_non_endpoint_source_path(norm_p):
@@ -946,6 +961,7 @@ def _extract_ui_resource_info(path: str) -> tuple[str, bool, str] | None:
         or resource.startswith((".", "_", "$"))
         or "=" in resource
         or is_id_segment(resource)
+        or _NUMERIC_SLUG_CATEGORY_RE.match(resource) is not None
         or resource.endswith(_NON_RESOURCE_FILE_EXTS)
     ):
         return None
@@ -1026,6 +1042,81 @@ _OPENAPI_SPEC_SUFFIXES: tuple[str, ...] = (
     "/swagger.json",
     "/api-docs",
 )
+_PASSIVE_SPEC_EXACT_SUFFIXES: tuple[str, ...] = (
+    *_OPENAPI_SPEC_SUFFIXES,
+    "/openapi.yaml",
+    "/openapi.yml",
+    "/swagger.yaml",
+    "/swagger.yml",
+    "/api-docs.json",
+    "/swagger-ui",
+    "/swagger-ui.html",
+    "/redoc",
+    "/swagger",
+)
+
+
+def _is_passive_spec_path(url_or_path: str) -> bool:
+    """Return True for OpenAPI/Swagger specification or API-docs metadata probe paths."""
+    norm_p = normalize_path(url_or_path).lower()
+    if norm_p == "/":
+        return False
+    if norm_p.endswith(_PASSIVE_SPEC_EXACT_SUFFIXES):
+        return True
+    return "/api-docs/" in norm_p or "/swagger-ui/" in norm_p
+
+
+def _is_spa_only_source(source_tag: str = "", sources: Sequence[str] = ()) -> bool:
+    """Return True when a route was discovered strictly via client-side SPA routing tags."""
+    tags: list[str] = []
+    if source_tag:
+        tags.append(str(source_tag).strip().lower())
+    for src in sources:
+        st = str(src or "").strip().lower()
+        if st:
+            tags.append(st)
+    if not tags:
+        return False
+    return any(t in _SPA_ONLY_SOURCE_TAGS for t in tags) and all(
+        t in _SPA_CRAWL_SOURCE_TAGS for t in tags
+    )
+
+
+def _is_soft_deny_200(
+    receipt: dict[str, Any],
+    *,
+    method: str,
+    status: int,
+    body: str,
+) -> bool:
+    """Return True when HTTP 200 is an empty GET body or JSON access-denied envelope."""
+    if status != 200:
+        return False
+    raw_len = receipt.get("response_length")
+    has_zero_len = isinstance(raw_len, int) and not isinstance(raw_len, bool) and raw_len == 0
+    if not has_zero_len and isinstance(raw_len, str) and raw_len.strip().isdigit():
+        has_zero_len = int(raw_len.strip()) == 0
+    if method == "GET" and len(body) == 0 and (raw_len is None or has_zero_len):
+        return True
+    stripped = body.lstrip()
+    if stripped.startswith("{") and len(stripped) <= 2048:
+        try:
+            parsed = json.loads(stripped)
+        except ValueError:
+            parsed = None
+        if isinstance(parsed, dict):
+            code_raw = parsed.get("code")
+            if isinstance(code_raw, int) and not isinstance(code_raw, bool):
+                has_payload = any(
+                    k in parsed and parsed[k] not in (None, "", [], {})
+                    for k in ("result", "data", "rows", "items")
+                )
+                if not has_payload and (
+                    code_raw in {401, 403}
+                    or (code_raw == 400 and ("result" in parsed or "data" in parsed))
+                ):
+                    return True
+    return False
 
 
 def is_loopback_or_private_base_url(base_url: str) -> bool:
@@ -1621,6 +1712,15 @@ class SurfaceFrontierTracker:
         self.actors_by_template: dict[str, set[str]] = {}
         self.actors_by_path: dict[str, set[str]] = {}
         self.route_2xx_actors: dict[str, set[str]] = {}
+        self.soft_deny_routes: dict[str, set[str]] = {}
+        self.error_delta_params: dict[tuple[str, str], dict[str, Any]] = {}
+        self._param_2xx_values: dict[tuple[str, str], set[str]] = {}
+        self._param_2xx_status: dict[tuple[str, str], int] = {}
+        self._param_500_values: dict[tuple[str, str], set[str]] = {}
+        self._2xx_templates: set[str] = set()
+        self._spa_route_candidates: set[str] = set()
+        self._non_spa_discovered_paths: set[str] = set()
+        self.pruned_spa_routes: set[str] = set()
 
         # Discovered attack surface
         # key: (method, normalized_path) -> sample URL or path with query hint
@@ -1767,6 +1867,119 @@ class SurfaceFrontierTracker:
         )
         return not needs_depth
 
+    def _upsert_error_delta_param(
+        self,
+        *,
+        key: tuple[str, str],
+        norm_p: str,
+        method: str,
+        baseline_status: int,
+        baseline_value: str,
+        error_value: str,
+    ) -> None:
+        """Insert or update a `(route_template, param_name)` 2xx->500 injection candidate."""
+        tmpl, pname = key
+        existing = self.error_delta_params.get(key)
+        if existing is None:
+            if len(self.error_delta_params) >= _MAX_ERROR_DELTA_PARAMS:
+                return
+            self.error_delta_params[key] = {
+                "route_template": tmpl,
+                "param": pname,
+                "sample_path": norm_p,
+                "method": method,
+                "baseline_status": int(baseline_status),
+                "error_status": 500,
+                "baseline_value": baseline_value,
+                "error_value": error_value,
+                "count_500": 1,
+            }
+        else:
+            existing["count_500"] = int(existing.get("count_500") or 0) + 1
+            existing["error_value"] = error_value
+            if not existing.get("sample_path"):
+                existing["sample_path"] = norm_p
+
+    def _record_error_delta_observations(
+        self,
+        *,
+        tmpl: str,
+        norm_p: str,
+        method: str,
+        status: int,
+        param_pairs: Sequence[tuple[str, str]],
+    ) -> None:
+        """Track baseline 2xx vs mutated 500 deltas per `(route_template, param_name)`."""
+        if not tmpl or (not (200 <= status < 300) and status != 500):
+            return
+        if 200 <= status < 300:
+            self._2xx_templates.add(tmpl)
+
+        for raw_k, raw_v in param_pairs:
+            pname = str(raw_k or "").strip()
+            if not pname or pname.lower() in _ROTATING_META_PARAMS or _is_secret_key(pname):
+                continue
+            val = str(raw_v or "")[:64]
+            if "<REDACTED" in val or val == "<redacted>":
+                continue
+            key = (tmpl, pname)
+
+            if 200 <= status < 300:
+                bucket = self._param_2xx_values.get(key)
+                if bucket is None:
+                    if len(self._param_2xx_values) >= _MAX_ERROR_DELTA_VALUE_TRACKED:
+                        continue
+                    bucket = set()
+                    self._param_2xx_values[key] = bucket
+                if len(bucket) < _MAX_PARAM_VALUES_TRACKED:
+                    bucket.add(val)
+                self._param_2xx_status.setdefault(key, status)
+
+                err_vals = self._param_500_values.get(key) or set()
+                if err_vals:
+                    diff_err = [ev for ev in sorted(err_vals) if ev not in bucket]
+                    if diff_err:
+                        self._upsert_error_delta_param(
+                            key=key,
+                            norm_p=norm_p,
+                            method=method,
+                            baseline_status=self._param_2xx_status.get(key, status),
+                            baseline_value=val,
+                            error_value=diff_err[0],
+                        )
+                    elif key in self.error_delta_params:
+                        del self.error_delta_params[key]
+            elif status == 500:
+                err_bucket = self._param_500_values.get(key)
+                if err_bucket is None:
+                    if len(self._param_500_values) >= _MAX_ERROR_DELTA_VALUE_TRACKED:
+                        continue
+                    err_bucket = set()
+                    self._param_500_values[key] = err_bucket
+                if len(err_bucket) < _MAX_PARAM_VALUES_TRACKED:
+                    err_bucket.add(val)
+
+                ok_vals = self._param_2xx_values.get(key) or set()
+                if ok_vals:
+                    if val not in ok_vals:
+                        self._upsert_error_delta_param(
+                            key=key,
+                            norm_p=norm_p,
+                            method=method,
+                            baseline_status=self._param_2xx_status.get(key, 200),
+                            baseline_value=next(iter(sorted(ok_vals))),
+                            error_value=val,
+                        )
+                elif tmpl in self._2xx_templates and _is_active_probe_param_value(val):
+                    self._upsert_error_delta_param(
+                        key=key,
+                        norm_p=norm_p,
+                        method=method,
+                        baseline_status=200,
+                        baseline_value="",
+                        error_value=val,
+                    )
+
     def was_object_listed_for_actor(self, url_or_path: str, actor: str) -> bool:
         """Return True if `actor` legitimately received this concrete object ID in its own 2xx collection listing."""
         clean_actor = str(actor or "").strip()
@@ -1866,11 +2079,20 @@ class SurfaceFrontierTracker:
         status: int = 0,
         ctype: str = "",
     ) -> None:
-        if is_non_endpoint_source_path(norm_p):
+        if is_non_endpoint_source_path(norm_p) or _is_passive_spec_path(norm_p):
             return
         api_prefix = _extract_api_prefix(norm_p)
         if api_prefix:
-            if discovered or status != 404:
+            low_ct = ctype.lower()
+            is_json_api_ct = "json" in low_ct or "graphql" in low_ct
+            was_discovered = discovered or any(p == norm_p for _, p in self.discovered_routes)
+            should_register_api = (
+                discovered
+                or (200 <= status < 400)
+                or (status in (400, 405, 422))
+                or (status in (401, 403) and (is_json_api_ct or was_discovered))
+            )
+            if should_register_api:
                 self.api_prefix_routes.setdefault(api_prefix, set()).add(norm_p)
                 remainder = norm_p[len(api_prefix):].lstrip("/")
                 if remainder:
@@ -1961,6 +2183,8 @@ class SurfaceFrontierTracker:
         current_url: str = "",
         is_form: bool = False,
         listed_from_collection: bool = False,
+        source_tag: str = "",
+        sources: Sequence[str] = (),
     ) -> None:
         norm_method = str(method or "GET").strip().upper()
         resolved = self._resolve_same_origin(raw_url, current_url=current_url)
@@ -1970,6 +2194,27 @@ class SurfaceFrontierTracker:
         if is_non_endpoint_source_path(norm_p):
             return
         tmpl = route_template_of(norm_p)
+
+        spa_only = _is_spa_only_source(source_tag, sources)
+        neutral_js_string = str(source_tag or "").strip().lower() == "js-string"
+        if norm_method == "GET":
+            if spa_only:
+                if norm_p in self.pruned_spa_routes or (
+                    tmpl in self.pruned_spa_routes and tmpl not in self._non_404_templates
+                ):
+                    return
+                if norm_p not in self._non_spa_discovered_paths:
+                    self._spa_route_candidates.add(norm_p)
+            elif neutral_js_string:
+                if norm_p in self.pruned_spa_routes or (
+                    tmpl in self.pruned_spa_routes and tmpl not in self._non_404_templates
+                ):
+                    return
+            else:
+                self._non_spa_discovered_paths.add(norm_p)
+                self._non_spa_discovered_paths.add(tmpl)
+                self._spa_route_candidates.discard(norm_p)
+                self.pruned_spa_routes.discard(norm_p)
 
         q_names = [k.strip() for k, _ in parse_qsl(query, keep_blank_values=True) if k.strip()]
         for p in params:
@@ -2212,6 +2457,7 @@ class SurfaceFrontierTracker:
                 if non_meta_keys:
                     self.discovered_params.setdefault(tmpl, set()).update(non_meta_keys)
 
+        body_probe_pairs: list[tuple[str, str]] = []
         if method in {"POST", "PUT", "PATCH", "DELETE"}:
             req_body = str(receipt.get("request_body") or "")
             stripped_req = req_body.strip()
@@ -2233,22 +2479,66 @@ class SurfaceFrontierTracker:
                 ]
                 if json_probe_pairs:
                     self._record_param_probes(tmpl, json_probe_pairs)
+                    body_probe_pairs.extend(json_probe_pairs)
                 if method in {"POST", "PUT", "PATCH"} and 200 <= status < 400 and parsed_req_obj:
                     self._record_body_template(method, tmpl, parsed_req_obj)
             elif stripped_req and not is_multipart_summary and not stripped_req.startswith(("{", "[")):
                 body_pairs = [(k.strip(), v) for k, v in parse_qsl(req_body, keep_blank_values=True) if k.strip()]
                 if body_pairs:
                     self._record_param_probes(tmpl, body_pairs)
+                    body_probe_pairs.extend(body_pairs)
             if not _is_auth_utility_path(norm_p):
                 self.tested_write_ops.add((method, tmpl))
 
+        delta_pairs = [*observed_param_pairs, *body_probe_pairs]
+        self._record_error_delta_observations(
+            tmpl=active_probe_tmpl,
+            norm_p=norm_p,
+            method=method,
+            status=status,
+            param_pairs=delta_pairs,
+        )
+        if active_probe_tmpl != tmpl and (q_pairs or body_probe_pairs):
+            self._record_error_delta_observations(
+                tmpl=tmpl,
+                norm_p=norm_p,
+                method=method,
+                status=status,
+                param_pairs=[*q_pairs, *body_probe_pairs],
+            )
+
+        is_soft_deny = False
         if 200 <= status < 300:
-            self.route_2xx_actors.setdefault(norm_p, set()).add(actor)
+            is_soft_deny = _is_soft_deny_200(receipt, method=method, status=status, body=body)
+            if is_soft_deny:
+                if actor not in (self.route_2xx_actors.get(norm_p) or ()):
+                    self.soft_deny_routes.setdefault(norm_p, set()).add(actor)
+            else:
+                self.route_2xx_actors.setdefault(norm_p, set()).add(actor)
+                if norm_p in self.soft_deny_routes:
+                    self.soft_deny_routes[norm_p].discard(actor)
+                    if not self.soft_deny_routes[norm_p]:
+                        del self.soft_deny_routes[norm_p]
+
+        if method == "GET" and status == 404:
+            if (
+                (norm_p in self._spa_route_candidates or tmpl in self._spa_route_candidates)
+                and norm_p not in self._non_spa_discovered_paths
+                and tmpl not in self._non_spa_discovered_paths
+            ):
+                if norm_p in self._spa_route_candidates:
+                    self.pruned_spa_routes.add(norm_p)
+                    self.discovered_routes.pop(("GET", norm_p), None)
+                if tmpl in self._spa_route_candidates and tmpl not in self._non_404_templates:
+                    self.pruned_spa_routes.add(tmpl)
+                    self.discovered_routes.pop(("GET", tmpl), None)
+        elif status and status != 404:
+            self.pruned_spa_routes.discard(norm_p)
 
         self._observe_parity_path(norm_p, discovered=False, status=status, ctype=ctype)
 
         # Track concrete object visits
-        if "{id}" in tmpl and "{" not in norm_p and 200 <= status < 300:
+        if "{id}" in tmpl and "{" not in norm_p and 200 <= status < 300 and not is_soft_deny:
             owner_hint = ""
             if body.lstrip().startswith("{"):
                 try:
@@ -2393,6 +2683,7 @@ class SurfaceFrontierTracker:
                         method="GET",
                         actor=actor,
                         current_url=url,
+                        sources=sr.get("sources") or ("spa-route",),
                     )
                 for spec_u in find_spec_urls(script, url):
                     self._register_discovered_url(spec_u, method="GET", actor=actor, current_url=url)
@@ -2417,6 +2708,7 @@ class SurfaceFrontierTracker:
                     params=rec.get("params") or (),
                     actor=actor,
                     current_url=url,
+                    source_tag="js-string",
                 )
                 kept_js += 1
                 if kept_js >= 60:
@@ -2431,6 +2723,7 @@ class SurfaceFrontierTracker:
                     method="GET",
                     actor=actor,
                     current_url=url,
+                    sources=sr.get("sources") or ("spa-route",),
                 )
                 kept_spa += 1
                 if kept_spa >= 60:
@@ -2513,20 +2806,55 @@ class SurfaceFrontierTracker:
                     is_form=True,
                 )
                 _ingest_item_schemas(item_url, item_method, item)
-        for item in [
-            *(surface.get("links") or []),
-            *(surface.get("js_calls") or []),
-            *(surface.get("spa_routes") or []),
-        ]:
+        batch_spa_paths: set[str] = set()
+        for item in (surface.get("spa_routes") or []):
             if isinstance(item, dict):
+                raw_spa_u = str(item.get("url") or "")
+                res_spa = self._resolve_same_origin(raw_spa_u, current_url=curr_url)
+                if res_spa is not None:
+                    batch_spa_paths.add(res_spa[0])
+
+        for is_link_bucket, bucket in (
+            (True, surface.get("links") or ()),
+            (False, surface.get("js_calls") or ()),
+        ):
+            for item in bucket:
+                if not isinstance(item, dict):
+                    continue
                 item_url = str(item.get("url") or "")
                 item_method = str(item.get("method") or "GET")
+                item_tag = str(item.get("source_tag") or "")
+                item_sources = item.get("sources") or ()
+                if is_link_bucket and not item_tag and not item_sources and batch_spa_paths:
+                    res_link = self._resolve_same_origin(item_url, current_url=curr_url)
+                    if res_link is not None and res_link[0] in batch_spa_paths:
+                        item_tag = "spa-route"
                 self._register_discovered_url(
                     item_url,
                     method=item_method,
                     params=item.get("params") or (),
                     actor=actor,
                     current_url=curr_url,
+                    source_tag=item_tag,
+                    sources=item_sources,
+                )
+                _ingest_item_schemas(item_url, item_method, item)
+        for item in (surface.get("spa_routes") or []):
+            if isinstance(item, dict):
+                item_url = str(item.get("url") or "")
+                item_method = str(item.get("method") or "GET")
+                item_tag = str(item.get("source_tag") or "")
+                item_sources = item.get("sources") or ()
+                if not item_tag and not item_sources:
+                    item_tag = "spa-route"
+                self._register_discovered_url(
+                    item_url,
+                    method=item_method,
+                    params=item.get("params") or (),
+                    actor=actor,
+                    current_url=curr_url,
+                    source_tag=item_tag,
+                    sources=item_sources,
                 )
                 _ingest_item_schemas(item_url, item_method, item)
         for spec_u in (surface.get("spec_urls") or []):
@@ -2678,6 +3006,11 @@ class SurfaceFrontierTracker:
             ):
                 continue
             tmpl = route_template_of(norm_p)
+            if method == "GET" and (
+                norm_p in self.pruned_spa_routes
+                or (tmpl in self.pruned_spa_routes and tmpl not in self._non_404_templates)
+            ):
+                continue
             # Skip unexpanded OpenAPI template strings `{...}` if a concrete path for that template was visited
             if "{" in norm_p and (method, tmpl) in self.visited_method_templates:
                 continue
@@ -2719,7 +3052,11 @@ class SurfaceFrontierTracker:
                 sample_path_by_tmpl[t] = path
 
         for tmpl, disc_p in sorted(self.discovered_params.items()):
-            if tmpl not in visited_tmpls or _is_auth_utility_path(tmpl):
+            if (
+                tmpl not in visited_tmpls
+                or _is_auth_utility_path(tmpl)
+                or (tmpl in self.pruned_spa_routes and tmpl not in self._non_404_templates)
+            ):
                 continue
             tested_p = self.tested_params_by_template.get(tmpl) or set()
             shallow = [
@@ -3005,7 +3342,11 @@ class SurfaceFrontierTracker:
 
         candidates: list[tuple[tuple[int, int, int, str], str]] = []
         for resource, info in self.ui_resource_families.items():
-            if self._has_visited_api_resource(resource):
+            if (
+                _NUMERIC_SLUG_CATEGORY_RE.match(resource) is not None
+                or _is_passive_spec_path(f"{primary_prefix}/{resource}")
+                or self._has_visited_api_resource(resource)
+            ):
                 continue
             concrete_ids = info.get("concrete_ids") or []
             col_2xx = bool(info.get("collection_2xx"))
@@ -3249,6 +3590,8 @@ class SurfaceFrontierTracker:
 
             if self.is_route_actively_probed(tmpl, methods=sorted(allowed_m)):
                 continue
+            if tmpl in self.pruned_spa_routes and tmpl not in self._non_404_templates:
+                continue
 
             ordered_params = _order_params_by_risk(sorted(route_params.get(tmpl) or ()))
             hints = sorted(self.discovered_schema_hints.get(tmpl) or ())
@@ -3329,6 +3672,25 @@ class SurfaceFrontierTracker:
                 break
         return f"body_templates: [{'; '.join(items)}]" if items else ""
 
+    def _format_error_delta_candidates(self, *, max_items: int = 3) -> str:
+        """Render compact 500-delta injection candidates (2xx -> 500) for high-priority verification."""
+        if not self.error_delta_params or max_items <= 0:
+            return ""
+        ordered = sorted(
+            self.error_delta_params.items(),
+            key=lambda kv: (-int(kv[1].get("count_500") or 1), kv[0]),
+        )
+        items: list[str] = []
+        for (tmpl, pname), info in ordered[:max_items]:
+            sample_p = str(info.get("sample_path") or tmpl)
+            b_stat = int(info.get("baseline_status") or 200)
+            e_stat = int(info.get("error_status") or 500)
+            if str(pname).startswith("path:"):
+                items.append(f"{sample_p} [{pname}] ({b_stat}->{e_stat}, verify SQLi/SSTI/injection)")
+            else:
+                items.append(f"{sample_p}?{pname} ({b_stat}->{e_stat}, verify SQLi/SSTI/injection)")
+        return f"500-delta injection candidates: {'; '.join(items)}" if items else ""
+
     def format_frontier_banner(self, *, max_chars: int = 1000) -> str:
         """Render a compact (~1 KB) `[SURFACE FRONTIER]` block for turn state injection."""
         if max_chars <= 0:
@@ -3356,11 +3718,34 @@ class SurfaceFrontierTracker:
                 frontier["untested_actors"],
             )
         ):
+            for ed_cap in (3, 1, 0):
+                ed_line = self._format_error_delta_candidates(max_items=ed_cap)
+                if ed_line:
+                    base_with_done = (
+                        f"\n[SURFACE FRONTIER] {ed_line} | "
+                        "All discovered routes, objects, and allowed write ops covered."
+                    )
+                    if len(base_with_done) <= max_chars:
+                        return _append_compact_intel(base_with_done)
+                    base_ed_only = f"\n[SURFACE FRONTIER] {ed_line}"
+                    if len(base_ed_only) <= max_chars or ed_cap == 1:
+                        return base_ed_only[:max_chars]
             base_done = "\n[SURFACE FRONTIER] All discovered routes, objects, and allowed write ops covered."
             return _append_compact_intel(base_done)
 
-        def _build(r_cap: int, q_cap: int, o_cap: int, p_cap: int, w_cap: int, a_cap: int) -> str:
+        def _build(
+            r_cap: int,
+            q_cap: int,
+            o_cap: int,
+            p_cap: int,
+            w_cap: int,
+            a_cap: int,
+            ed_cap: int = 2,
+        ) -> str:
             parts: list[str] = []
+            ed_line = self._format_error_delta_candidates(max_items=ed_cap)
+            if ed_line:
+                parts.append(ed_line)
             if frontier["unvisited_routes"]:
                 routes = ", ".join(frontier["unvisited_routes"][:r_cap])
                 parts.append(f"unvisited_routes({len(all_routes)}): [{routes}]")
@@ -3381,11 +3766,20 @@ class SurfaceFrontierTracker:
                 parts.append(f"untested_actors: [{acts}]")
             return "\n[SURFACE FRONTIER] " + " | ".join(parts)
 
-        for caps in ((6, 3, 4, 3, 6, 5), (3, 2, 2, 3, 3, 3), (2, 1, 1, 3, 1, 2), (1, 1, 1, 2, 1, 1)):
+        for caps in (
+            (6, 3, 4, 3, 6, 5, 2),
+            (3, 2, 2, 3, 3, 3, 2),
+            (2, 1, 1, 3, 1, 2, 1),
+            (1, 1, 1, 2, 1, 1, 1),
+        ):
             candidate = _build(*caps)
             if len(candidate) <= max_chars:
                 return _append_compact_intel(candidate)
-        return _build(1, 1, 1, 2, 1, 1)[:max_chars]
+        return _build(1, 1, 1, 2, 1, 1, 1)[:max_chars]
+
+    def render_frontier_banner(self, *, max_chars: int = 1000) -> str:
+        """Render the compact (~1 KB) `[SURFACE FRONTIER]` banner (alias of `format_frontier_banner`)."""
+        return self.format_frontier_banner(max_chars=max_chars)
 
     def to_dict(self) -> dict[str, Any]:
         """Serialize tracker state for checkpoint persistence."""
@@ -3413,6 +3807,28 @@ class SurfaceFrontierTracker:
             "non_404_templates": sorted(self._non_404_templates),
             "actors_by_template": {k: sorted(v) for k, v in self.actors_by_template.items()},
             "actors_by_path": {k: sorted(v) for k, v in self.actors_by_path.items()},
+            "route_2xx_actors": {k: sorted(v) for k, v in sorted(self.route_2xx_actors.items()) if v},
+            "soft_deny_routes": {k: sorted(v) for k, v in sorted(self.soft_deny_routes.items()) if v},
+            "error_delta_params": [
+                [k[0], k[1], dict(v)]
+                for k, v in sorted(self.error_delta_params.items())
+            ],
+            "param_2xx_values": [
+                [k[0], k[1], sorted(v)]
+                for k, v in sorted(self._param_2xx_values.items())
+            ],
+            "param_2xx_status": [
+                [k[0], k[1], int(v)]
+                for k, v in sorted(self._param_2xx_status.items())
+            ],
+            "param_500_values": [
+                [k[0], k[1], sorted(v)]
+                for k, v in sorted(self._param_500_values.items())
+            ],
+            "two_xx_templates": sorted(self._2xx_templates),
+            "spa_route_candidates": sorted(self._spa_route_candidates),
+            "non_spa_discovered_paths": sorted(self._non_spa_discovered_paths),
+            "pruned_spa_routes": sorted(self.pruned_spa_routes),
             "discovered_routes": [[k[0], k[1], v] for k, v in sorted(self.discovered_routes.items())],
             "discovered_params": {k: sorted(v) for k, v in self.discovered_params.items()},
             "discovered_objects": {
@@ -3495,6 +3911,70 @@ class SurfaceFrontierTracker:
         self.actors_by_path = {
             str(k): set(v) for k, v in (data.get("actors_by_path") or {}).items() if isinstance(v, list)
         }
+        self.route_2xx_actors = {
+            str(k): {str(a) for a in v if str(a)}
+            for k, v in (data.get("route_2xx_actors") or {}).items()
+            if isinstance(v, list) and not is_non_endpoint_source_path(str(k))
+        }
+        self.soft_deny_routes = {
+            str(k): {str(a) for a in v if str(a)}
+            for k, v in (data.get("soft_deny_routes") or {}).items()
+            if isinstance(v, list) and not is_non_endpoint_source_path(str(k))
+        }
+        self.error_delta_params = {}
+        for row in (data.get("error_delta_params") or []):
+            if isinstance(row, list) and len(row) == 3 and isinstance(row[2], dict):
+                e_tmpl = str(row[0] or "").strip()
+                e_param = str(row[1] or "").strip()
+                if e_tmpl and e_param and len(self.error_delta_params) < _MAX_ERROR_DELTA_PARAMS:
+                    self.error_delta_params[(e_tmpl, e_param)] = {
+                        "route_template": e_tmpl,
+                        "param": e_param,
+                        "sample_path": str(row[2].get("sample_path") or e_tmpl),
+                        "method": str(row[2].get("method") or "GET").upper(),
+                        "baseline_status": int(row[2].get("baseline_status") or 200),
+                        "error_status": int(row[2].get("error_status") or 500),
+                        "baseline_value": str(row[2].get("baseline_value") or "")[:64],
+                        "error_value": str(row[2].get("error_value") or "")[:64],
+                        "count_500": max(1, int(row[2].get("count_500") or 1)),
+                    }
+        self._param_2xx_values = {}
+        for row in (data.get("param_2xx_values") or []):
+            if isinstance(row, list) and len(row) == 3 and isinstance(row[2], list):
+                p_tmpl, p_name = str(row[0] or "").strip(), str(row[1] or "").strip()
+                if p_tmpl and p_name and len(self._param_2xx_values) < _MAX_ERROR_DELTA_VALUE_TRACKED:
+                    self._param_2xx_values[(p_tmpl, p_name)] = {
+                        str(x)[:64] for x in row[2][:_MAX_PARAM_VALUES_TRACKED]
+                    }
+        self._param_2xx_status = {}
+        for row in (data.get("param_2xx_status") or []):
+            if isinstance(row, list) and len(row) == 3:
+                p_tmpl, p_name = str(row[0] or "").strip(), str(row[1] or "").strip()
+                if p_tmpl and p_name and not isinstance(row[2], bool):
+                    try:
+                        self._param_2xx_status[(p_tmpl, p_name)] = int(row[2])
+                    except (TypeError, ValueError):
+                        pass
+        self._param_500_values = {}
+        for row in (data.get("param_500_values") or []):
+            if isinstance(row, list) and len(row) == 3 and isinstance(row[2], list):
+                p_tmpl, p_name = str(row[0] or "").strip(), str(row[1] or "").strip()
+                if p_tmpl and p_name and len(self._param_500_values) < _MAX_ERROR_DELTA_VALUE_TRACKED:
+                    self._param_500_values[(p_tmpl, p_name)] = {
+                        str(x)[:64] for x in row[2][:_MAX_PARAM_VALUES_TRACKED]
+                    }
+        self._2xx_templates = {
+            str(x) for x in (data.get("two_xx_templates") or []) if str(x)
+        }
+        self._spa_route_candidates = {
+            str(x) for x in (data.get("spa_route_candidates") or []) if str(x)
+        }
+        self._non_spa_discovered_paths = {
+            str(x) for x in (data.get("non_spa_discovered_paths") or []) if str(x)
+        }
+        self.pruned_spa_routes = {
+            str(x) for x in (data.get("pruned_spa_routes") or []) if str(x)
+        }
         self.discovered_routes = {
             (str(x[0]), str(x[1])): str(x[2])
             for x in (data.get("discovered_routes") or [])
@@ -3503,6 +3983,7 @@ class SurfaceFrontierTracker:
             and not is_non_endpoint_source_path(str(x[1]))
             and not self._is_port_in_path_noise(str(x[1]))
             and not (is_static_asset_url(str(x[1])) and not _extract_path_embedded_params(str(x[1])))
+            and not (str(x[0]) == "GET" and str(x[1]) in self.pruned_spa_routes)
         }
         self.discovered_params = {
             str(k): set(v)
@@ -3572,15 +4053,21 @@ class SurfaceFrontierTracker:
         self.tested_write_ops = {(str(x[0]), str(x[1])) for x in (data.get("tested_write_ops") or []) if len(x) == 2}
 
         if isinstance(data.get("api_prefix_routes"), dict):
-            self.api_prefix_routes = {
-                str(k): {str(p) for p in v if not is_non_endpoint_source_path(str(p))}
-                for k, v in data["api_prefix_routes"].items()
-                if isinstance(v, list)
-            }
+            self.api_prefix_routes = {}
+            for k, v in data["api_prefix_routes"].items():
+                if not isinstance(v, list):
+                    continue
+                cleaned_p = {
+                    str(p)
+                    for p in v
+                    if not is_non_endpoint_source_path(str(p)) and not _is_passive_spec_path(str(p))
+                }
+                if cleaned_p:
+                    self.api_prefix_routes[str(k)] = cleaned_p
         else:
             self.api_prefix_routes = {}
             for _, path in list(self.discovered_routes.keys()) + list(self.visited_method_paths):
-                if is_non_endpoint_source_path(path):
+                if is_non_endpoint_source_path(path) or _is_passive_spec_path(path):
                     continue
                 prefix = _extract_api_prefix(path)
                 if prefix:
@@ -3589,8 +4076,13 @@ class SurfaceFrontierTracker:
         if isinstance(data.get("ui_resource_families"), dict):
             self.ui_resource_families = {}
             for k, v in data["ui_resource_families"].items():
-                if isinstance(v, dict):
-                    self.ui_resource_families[str(k)] = {
+                res_k = str(k)
+                if (
+                    isinstance(v, dict)
+                    and _NUMERIC_SLUG_CATEGORY_RE.match(res_k) is None
+                    and not _is_passive_spec_path(f"/{res_k}")
+                ):
+                    self.ui_resource_families[res_k] = {
                         "concrete_ids": [str(cid) for cid in (v.get("concrete_ids") or []) if str(cid)],
                         "collection_2xx": bool(v.get("collection_2xx")),
                         "collection_403": bool(v.get("collection_403")),

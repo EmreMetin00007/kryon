@@ -11,6 +11,7 @@ import re
 import tempfile
 import threading
 from typing import Any, Sequence
+from urllib.parse import parse_qsl, urlsplit
 
 from agentic_bsag import STATUS_REFUTED, STATUS_SUSPECT_DECOY, BeliefStateAttackGraph
 from agentic_surface import route_template_of
@@ -365,6 +366,48 @@ class TelemetryLogger:
             return list(self._events)
 
 
+def _http_status_class(status: int | None) -> str:
+    """Return normalized HTTP status bucket for non-BSAG novelty tracking."""
+    if status is None or status <= 0:
+        return "error"
+    if 200 <= status < 300:
+        return "2xx"
+    if 300 <= status < 400:
+        return "3xx"
+    if status in (401, 403):
+        return "401/403"
+    if status == 404:
+        return "404"
+    if 400 <= status < 500:
+        return "4xx"
+    if 500 <= status < 600:
+        return "5xx"
+    return "other"
+
+
+def _extract_http_event_query_keys(event: dict[str, Any]) -> frozenset[str]:
+    """Extract normalized query parameter key set from an `http_event` record."""
+    keys: set[str] = set()
+    for field in ("query_keys", "params"):
+        raw_seq = event.get(field)
+        if isinstance(raw_seq, (list, tuple, set, frozenset)):
+            for item in raw_seq:
+                k = str(item.get("name") if isinstance(item, dict) else item or "").strip()
+                if k:
+                    keys.add(k)
+    for raw_q in (
+        str(event.get("query") or ""),
+        urlsplit(str(event.get("path") or "")).query,
+        urlsplit(str(event.get("url") or "")).query,
+    ):
+        if raw_q:
+            for k, _ in parse_qsl(raw_q, keep_blank_values=True):
+                clean_k = k.strip()
+                if clean_k:
+                    keys.add(clean_k)
+    return frozenset(keys)
+
+
 def compute_process_metrics(
     *,
     events: Sequence[dict[str, Any]],
@@ -426,10 +469,56 @@ def compute_process_metrics(
         exposure_block["reference_total"] = len(ref_set)
         exposure_block["reference_exposure_rate"] = round(matched / max(1, len(ref_set)), 4)
 
-    # 2. Fixation ratio: fraction of steps/events producing delta_v == 0 and delta_e == 0
+    # 2. Fixation ratio: fraction of steps/events producing zero delta
     step_samples = [e for e in delta_events if "delta_v" in e and "delta_e" in e]
-    zero_delta_count = sum(1 for e in step_samples if int(e.get("delta_v") or 0) == 0 and int(e.get("delta_e") or 0) == 0)
-    fixation_ratio = round(zero_delta_count / max(1, len(step_samples)), 4) if step_samples else 0.0
+    has_nonzero_bsag_delta = any(
+        int(e.get("delta_v") or 0) != 0 or int(e.get("delta_e") or 0) != 0
+        for e in step_samples
+    )
+    if bsag is None and not has_nonzero_bsag_delta and http_events:
+        seen_method_tmpls: set[tuple[str, str]] = set()
+        seen_tmpl_actors: set[tuple[str, str]] = set()
+        seen_tmpl_statuses: set[tuple[str, str]] = set()
+        seen_tmpl_qkeys: set[tuple[str, frozenset[str]]] = set()
+        zero_delta_count = 0
+        for ev in http_events:
+            method = str(ev.get("method") or "GET").strip().upper() or "GET"
+            raw_tmpl = str(ev.get("route_template") or "").strip()
+            if raw_tmpl:
+                tmpl = route_template_of(raw_tmpl)
+            else:
+                raw_target = str(ev.get("path") or ev.get("url") or "/").strip() or "/"
+                tmpl = route_template_of(raw_target)
+            actor = str(ev.get("actor") or "anon").strip() or "anon"
+            status_cls = _http_status_class(_safe_int(ev.get("status")))
+            q_keys = _extract_http_event_query_keys(ev)
+
+            m_key = (method, tmpl)
+            a_key = (tmpl, actor)
+            s_key = (tmpl, status_cls)
+            q_key = (tmpl, q_keys)
+            novel = (
+                m_key not in seen_method_tmpls
+                or a_key not in seen_tmpl_actors
+                or s_key not in seen_tmpl_statuses
+                or q_key not in seen_tmpl_qkeys
+            )
+            seen_method_tmpls.add(m_key)
+            seen_tmpl_actors.add(a_key)
+            seen_tmpl_statuses.add(s_key)
+            seen_tmpl_qkeys.add(q_key)
+            if not novel:
+                zero_delta_count += 1
+        step_sample_count = len(http_events)
+        fixation_ratio = round(zero_delta_count / max(1, step_sample_count), 4)
+    else:
+        step_sample_count = len(step_samples)
+        zero_delta_count = sum(
+            1
+            for e in step_samples
+            if int(e.get("delta_v") or 0) == 0 and int(e.get("delta_e") or 0) == 0
+        )
+        fixation_ratio = round(zero_delta_count / max(1, step_sample_count), 4) if step_sample_count else 0.0
 
     # 3. Category entropy H(C)
     cat_labels = [str(e.get("category") or "") for e in worker_starts if e.get("category")]
@@ -506,7 +595,7 @@ def compute_process_metrics(
         "counts": {
             "http_events": len(http_events),
             "zero_delta_steps": zero_delta_count,
-            "step_samples": len(step_samples),
+            "step_samples": step_sample_count,
             "workers_spawned": len(worker_starts),
             "interventions_total": len(interventions),
             "interventions_by_trigger": interventions_by_trigger,

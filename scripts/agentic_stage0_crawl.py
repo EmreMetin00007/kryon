@@ -253,6 +253,25 @@ _BENIGN_TECH_PROBES: dict[str, tuple[str, ...]] = {
     "php": ("/api",),
     "go": ("/api", "/metrics"),
 }
+_STANDARD_NON_AUTH_HEADERS: frozenset[str] = frozenset({
+    "authorization",
+    "proxy-authorization",
+    "cookie",
+    "set-cookie",
+    "accept",
+    "accept-encoding",
+    "accept-language",
+    "content-type",
+    "content-length",
+    "host",
+    "origin",
+    "referer",
+    "user-agent",
+    "connection",
+    "cache-control",
+})
+_SAFE_OPENAPI_HEADER_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+_MAX_OPENAPI_SPEC_BYTES = 512 * 1024
 
 _MAX_JS_CHUNKS = 96
 _MAX_JS_CHUNK_BYTES = 256 * 1024
@@ -659,6 +678,8 @@ def _empty_result(
         "network_requests_captured": 0,
         "js_chunks_parsed": 0,
         "passive_probes_sent": 0,
+        "probed_paths": [],
+        "discovered_auth_headers": [],
         "ws_endpoints_found": 0,
         "routes_accepted": 0,
         "body_templates_count": 0,
@@ -677,6 +698,7 @@ def _empty_result(
         "ws_endpoints": [],
         "body_templates": {},
         "multipart_schemas": {},
+        "auth_headers": [],
         "discovery_hints": [],
         "seed_file": "",
         "stats": stats,
@@ -1327,6 +1349,146 @@ def _extract_openapi_templates(
     return templates, multipart_map, ops_meta
 
 
+def _parse_openapi_spec_document(
+    body_text: str,
+    *,
+    content_type: str = "",
+    path: str = "",
+) -> dict[str, Any] | None:
+    """Parse a bounded JSON or YAML OpenAPI/Swagger document if valid."""
+    text = str(body_text or "")
+    if not text or len(text) > _MAX_OPENAPI_SPEC_BYTES:
+        return None
+    stripped = text.lstrip()
+    if not stripped or stripped.startswith("<"):
+        return None
+    parsed: Any = None
+    if stripped.startswith("{"):
+        try:
+            parsed = json.loads(text)
+        except ValueError:
+            parsed = None
+    else:
+        ctype_low = str(content_type or "").lower()
+        path_low = str(path or "").lower()
+        looks_yaml = (
+            "yaml" in ctype_low
+            or "yml" in ctype_low
+            or path_low.endswith((".yaml", ".yml"))
+            or bool(re.search(r"(?m)^\s*(?:openapi|swagger)\s*:", stripped[:4096]))
+        )
+        if looks_yaml:
+            try:
+                import yaml  # type: ignore[import-untyped]
+
+                parsed = yaml.safe_load(text)
+            except Exception:
+                parsed = None
+    if (
+        isinstance(parsed, dict)
+        and isinstance(parsed.get("paths"), dict)
+        and ("openapi" in parsed or "swagger" in parsed)
+    ):
+        return parsed
+    return None
+
+
+def extract_openapi_header_auth_names(spec: dict[str, Any]) -> list[str]:
+    """Extract custom header names from OpenAPI 3 ``securitySchemes`` or Swagger 2 ``securityDefinitions``."""
+    if not isinstance(spec, dict):
+        return []
+    resolver = LocalSchema(spec) if LocalSchema is not None else None
+    scheme_maps: list[dict[str, Any]] = []
+    components = spec.get("components")
+    if isinstance(components, dict) and isinstance(components.get("securitySchemes"), dict):
+        scheme_maps.append(components["securitySchemes"])
+    sec_defs = spec.get("securityDefinitions")
+    if isinstance(sec_defs, dict):
+        scheme_maps.append(sec_defs)
+
+    found: list[str] = []
+    seen_low: set[str] = set()
+    for scheme_map in scheme_maps:
+        for raw_scheme in scheme_map.values():
+            if not isinstance(raw_scheme, dict):
+                continue
+            scheme = resolver.resolve(raw_scheme) if resolver is not None else raw_scheme
+            if not isinstance(scheme, dict):
+                continue
+            scheme_type = str(scheme.get("type") or "").strip().lower()
+            scheme_in = str(scheme.get("in") or "").strip().lower()
+            if scheme_type != "apikey" or scheme_in != "header":
+                continue
+            hdr_name = str(scheme.get("name") or "").strip()
+            if not hdr_name or not _SAFE_OPENAPI_HEADER_NAME_RE.fullmatch(hdr_name):
+                continue
+            hdr_low = hdr_name.lower()
+            if hdr_low in _STANDARD_NON_AUTH_HEADERS or hdr_low in seen_low:
+                continue
+            seen_low.add(hdr_low)
+            found.append(hdr_name)
+    return found
+
+
+def _register_openapi_auth_headers(
+    http_client: AgenticHTTPClient,
+    collector: _Stage0Collector,
+    spec: dict[str, Any],
+) -> None:
+    """Record and register discovered OpenAPI header auth schemes on ``http_client`` if supported."""
+    header_names = extract_openapi_header_auth_names(spec)
+    if not header_names:
+        return
+    reg = getattr(http_client, "register_discovered_auth_header", None)
+    for hdr_name in header_names:
+        is_new = collector.record_discovered_auth_header(hdr_name)
+        if is_new and callable(reg):
+            try:
+                reg(hdr_name, "")
+            except TypeError:
+                reg(hdr_name)
+            except Exception:
+                pass
+
+
+def _ingest_openapi_spec(
+    http_client: AgenticHTTPClient,
+    collector: _Stage0Collector,
+    parsed_spec: dict[str, Any],
+    *,
+    spec_url: str,
+    summary_rec: dict[str, Any] | None = None,
+) -> None:
+    """Ingest operations, templates, and custom header auth schemes from a parsed OpenAPI/Swagger spec."""
+    oa_prefix = infer_openapi_mount_prefix(parsed_spec, spec_url)
+    if summary_rec is not None:
+        try:
+            summary = _extract_surface_summary(summary_rec, http_client.base_url)
+            collector.ingest_surface_summary(
+                summary,
+                source_url=spec_url,
+                openapi_path_prefix=oa_prefix,
+            )
+        except Exception:
+            pass
+
+    oa_templates, oa_multipart, oa_ops = _extract_openapi_templates(
+        parsed_spec,
+        path_prefix=oa_prefix,
+    )
+    for op_method, op_path, op_params in oa_ops:
+        collector.record_route(
+            method=op_method,
+            raw_url=op_path,
+            current_url=http_client.base_url,
+            params=op_params,
+            body_template=oa_templates.get((op_method, op_path)),
+            body_template_observed=False,
+            multipart_schema=oa_multipart.get((op_method, op_path)),
+        )
+    _register_openapi_auth_headers(http_client, collector, parsed_spec)
+
+
 def _status_priority(status: int) -> int:
     if 200 <= status < 300 or status in {401, 403}:
         return 8
@@ -1510,8 +1672,12 @@ class _Stage0Collector:
         self.captured_html: dict[str, dict[str, Any]] = {}
         self.captured_js: dict[str, dict[str, Any]] = {}
         self.captured_css: dict[str, dict[str, Any]] = {}
+        self.captured_specs: dict[str, tuple[str, dict[str, Any]]] = {}
         self.discovered_spec_urls: list[str] = []
         self.fetched_2xx_paths: set[str] = set()
+        self.probed_paths: set[str] = set()
+        self.discovered_auth_headers: list[str] = []
+        self._seen_auth_headers_low: set[str] = set()
         self.server_headers: list[str] = []
         self.powered_by_headers: list[str] = []
         self.body_snippets: list[str] = []
@@ -1529,6 +1695,19 @@ class _Stage0Collector:
         self.network_requests_captured = 0
         self.js_chunks_parsed = 0
         self.passive_probes_sent = 0
+
+    def record_discovered_auth_header(self, header_name: str) -> bool:
+        """Record a custom OpenAPI auth header name once (case-insensitive)."""
+        clean = str(header_name or "").strip()
+        if not clean:
+            return False
+        low = clean.lower()
+        with self._lock:
+            if low in self._seen_auth_headers_low:
+                return False
+            self._seen_auth_headers_low.add(low)
+            self.discovered_auth_headers.append(clean)
+            return True
 
     def try_reserve_script_asset(self, clean_url: str) -> bool:
         """Allow up to ``_MAX_STAGE0_SCRIPT_ASSETS`` unique browser script assets per crawl."""
@@ -2423,9 +2602,26 @@ def _crawl_actor_playwright(
             )
             is_css = ("css" in ctype) or low_resp_path.endswith(".css")
             is_html = "html" in ctype
-            if not is_js and not is_css and not is_html:
+            is_spec_candidate = (
+                not is_js
+                and not is_css
+                and not is_html
+                and any(tok in low_resp_path for tok in ("openapi", "swagger", "api-docs"))
+                and (
+                    "json" in ctype
+                    or "yaml" in ctype
+                    or "yml" in ctype
+                    or "text/plain" in ctype
+                    or low_resp_path.endswith((".json", ".yaml", ".yml"))
+                )
+            )
+            if not is_js and not is_css and not is_html and not is_spec_candidate:
                 return
-            max_bytes = _MAX_JS_CHUNK_BYTES if is_js else (_MAX_CSS_BYTES if is_css else _MAX_HTML_BYTES)
+            max_bytes = (
+                _MAX_OPENAPI_SPEC_BYTES
+                if is_spec_candidate
+                else (_MAX_JS_CHUNK_BYTES if is_js else (_MAX_CSS_BYTES if is_css else _MAX_HTML_BYTES))
+            )
             try:
                 raw_body = resp.body()
             except Exception:
@@ -2433,6 +2629,21 @@ def _crawl_actor_playwright(
             if not raw_body:
                 return
             text_body = bytes(raw_body[:max_bytes]).decode("utf-8", errors="replace")
+            if is_spec_candidate:
+                parsed_doc = _parse_openapi_spec_document(
+                    text_body,
+                    content_type=ctype,
+                    path=resp_path,
+                )
+                if parsed_doc is not None:
+                    try:
+                        norm_sp = normalize_path(resp_path or "/")
+                    except ValueError:
+                        norm_sp = resp_path or "/"
+                    with collector._lock:
+                        if norm_sp not in collector.captured_specs and len(collector.captured_specs) < 8:
+                            collector.captured_specs[norm_sp] = (resp_url, parsed_doc)
+                return
             if is_html and collector._allow_canonical_host_aliases:
                 collector.register_canonical_hosts(
                     detect_internal_canonical_hosts(
@@ -2913,6 +3124,7 @@ def _run_layer4_passive_fusion(
     *,
     primary_actor: str,
     max_passive_probes: int,
+    skip_probe_paths: Sequence[str] | None = None,
 ) -> None:
     """Fuse captured HTML, JS chunks, and CSS via ``_extract_surface_summary`` and run bounded manifest probes."""
     if collector._allow_canonical_host_aliases:
@@ -2959,6 +3171,14 @@ def _run_layer4_passive_fusion(
             except Exception:
                 continue
 
+    for spec_url, parsed_spec in list(collector.captured_specs.values()):
+        _ingest_openapi_spec(
+            http_client,
+            collector,
+            parsed_spec,
+            spec_url=spec_url,
+        )
+
     if max_passive_probes <= 0 or "GET" not in http_client.allowed_methods:
         return
 
@@ -2974,6 +3194,20 @@ def _run_layer4_passive_fusion(
                 tech_probes.append(tpath)
 
     seen_probes: set[str] = set()
+    for raw_skip in skip_probe_paths or ():
+        cand_skip = str(raw_skip or "").strip()
+        if not cand_skip:
+            continue
+        try:
+            _u, clean_skip, _q = _check_http_scope(http_client, cand_skip, allow_fragment=False)
+            norm_skip = normalize_path(clean_skip)
+        except (ScopeViolationError, ValueError):
+            try:
+                norm_skip = normalize_path(urlsplit(cand_skip).path or "/")
+            except ValueError:
+                continue
+        seen_probes.add(norm_skip)
+
     found_openapi_spec = False
     stop_probing = False
 
@@ -3022,6 +3256,7 @@ def _run_layer4_passive_fusion(
         after_used = int(http_client.budget.used)
         stage0_budget.account_external(max(0, after_used - before_used))
         collector.passive_probes_sent += 1
+        collector.probed_paths.add(probe_path)
 
         status = int(rec.get("status") or 0)
         rec_url = str(rec.get("url") or urljoin(http_client.base_url, probe_path))
@@ -3041,56 +3276,43 @@ def _run_layer4_passive_fusion(
         collector.record_route(method="GET", raw_url=rec_url, status=status)
 
         body_text = str(rec.get("body") or "")
-        stripped = body_text.lstrip()
-        parsed_spec: dict[str, Any] | None = None
-        if stripped.startswith("{"):
-            try:
-                parsed = json.loads(body_text)
-            except ValueError:
-                parsed = None
-            if (
-                isinstance(parsed, dict)
-                and isinstance(parsed.get("paths"), dict)
-                and ("openapi" in parsed or "swagger" in parsed)
-            ):
-                parsed_spec = parsed
+        rec_ctype = str(rec.get("content_type") or "")
+        parsed_spec = _parse_openapi_spec_document(
+            body_text,
+            content_type=rec_ctype,
+            path=probe_path,
+        )
 
-        oa_prefix = infer_openapi_mount_prefix(parsed_spec, rec_url) if parsed_spec is not None else ""
+        if parsed_spec is not None:
+            summary_rec: dict[str, Any] | None = None
+            if body_text.lstrip().startswith("{"):
+                summary_rec = rec
+            _ingest_openapi_spec(
+                http_client,
+                collector,
+                parsed_spec,
+                spec_url=rec_url,
+                summary_rec=summary_rec,
+            )
+            return True
+
         try:
-            summary_rec = rec
+            summary_rec_non_spec = rec
             cur_aliases = collector.canonical_hosts_snapshot()
-            if cur_aliases and body_text and parsed_spec is None:
-                summary_rec = dict(rec)
-                summary_rec["body"] = rewrite_internal_canonical_urls_in_text(
+            if cur_aliases and body_text:
+                summary_rec_non_spec = dict(rec)
+                summary_rec_non_spec["body"] = rewrite_internal_canonical_urls_in_text(
                     body_text,
                     base_url=http_client.base_url,
                     canonical_hosts=cur_aliases,
                 )
-            summary = _extract_surface_summary(summary_rec, http_client.base_url)
+            summary = _extract_surface_summary(summary_rec_non_spec, http_client.base_url)
             collector.ingest_surface_summary(
                 summary,
                 source_url=rec_url,
-                openapi_path_prefix=oa_prefix,
             )
         except Exception:
             pass
-
-        if parsed_spec is not None:
-            oa_templates, oa_multipart, oa_ops = _extract_openapi_templates(
-                parsed_spec,
-                path_prefix=oa_prefix,
-            )
-            for op_method, op_path, op_params in oa_ops:
-                collector.record_route(
-                    method=op_method,
-                    raw_url=op_path,
-                    current_url=http_client.base_url,
-                    params=op_params,
-                    body_template=oa_templates.get((op_method, op_path)),
-                    body_template_observed=False,
-                    multipart_schema=oa_multipart.get((op_method, op_path)),
-                )
-            return True
         return False
 
     for probe_path in _prepare_probe_candidates(collector.discovered_spec_urls):
@@ -3290,6 +3512,7 @@ def run_stage0_crawl(
     timeout_ms: int = 12000,
     wait_ms: int = 500,
     max_passive_probes: int = 12,
+    skip_probe_paths: Sequence[str] | None = None,
 ) -> dict[str, Any]:
     """Run deterministic Stage 0 Playwright surface crawl and return ``stage0-seed/1`` payload."""
     started = time.monotonic()
@@ -3459,10 +3682,13 @@ def run_stage0_crawl(
             stage0_budget,
             primary_actor=primary_actor,
             max_passive_probes=eff_max_probes,
+            skip_probe_paths=skip_probe_paths,
         )
 
     links, forms, body_templates_map, multipart_schemas_map, discovery_hints = _finalize_routes(collector)
     ws_endpoints = list(collector.ws_endpoints.values())
+    probed_paths_sorted = sorted(collector.probed_paths)
+    auth_headers_list = list(collector.discovered_auth_headers)
     elapsed = round(time.monotonic() - started, 3)
 
     if crawl_error and not links and not forms and not ws_endpoints:
@@ -3484,6 +3710,8 @@ def run_stage0_crawl(
         "network_requests_captured": int(collector.network_requests_captured),
         "js_chunks_parsed": int(collector.js_chunks_parsed),
         "passive_probes_sent": int(collector.passive_probes_sent),
+        "probed_paths": probed_paths_sorted,
+        "discovered_auth_headers": list(auth_headers_list),
         "ws_endpoints_found": len(ws_endpoints),
         "routes_accepted": len(links) + len(forms),
         "body_templates_count": len(body_templates_map),
@@ -3505,6 +3733,7 @@ def run_stage0_crawl(
         "ws_endpoints": ws_endpoints,
         "body_templates": body_templates_map,
         "multipart_schemas": multipart_schemas_map,
+        "auth_headers": auth_headers_list,
         "discovery_hints": discovery_hints,
         "seed_file": "",
         "stats": stats,
@@ -3524,6 +3753,7 @@ def run_stage0_crawl(
 
 __all__ = [
     "HAS_PLAYWRIGHT",
+    "extract_openapi_header_auth_names",
     "run_stage0_crawl",
     "should_skip_stage0_form_submit",
 ]

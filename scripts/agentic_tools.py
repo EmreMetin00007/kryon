@@ -149,15 +149,24 @@ from agentic_preview import (
 )
 from agentic_receipts import DEFAULT_PREVIEW_CHARS, ReceiptStore
 from agentic_surface import SurfaceFrontierTracker, is_virgin_state_sensitive_path
+from kryon_core.surface.openapi import extract_openapi_header_auth_names
 
 _SKIP_REPLAY_HEADERS = frozenset({
     "authorization",
     "cookie",
+    "x-access-token",
+    "x-auth-token",
+    "x-api-key",
+    "x-token",
+    "x-session-token",
+    "x-api-token",
     "x-csrf-token",
+    "x-csrftoken",
     "x-xsrf-token",
     "content-length",
     "host",
 })
+_HTTP_HEADER_NAME_RE = re.compile(r"^[!#$%&'*+\-.^_`|~0-9A-Za-z]{1,128}$")
 _PERSISTENT_VULN_CLASSES = frozenset({"stored_xss", "mass_assignment", "ssti"})
 _OOB_CALLBACK_CLASSES = frozenset({"ssrf", "xxe", "ssti", "command_injection", "insecure_deserialization"})
 _MUTATING_WRITE_METHODS = frozenset({"POST", "PUT", "PATCH"})
@@ -220,6 +229,10 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                     "follow_redirects": {"type": "boolean"},
                     "force": {"type": "boolean"},
                     "save_session_as": {"type": "string", "description": "Captured session alias."},
+                    "auth_header": {
+                        "type": "string",
+                        "description": "Custom token header name for save_session_as (e.g. X-Access-Token).",
+                    },
                 },
                 "required": ["url"],
             },
@@ -847,6 +860,16 @@ class ToolDispatcher:
 
         headers = _coerce_mapping_arg(args.get("headers"))
         query = _coerce_mapping_arg(args.get("query"))
+        raw_auth_header = args.get("auth_header")
+        auth_header_name = ""
+        if raw_auth_header is not None:
+            if not isinstance(raw_auth_header, str):
+                raise ValueError("auth_header must be a string")
+            if "\r" in raw_auth_header or "\n" in raw_auth_header or "\x00" in raw_auth_header:
+                raise ValueError("auth_header must not contain control characters")
+            auth_header_name = raw_auth_header.strip()
+            if auth_header_name and not _HTTP_HEADER_NAME_RE.fullmatch(auth_header_name):
+                raise ValueError(f"invalid auth_header name: {raw_auth_header!r}")
         follow_redirects = bool(args.get("follow_redirects", False))
         request_kwargs: dict[str, Any] = {
             "method": eff_method,
@@ -863,8 +886,17 @@ class ToolDispatcher:
         }
         if follow_redirects:
             request_kwargs["follow_redirects"] = True
+        if auth_header_name:
+            request_kwargs["auth_header_name"] = auth_header_name
         self._enforce_http_reserve_floor(needed=1)
         receipt = self.http.request(**request_kwargs)
+        if (
+            auth_header_name
+            and isinstance(receipt.get("saved_session"), dict)
+            and not receipt["saved_session"].get("auth_header")
+        ):
+            receipt = dict(receipt)
+            receipt["saved_session"] = {**receipt["saved_session"], "auth_header": auth_header_name}
         self._ingest_receipt_hooks(receipt)
         preview = _format_receipt_preview(receipt)
         if eff_method == "GET" and has_payload:
@@ -942,10 +974,17 @@ class ToolDispatcher:
             )
 
         # Preserve safe non-auth request headers when replaying.
+        skip_replay_headers = set(_SKIP_REPLAY_HEADERS)
+        try:
+            baseline_sess = self.http.actors.get(str(baseline.get("actor") or "anon"))
+            if getattr(baseline_sess, "auth_header_name", "").strip():
+                skip_replay_headers.add(baseline_sess.auth_header_name.strip().lower())
+        except ValueError:
+            pass
         req_headers: dict[str, str] = {}
         for k, v in (baseline.get("request_headers") or {}).items():
             kl = str(k).strip().lower()
-            if kl in _SKIP_REPLAY_HEADERS or "<REDACTED" in str(v):
+            if kl in skip_replay_headers or "<REDACTED" in str(v):
                 continue
             if baseline_is_multipart and kl == "content-type":
                 continue
@@ -1174,6 +1213,23 @@ class ToolDispatcher:
 
     def _tool_extract_surface(self, args: dict[str, Any]) -> str:
         receipt = self.receipts.get(str(args.get("receipt_id") or ""))
+        body = str(receipt.get("body") or "")
+        if (
+            200 <= int(receipt.get("status") or 0) < 300
+            and len(body) <= 2_000_000
+            and body.lstrip().startswith("{")
+            and ('"securitySchemes"' in body or '"securityDefinitions"' in body)
+            and not self.http.actors.discovered_auth_header
+        ):
+            try:
+                parsed_spec = json.loads(body)
+            except ValueError:
+                parsed_spec = None
+            if isinstance(parsed_spec, dict):
+                for hdr_name in extract_openapi_header_auth_names(parsed_spec):
+                    if hdr_name.lower() != "authorization":
+                        self.http.register_discovered_auth_header(hdr_name)
+                        break
         surface = _extract_surface_summary(receipt, self.http.base_url)
         self.surface_tracker.ingest_receipt(receipt)
         self.surface_tracker.ingest_surface(surface, actor=str(receipt.get("actor") or ""))
@@ -1264,7 +1320,11 @@ class ToolDispatcher:
 
         clean_url, _, _ = self.http._merge_query(url, query)
         session = self.http.actors.get(actor)
-        has_auth_override = any(str(k).lower() in {"authorization", "cookie"} for k in (headers or {}))
+        auth_override_keys = {"authorization", "cookie"}
+        with session._lock:
+            if getattr(session, "auth_header_name", "").strip():
+                auth_override_keys.add(session.auth_header_name.strip().lower())
+        has_auth_override = any(str(k).strip().lower() in auth_override_keys for k in (headers or {}))
         self._enforce_http_reserve_floor(needed=count)
         if actor != "anon" and not has_auth_override and not session.authenticated:
             self.http.authenticate_actor(actor, force_login=False)

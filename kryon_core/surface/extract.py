@@ -607,13 +607,26 @@ _INLINE_SCRIPT_RE = re.compile(r"<script\b([^>]*)>([\s\S]*?)</script>", re.I)
 _SCRIPT_SRC_ATTR_RE = re.compile(r"\bsrc\s*=", re.I)
 _SPA_HASH_ROUTE_RE = re.compile(r"""(?:href\s*=\s*)?(['"`])(#/[^'"`\s<>]+)\1""", re.I)
 _SPA_ROUTER_CALL_RE = re.compile(
-    r"""(?:router\.(?:push|replace)|navigate|history\.pushState\s*\([^,]*,[^,]*,)\s*\(\s*(['"`])(/[^'"`\s<>]+)\1""",
+    r"""(?:router\.(?:push|replace)|history\.pushState\s*\([^,]*,[^,]*,)\s*\(\s*(['"`])([^'"`\s<>]+)\1""",
+    re.I,
+)
+_SPA_NAVIGATE_CALL_RE = re.compile(
+    r"""\bnavigate\s*\(\s*(['"`])(/[^'"`\s<>]+)\1""",
+    re.I,
+)
+_SPA_ROUTER_OBJ_CALL_RE = re.compile(
+    r"""(?:router\.(?:push|replace)|next)\s*\(\s*\{\s*path\s*:\s*(['"`])([^'"`\s<>]+)\1""",
     re.I,
 )
 _SPA_ROUTE_PATH_RE = re.compile(
-    r"""\bpath\s*:\s*(['"`])(/[^'"`\s<>]{2,})\1""",
+    r"""\bpath\s*:\s*(['"`])(/[^'"`\s<>]{2,}|(?:\.\.?/)?[A-Za-z0-9_-]+(?:/[A-Za-z0-9._~:-]+)+(?:\?[^'"`\s<>]*)?|[A-Za-z0-9_-]{2,64}(?=['"`]\s*,\s*(?:query|params|name|redirect|component|components|meta|children|hash|replace)\s*:))\1""",
     re.I,
 )
+_SPA_SCHEME_PREFIX_RE = re.compile(
+    r"^(?:[A-Za-z][A-Za-z0-9+.-]*://|(?:javascript|mailto|data|tel|blob|about):)",
+    re.I,
+)
+_SPA_MIME_PREFIXES = ("application/", "text/", "image/", "audio/", "video/", "font/", "multipart/")
 _SPA_ANGULAR_WHEN_RE = re.compile(
     r"""\.when\s*\(\s*(['"`])(/[^'"`\s<>]+)\1""",
     re.I,
@@ -675,6 +688,7 @@ _BUNDLER_PATH_MARKERS = (
 )
 _BUNDLER_EXACT_PATHS = frozenset({
     "/node_modules",
+    "/dist",
     "/@vite",
     "/@fs",
     "/@id",
@@ -990,9 +1004,85 @@ _KNOWN_SHORT_UPPER_ROUTES = frozenset({
     "CORS", "CSRF", "CMS", "CRM", "ERP", "RPC", "SQL", "XML", "CSV", "PDF",
     "RSS", "CDN", "WAF", "DNS", "FTP", "SSH", "OAUTH",
 })
+_KNOWN_SHORT_LOWER_ROUTES = frozenset({
+    *(tok.lower() for tok in _KNOWN_SHORT_UPPER_ROUTES),
+    "css", "js", "svg", "php", "jsp", "cgi", "src", "www", "sdk", "cli", "cfg",
+    "pwd", "tmp", "mnt", "srv", "tls", "ssl", "vpn", "mcp", "llm", "nlp",
+    "ocr", "rfq", "rfi", "kpi", "pkg", "cmd", "msg", "txt", "png", "jpg",
+    "gif", "ttf", "eot", "xhr", "gql", "jwks", "jwk", "jws", "xsrf", "csp",
+    "hsts", "trpc", "htmx", "npm", "wsdl", "crl", "kms", "sts", "mtls",
+    "ntlm", "smtp", "dhcp", "snmp", "rdp", "smb", "nfs", "vpc", "sftp",
+    "hrm", "lms", "scm", "k8s", "v1", "v2", "v3", "ws", "db", "fs", "sh",
+})
 _UPPER_VERSION_TOKEN_RE = re.compile(r"^V\d{1,2}$")
 _VOWEL_CHARS = frozenset("aeiouyAEIOUY")
 _BARE_JS_IDENT_PART_RE = re.compile(r"^[A-Za-z_$][A-Za-z0-9_$]*$")
+_JS_ASSET_BASE_EXTS = (".js", ".mjs", ".cjs")
+_WEBPACK_BUNDLE_CONTEXT_RE = re.compile(
+    r"(?:webpackJsonp|webpackChunk|__webpack_require__|__webpack_modules__)"
+    r"|(?:['\"][A-Za-z0-9+/]{4}['\"]|[A-Za-z0-9_$]{4})\s*:\s*"
+    r"(?:function\s*\(\s*[A-Za-z_$][\w$]*\s*,\s*[A-Za-z_$][\w$]*|"
+    r"\(\s*[A-Za-z_$][\w$]*\s*,\s*[A-Za-z_$][\w$]*[^)]*\)\s*=>)"
+)
+_WEBPACK_SHORT_MOD_CAND_RE = re.compile(r"^(?:\./|/)[A-Za-z0-9+_$-][A-Za-z0-9+/_$-]{1,3}$")
+_WEBPACK_DEF_AFTER_RE = re.compile(r"^:\s*(?:function\s*\*?\s*\(|\([^)]*\)\s*=>)")
+_WEBPACK_EXPLICIT_REQ_BEFORE_RE = re.compile(
+    r"(?:(?:^|[^.\w$])__webpack_require__\s*\(|"
+    r"(?:^|[^.\w$])(?:__webpack_require__|[A-Za-z_$])\.bind\s*\(\s*null\s*,)\s*$"
+)
+_WEBPACK_MINIFIED_REQ_BEFORE_RE = re.compile(r"(?:^|[^.\w$])[A-Za-z_$]\s*\(\s*$")
+
+
+def _origin_base_url(base: str) -> str:
+    """Return ``scheme://netloc/`` when ``base`` has an HTTP(S) scheme and netloc, else ``base``."""
+    parsed = urlsplit(str(base or "").strip())
+    if parsed.scheme.lower() in {"http", "https"} and parsed.netloc:
+        return f"{parsed.scheme.lower()}://{parsed.netloc}/"
+    return base
+
+
+def _script_origin_base(base: str) -> str:
+    """Resolve `.js`/`.mjs`/`.cjs` asset URLs to origin root while preserving HTML page bases."""
+    parsed = urlsplit(str(base or "").strip())
+    if (
+        parsed.scheme.lower() in {"http", "https"}
+        and parsed.netloc
+        and parsed.path.lower().endswith(_JS_ASSET_BASE_EXTS)
+    ):
+        return f"{parsed.scheme.lower()}://{parsed.netloc}/"
+    return base
+
+
+def _is_webpack_module_id_match(
+    source: str,
+    match: re.Match[str],
+    candidate: str,
+    *,
+    is_webpack_bundle: bool,
+) -> bool:
+    """Return True when a short `/...` or `./...` match sits in a Webpack module-map or require call."""
+    if not match.lastindex or match.lastindex < 1:
+        return False
+    start, end = match.start(1), match.end(1)
+    if start <= 0 or end >= len(source):
+        return False
+    q_open = source[start - 1]
+    q_close = source[end]
+    if q_open not in ("'", '"', "`") or q_close != q_open:
+        return False
+    cand = (candidate or "").strip()
+    if not _WEBPACK_SHORT_MOD_CAND_RE.fullmatch(cand):
+        return False
+    after = source[end + 1 : end + 49].lstrip()
+    if _WEBPACK_DEF_AFTER_RE.match(after):
+        return True
+    if after.startswith(")"):
+        before = source[max(0, start - 49) : start - 1]
+        if _WEBPACK_EXPLICIT_REQ_BEFORE_RE.search(before):
+            return True
+        if is_webpack_bundle and _WEBPACK_MINIFIED_REQ_BEFORE_RE.search(before):
+            return True
+    return False
 
 
 def _is_minified_js_noise_path(path: str, *, is_unrooted_rel: bool = False) -> bool:
@@ -1003,10 +1093,14 @@ def _is_minified_js_noise_path(path: str, *, is_unrooted_rel: bool = False) -> b
     - Single-segment 2-4 char alphanumeric tokens containing uppercase letters with digits
       (``/86O``, ``/99E``, ``/I4U``), internal mixed case (``/bQp``), consonant-only TitleCase,
       or 3-4 letter all-uppercase non-route tokens (``/ZBO``, ``/BOW``).
+    - Single-segment 3-4 char all-lowercase consonant-only tokens not in the explicit known
+      short-route allowlist (e.g. ``/bpg``, ``/gxq``, ``/xsj``).
 
-    Preserves explicit known routes (``/API``, ``/SSO``, ``/JWT``, ``/OAuth``, ``/V1``),
-    vowel-bearing TitleCase routes (``/Home``, ``/User``, ``/Auth``), and ALL lowercase routes
-    (``/api``, ``/app``, ``/v1``, ``/v2``, ``/ui``, ``/ws``, ``/doc``, ``/docs``, etc.).
+    Preserves explicit known routes (``/API``, ``/SSO``, ``/JWT``, ``/OAuth``, ``/V1``,
+    ``/css``, ``/js``, ``/svg``, ``/xml``, ``/pdf``, ``/rpc``, ``/sql``, etc.),
+    vowel-bearing TitleCase routes (``/Home``, ``/User``, ``/Auth``), and vowel-bearing or
+    allowlisted lowercase routes (``/api``, ``/app``, ``/v1``, ``/v2``, ``/ui``, ``/ws``,
+    ``/doc``, ``/docs``, ``/faq``, etc.).
     """
     check_path = (path or "").strip()
     if not check_path or check_path == "/":
@@ -1029,6 +1123,13 @@ def _is_minified_js_noise_path(path: str, *, is_unrooted_rel: bool = False) -> b
         return False
     has_upper = any(ch.isupper() for ch in seg)
     if not has_upper:
+        if (
+            3 <= len(seg) <= 4
+            and seg.isalpha()
+            and not any(ch in _VOWEL_CHARS for ch in seg)
+            and seg not in _KNOWN_SHORT_LOWER_ROUTES
+        ):
+            return True
         return False
     if seg.upper() in _KNOWN_SHORT_UPPER_ROUTES or _UPPER_VERSION_TOKEN_RE.fullmatch(seg):
         return False
@@ -1229,15 +1330,7 @@ def extract_js_calls(text: str, base: str, allow_subdomains: bool = False,
     source = text or ""
     sdk_ctx = has_google_identity_sdk_context(source)
     symtab = _collect_js_string_symtab(source)
-    parsed_base = urlparse(base or "")
-    if (
-        parsed_base.scheme in ("http", "https")
-        and parsed_base.netloc
-        and parsed_base.path.lower().endswith((".js", ".mjs"))
-    ):
-        call_base = f"{parsed_base.scheme}://{parsed_base.netloc}/"
-    else:
-        call_base = base
+    call_base = _script_origin_base(base)
     calls = []  # (raw_url, method, body_keys, is_graphql_hint)
 
     def option_slice(start: int) -> str:
@@ -1435,7 +1528,10 @@ def _join_spa_basename(basename: str, raw_path: str) -> str:
         return path
     if path == "/":
         return basename
-    return basename + "/" + path.lstrip("/")
+    while path.startswith(("./", "../")):
+        path = path[2:] if path.startswith("./") else path[3:]
+    cleaned_rel = path.lstrip("/")
+    return f"{basename}/{cleaned_rel}" if cleaned_rel else basename
 
 
 def _normalize_spa_route_path(
@@ -1444,14 +1540,22 @@ def _normalize_spa_route_path(
     normalize_colon: bool = True,
     drop_empty_root: bool = False,
 ) -> str:
-    """Normalize `:param`/`[param]` syntax and strip virtual router group segments like `(app)`."""
+    """Normalize `:param`/`[param]` syntax, guarantee a leading `/`, and strip virtual groups like `(app)`."""
     cleaned = str(raw_path or "").strip()
     if not cleaned:
         return ""
     if cleaned.startswith("#/"):
         cleaned = cleaned[1:]
-    if not cleaned.startswith("/"):
+    elif cleaned.startswith("#"):
         return ""
+    if cleaned.startswith("//") or _SPA_SCHEME_PREFIX_RE.match(cleaned):
+        return ""
+    while cleaned.startswith(("./", "../")):
+        cleaned = cleaned[2:] if cleaned.startswith("./") else cleaned[3:]
+    if not cleaned or cleaned in {".", ".."}:
+        return ""
+    if not cleaned.startswith("/"):
+        cleaned = "/" + cleaned
     path_part, sep, query_part = cleaned.partition("?")
     if "*" in path_part:
         return ""
@@ -1479,6 +1583,7 @@ def extract_spa_routes(
     """Extract SPA hash routes (#/path?q=1) and client router route definitions."""
     source = text or ""
     sdk_ctx = has_google_identity_sdk_context(source)
+    origin_base = _origin_base_url(base)
     records: list[dict] = []
     seen: set[str] = set()
 
@@ -1494,21 +1599,26 @@ def extract_spa_routes(
     def _emit_route(raw_path: str, source_tag: str) -> None:
         if limit is not None and len(records) >= limit:
             return
-        if is_third_party_sdk_static_route(raw_path, sdk_context=sdk_ctx) or is_os_filesystem_path(raw_path):
+        raw_str = str(raw_path or "").strip()
+        if not raw_str or _is_bare_js_property_token(raw_str):
             return
-        if _is_implausible_url_path(raw_path, allow_virtual_groups=True):
+        if not raw_str.startswith(("/", "#", ".")) and raw_str.lower().startswith(_SPA_MIME_PREFIXES):
             return
-        cleaned = _normalize_spa_route_path(raw_path)
+        if is_third_party_sdk_static_route(raw_str, sdk_context=sdk_ctx) or is_os_filesystem_path(raw_str):
+            return
+        if _is_implausible_url_path(raw_str, allow_virtual_groups=True):
+            return
+        cleaned = _normalize_spa_route_path(raw_str)
         if not cleaned or _STATIC_SPA_EXT_RE.search(cleaned):
             return
         if is_third_party_sdk_static_route(cleaned, sdk_context=sdk_ctx) or is_non_endpoint_noise_path(cleaned):
             return
-        url = normalize_url(cleaned, base=base)
-        if not url or not same_host(url, base, allow_subdomains=allow_subdomains):
+        url = normalize_url(cleaned, base=origin_base)
+        if not url or not same_host(url, origin_base, allow_subdomains=allow_subdomains):
             return
         if (
             is_third_party_sdk_static_route(url, sdk_context=sdk_ctx)
-            or is_port_in_path_artifact(url, origin_url=base)
+            or is_port_in_path_artifact(url, origin_url=origin_base)
             or is_os_filesystem_path(url)
             or _is_bare_numeric_root_path(url)
         ):
@@ -1528,7 +1638,14 @@ def extract_spa_routes(
 
     for match in _SPA_HASH_ROUTE_RE.finditer(source):
         _emit_route(match.group(2), "spa-hash")
-    for pattern in (_SPA_ROUTER_CALL_RE, _SPA_ROUTE_PATH_RE, _SPA_ANGULAR_WHEN_RE, _SPA_UI_ROUTER_URL_RE):
+    for pattern in (
+        _SPA_ROUTER_CALL_RE,
+        _SPA_NAVIGATE_CALL_RE,
+        _SPA_ROUTER_OBJ_CALL_RE,
+        _SPA_ROUTE_PATH_RE,
+        _SPA_ANGULAR_WHEN_RE,
+        _SPA_UI_ROUTER_URL_RE,
+    ):
         for match in pattern.finditer(source):
             _emit_route(match.group(2), "spa-route")
     for pattern in (_SPA_REACT_ROUTE_RE, _SPA_REACT_LINK_RE):
@@ -1658,24 +1775,26 @@ def extract_js(text: str, base: str, allow_subdomains: bool = False, limit: int 
         return []
     source = text or ""
     sdk_ctx = has_google_identity_sdk_context(source)
+    is_webpack_bundle = bool(_WEBPACK_BUNDLE_CONTEXT_RE.search(source))
+    js_base = _script_origin_base(base)
     records: list[dict] = []
     seen: set[str] = set()
 
-    parsed_base_origin = urlsplit(base or "")
+    parsed_base_origin = urlsplit(js_base or "")
     base_scheme = (parsed_base_origin.scheme or "http").lower()
     if base_scheme not in {"http", "https"}:
         base_scheme = "http"
     base_netloc_low = (parsed_base_origin.netloc or "").lower()
 
     def _emit_js(candidate: str) -> bool:
-        cand = normalize_bare_hostport_url((candidate or "").strip(), base=base)
+        cand = normalize_bare_hostport_url((candidate or "").strip(), base=js_base)
         if not cand or "${" in cand:
             return False
-        if (cand.isascii() and cand.isdigit()) or _is_bare_js_property_token(cand):
+        if (len(cand) == 1 and not cand.startswith("/")) or (cand.isascii() and cand.isdigit()) or _is_bare_js_property_token(cand):
             return False
         if (
             is_third_party_sdk_static_route(cand, sdk_context=sdk_ctx)
-            or is_port_in_path_artifact(cand, origin_url=base)
+            or is_port_in_path_artifact(cand, origin_url=js_base)
             or is_os_filesystem_path(cand)
         ):
             return False
@@ -1687,14 +1806,14 @@ def extract_js(text: str, base: str, allow_subdomains: bool = False, limit: int 
                 return False
         if cand.lower().endswith(_JS_STATIC_EXTS):
             return False
-        url = normalize_url(cand, base=base)
-        if not url or not same_host(url, base, allow_subdomains=allow_subdomains):
+        url = normalize_url(cand, base=js_base)
+        if not url or not same_host(url, js_base, allow_subdomains=allow_subdomains):
             return False
         if urlparse(url).path.lower().endswith(_JS_STATIC_EXTS):
             return False
         if (
             is_third_party_sdk_static_route(url, sdk_context=sdk_ctx)
-            or is_port_in_path_artifact(url, origin_url=base)
+            or is_port_in_path_artifact(url, origin_url=js_base)
             or is_os_filesystem_path(url)
             or _is_bare_numeric_root_path(url)
         ):
@@ -1708,8 +1827,15 @@ def extract_js(text: str, base: str, allow_subdomains: bool = False, limit: int 
         return limit is not None and len(records) >= limit
 
     for pattern in JS_PATTERNS:
-        for match in pattern.findall(source):
-            candidate = match if isinstance(match, str) else match[0]
+        for match in pattern.finditer(source):
+            candidate = match.group(1) if match.lastindex and match.lastindex >= 1 else match.group(0)
+            if _is_webpack_module_id_match(
+                source,
+                match,
+                candidate,
+                is_webpack_bundle=is_webpack_bundle,
+            ):
+                continue
             if _emit_js(candidate):
                 return records
 

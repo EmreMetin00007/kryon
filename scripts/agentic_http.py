@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import base64
 import binascii
+from collections.abc import Set as AbstractSet
 from dataclasses import dataclass, field
 from datetime import timezone
 from email.utils import parsedate_to_datetime
@@ -33,6 +34,7 @@ if str(_REPO_ROOT) not in sys.path:
 from agentic_receipts import ReceiptStore  # noqa: E402
 from kryon_core.protocol.grpc_web import decode_grpc_web_frames, is_grpc_web_content_type  # noqa: E402
 from kryon_core.protocol.websocket_probe import probe_websocket  # noqa: E402
+from kryon_core.surface.openapi import extract_openapi_header_auth_names  # noqa: E402
 from target_bootstrap import ScopeGuard, match_logout_route  # noqa: E402
 from wire_budget import WireBudget  # noqa: E402
 
@@ -47,6 +49,47 @@ STATIC_EXTENSIONS = frozenset({
 _MUTATING_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
 _AUTH_OVERRIDE_HEADERS = frozenset({"authorization", "cookie"})
 _CSRF_HEADER_NAMES = frozenset({"x-csrf-token", "x-csrftoken", "x-xsrf-token"})
+_CUSTOM_TOKEN_RESPONSE_HEADERS: tuple[str, ...] = (
+    "x-access-token",
+    "x-auth-token",
+    "x-token",
+    "x-session-token",
+    "x-api-token",
+)
+_ANON_OBSERVED_AUTH_HEADERS = frozenset(_CUSTOM_TOKEN_RESPONSE_HEADERS)
+_EXTRA_SENSITIVE_HEADER_NAMES = frozenset({
+    "x-csrftoken",
+    "x-access-token",
+    "x-token",
+    "x-session-token",
+    "x-api-token",
+})
+_NON_DISCOVERABLE_AUTH_HEADERS = frozenset({
+    "authorization",
+    "proxy-authorization",
+    "cookie",
+    "set-cookie",
+    "content-type",
+    "content-length",
+    "user-agent",
+    "accept",
+    "host",
+    "origin",
+    "referer",
+    "x-csrf-token-next",
+}) | _CSRF_HEADER_NAMES
+_HTTP_HEADER_NAME_RE = re.compile(r"^[!#$%&'*+\-.^_`|~0-9A-Za-z]{1,128}$")
+_SESSION_ENVELOPE_SUBKEYS: tuple[str, ...] = (
+    "data",
+    "result",
+    "payload",
+    "session",
+    "auth",
+    "user",
+    "response",
+    "body",
+)
+_SESSION_NESTED_PARENTS: tuple[str, ...] = ("data", "result")
 _CSRF_RESPONSE_HEADERS: tuple[tuple[str, str], ...] = (
     ("x-csrf-token-next", "X-CSRF-Token"),
     ("x-csrf-token", "X-CSRF-Token"),
@@ -175,20 +218,51 @@ def _extract_token_from_auth(auth_header: str) -> str:
     return parts[1].strip() if len(parts) == 2 else ""
 
 
-def _redact_framework_csrf_headers(headers: dict[str, str]) -> dict[str, str]:
-    """Ensure framework-specific CSRF headers (e.g. X-CSRFToken) are redacted before receipt persistence."""
+def _validate_auth_header_name(raw: Any, *, strict: bool = False) -> str:
+    """Validate and normalize an HTTP auth header name, rejecting CRLF, NUL, and non-token characters."""
+    if raw is None:
+        return ""
+    if not isinstance(raw, str):
+        if strict:
+            raise ValueError("auth_header must be a string")
+        return ""
+    if "\r" in raw or "\n" in raw or "\x00" in raw:
+        if strict:
+            raise ValueError("auth_header must not contain control characters")
+        return ""
+    clean = raw.strip()
+    if not clean:
+        return ""
+    if not _HTTP_HEADER_NAME_RE.fullmatch(clean):
+        if strict:
+            raise ValueError(f"invalid auth_header name: {raw!r}")
+        return ""
+    return clean
+
+
+def _redact_extra_sensitive_headers(
+    headers: dict[str, str],
+    extra_names: AbstractSet[str] = frozenset(),
+) -> dict[str, str]:
+    """Ensure framework CSRF and custom API token headers are redacted before receipt persistence."""
     if not headers:
         return {}
+    sensitive = _EXTRA_SENSITIVE_HEADER_NAMES | extra_names
     out: dict[str, str] = {}
     for k, v in headers.items():
         key_str = str(k)
         val_str = str(v)
-        if key_str.strip().lower() == "x-csrftoken" and val_str and not val_str.startswith("<REDACTED"):
+        if key_str.strip().lower() in sensitive and val_str and not val_str.startswith("<REDACTED"):
             digest8 = hashlib.sha256(val_str.encode("utf-8", errors="replace")).hexdigest()[:8]
             out[key_str] = f"<REDACTED:len={len(val_str)},sha256_8={digest8}>"
         else:
             out[key_str] = val_str
     return out
+
+
+def _redact_framework_csrf_headers(headers: dict[str, str]) -> dict[str, str]:
+    """Ensure framework-specific CSRF headers (e.g. X-CSRFToken) are redacted before receipt persistence."""
+    return _redact_extra_sensitive_headers(headers)
 
 
 def _parse_retry_after_seconds(
@@ -254,6 +328,8 @@ class ActorSession:
     cookies: dict[str, str] = field(default_factory=dict)
     local_storage: dict[str, str] = field(default_factory=dict)
     access_token: str = ""
+    auth_header_name: str = ""
+    auth_header_prefix: str = ""
     refresh_token: str = ""
     refresh_path: str = ""
     csrf_token: str = ""
@@ -273,11 +349,22 @@ class ActorSession:
             for candidate in (self.password, self.access_token, self.refresh_token, self.csrf_token):
                 if candidate and len(candidate) >= 4:
                     secrets.append(candidate)
+            if self.access_token and self.auth_header_prefix:
+                prefixed = f"{self.auth_header_prefix}{self.access_token}"
+                if len(prefixed) >= 4 and prefixed not in secrets:
+                    secrets.append(prefixed)
             if self.csrf_token and len(self.csrf_token) >= 4:
                 for encoded in (quote_plus(self.csrf_token), quote(self.csrf_token, safe="")):
                     if encoded and encoded != self.csrf_token and encoded not in secrets:
                         secrets.append(encoded)
-            secret_header_names = {"authorization", "cookie", "x-api-key"} | _CSRF_HEADER_NAMES
+            secret_header_names = (
+                {"authorization", "cookie", "x-api-key"}
+                | _ANON_OBSERVED_AUTH_HEADERS
+                | _CSRF_HEADER_NAMES
+            )
+            clean_auth_hdr = self.auth_header_name.strip().lower()
+            if clean_auth_hdr:
+                secret_header_names.add(clean_auth_hdr)
             for k, v in self.base_headers.items():
                 if k.lower() in secret_header_names and v:
                     secrets.append(v)
@@ -296,23 +383,44 @@ class ActorSession:
         with self._lock:
             extra_items = list((extra_headers or {}).items())
             extra_low = {str(k).strip().lower(): ("" if v is None else str(v)) for k, v in extra_items}
-            override_auth = bool(extra_low.get("authorization", "").strip())
+            eff_auth_header = self.auth_header_name.strip()
+            use_custom_header = bool(eff_auth_header) and eff_auth_header.lower() != "authorization"
+            custom_header_low = eff_auth_header.lower() if use_custom_header else ""
+            explicit_authorization = bool(extra_low.get("authorization", "").strip())
+            explicit_custom = bool(use_custom_header and extra_low.get(custom_header_low, "").strip())
+            override_auth = explicit_authorization or explicit_custom
             override_cookie = bool(extra_low.get("cookie", "").strip())
 
             headers = dict(self.base_headers)
-            # When an explicit Authorization override is supplied without Cookie (or vice
+            # When an explicit Authorization/custom-auth override is supplied without Cookie (or vice
             # versa), suppress the actor's default peer auth channel so a stale session
-            # cookie or bearer token does not shadow the tested credential on dual-auth apps.
+            # cookie or token does not shadow the tested credential on dual-auth apps.
             if override_auth and "cookie" not in extra_low:
                 for ek in [k for k in headers if k.lower() == "cookie"]:
                     headers.pop(ek, None)
-            if override_cookie and "authorization" not in extra_low:
-                for ek in [k for k in headers if k.lower() == "authorization"]:
+            if override_cookie:
+                if "authorization" not in extra_low:
+                    for ek in [k for k in headers if k.lower() == "authorization"]:
+                        headers.pop(ek, None)
+                if use_custom_header and custom_header_low not in extra_low:
+                    for ek in [k for k in headers if k.lower() == custom_header_low]:
+                        headers.pop(ek, None)
+            if explicit_authorization and use_custom_header and custom_header_low not in extra_low:
+                for ek in [k for k in headers if k.lower() == custom_header_low]:
                     headers.pop(ek, None)
 
-            if self.access_token and not (override_cookie and "authorization" not in extra_low):
-                if not any(k.lower() == "authorization" for k in headers):
-                    headers["Authorization"] = f"Bearer {self.access_token}"
+            if self.access_token:
+                if use_custom_header:
+                    suppress_custom = (
+                        (override_cookie and custom_header_low not in extra_low)
+                        or (explicit_authorization and custom_header_low not in extra_low)
+                    )
+                    if not suppress_custom and not any(k.lower() == custom_header_low for k in headers):
+                        headers[eff_auth_header] = f"{self.auth_header_prefix}{self.access_token}"
+                else:
+                    if not (override_cookie and "authorization" not in extra_low):
+                        if not any(k.lower() == "authorization" for k in headers):
+                            headers["Authorization"] = f"Bearer {self.access_token}"
             if self.cookies and not (override_auth and "cookie" not in extra_low):
                 if not any(k.lower() == "cookie" for k in headers):
                     headers["Cookie"] = "; ".join(f"{k}={v}" for k, v in sorted(self.cookies.items()))
@@ -335,30 +443,46 @@ class ActorSession:
             return headers
 
 
-def _extract_session_material_details(
+def _extract_session_material_full(
     *,
     headers: dict[str, str],
     cookies: dict[str, str],
     body_text: str,
-) -> tuple[dict[str, str], str, str, str, str, str]:
-    """Extract (cookies, bearer_token, refresh_token, csrf_token, csrf_header_name, csrf_field_name)."""
+) -> tuple[dict[str, str], str, str, str, str, str, str, str]:
+    """Extract (cookies, bearer_token, refresh_token, csrf_token, csrf_header_name, csrf_field_name, auth_header_name, token_source)."""
     captured_cookies = {str(k): str(v) for k, v in (cookies or {}).items() if k and v}
-    lower_headers = {str(k).lower(): str(v) for k, v in (headers or {}).items()}
+    lower_headers = {str(k).strip().lower(): str(v) for k, v in (headers or {}).items()}
+    raw_header_names = {str(k).strip().lower(): str(k).strip() for k in (headers or {}) if str(k).strip()}
     csrf_token = ""
     csrf_header_name = ""
     csrf_field_name = ""
     csrf_from_response_header = False
     for hdr_key, canonical_hdr in _CSRF_RESPONSE_HEADERS:
         hdr_val = (lower_headers.get(hdr_key) or "").strip()
-        if hdr_val:
+        if hdr_val and not hdr_val.startswith("<REDACTED"):
             csrf_token = hdr_val
             csrf_header_name = canonical_hdr
             csrf_from_response_header = True
             break
     bearer_token = ""
+    auth_header_name = ""
+    token_source = ""
     auth_hdr = lower_headers.get("authorization", "").strip()
     if auth_hdr:
-        bearer_token = _extract_token_from_auth(auth_hdr)
+        extracted_auth = _extract_token_from_auth(auth_hdr)
+        if extracted_auth and not extracted_auth.startswith("<REDACTED"):
+            bearer_token = extracted_auth
+            token_source = "authorization_header"
+    if not bearer_token:
+        for hdr_key in _CUSTOM_TOKEN_RESPONSE_HEADERS:
+            hdr_val = (lower_headers.get(hdr_key) or "").strip()
+            if hdr_val and not hdr_val.startswith("<REDACTED"):
+                if hdr_val[:7].lower() == "bearer " and hdr_val[7:].strip():
+                    hdr_val = hdr_val[7:].strip()
+                bearer_token = hdr_val
+                auth_header_name = raw_header_names.get(hdr_key, hdr_key)
+                token_source = "response_header"
+                break
     refresh_token = ""
 
     stripped = (body_text or "").lstrip()
@@ -369,20 +493,21 @@ def _extract_session_material_details(
             parsed = None
         if isinstance(parsed, dict):
             candidates: list[dict[str, Any]] = [parsed]
-            for subkey in ("data", "session", "auth", "user"):
+            for subkey in _SESSION_ENVELOPE_SUBKEYS:
                 sub = parsed.get(subkey)
                 if isinstance(sub, dict):
                     candidates.append(sub)
-            # Support GraphQL mutation responses such as {"data": {"login": {"access_token": ...}}}.
-            data_obj = parsed.get("data")
-            if isinstance(data_obj, dict):
-                nested_count = 0
-                for sub_val in data_obj.values():
-                    if isinstance(sub_val, dict):
-                        candidates.append(sub_val)
-                        nested_count += 1
-                        if nested_count >= 8:
-                            break
+            # Support nested envelopes such as {"data": {"login": {...}}} or {"result": {"data": {...}}}.
+            for parent_key in _SESSION_NESTED_PARENTS:
+                parent_obj = parsed.get(parent_key)
+                if isinstance(parent_obj, dict):
+                    nested_count = 0
+                    for sub_val in parent_obj.values():
+                        if isinstance(sub_val, dict):
+                            candidates.append(sub_val)
+                            nested_count += 1
+                            if nested_count >= 8:
+                                break
             for obj in candidates:
                 if not bearer_token:
                     for tkey in (
@@ -398,19 +523,20 @@ def _extract_session_material_details(
                         "bearerToken",
                     ):
                         val = obj.get(tkey)
-                        if isinstance(val, str) and val.strip():
+                        if isinstance(val, str) and val.strip() and not val.strip().startswith("<REDACTED"):
                             bearer_token = val.strip()
+                            token_source = "json_body"
                             break
                 if not refresh_token:
                     for rkey in ("refresh_token", "refreshToken"):
                         ref_val = obj.get(rkey)
-                        if isinstance(ref_val, str) and ref_val.strip():
+                        if isinstance(ref_val, str) and ref_val.strip() and not ref_val.strip().startswith("<REDACTED"):
                             refresh_token = ref_val.strip()
                             break
                 if not csrf_token:
                     for ckey in ("csrf_token", "csrfToken", "csrf", "xsrf_token", "xsrfToken"):
                         cval = obj.get(ckey)
-                        if isinstance(cval, str) and cval.strip():
+                        if isinstance(cval, str) and cval.strip() and not cval.strip().startswith("<REDACTED"):
                             csrf_token = cval.strip()
                             break
     elif body_text:
@@ -465,6 +591,39 @@ def _extract_session_material_details(
                         csrf_header_name = cookie_hdr
                     break
 
+    return (
+        captured_cookies,
+        bearer_token,
+        refresh_token,
+        csrf_token,
+        csrf_header_name,
+        csrf_field_name,
+        auth_header_name,
+        token_source,
+    )
+
+
+def _extract_session_material_details(
+    *,
+    headers: dict[str, str],
+    cookies: dict[str, str],
+    body_text: str,
+) -> tuple[dict[str, str], str, str, str, str, str]:
+    """Extract (cookies, bearer_token, refresh_token, csrf_token, csrf_header_name, csrf_field_name)."""
+    (
+        captured_cookies,
+        bearer_token,
+        refresh_token,
+        csrf_token,
+        csrf_header_name,
+        csrf_field_name,
+        _,
+        _,
+    ) = _extract_session_material_full(
+        headers=headers,
+        cookies=cookies,
+        body_text=body_text,
+    )
     return captured_cookies, bearer_token, refresh_token, csrf_token, csrf_header_name, csrf_field_name
 
 
@@ -498,6 +657,8 @@ class ActorManager:
         self.session_check_path = session_check_path
         self.refresh_path = refresh_path
         self._lock = threading.Lock()
+        self._discovered_auth_header: str = ""
+        self._discovered_auth_prefix: str = ""
         self.actors: dict[str, ActorSession] = {
             "anon": ActorSession(alias="anon", role="anonymous", tenant="", authenticated=True)
         }
@@ -512,6 +673,8 @@ class ActorManager:
                 base_headers.update({str(k): str(v) for k, v in raw["headers"].items() if k and v is not None})
             if isinstance(raw.get("auth_header"), str) and raw["auth_header"].strip():
                 base_headers.setdefault("Authorization", raw["auth_header"].strip())
+            auth_header_name = _validate_auth_header_name(raw.get("auth_header_name"), strict=False)
+            auth_header_prefix = str(raw.get("auth_header_prefix") or "")
             access_token = str(raw.get("session_token") or raw.get("access_token") or "").strip()
             if not access_token and "Authorization" in base_headers:
                 access_token = _extract_token_from_auth(base_headers["Authorization"])
@@ -547,6 +710,8 @@ class ActorManager:
                 cookies=cookies,
                 local_storage=local_storage,
                 access_token=access_token,
+                auth_header_name=auth_header_name,
+                auth_header_prefix=auth_header_prefix,
                 refresh_token=str(raw.get("refresh_token") or "").strip(),
                 refresh_path=str(raw.get("refresh_path") or "").strip(),
                 csrf_token=str(raw.get("csrf_token") or "").strip(),
@@ -554,6 +719,39 @@ class ActorManager:
                 csrf_field_name=str(raw.get("csrf_field_name") or "").strip(),
                 authenticated=has_preauth,
             )
+
+    @property
+    def discovered_auth_header(self) -> str:
+        with self._lock:
+            return self._discovered_auth_header
+
+    def get_discovered_auth_header(self) -> tuple[str, str]:
+        with self._lock:
+            return self._discovered_auth_header, self._discovered_auth_prefix
+
+    def register_discovered_auth_header(self, header_name: str, prefix: str = "") -> str:
+        """Store a preferred non-Authorization API token header discovered from OpenAPI or 2xx traffic."""
+        clean = _validate_auth_header_name(header_name, strict=False)
+        if not clean or clean.lower() in _NON_DISCOVERABLE_AUTH_HEADERS:
+            return ""
+        clean_prefix = str(prefix or "")
+        with self._lock:
+            self._discovered_auth_header = clean
+            self._discovered_auth_prefix = clean_prefix
+        return clean
+
+    def sensitive_header_names(self) -> frozenset[str]:
+        """Return lowercased custom auth header names registered on the manager or any actor."""
+        names: set[str] = set()
+        with self._lock:
+            if self._discovered_auth_header:
+                names.add(self._discovered_auth_header.strip().lower())
+            sessions = list(self.actors.values())
+        for session in sessions:
+            with session._lock:
+                if session.auth_header_name.strip():
+                    names.add(session.auth_header_name.strip().lower())
+        return frozenset(names)
 
     def get(self, alias: str) -> ActorSession:
         key = str(alias or "anon").strip() or "anon"
@@ -635,6 +833,8 @@ class ActorManager:
         csrf_field_name: str | None = None,
         source_receipt_id: str = "",
         base_headers: dict[str, str] | None = None,
+        auth_header_name: str | None = None,
+        auth_header_prefix: str | None = None,
     ) -> ActorSession:
         """Register or update a dynamic session strictly in harness memory (never exposing secrets)."""
         clean_alias = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(alias or "").strip())[:48]
@@ -647,15 +847,43 @@ class ActorManager:
         clean_csrf_header = str(csrf_header_name or "").strip()
         clean_csrf_field = str(csrf_field_name or "").strip()
         clean_headers = {str(k): str(v) for k, v in (base_headers or {}).items() if k and v}
+        explicit_auth_header = (
+            _validate_auth_header_name(auth_header_name, strict=True)
+            if auth_header_name is not None
+            else None
+        )
         is_auth = bool(clean_cookies or clean_bearer or clean_headers)
         with self._lock:
+            if explicit_auth_header is not None:
+                eff_auth_header: str | None = explicit_auth_header
+                eff_auth_prefix: str | None = "" if auth_header_prefix is None else str(auth_header_prefix)
+            elif clean_bearer and self._discovered_auth_header:
+                eff_auth_header = self._discovered_auth_header
+                eff_auth_prefix = (
+                    self._discovered_auth_prefix
+                    if auth_header_prefix is None
+                    else str(auth_header_prefix)
+                )
+            else:
+                eff_auth_header = None
+                eff_auth_prefix = None if auth_header_prefix is None else str(auth_header_prefix)
+
             existing = self.actors.get(clean_alias)
             if existing is not None:
                 with existing._lock:
                     existing.cookies.update(clean_cookies)
+                    if eff_auth_header is not None:
+                        existing.auth_header_name = eff_auth_header
+                    if eff_auth_prefix is not None:
+                        existing.auth_header_prefix = eff_auth_prefix
                     if clean_bearer:
                         existing.access_token = clean_bearer
-                        for auth_key in [k for k in existing.base_headers if k.lower() == "authorization"]:
+                        target_hdr_low = (
+                            existing.auth_header_name.strip().lower()
+                            if existing.auth_header_name.strip()
+                            else "authorization"
+                        )
+                        for auth_key in [k for k in existing.base_headers if k.lower() in {"authorization", target_hdr_low}]:
                             existing.base_headers.pop(auth_key, None)
                     if clean_refresh:
                         existing.refresh_token = clean_refresh
@@ -683,6 +911,8 @@ class ActorManager:
                 base_headers=clean_headers,
                 cookies=clean_cookies,
                 access_token=clean_bearer,
+                auth_header_name=eff_auth_header or "",
+                auth_header_prefix=eff_auth_prefix or "",
                 refresh_token=clean_refresh,
                 csrf_token=clean_csrf,
                 csrf_header_name=clean_csrf_header,
@@ -714,6 +944,8 @@ class ActorManager:
             return
         with self._lock:
             session = self.actors.get(alias)
+            disc_hdr = self._discovered_auth_header
+            disc_pfx = self._discovered_auth_prefix
         if session is None:
             return
         (
@@ -723,7 +955,9 @@ class ActorManager:
             cap_csrf,
             cap_csrf_header,
             cap_csrf_field,
-        ) = _extract_session_material_details(
+            cap_auth_header,
+            cap_token_source,
+        ) = _extract_session_material_full(
             headers=headers,
             cookies=cookies,
             body_text=body_text,
@@ -746,8 +980,28 @@ class ActorManager:
             if cap_csrf_field:
                 session.csrf_field_name = cap_csrf_field
             if cap_bearer:
+                if cap_auth_header:
+                    session.auth_header_name = cap_auth_header
+                    session.auth_header_prefix = ""
+                elif cap_token_source == "authorization_header":
+                    session.auth_header_name = ""
+                    session.auth_header_prefix = ""
+                elif (
+                    cap_token_source == "json_body"
+                    and not session.auth_header_name
+                    and not session.access_token
+                    and not any(k.lower() == "authorization" for k in session.base_headers)
+                    and disc_hdr
+                ):
+                    session.auth_header_name = disc_hdr
+                    session.auth_header_prefix = disc_pfx
                 session.access_token = cap_bearer
-                for auth_key in [k for k in session.base_headers if k.lower() == "authorization"]:
+                target_hdr_low = (
+                    session.auth_header_name.strip().lower()
+                    if session.auth_header_name.strip()
+                    else "authorization"
+                )
+                for auth_key in [k for k in session.base_headers if k.lower() in {"authorization", target_hdr_low}]:
                     session.base_headers.pop(auth_key, None)
                 session.authenticated = True
             if cap_refresh:
@@ -774,8 +1028,13 @@ class ActorManager:
                                 cookies.setdefault(ck_clean, cv_clean)
                 else:
                     auth_headers[str(key)] = str(val)
-            if session.access_token and not any(k.lower() == "authorization" for k in auth_headers):
-                auth_headers["Authorization"] = f"Bearer {session.access_token}"
+            if session.access_token:
+                eff_auth_hdr = session.auth_header_name.strip()
+                if eff_auth_hdr and eff_auth_hdr.lower() != "authorization":
+                    if not any(k.lower() == eff_auth_hdr.lower() for k in auth_headers):
+                        auth_headers[eff_auth_hdr] = f"{session.auth_header_prefix}{session.access_token}"
+                elif not any(k.lower() == "authorization" for k in auth_headers):
+                    auth_headers["Authorization"] = f"Bearer {session.access_token}"
             if session.csrf_token and not any(k.lower() in _CSRF_HEADER_NAMES for k in auth_headers):
                 auth_headers[session.csrf_header_name or "X-CSRF-Token"] = session.csrf_token
             state: dict[str, Any] = {"cookies": cookies, "headers": auth_headers}
@@ -1313,6 +1572,37 @@ class AgenticHTTPClient:
             allow_lifecycle_routes=allow_lifecycle_routes,
         )
 
+    def register_discovered_auth_header(self, header_name: str, prefix: str = "") -> str:
+        """Store a preferred non-Authorization API token header on ActorManager."""
+        return self.actors.register_discovered_auth_header(header_name, prefix=prefix)
+
+    def _maybe_register_openapi_auth_header(
+        self,
+        *,
+        status: int,
+        content_type: str,
+        body_text: str,
+    ) -> None:
+        if not (200 <= status < 300) or not body_text or len(body_text) > 2_000_000:
+            return
+        if self.actors.discovered_auth_header:
+            return
+        if "json" not in content_type and not body_text.lstrip().startswith("{"):
+            return
+        if '"securitySchemes"' not in body_text and '"securityDefinitions"' not in body_text:
+            return
+        try:
+            parsed = json.loads(body_text)
+        except ValueError:
+            return
+        if not isinstance(parsed, dict):
+            return
+        for hdr_name in extract_openapi_header_auth_names(parsed):
+            if hdr_name.lower() != "authorization":
+                registered = self.actors.register_discovered_auth_header(hdr_name)
+                if registered:
+                    return
+
     def _check_actor_logout_guard(
         self,
         *,
@@ -1325,14 +1615,18 @@ class AgenticHTTPClient:
         """Prevent shared authenticated actors from accidentally invalidating their own session."""
         if allow_lifecycle_routes or actor == "anon":
             return
+        with session._lock:
+            is_active_or_provisioned = bool(session.authenticated or session.login_payload)
+            actor_auth_hdr = session.auth_header_name.strip().lower()
+        auth_override_keys = set(_AUTH_OVERRIDE_HEADERS)
+        if actor_auth_hdr:
+            auth_override_keys.add(actor_auth_hdr)
         has_explicit_auth_override = any(
-            k.strip().lower() in _AUTH_OVERRIDE_HEADERS and str(v).strip()
+            k.strip().lower() in auth_override_keys and str(v).strip()
             for k, v in extra_headers.items()
         )
         if has_explicit_auth_override:
             return
-        with session._lock:
-            is_active_or_provisioned = bool(session.authenticated or session.login_payload)
         if not is_active_or_provisioned:
             return
         matched_logout = match_logout_route(path)
@@ -1374,6 +1668,7 @@ class AgenticHTTPClient:
         body_preview: str,
         record_receipt: bool = True,
         save_session_as: str = "",
+        auth_header_name: str = "",
         out_cookies: dict[str, str] | None = None,
         record_degradation: bool = True,
         skip_adaptive_pacing: bool = False,
@@ -1454,12 +1749,32 @@ class AgenticHTTPClient:
                         cap_csrf,
                         cap_csrf_header,
                         cap_csrf_field,
-                    ) = _extract_session_material_details(
+                        cap_auth_header,
+                        cap_token_source,
+                    ) = _extract_session_material_full(
                         headers=resp_headers,
                         cookies=cookies,
                         body_text=text,
                     )
                     if cap_cookies or cap_bearer or cap_csrf:
+                        explicit_auth_hdr = _validate_auth_header_name(auth_header_name, strict=False)
+                        disc_auth_hdr, disc_auth_pfx = self.actors.get_discovered_auth_header()
+                        if cap_bearer:
+                            if explicit_auth_hdr:
+                                resolved_auth_hdr = explicit_auth_hdr
+                                resolved_auth_pfx = ""
+                            elif cap_auth_header:
+                                resolved_auth_hdr = cap_auth_header
+                                resolved_auth_pfx = ""
+                            elif cap_token_source == "json_body" and disc_auth_hdr:
+                                resolved_auth_hdr = disc_auth_hdr
+                                resolved_auth_pfx = disc_auth_pfx
+                            else:
+                                resolved_auth_hdr = ""
+                                resolved_auth_pfx = ""
+                        else:
+                            resolved_auth_hdr = explicit_auth_hdr
+                            resolved_auth_pfx = ""
                         dyn = self.actors.register_dynamic_session(
                             clean_save_alias,
                             cookies=cap_cookies,
@@ -1468,6 +1783,8 @@ class AgenticHTTPClient:
                             csrf_token=cap_csrf,
                             csrf_header_name=cap_csrf_header,
                             csrf_field_name=cap_csrf_field,
+                            auth_header_name=resolved_auth_hdr,
+                            auth_header_prefix=resolved_auth_pfx,
                         )
                         saved_session_meta = {
                             "alias": dyn.alias,
@@ -1477,10 +1794,18 @@ class AgenticHTTPClient:
                             "has_bearer": bool(dyn.access_token),
                             "has_csrf": bool(dyn.csrf_token),
                         }
+                        if dyn.auth_header_name:
+                            saved_session_meta["auth_header"] = dyn.auth_header_name
                 elif not clean_save_alias:
                     self.actors.update_from_response(
                         actor, headers=resp_headers, cookies=cookies, body_text=text
                     )
+                    if record_receipt:
+                        self._maybe_register_openapi_auth_header(
+                            status=status,
+                            content_type=content_type,
+                            body_text=text,
+                        )
             finally:
                 http_session.cookies.clear()
                 resp.close()
@@ -1520,18 +1845,19 @@ class AgenticHTTPClient:
                 "_body_mentions_csrf": "csrf" in text.lower(),
                 "_graphql_has_errors": graphql_has_errors,
             }
+        extra_sensitive_hdrs = self.actors.sensitive_header_names()
         rec = self.receipt_store.record(
             actor=actor,
             method=method,
             url=url,
             path=path,
             query=query,
-            request_headers=_redact_framework_csrf_headers(wire_headers),
+            request_headers=_redact_extra_sensitive_headers(wire_headers, extra_sensitive_hdrs),
             request_body=body_preview,
             status=status,
             elapsed_ms=elapsed_ms,
             content_type=content_type,
-            response_headers=_redact_framework_csrf_headers(resp_headers),
+            response_headers=_redact_extra_sensitive_headers(resp_headers, extra_sensitive_hdrs),
             redirect_location=redirect_location,
             raw_response_bytes=raw_bytes,
             response_text=text,
@@ -1559,6 +1885,7 @@ class AgenticHTTPClient:
         body_bytes: bytes | None,
         body_preview: str,
         save_session_as: str = "",
+        auth_header_name: str = "",
         out_cookies: dict[str, str] | None = None,
     ) -> dict[str, Any]:
         """Send wire request with bounded 429/503 Retry-After backoff, adaptive pacing, and degradation accounting."""
@@ -1574,6 +1901,7 @@ class AgenticHTTPClient:
                 body_bytes=body_bytes,
                 body_preview=body_preview,
                 save_session_as=save_session_as,
+                auth_header_name=auth_header_name,
                 out_cookies=out_cookies,
                 record_degradation=False,
                 skip_adaptive_pacing=(attempt > 0),
@@ -1658,18 +1986,22 @@ class AgenticHTTPClient:
         summary_text = json.dumps(summary_doc, ensure_ascii=False)
         summary_bytes = summary_text.encode("utf-8")
 
+        extra_sensitive_hdrs = self.actors.sensitive_header_names()
         rec = self.receipt_store.record(
             actor=actor,
             method="WS",
             url=url,
             path=path,
             query=query,
-            request_headers=wire_headers,
+            request_headers=_redact_extra_sensitive_headers(wire_headers, extra_sensitive_hdrs),
             request_body=body_preview,
             status=status,
             elapsed_ms=elapsed_ms,
             content_type="application/json",
-            response_headers={str(k): str(v) for k, v in resp_headers.items()},
+            response_headers=_redact_extra_sensitive_headers(
+                {str(k): str(v) for k, v in resp_headers.items()},
+                extra_sensitive_hdrs,
+            ),
             redirect_location="",
             raw_response_bytes=summary_bytes,
             response_text=summary_text,
@@ -2251,10 +2583,12 @@ class AgenticHTTPClient:
         files: Sequence[dict[str, Any]] | None = None,
         force: bool = False,
         save_session_as: str = "",
+        auth_header_name: str = "",
         follow_redirects: bool = False,
         allow_lifecycle_routes: bool | None = None,
     ) -> dict[str, Any]:
         """Execute a scope-locked, metered, receipted HTTP or WebSocket request."""
+        clean_auth_header_name = _validate_auth_header_name(auth_header_name, strict=True)
         raw_url_str = str(url or "").strip()
         norm_method = str(method or "GET").strip().upper()
         is_ws = raw_url_str.lower().startswith(("ws://", "wss://")) or norm_method == "WS"
@@ -2291,8 +2625,14 @@ class AgenticHTTPClient:
             extra_headers=extra_headers,
             allow_lifecycle_routes=eff_allow_lifecycle,
         )
-        has_auth_override = any(k.lower() in _AUTH_OVERRIDE_HEADERS for k in extra_headers)
-        if actor != "anon" and not has_auth_override and not session.authenticated:
+        auth_override_keys = set(_AUTH_OVERRIDE_HEADERS)
+        with session._lock:
+            actor_auth_hdr = session.auth_header_name.strip().lower()
+            is_session_auth = bool(session.authenticated)
+        if actor_auth_hdr:
+            auth_override_keys.add(actor_auth_hdr)
+        has_auth_override = any(k.strip().lower() in auth_override_keys for k in extra_headers)
+        if actor != "anon" and not has_auth_override and not is_session_auth:
             self.authenticate_actor(actor, force_login=False)
 
         if is_ws:
@@ -2363,6 +2703,7 @@ class AgenticHTTPClient:
             body_bytes=body_bytes,
             body_preview=body_preview,
             save_session_as=save_session_as,
+            auth_header_name=clean_auth_header_name,
             out_cookies=hop_cookies if follow_redirects else None,
         )
 
@@ -2510,10 +2851,27 @@ class AgenticHTTPClient:
                     body_bytes=cur_body_bytes,
                     body_preview=cur_body_preview,
                     save_session_as=save_session_as,
+                    auth_header_name=clean_auth_header_name,
                     out_cookies=new_hop_cookies,
                 )
                 if new_hop_cookies:
                     hop_cookies.update(new_hop_cookies)
+
+        if (
+            str(actor or "anon").strip() == "anon"
+            and 200 <= int(receipt.get("status") or 0) < 300
+            and extra_headers
+        ):
+            for hk, hv in extra_headers.items():
+                hk_clean = hk.strip()
+                hv_clean = str(hv or "").strip()
+                if (
+                    hk_clean.lower() in _ANON_OBSERVED_AUTH_HEADERS
+                    and hv_clean
+                    and not hv_clean.startswith("<REDACTED")
+                ):
+                    self.actors.register_discovered_auth_header(hk_clean)
+                    break
 
         result = dict(receipt)
         if redirect_chain:

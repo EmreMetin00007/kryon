@@ -783,6 +783,12 @@ class BeliefStateAttackGraph:
                             delta_v += av
                             delta_e += ae
 
+                parsed_doc_url = urlsplit(url)
+                origin_base = (
+                    f"{parsed_doc_url.scheme}://{parsed_doc_url.netloc}/"
+                    if parsed_doc_url.scheme in {"http", "https"} and parsed_doc_url.netloc
+                    else self.base_url
+                )
                 if "html" in ctype or "<html" in body[:512].lower() or "<form" in body.lower() or "href=" in body.lower():
                     for rec in extract_html(body, url):
                         rm = str(rec.get("method") or "GET").upper()
@@ -797,17 +803,17 @@ class BeliefStateAttackGraph:
                     for script in extract_inline_scripts(body):
                         for jc in extract_js_calls(script, url, limit=40):
                             _link_discovered(str(jc.get("url") or ""), m=str(jc.get("method") or "GET"), p_list=jc.get("params") or (), via="inline_js")
-                        for sr in extract_spa_routes(script, url, limit=40):
+                        for sr in extract_spa_routes(script, origin_base, limit=40):
                             _link_discovered(str(sr.get("url") or ""), m="GET", via="spa_route")
                         for spec_u in find_spec_urls(script, url):
                             _link_discovered(spec_u, m="GET", via="spec_url")
 
                 if "javascript" in ctype or norm_p.lower().endswith((".js", ".mjs")):
-                    for jc in extract_js_calls(body, url, limit=80):
+                    for jc in extract_js_calls(body, origin_base, limit=80):
                         _link_discovered(str(jc.get("url") or ""), m=str(jc.get("method") or "GET"), p_list=jc.get("params") or (), via="js_call")
-                    for rec in extract_js(body, url, limit=60):
+                    for rec in extract_js(body, origin_base, limit=60):
                         _link_discovered(str(rec.get("url") or ""), m=str(rec.get("method") or "GET"), p_list=rec.get("params") or (), via="js_link")
-                    for sr in extract_spa_routes(body, url, limit=60):
+                    for sr in extract_spa_routes(body, origin_base, limit=60):
                         _link_discovered(str(sr.get("url") or ""), m="GET", via="spa_route")
                     for spec_u in find_spec_urls(body, url):
                         _link_discovered(spec_u, m="GET", via="spec_url")
