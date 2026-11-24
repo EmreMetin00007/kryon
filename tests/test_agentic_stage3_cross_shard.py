@@ -1061,3 +1061,20 @@ def test_http_reserve_floor_wrapup_and_clean_break(tmp_path: Path, monkeypatch: 
         client.close()
         srv.shutdown()
         srv.server_close()
+
+
+def test_stage3_extract_internal_urls_tolerates_malformed_port_suffixes() -> None:
+    from agentic_sharding import _extract_internal_urls_from_text, _is_target_own_origin_url
+
+    assert _is_target_own_origin_url("http://localhost:8080`", "http://127.0.0.1:57673/") is False
+    dst: list[str] = []
+    seen: set[str] = set()
+    _extract_internal_urls_from_text(
+        "Found snippet `http://localhost:8080` and `http://127.0.0.1:99999/bad` and http://127.0.0.1:9001/ok.",
+        base_url="http://127.0.0.1:57673/",
+        dst=dst,
+        seen=seen,
+    )
+    assert "http://localhost:8080" in dst
+    assert "http://127.0.0.1:9001/ok" in dst
+    assert all("`" not in u and "99999" not in u for u in dst)

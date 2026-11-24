@@ -897,6 +897,8 @@ def _is_target_own_origin_url(url_str: str, base_url: str) -> bool:
         return False
     try:
         parsed_u = urlsplit(url_str)
+        u_port = parsed_u.port
+        base_port = parsed_base.port
     except ValueError:
         return False
     if (parsed_u.scheme.lower(), parsed_u.netloc.lower()) == (
@@ -907,8 +909,8 @@ def _is_target_own_origin_url(url_str: str, base_url: str) -> bool:
     base_host = (parsed_base.hostname or "").lower()
     u_host = (parsed_u.hostname or "").lower()
     if (
-        parsed_base.port is not None
-        and parsed_u.port == parsed_base.port
+        base_port is not None
+        and u_port == base_port
         and base_host in _LOOPBACK_HOSTS
         and u_host in _LOOPBACK_HOSTS
     ):
@@ -928,10 +930,15 @@ def _extract_internal_urls_from_text(
     if not text or len(dst) >= limit:
         return
     for match in _INTERNAL_URL_RE.finditer(text):
-        cand = match.group(0).rstrip(",;.")
+        cand = match.group(0).rstrip(",;.`'\"")
         if cand.endswith(")") and "(" not in cand:
             cand = cand[:-1]
         if not cand or "<redacted" in cand.lower():
+            continue
+        try:
+            parsed_cand = urlsplit(cand)
+            _ = parsed_cand.port
+        except ValueError:
             continue
         if _is_target_own_origin_url(cand, base_url):
             continue

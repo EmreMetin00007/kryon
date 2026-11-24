@@ -735,8 +735,12 @@ def _sanitize_url(raw_url: str, secret_values: Sequence[str] = ()) -> str:
     netloc = parts.netloc
     if parts.username or parts.password:
         host_port = parts.hostname or ""
-        if parts.port is not None:
-            host_port = f"{host_port}:{parts.port}"
+        try:
+            port_val = parts.port
+        except ValueError:
+            port_val = None
+        if port_val is not None:
+            host_port = f"{host_port}:{port_val}"
         netloc = f"<REDACTED_CREDENTIALS>@{host_port}" if host_port else "<REDACTED_CREDENTIALS>"
 
     safe_path = _sanitize_url_path(parts.path, secret_values)
