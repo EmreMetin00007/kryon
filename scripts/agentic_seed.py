@@ -21,6 +21,10 @@ _SCRIPTS_DIR = Path(__file__).resolve().parent
 if str(_SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS_DIR))
 
+_REPO_ROOT = _SCRIPTS_DIR.parent
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
 from agentic_http import is_static_asset_url  # noqa: E402
 from agentic_surface import (  # noqa: E402
     SurfaceFrontierTracker,
@@ -30,6 +34,8 @@ from agentic_surface import (  # noqa: E402
     is_non_endpoint_source_path,
     route_template_of,
 )
+from kryon_core.surface.extract import is_hashed_asset_chunk_path  # noqa: E402
+from kryon_core.surface.normalize import is_os_filesystem_path  # noqa: E402
 from target_bootstrap import ScopeGuard, normalize_path  # noqa: E402
 
 MAX_SEED_FILE_BYTES = 10 * 1024 * 1024  # 10 MB hard cap per seed file
@@ -126,6 +132,28 @@ _HIGH_SIGNAL_KEYWORDS = (
     "graphql",
 )
 _LOW_SIGNAL_EXACT_PATHS = frozenset({"/", "/robots.txt", "/sitemap.xml", "/favicon.ico"})
+_NON_HINT_STATIC_ASSET_EXTS: tuple[str, ...] = (
+    ".js",
+    ".mjs",
+    ".cjs",
+    ".css",
+    ".map",
+    ".png",
+    ".jpg",
+    ".jpeg",
+    ".gif",
+    ".webp",
+    ".svg",
+    ".ico",
+    ".woff",
+    ".woff2",
+    ".ttf",
+    ".eot",
+    ".otf",
+    ".mp4",
+    ".mp3",
+    ".webm",
+)
 
 _TECH_TAG_ALIASES: dict[str, str] = {
     "next": "nextjs",
@@ -1324,13 +1352,43 @@ def _route_priority_score(route: _AcceptedRoute) -> int:
     return score
 
 
+def _is_non_hint_asset_path(path: str) -> bool:
+    """Return True if `path` is a static/hashed frontend asset chunk or OS filesystem path.
+
+    Such paths must never occupy `discovery_hints` slots, while real HTML/API/app
+    endpoints (`/`, `/api/settings`, `/users`, `/internal/logs`, `/admin/index.html`,
+    `/index/Article/info.html`, etc.) remain eligible.
+    """
+    raw = str(path or "").strip()
+    if not raw:
+        return False
+    if is_hashed_asset_chunk_path(raw) or is_os_filesystem_path(raw):
+        return True
+    try:
+        parsed_path = (urlsplit(raw).path or "").strip()
+    except ValueError:
+        return False
+    if not parsed_path:
+        return False
+    if is_hashed_asset_chunk_path(parsed_path) or is_os_filesystem_path(parsed_path):
+        return True
+    trimmed = parsed_path.rstrip("/").lower()
+    if not trimmed:
+        return False
+    return trimmed.endswith(_NON_HINT_STATIC_ASSET_EXTS)
+
+
 def _select_discovery_hints(routes: Sequence[_AcceptedRoute], max_hints: int) -> list[str]:
     """Select up to `max_hints` diverse high-signal GET/entry `/path` discovery hints."""
     cap = max(0, int(max_hints))
     if cap == 0:
         return []
 
-    get_routes = [r for r in routes if r.method in {"GET", "HEAD"}]
+    get_routes = [
+        r
+        for r in routes
+        if r.method in {"GET", "HEAD"} and not _is_non_hint_asset_path(r.path)
+    ]
     if not get_routes:
         return []
 
@@ -1534,7 +1592,11 @@ def _finalize_seed_surface(
                 norm_h = normalize_path(urlsplit(resolved_h).path or "/")
             except ValueError:
                 continue
-            if is_static_asset_url(norm_h) or is_non_endpoint_source_path(norm_h):
+            if (
+                is_static_asset_url(norm_h)
+                or is_non_endpoint_source_path(norm_h)
+                or _is_non_hint_asset_path(norm_h)
+            ):
                 continue
             if norm_h not in seen_hints:
                 seen_hints.add(norm_h)
@@ -1712,7 +1774,7 @@ def _normalize_hint_path(raw: str) -> str:
         norm = normalize_path(raw_path)
     except ValueError:
         return ""
-    if is_static_asset_url(norm):
+    if is_static_asset_url(norm) or _is_non_hint_asset_path(norm):
         return ""
     return norm
 

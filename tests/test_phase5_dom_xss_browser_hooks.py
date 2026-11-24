@@ -2,9 +2,11 @@
 from __future__ import annotations
 
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import json
 from pathlib import Path
 import sys
 import threading
+from typing import Any
 
 import pytest
 
@@ -21,6 +23,7 @@ from agentic_browser import (  # noqa: E402
 )
 from agentic_http import ActorManager, AgenticHTTPClient, ScopeViolationError  # noqa: E402
 from agentic_receipts import ReceiptStore  # noqa: E402
+from agentic_tools import TOOL_SCHEMAS, ToolDispatcher  # noqa: E402
 from kryon_core.browser.hooks import (  # noqa: E402
     build_runtime_hook_script,
     normalize_dom_sinks,
@@ -186,5 +189,119 @@ def test_browser_dom_sink_hash_and_postmessage_live(tmp_path: Path) -> None:
         assert len(inspected["postmessage_listeners"]) >= 1
         assert inspected["postmessage_listeners"][0]["has_origin_check"] is False
     finally:
+        server.shutdown()
+        server.server_close()
+
+
+def _unwrap_untrusted(raw: str) -> dict[str, Any]:
+    prefix = "<<<UNTRUSTED_TARGET_RESPONSE>>>\n"
+    suffix = "\n<<<END_UNTRUSTED_TARGET_RESPONSE>>>"
+    assert raw.startswith(prefix)
+    assert raw.rstrip().endswith(suffix.strip())
+    body = raw[len(prefix) :].rsplit(suffix, 1)[0]
+    parsed = json.loads(body)
+    assert isinstance(parsed, dict)
+    return parsed
+
+
+def test_browser_crawl_schema_exposes_dom_verify_and_preserves_11_tools() -> None:
+    assert len(TOOL_SCHEMAS) == 11
+    browser_tool = next(
+        t["function"] for t in TOOL_SCHEMAS if t["function"]["name"] == "browser_crawl"
+    )
+    props = browser_tool["parameters"]["properties"]
+    assert props["mode"]["enum"] == ["crawl", "inspect", "dom_verify"]
+    assert props["source"]["enum"] == ["hash", "query", "postmessage"]
+    assert props["param_name"]["type"] == "string"
+
+
+def test_tool_dispatcher_browser_crawl_dom_verify_fails_closed(tmp_path: Path) -> None:
+    store = ReceiptStore(tmp_path / "receipts")
+    http = AgenticHTTPClient(
+        base_url="http://127.0.0.1:18080",
+        receipt_store=store,
+        actors=ActorManager([]),
+        max_requests=20,
+    )
+    dispatcher = ToolDispatcher(http_client=http, receipt_store=store, root_dir=tmp_path)
+    try:
+        # Invalid source returns a clean error dict wrapped as untrusted target response.
+        bad_src_raw = dispatcher.dispatch(
+            "browser_crawl",
+            {"mode": "dom_verify", "url": "/hash-html", "source": "invalid_source"},
+        )
+        bad_src = _unwrap_untrusted(bad_src_raw)
+        assert bad_src["ok"] is False
+        assert bad_src["verified_dom_injection"] is False
+        assert "Unsupported DOM verification source" in bad_src["error"]
+
+        # Off-origin URL fails closed with ScopeViolationError via dispatch().
+        off_origin_raw = dispatcher.dispatch(
+            "browser_crawl",
+            {"mode": "dom_verify", "url": "http://127.0.0.1:19999/other", "source": "hash"},
+        )
+        off_origin = json.loads(off_origin_raw)
+        assert off_origin["error"] == "ScopeViolationError"
+
+        proto_rel_raw = dispatcher.dispatch(
+            "browser_crawl",
+            {"mode": "dom_verify", "url": "//evil.example/hash-html", "source": "hash"},
+        )
+        proto_rel = json.loads(proto_rel_raw)
+        assert proto_rel["error"] == "ScopeViolationError"
+    finally:
+        dispatcher.close()
+        http.close()
+
+
+@pytest.mark.skipif(not HAS_PLAYWRIGHT, reason="Playwright not installed")
+def test_tool_dispatcher_browser_crawl_dom_verify_live(tmp_path: Path) -> None:
+    server, base_url = _start_test_server()
+    store = ReceiptStore(tmp_path / "receipts")
+    http = AgenticHTTPClient(
+        base_url=base_url,
+        receipt_store=store,
+        actors=ActorManager([]),
+        max_requests=30,
+    )
+    dispatcher = ToolDispatcher(http_client=http, receipt_store=store, root_dir=tmp_path)
+    try:
+        # 1. Vulnerable hash -> innerHTML via ToolDispatcher
+        vuln_hash = _unwrap_untrusted(
+            dispatcher.dispatch(
+                "browser_crawl",
+                {"mode": "dom_verify", "url": "/hash-html", "source": "hash"},
+            )
+        )
+        assert vuln_hash["ok"] is True
+        assert vuln_hash["verified_dom_injection"] is True
+        assert vuln_hash["dom_element_parsed"] is True
+        assert any(s["sink"] == "innerHTML" for s in vuln_hash["matched_sinks"])
+
+        # 2. Safe hash -> textContent via ToolDispatcher
+        safe_hash = _unwrap_untrusted(
+            dispatcher.dispatch(
+                "browser_crawl",
+                {"mode": "dom_verify", "url": "/hash-safe", "source": "hash"},
+            )
+        )
+        assert safe_hash["ok"] is True
+        assert safe_hash["verified_dom_injection"] is False
+        assert safe_hash["dom_element_parsed"] is False
+
+        # 3. Vulnerable postMessage listener via ToolDispatcher
+        vuln_pm = _unwrap_untrusted(
+            dispatcher.dispatch(
+                "browser_crawl",
+                {"mode": "dom_verify", "url": "/pm-unsafe", "source": "postmessage"},
+            )
+        )
+        assert vuln_pm["ok"] is True
+        assert vuln_pm["verified_dom_injection"] is True
+        assert vuln_pm["dom_element_parsed"] is True
+        assert any(not ln["has_origin_check"] for ln in vuln_pm["postmessage_listeners"])
+    finally:
+        dispatcher.close()
+        http.close()
         server.shutdown()
         server.server_close()

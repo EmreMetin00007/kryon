@@ -169,7 +169,10 @@ def test_receipt_store_and_http_client_concurrent_thread_safety(tmp_path: Path) 
             self.end_headers()
             self.wfile.write(payload)
 
-    srv = ThreadingHTTPServer(("127.0.0.1", 0), _ConcurrentHandler)
+    class _ConcurrentServer(ThreadingHTTPServer):
+        request_queue_size = 64
+
+    srv = _ConcurrentServer(("127.0.0.1", 0), _ConcurrentHandler)
     port = srv.server_address[1]
     srv_thread = threading.Thread(target=srv.serve_forever, daemon=True)
     srv_thread.start()

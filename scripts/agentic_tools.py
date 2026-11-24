@@ -83,6 +83,7 @@ from agentic_evidence import (
 from agentic_browser import (
     inspect_rendered_page as inspect_rendered_page,
     run_browser_crawl as run_browser_crawl,
+    verify_dom_sink_in_browser as verify_dom_sink_in_browser,
 )
 from agentic_crypto import (
     _b64url_decode_segment as _b64url_decode_segment,
@@ -346,15 +347,17 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "browser_crawl",
-            "description": "Read-only same-origin headless browser crawl (SPA/Shadow DOM/XHR) or rendered DOM/CSP inspect.",
+            "description": "Read-only same-origin browser crawl (SPA/XHR), DOM/CSP inspect, or dom_verify.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "mode": {"type": "string", "enum": ["crawl", "inspect"]},
+                    "mode": {"type": "string", "enum": ["crawl", "inspect", "dom_verify"]},
                     "url": {"type": "string"},
                     "actor": {"type": "string"},
                     "max_pages": {"type": "integer", "description": "1-12 (default 6)."},
                     "marker": {"type": "string"},
+                    "source": {"type": "string", "enum": ["hash", "query", "postmessage"]},
+                    "param_name": {"type": "string"},
                 },
             },
         },
@@ -1022,6 +1025,32 @@ class ToolDispatcher:
                 actor=actor,
                 marker=str(args.get("marker") or ""),
             )
+            return wrap_untrusted(result)
+        if mode == "dom_verify":
+            source = str(args.get("source") or "hash").strip().lower() or "hash"
+            param_name = str(args.get("param_name") or "").strip()
+            try:
+                result = verify_dom_sink_in_browser(
+                    self.http,
+                    url=url,
+                    actor=actor,
+                    source=source,
+                    param_name=param_name,
+                )
+            except (ScopeViolationError, BudgetExhaustedError):
+                raise
+            except ValueError as exc:
+                result = {
+                    "ok": False,
+                    "verified_dom_injection": False,
+                    "dom_element_parsed": False,
+                    "matched_sinks": [],
+                    "postmessage_listeners": [],
+                    "source": source,
+                    "url": url,
+                    "actor": actor,
+                    "error": str(exc),
+                }
             return wrap_untrusted(result)
         raw_max_pages = args.get("max_pages", 6)
         try:

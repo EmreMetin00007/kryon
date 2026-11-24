@@ -20,6 +20,12 @@ from agentic_preview import (  # noqa: E402
     _is_skipped_surface_url,
 )
 from agentic_receipts import ReceiptStore  # noqa: E402
+from agentic_seed import (  # noqa: E402
+    _AcceptedRoute,
+    _is_non_hint_asset_path,
+    _select_discovery_hints,
+    merge_seed_surfaces,
+)
 from agentic_stage0_crawl import _Stage0Collector, _finalize_routes, _is_stage0_noise_path  # noqa: E402
 from agentic_surface import SurfaceFrontierTracker, is_non_endpoint_source_path  # noqa: E402
 from kryon_core.surface.extract import (  # noqa: E402
@@ -463,3 +469,123 @@ def test_hashed_chunks_and_static_assets_excluded_from_hints_and_tracker_while_j
         for h in discovery_hints
     )
     assert not any(is_hashed_asset_chunk_path(item["url"]) for item in links)
+
+
+# ---------------------------------------------------------------------------
+# 4. Faz 5.2B: agentic_seed discovery_hints excludes static/hashed assets & OS paths
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "asset_or_os_path",
+    [
+        "/assets/GraphView-C5BS5-5e.js",
+        "/assets/LazyImage.vue_vue_type_script_setup_true_lang-BEjdi0-r.js",
+        "/assets/WidgetAudioUI-CXnPdl40.js",
+        "/assets/ServerConfigPanel-D6a37zVp.js",
+        "/static/app.js",
+        "/static/module.mjs",
+        "/static/vendor.cjs",
+        "/static/app.css",
+        "/static/app.js.map",
+        "/static/logo.svg",
+        "/static/hero.png",
+        "/static/photo.jpg",
+        "/static/pic.jpeg",
+        "/static/anim.gif",
+        "/static/img.webp",
+        "/favicon.ico",
+        "/fonts/inter.woff",
+        "/fonts/inter.woff2",
+        "/fonts/inter.ttf",
+        "/fonts/inter.eot",
+        "/fonts/inter.otf",
+        "/media/demo.mp4",
+        "/media/audio.mp3",
+        "/media/clip.webm",
+        "/var/www/html/index.php",
+        "/etc/passwd",
+        "/Users/username/Documents/ComfyUI",
+        "C:/inetpub/wwwroot/index.php",
+    ],
+)
+def test_is_non_hint_asset_path_rejects_static_hashed_assets_and_os_paths(asset_or_os_path: str) -> None:
+    assert _is_non_hint_asset_path(asset_or_os_path) is True
+
+
+@pytest.mark.parametrize(
+    "real_route",
+    [
+        "/",
+        "/api/settings",
+        "/internal/logs",
+        "/users",
+        "/users/42",
+        "/admin/index.html",
+        "/index/Article/info.html",
+        "/api/download?file=/etc/passwd",
+        "/api/v1/openapi.json",
+    ],
+)
+def test_is_non_hint_asset_path_preserves_real_application_routes(real_route: str) -> None:
+    assert _is_non_hint_asset_path(real_route) is False
+
+
+def test_select_discovery_hints_and_merge_seed_surfaces_exclude_static_chunks_and_os_paths() -> None:
+    noisy_paths = [
+        "/assets/GraphView-C5BS5-5e.js",
+        "/assets/LazyImage.vue_vue_type_script_setup_true_lang-BEjdi0-r.js",
+        "/assets/WidgetAudioUI-CXnPdl40.js",
+        "/static/app.css",
+        "/static/logo.svg",
+        "/var/www/html/index.php",
+    ]
+    real_paths = [
+        "/api/settings",
+        "/internal/logs",
+        "/users",
+        "/admin/index.html",
+    ]
+
+    # 1. Direct _select_discovery_hints: noisy assets/OS paths never occupy Pass 1 or Pass 2 slots.
+    direct_routes = [
+        _AcceptedRoute(method="GET", path=p, best_status=200, first_seen=idx)
+        for idx, p in enumerate([*noisy_paths, *real_paths], start=1)
+    ]
+    selected = _select_discovery_hints(direct_routes, max_hints=12)
+    for noisy in noisy_paths:
+        assert noisy not in selected
+    assert set(real_paths).issubset(set(selected))
+
+    # If only noisy routes are supplied, _select_discovery_hints returns [].
+    noisy_only = [
+        _AcceptedRoute(method="GET", path=p, best_status=200, first_seen=idx)
+        for idx, p in enumerate(noisy_paths, start=1)
+    ]
+    assert _select_discovery_hints(noisy_only, max_hints=12) == []
+
+    # 2. merge_seed_surfaces: hashed/static chunks & OS paths in links or discovery_hints never leak into discovery_hints.
+    stage0_seed = {
+        "schema": "stage0-seed/1",
+        "url": f"{ORIGIN}/",
+        "links": [
+            {"method": "GET", "url": p, "params": []}
+            for p in [*noisy_paths, *real_paths]
+        ],
+        "forms": [],
+        "discovery_hints": [
+            "/assets/GraphView-C5BS5-5e.js",
+            "/assets/LazyImage.vue_vue_type_script_setup_true_lang-BEjdi0-r.js",
+            "/static/app.css",
+            "/static/logo.svg",
+            "/var/www/html/index.php",
+            "/api/settings",
+        ],
+    }
+    merged = merge_seed_surfaces([stage0_seed], base_url=ORIGIN, max_discovery_hints=12)
+    assert merged is not None
+    hints = merged["discovery_hints"]
+    for noisy in noisy_paths:
+        assert noisy not in hints
+    for real in real_paths:
+        assert real in hints
