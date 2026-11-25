@@ -164,3 +164,56 @@ def test_wizard_warns_and_stops_cleanly_when_remote_api_key_env_missing(tmp_path
     assert rc == 0
     assert called_runner == []
     assert any("AI_GATEWAY_API_KEY" in line for line in logs)
+
+
+def test_wizard_non_loopback_auto_creates_scope_file_when_omitted(tmp_path: Path) -> None:
+    remote_provider = tmp_path / "remote-llm.json"
+    remote_provider.write_text(
+        json.dumps({
+            "schema": "cco-llm/1",
+            "model": "vercel/deepseek/deepseek-v4.1-flash",
+            "providers": {
+                "vercel": {
+                    "base_url": "https://ai-gateway.vercel.sh/v1",
+                    "models": ["deepseek/deepseek-v4.1-flash"],
+                    "api_key_env": "AI_GATEWAY_API_KEY",
+                    "api_key_header": "Authorization",
+                }
+            },
+        }),
+        encoding="utf-8",
+    )
+    out_dir = tmp_path / "auto-scope-out"
+    called_runner: list[list[str]] = []
+    logs: list[str] = []
+
+    rc = agentic_wizard.run_wizard(
+        provider_config=remote_provider,
+        input_fn=_make_inputs([
+            "https://wide-target.example.invalid",  # 1) non-loopback target (no .codex/scope.json exists)
+            "",                                     # 2) press Enter -> auto-create scope.json
+            "/logout,/admin/delete",                # 2b) optional excluded paths
+            "3",                                    # 3) bounty-safe
+            "",                                     # 4) default methods
+            "",                                     # 5) no custom headers
+            "",                                     # 6) anon
+            str(out_dir),                           # 7) output_dir
+            "e",                                    # confirm live run
+        ]),
+        output_fn=logs.append,
+        runner_main=lambda argv: (called_runner.append(argv), 0)[1],
+        workdir=tmp_path,
+        cwd=tmp_path,
+        environ={"AI_GATEWAY_API_KEY": "present-for-test"},
+    )
+    assert rc == 0
+    auto_scope = out_dir / "scope.json"
+    assert auto_scope.is_file()
+    scope_doc = json.loads(auto_scope.read_text(encoding="utf-8"))
+    assert scope_doc["in_scope"] == ["https://wide-target.example.invalid/"]
+    assert scope_doc["excluded_paths"] == ["/logout", "/admin/delete"]
+    assert len(called_runner) == 1
+    assert "--scope-file" in called_runner[0]
+    assert str(auto_scope.resolve()) in called_runner[0]
+    assert "--allow-non-loopback" in called_runner[0]
+

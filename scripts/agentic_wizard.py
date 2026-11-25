@@ -108,6 +108,42 @@ def _is_sensitive_header_name(name: str) -> bool:
     return any(tok in low for tok in _SENSITIVE_HEADER_TOKENS)
 
 
+def _write_auto_scope_file(
+    output_dir: Path,
+    *,
+    target_url: str,
+    excluded_paths: Sequence[str] = (),
+) -> Path:
+    """Create a per-run scope.json locked to the exact operator-entered target origin."""
+    parsed = urlsplit(target_url)
+    origin = f"{parsed.scheme.lower()}://{parsed.netloc}/"
+    clean_excluded = [p.strip() for p in excluded_paths if str(p or "").strip()]
+    doc: dict[str, Any] = {
+        "in_scope": [origin],
+        "excluded_paths": clean_excluded,
+    }
+    output_dir.mkdir(parents=True, exist_ok=True)
+    scope_path = output_dir / "scope.json"
+    scope_path.write_text(json.dumps(doc, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    try:
+        scope_path.chmod(0o600)
+    except OSError:
+        pass
+    return scope_path
+
+
+def _scope_authorizes_target(scope_path: Path, raw_target: str, *, allow_non_loopback: bool) -> bool:
+    try:
+        target_bootstrap.resolve_target_origin(
+            raw_target,
+            scope_file=scope_path,
+            allow_non_loopback=allow_non_loopback,
+        )
+        return True
+    except ValueError:
+        return False
+
+
 def _write_reusable_run_config(
     output_dir: Path,
     *,
@@ -189,24 +225,44 @@ def run_wizard(
 
     loopback = _is_loopback_url(raw_target)
 
-    # 2. Scope file (required if non-loopback; optional if loopback)
+    # 2. Scope file (optional: auto-creates per-run scope.json for the entered target if omitted)
     detected_scope = _detect_default_scope_file(cwd=cwd)
+    usable_detected = (
+        detected_scope
+        if detected_scope is not None
+        and _scope_authorizes_target(detected_scope, raw_target, allow_non_loopback=not loopback)
+        else None
+    )
     scope_file: Path | None = None
+    auto_scope_excluded: list[str] = []
+    auto_create_scope = False
     if not loopback:
-        while scope_file is None:
-            hint = f" [{detected_scope}]" if detected_scope is not None else ""
+        while scope_file is None and not auto_create_scope:
+            if usable_detected is not None:
+                hint = f" [Enter={usable_detected}, 'yeni'=otomatik olustur]"
+            else:
+                hint = " [Enter=bu hedef icin otomatik olustur]"
             entered_scope = input_fn(f"2) Kapsam dosyasi (scope.json){hint}: ").strip()
-            chosen = Path(entered_scope).expanduser() if entered_scope else detected_scope
-            if chosen is None:
-                output_fn("   Dis (non-loopback) hedefler icin scope.json zorunludur.")
-                continue
+            if not entered_scope:
+                if usable_detected is not None:
+                    scope_file = usable_detected.resolve()
+                    break
+                auto_create_scope = True
+                break
+            if entered_scope.lower() in {"yeni", "new", "auto", "otomatik"}:
+                auto_create_scope = True
+                break
+            chosen = Path(entered_scope).expanduser()
             try:
                 target_bootstrap.resolve_target_origin(raw_target, scope_file=chosen, allow_non_loopback=True)
                 scope_file = chosen.resolve()
             except ValueError as exc:
-                output_fn(f"   Kapsam hatasi: {exc}")
+                output_fn(f"   Kapsam hatasi: {exc} (otomatik olusturmak icin Enter'a basin)")
+        if auto_create_scope:
+            excl_raw = input_fn("   Haric tutulacak yollar (virgulle, orn. /logout,/admin/delete) [Enter=yok]: ").strip()
+            auto_scope_excluded = [p.strip() for p in excl_raw.split(",") if p.strip()]
     else:
-        hint = f" [Enter=atla, mevcut={detected_scope}]" if detected_scope is not None else " [Enter=atla]"
+        hint = f" [Enter=atla, mevcut={usable_detected}]" if usable_detected is not None else " [Enter=atla]"
         entered_scope = input_fn(f"2) Kapsam dosyasi (opsiyonel){hint}: ").strip()
         if entered_scope:
             cand = Path(entered_scope).expanduser()
@@ -277,6 +333,13 @@ def run_wizard(
     default_out = _default_output_dir(raw_target, workdir=workdir)
     out_raw = input_fn(f"7) Cikti klasoru [{default_out}]: ").strip()
     output_dir = Path(out_raw).expanduser().resolve() if out_raw else default_out.resolve()
+
+    if auto_create_scope and scope_file is None:
+        scope_file = _write_auto_scope_file(
+            output_dir,
+            target_url=raw_target,
+            excluded_paths=auto_scope_excluded,
+        ).resolve()
 
     parsed_headers = parse_custom_headers(raw_custom_headers)
 
