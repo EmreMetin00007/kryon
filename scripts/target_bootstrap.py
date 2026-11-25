@@ -452,6 +452,52 @@ def _extract_excluded_paths(
     return collected
 
 
+def _parse_scope_header_collection(raw: Any, field_name: str) -> dict[str, str]:
+    """Validate and parse optional scope-file custom headers (dict or list of 'Name: Value')."""
+    if raw is None:
+        return {}
+    parsed: dict[str, str] = {}
+    if isinstance(raw, dict):
+        for k, v in raw.items():
+            if not isinstance(k, str) or not k.strip() or not isinstance(v, str) or not v.strip():
+                raise ValueError(
+                    f"scope file '{field_name}' entries must map non-empty header names to non-empty strings"
+                )
+            name = k.strip()
+            val = v.strip()
+            for existing in [ek for ek in parsed if ek.lower() == name.lower()]:
+                parsed.pop(existing, None)
+            parsed[name] = val
+        return parsed
+    if isinstance(raw, list):
+        for entry in raw:
+            if not isinstance(entry, str) or not entry.strip():
+                raise ValueError(f"scope file '{field_name}' entries must be non-empty 'Name: Value' strings")
+            name, sep, value = entry.strip().partition(":")
+            clean_name = name.strip()
+            clean_value = value.strip()
+            if not sep or not clean_name or not clean_value:
+                raise ValueError(f"scope file '{field_name}' entries must use 'Name: Value' format")
+            for existing in [ek for ek in parsed if ek.lower() == clean_name.lower()]:
+                parsed.pop(existing, None)
+            parsed[clean_name] = clean_value
+        return parsed
+    raise ValueError(f"scope file '{field_name}' must be a JSON object or array of 'Name: Value' strings")
+
+
+def _extract_scope_custom_headers(scope_doc: dict[str, Any]) -> dict[str, str]:
+    """Extract optional operator custom headers from a validated scope.json document."""
+    merged: dict[str, str] = {}
+    for key in ("request_headers", "custom_headers"):
+        if key not in scope_doc or scope_doc.get(key) is None:
+            continue
+        for hk, hv in _parse_scope_header_collection(scope_doc.get(key), key).items():
+            for existing in [ek for ek in merged if ek.lower() == hk.lower()]:
+                merged.pop(existing, None)
+            merged[hk] = hv
+    return merged
+
+
 def load_scope_file(path: Path) -> dict[str, Any]:
     """Load and strictly validate a .codex/scope.json style authorization document."""
     if path is None:
@@ -510,6 +556,10 @@ def load_scope_file(path: Path) -> dict[str, Any]:
         if not isinstance(entry, str) or not entry.strip():
             raise ValueError("scope file 'excluded_assets' entries must be non-empty strings")
 
+    for hdr_key in ("request_headers", "custom_headers"):
+        if hdr_key in data and data[hdr_key] is not None:
+            _parse_scope_header_collection(data[hdr_key], hdr_key)
+
     return data
 
 
@@ -537,6 +587,7 @@ def resolve_target_origin(
             "loopback_only": True,
             "excluded_paths": excluded_paths,
             "scope_file": str(scope_path.resolve()),
+            "custom_headers": _extract_scope_custom_headers(scope_doc),
         }
 
     if scope_file is None or (isinstance(scope_file, str) and not scope_file.strip()):
@@ -572,6 +623,7 @@ def resolve_target_origin(
         "excluded_paths": excluded_paths,
         "scope_file": str(scope_path.resolve()),
         "matched_in_scope": matched_in_scope,
+        "custom_headers": _extract_scope_custom_headers(scope_doc),
     }
 
 

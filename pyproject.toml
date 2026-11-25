@@ -44,7 +44,7 @@ scripts = ["*.sh"]
 [tool.setuptools.data-files]
 "share/hackagent" = ["pyproject.toml", "requirements.lock"]
 "share/hackagent/scripts" = ["scripts/*.py"]
-"share/hackagent/config" = ["config/llm.example.json", "config/bounty-program-policy.json"]
+"share/hackagent/config" = ["config/llm.example.json", "config/bounty-program-policy.json", "config/run.example.json"]
 
 [tool.ruff]
 target-version = "py312"
@@ -83,6 +83,7 @@ files = [
   "scripts/agentic_investigator.py",
   "scripts/agentic_oob.py",
   "scripts/agentic_oracle.py",
+  "scripts/agentic_presets.py",
   "scripts/agentic_preview.py",
   "scripts/agentic_receipts.py",
   "scripts/agentic_report.py",
@@ -94,6 +95,7 @@ files = [
   "scripts/agentic_surface.py",
   "scripts/agentic_telemetry.py",
   "scripts/agentic_tools.py",
+  "scripts/agentic_tui.py",
   "scripts/agentic_vault.py",
   "scripts/agentic_waf.py",
   "scripts/check_repo_layout.py",

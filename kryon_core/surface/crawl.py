@@ -665,10 +665,18 @@ def _crawl_site_sync(
 
     with sync_playwright() as playwright:
         browser = playwright.chromium.launch(headless=True, args=CHROMIUM_ARGS)
+        custom_user_agent = next(
+            (
+                str(v).strip()
+                for k, v in extra_headers.items()
+                if str(k).lower() == "user-agent" and str(v).strip()
+            ),
+            "",
+        )
         context_kwargs: dict[str, Any] = {
             "ignore_https_errors": True,
             "service_workers": "block",
-            "user_agent": (
+            "user_agent": custom_user_agent or (
                 "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
                 "Chrome/120.0.0.0 Safari/537.36"
             ),

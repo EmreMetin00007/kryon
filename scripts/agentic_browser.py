@@ -266,17 +266,85 @@ def _normalize_browser_auth_parts(
     return cookie_hdr, extra_headers
 
 
+def _operator_global_headers(http: AgenticHTTPClient) -> dict[str, str]:
+    """Return validated operator headers that must accompany every browser request."""
+    actors = getattr(http, "actors", None)
+    getter = getattr(actors, "global_headers", None)
+    if not callable(getter):
+        return {}
+    try:
+        raw = getter()
+    except (TypeError, ValueError):
+        return {}
+    if not isinstance(raw, dict):
+        return {}
+    return {str(k): str(v) for k, v in raw.items() if k and v is not None}
+
+
+def _operator_browser_headers(http: AgenticHTTPClient) -> dict[str, str]:
+    """Return non-auth operator global headers safe for Playwright route continuation."""
+    global_headers = _operator_global_headers(http)
+    if not global_headers:
+        return {}
+    _, safe_headers = _normalize_browser_auth_parts(base_headers=global_headers)
+    return safe_headers
+
+
+def _operator_user_agent(http: AgenticHTTPClient, default_ua: str = _BROWSER_USER_AGENT) -> str:
+    """Return custom operator User-Agent when configured, otherwise ``default_ua``."""
+    for key, value in _operator_global_headers(http).items():
+        if key.strip().lower() == "user-agent" and value.strip():
+            return value.strip()
+    return default_ua
+
+
+def _merge_browser_route_headers(
+    req_headers: dict[str, Any],
+    extra_headers: dict[str, str],
+    *,
+    override_names: frozenset[str] = frozenset(),
+) -> dict[str, str]:
+    """Merge Playwright request headers with ``extra_headers`` (case-insensitive)."""
+    merged = {
+        str(k): str(v)
+        for k, v in (req_headers or {}).items()
+        if k and not str(k).startswith(":")
+    }
+    existing_lower = {k.lower() for k in merged}
+    for hk, hv in extra_headers.items():
+        low = hk.lower()
+        if low in override_names:
+            for existing_key in [ek for ek in merged if ek.lower() == low]:
+                merged.pop(existing_key, None)
+            merged[hk] = hv
+            existing_lower.add(low)
+        elif low not in existing_lower:
+            merged[hk] = hv
+            existing_lower.add(low)
+    return merged
+
+
 def _extract_actor_browser_auth(http: AgenticHTTPClient, actor: str) -> tuple[str, dict[str, str]]:
     """Extract host-side Playwright ``(cookie_header, extra_headers)`` for ``actor``.
 
     Uses ``http.actors.get_browser_auth_state(actor)`` when available, otherwise reads
-    ``ActorSession`` cookies/access_token/base_headers under lock. Returns ``("", {})``
-    for ``"anon"``. Values returned here are strictly for host-side Playwright use and
-    must NEVER be included in any tool output dictionary.
+    ``ActorSession`` cookies/access_token/base_headers under lock. Anonymous sessions
+    still receive operator global headers, but never credentials. Values returned here
+    are strictly for host-side Playwright use and must NEVER be included in any tool
+    output dictionary.
     """
     clean_actor = str(actor or "anon").strip() or "anon"
+    global_headers = _operator_global_headers(http)
+
+    def _with_global(parts: tuple[str, dict[str, str]]) -> tuple[str, dict[str, str]]:
+        cookie_hdr, extra_headers = parts
+        for key, value in global_headers.items():
+            if not any(existing.lower() == key.lower() for existing in extra_headers):
+                extra_headers[key] = value
+        return cookie_hdr, extra_headers
+
     if clean_actor == "anon":
-        return "", {}
+        return _normalize_browser_auth_parts(base_headers=global_headers)
 
     get_state = getattr(http.actors, "get_browser_auth_state", None)
     if callable(get_state):
@@ -284,23 +352,23 @@ def _extract_actor_browser_auth(http: AgenticHTTPClient, actor: str) -> tuple[st
         if isinstance(state, tuple) and len(state) == 2:
             raw_cookie, raw_headers = state
             if isinstance(raw_cookie, dict):
-                return _normalize_browser_auth_parts(
+                return _with_global(_normalize_browser_auth_parts(
                     cookies_map=raw_cookie,
                     base_headers=raw_headers if isinstance(raw_headers, dict) else {},
-                )
-            return _normalize_browser_auth_parts(
+                ))
+            return _with_global(_normalize_browser_auth_parts(
                 cookie_blob=str(raw_cookie or ""),
                 base_headers=raw_headers if isinstance(raw_headers, dict) else {},
-            )
+            ))
         if isinstance(state, dict):
             raw_hdrs = state.get("extra_headers") or state.get("headers") or state.get("base_headers")
-            return _normalize_browser_auth_parts(
+            return _with_global(_normalize_browser_auth_parts(
                 cookie_blob=str(state.get("cookie") or ""),
                 cookies_map=state.get("cookies") if isinstance(state.get("cookies"), dict) else None,
                 base_headers=raw_hdrs if isinstance(raw_hdrs, dict) else None,
                 access_token=str(state.get("access_token") or state.get("bearer_token") or ""),
-            )
-        return "", {}
+            ))
+        return _with_global(("", {}))
 
     session = http.actors.get(clean_actor)
     lock = getattr(session, "_lock", None)
@@ -310,11 +378,11 @@ def _extract_actor_browser_auth(http: AgenticHTTPClient, actor: str) -> tuple[st
         cookies_map = dict(getattr(session, "cookies", None) or {})
         access_token = str(getattr(session, "access_token", "") or "").strip()
 
-    return _normalize_browser_auth_parts(
+    return _with_global(_normalize_browser_auth_parts(
         cookies_map=cookies_map,
         base_headers=base_headers,
         access_token=access_token,
-    )
+    ))
 
 
 def _extract_actor_local_storage(http: AgenticHTTPClient, actor: str) -> dict[str, str]:
@@ -659,10 +727,14 @@ def run_browser_crawl(
         raw = crawl_fn(full_url, **call_kwargs)
     else:
         assert _default_crawl_site is not None
+        crawl_headers = dict(extra_headers)
+        custom_ua = _operator_user_agent(http, default_ua="")
+        if custom_ua and not any(k.lower() == "user-agent" for k in crawl_headers):
+            crawl_headers["User-Agent"] = custom_ua
         default_kwargs: dict[str, Any] = {
             "max_pages": eff_max_pages,
             "cookie": cookie_hdr,
-            "headers": extra_headers,
+            "headers": crawl_headers,
             "timeout_ms": eff_timeout_ms,
             "allow_subdomains": False,
             "wait_ms": eff_wait_ms,
@@ -977,12 +1049,13 @@ def _inspect_rendered_page_playwright(
             nonlocal console_error_count
             console_error_count += 1
 
+        operator_override_names = frozenset(k.lower() for k in _operator_browser_headers(http))
         with _sync_playwright() as playwright:
             browser = playwright.chromium.launch(headless=True, args=CHROMIUM_ARGS)
             context = browser.new_context(
                 ignore_https_errors=True,
                 service_workers="block",
-                user_agent=_BROWSER_USER_AGENT,
+                user_agent=_operator_user_agent(http),
             )
             try:
                 ls_init_script = _build_origin_localstorage_init_script(
@@ -1024,13 +1097,14 @@ def _inspect_rendered_page_playwright(
                         return
                     if extra_headers:
                         try:
-                            merged = dict(req.all_headers() or {})
+                            raw_req_headers = dict(req.all_headers() or {})
                         except Exception:
-                            merged = dict(getattr(req, "headers", None) or {})
-                        existing_lower = {str(k).lower() for k in merged}
-                        for hk, hv in extra_headers.items():
-                            if hk.lower() not in existing_lower:
-                                merged[hk] = hv
+                            raw_req_headers = dict(getattr(req, "headers", None) or {})
+                        merged = _merge_browser_route_headers(
+                            raw_req_headers,
+                            extra_headers,
+                            override_names=operator_override_names,
+                        )
                         route.continue_(headers=merged)
                     else:
                         route.continue_()
@@ -1382,12 +1456,13 @@ def verify_dom_sink_in_browser(
 
     def _run() -> dict[str, Any]:
         assert _sync_playwright is not None
+        operator_override_names = frozenset(k.lower() for k in _operator_browser_headers(http))
         with _sync_playwright() as playwright:
             browser = playwright.chromium.launch(headless=True, args=CHROMIUM_ARGS)
             context = browser.new_context(
                 ignore_https_errors=True,
                 service_workers="block",
-                user_agent=_BROWSER_USER_AGENT,
+                user_agent=_operator_user_agent(http),
             )
             try:
                 ls_init = _build_origin_localstorage_init_script(http.base_url, local_storage or {})
@@ -1422,13 +1497,14 @@ def verify_dom_sink_in_browser(
                         return
                     if extra_headers:
                         try:
-                            merged = dict(req.all_headers() or {})
+                            raw_req_headers = dict(req.all_headers() or {})
                         except Exception:
-                            merged = dict(getattr(req, "headers", None) or {})
-                        existing_lower = {str(k).lower() for k in merged}
-                        for hk, hv in extra_headers.items():
-                            if hk.lower() not in existing_lower:
-                                merged[hk] = hv
+                            raw_req_headers = dict(getattr(req, "headers", None) or {})
+                        merged = _merge_browser_route_headers(
+                            raw_req_headers,
+                            extra_headers,
+                            override_names=operator_override_names,
+                        )
                         route.continue_(headers=merged)
                     else:
                         route.continue_()
@@ -1529,6 +1605,9 @@ __all__ = [
     "_build_origin_localstorage_init_script",
     "_extract_actor_browser_auth",
     "_extract_actor_local_storage",
+    "_merge_browser_route_headers",
+    "_operator_browser_headers",
+    "_operator_user_agent",
     "inspect_rendered_page",
     "run_browser_crawl",
     "verify_dom_sink_in_browser",

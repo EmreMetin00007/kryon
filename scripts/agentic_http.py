@@ -79,6 +79,78 @@ _NON_DISCOVERABLE_AUTH_HEADERS = frozenset({
     "x-csrf-token-next",
 }) | _CSRF_HEADER_NAMES
 _HTTP_HEADER_NAME_RE = re.compile(r"^[!#$%&'*+\-.^_`|~0-9A-Za-z]{1,128}$")
+_RESERVED_GLOBAL_HEADER_NAMES = frozenset({
+    "authorization",
+    "connection",
+    "content-length",
+    "cookie",
+    "host",
+    "proxy-authorization",
+    "proxy-connection",
+    "te",
+    "trailer",
+    "transfer-encoding",
+    "upgrade",
+})
+
+
+def normalize_global_headers(raw_headers: dict[str, Any] | None) -> dict[str, str]:
+    """Validate operator-supplied headers applied to every actor and browser request."""
+    clean: dict[str, str] = {}
+    for raw_name, raw_value in (raw_headers or {}).items():
+        name = _validate_auth_header_name(raw_name, strict=True)
+        if not name:
+            raise ValueError("global header name must not be empty")
+        if name.lower() in _RESERVED_GLOBAL_HEADER_NAMES:
+            raise ValueError(f"global header {name!r} must be supplied through the actor session")
+        value = "" if raw_value is None else str(raw_value).strip()
+        if not value:
+            raise ValueError(f"global header {name!r} value must not be empty")
+        if any(ch in value for ch in ("\r", "\n", "\x00")):
+            raise ValueError(f"global header {name!r} value contains control characters")
+        if len(value) > 8192:
+            raise ValueError(f"global header {name!r} value is too long")
+        for existing in [k for k in clean if k.lower() == name.lower()]:
+            clean.pop(existing, None)
+        clean[name] = value
+    return clean
+
+
+def parse_custom_headers(raw_values: Sequence[str] | dict[str, Any] | None) -> dict[str, str]:
+    """Parse repeatable ``Name: Value`` strings or a mapping into validated global headers."""
+    if raw_values is None:
+        return {}
+    if isinstance(raw_values, dict):
+        return normalize_global_headers(raw_values)
+    if isinstance(raw_values, (str, bytes, bytearray)):
+        raise ValueError("custom_headers must be a mapping or sequence of 'Name: Value' strings")
+    parsed: dict[str, str] = {}
+    for raw in raw_values:
+        if not isinstance(raw, str):
+            raise ValueError(f"custom header entry must be a string, got {type(raw).__name__}")
+        text = raw.strip()
+        if not text:
+            continue
+        name, sep, value = text.partition(":")
+        clean_name = name.strip()
+        clean_value = value.strip()
+        if not sep or not clean_name or not clean_value:
+            raise ValueError(f"custom header must use 'Name: Value' format: {text!r}")
+        for existing in [k for k in parsed if k.lower() == clean_name.lower()]:
+            parsed.pop(existing, None)
+        parsed[clean_name] = clean_value
+    return normalize_global_headers(parsed)
+
+
+def _merge_headers_ci(base: dict[str, str], overlay: dict[str, str]) -> dict[str, str]:
+    """Return a new header dict with ``overlay`` replacing matching keys case-insensitively."""
+    merged = dict(base)
+    for hk, hv in overlay.items():
+        low = hk.lower()
+        for existing in [k for k in merged if k.lower() == low and k != hk]:
+            merged.pop(existing, None)
+        merged[hk] = hv
+    return merged
 _SESSION_ENVELOPE_SUBKEYS: tuple[str, ...] = (
     "data",
     "result",
@@ -652,6 +724,7 @@ class ActorManager:
         login_path: str = "/api/v1/access/sign-in",
         session_check_path: str = "/api/v1/access/session",
         refresh_path: str = "/api/v1/access/refresh",
+        global_headers: dict[str, Any] | None = None,
     ):
         self.login_path = login_path
         self.session_check_path = session_check_path
@@ -659,8 +732,16 @@ class ActorManager:
         self._lock = threading.Lock()
         self._discovered_auth_header: str = ""
         self._discovered_auth_prefix: str = ""
+        clean_global_headers = normalize_global_headers(global_headers)
+        self._global_headers: dict[str, str] = dict(clean_global_headers)
         self.actors: dict[str, ActorSession] = {
-            "anon": ActorSession(alias="anon", role="anonymous", tenant="", authenticated=True)
+            "anon": ActorSession(
+                alias="anon",
+                role="anonymous",
+                tenant="",
+                authenticated=True,
+                base_headers=dict(clean_global_headers),
+            )
         }
         for raw in accounts:
             if not isinstance(raw, dict) or not raw.get("alias"):
@@ -668,21 +749,32 @@ class ActorManager:
             alias = str(raw["alias"]).strip()
             if not alias or alias == "anon":
                 continue
-            base_headers: dict[str, str] = {}
+            account_headers: dict[str, str] = {}
             if isinstance(raw.get("headers"), dict):
-                base_headers.update({str(k): str(v) for k, v in raw["headers"].items() if k and v is not None})
+                account_headers = _merge_headers_ci(
+                    account_headers,
+                    {str(k): str(v) for k, v in raw["headers"].items() if k and v is not None},
+                )
             if isinstance(raw.get("auth_header"), str) and raw["auth_header"].strip():
-                base_headers.setdefault("Authorization", raw["auth_header"].strip())
+                if not any(k.lower() == "authorization" for k in account_headers):
+                    account_headers["Authorization"] = raw["auth_header"].strip()
             auth_header_name = _validate_auth_header_name(raw.get("auth_header_name"), strict=False)
             auth_header_prefix = str(raw.get("auth_header_prefix") or "")
             access_token = str(raw.get("session_token") or raw.get("access_token") or "").strip()
-            if not access_token and "Authorization" in base_headers:
-                access_token = _extract_token_from_auth(base_headers["Authorization"])
+            if not access_token:
+                auth_val = next(
+                    (v for k, v in account_headers.items() if k.lower() == "authorization"),
+                    "",
+                )
+                if auth_val:
+                    access_token = _extract_token_from_auth(auth_val)
             cookies: dict[str, str] = {}
             if isinstance(raw.get("cookies"), dict):
                 cookies.update({str(k): str(v) for k, v in raw["cookies"].items() if k and v is not None})
             if isinstance(raw.get("cookie"), str) and raw["cookie"].strip():
-                base_headers.setdefault("Cookie", raw["cookie"].strip())
+                if not any(k.lower() == "cookie" for k in account_headers):
+                    account_headers["Cookie"] = raw["cookie"].strip()
+            base_headers = _merge_headers_ci(clean_global_headers, account_headers)
             local_storage: dict[str, str] = {}
             if isinstance(raw.get("local_storage"), dict):
                 for lk, lv in raw["local_storage"].items():
@@ -698,7 +790,7 @@ class ActorManager:
                     if isinstance(val, str) and val.strip():
                         login_payload[key] = val.strip()
                         break
-            has_preauth = bool(base_headers or access_token or cookies or local_storage)
+            has_preauth = bool(account_headers or access_token or cookies or local_storage)
             self.actors[alias] = ActorSession(
                 alias=alias,
                 role=str(raw.get("role") or "member").strip() or "member",
@@ -752,6 +844,27 @@ class ActorManager:
                 if session.auth_header_name.strip():
                     names.add(session.auth_header_name.strip().lower())
         return frozenset(names)
+
+    def global_headers(self) -> dict[str, str]:
+        """Return a copy of operator headers attached to every actor session."""
+        with self._lock:
+            return dict(self._global_headers)
+
+    def set_global_headers(self, raw_headers: dict[str, Any] | Sequence[str] | None) -> dict[str, str]:
+        """Merge validated operator headers into the manager and all existing actor sessions."""
+        incoming = parse_custom_headers(raw_headers)
+        if not incoming:
+            return self.global_headers()
+        with self._lock:
+            self._global_headers = _merge_headers_ci(self._global_headers, incoming)
+            merged_global = dict(self._global_headers)
+            sessions = list(self.actors.values())
+        for session in sessions:
+            with session._lock:
+                # Preserve existing actor-specific headers over newly attached defaults only when
+                # they are auth headers; operator custom headers apply to every actor.
+                session.base_headers = _merge_headers_ci(session.base_headers, incoming)
+        return merged_global
 
     def get(self, alias: str) -> ActorSession:
         key = str(alias or "anon").strip() or "anon"
@@ -846,13 +959,14 @@ class ActorManager:
         clean_csrf = str(csrf_token or "").strip()
         clean_csrf_header = str(csrf_header_name or "").strip()
         clean_csrf_field = str(csrf_field_name or "").strip()
-        clean_headers = {str(k): str(v) for k, v in (base_headers or {}).items() if k and v}
+        provided_headers = {str(k): str(v) for k, v in (base_headers or {}).items() if k and v}
+        clean_headers = _merge_headers_ci(self.global_headers(), provided_headers)
         explicit_auth_header = (
             _validate_auth_header_name(auth_header_name, strict=True)
             if auth_header_name is not None
             else None
         )
-        is_auth = bool(clean_cookies or clean_bearer or clean_headers)
+        is_auth = bool(clean_cookies or clean_bearer or provided_headers)
         with self._lock:
             if explicit_auth_header is not None:
                 eff_auth_header: str | None = explicit_auth_header
@@ -894,7 +1008,7 @@ class ActorManager:
                     if clean_csrf_field:
                         existing.csrf_field_name = clean_csrf_field
                     if clean_headers:
-                        existing.base_headers.update(clean_headers)
+                        existing.base_headers = _merge_headers_ci(existing.base_headers, clean_headers)
                     if role:
                         existing.role = str(role).strip() or existing.role
                     if tenant:
@@ -1341,6 +1455,7 @@ class AgenticHTTPClient:
         max_retry_after_s: float = _DEFAULT_MAX_RETRY_AFTER_S,
         max_rate_limit_retries: int = _MAX_RATE_LIMIT_RETRIES,
         deadline_monotonic: float | None = None,
+        custom_headers: dict[str, Any] | Sequence[str] | None = None,
         _sleep_fn: Callable[[float], None] | None = None,
         _monotonic_fn: Callable[[], float] | None = None,
     ):
@@ -1376,7 +1491,9 @@ class AgenticHTTPClient:
         self._adaptive_healthy_streak: int = 0
         self._last_wire_at: float | None = None
         self.receipt_store = receipt_store
-        self.actors = actors or ActorManager()
+        self.actors = actors or ActorManager(global_headers=parse_custom_headers(custom_headers))
+        if actors is not None and custom_headers:
+            self.actors.set_global_headers(custom_headers)
         self.allowed_methods = frozenset(
             str(m).strip().upper() for m in allowed_methods if str(m).strip()
         ) or frozenset({"GET"})

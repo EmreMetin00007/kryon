@@ -90,22 +90,28 @@ Invoke via the installed `cco-agent` entry point, `./scripts/cco.sh`, or `python
 cco-agent --help
 cco-agent check-config --provider-config config/llm.example.json
 
-# 2. Generate an offline assessment plan (writes agentic-plan.json; 0 target/LLM traffic)
-cco-agent agentic \
+# 2. Generate an offline assessment plan using a preset or cco-run/1 config (0 target/LLM traffic)
+cco-agent presets --format text
+cco-agent plan \
+  --preset bounty-safe \
   --target http://127.0.0.1:8000 \
   --provider-config config/llm.example.json \
   --output-dir ~/cco-work/demo-plan
 
-# 3. Execute against an owned local loopback target with sharded mode + offline seeds
-cco-agent agentic \
+# 3. Execute against an owned local loopback target with sharded preset + offline seeds
+cco-agent run \
+  --preset standard \
   --target http://127.0.0.1:8000 \
   --provider-config config/llm.json \
-  --execution-mode sharded \
   --storage-state member=~/.cco/auth/demo-storage.json \
   --seed-surface ~/cco-work/seeds/traffic.har \
   --tech-hint nextjs \
   --output-dir ~/cco-work/demo-run \
   --execute
+
+# Inspect compact JSON status or launch the read-only live TUI monitor (see docs/llm-operator-guide.md)
+cco-agent status ~/cco-work/demo-run
+cco-agent watch ~/cco-work/demo-run --once
 
 # 4. Authorized non-loopback engagement (requires explicit scope file + opt-in flags + operator approval)
 cco-agent agentic \
@@ -115,6 +121,7 @@ cco-agent agentic \
   --provider-config config/llm.json \
   --authorize-live-provider \
   --live-authorization-reason "approved-engagement" \
+  --header "X-Program-Tag: authorized-test" \
   --execution-mode sharded \
   --output-dir ~/cco-work/target-run \
   --execute

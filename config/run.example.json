@@ -1,0 +1,13 @@
+{
+  "schema": "cco-run/1",
+  "preset": "bounty-safe",
+  "target": "http://127.0.0.1:8000/",
+  "provider_config": "config/llm.example.json",
+  "output_dir": "~/cco-work/demo-run",
+  "allowed_methods": ["GET", "HEAD"],
+  "custom_headers": {
+    "X-Program-Tag": "authorized-test"
+  },
+  "discovery_hints": ["/"],
+  "tech_hints": []
+}

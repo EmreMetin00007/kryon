@@ -23,14 +23,22 @@ import stat
 import sys
 import time
 from pathlib import Path
+from typing import Sequence
 
-_REPO_ROOT = Path(__file__).resolve().parent.parent
-if str(_REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(_REPO_ROOT))
+_SCRIPTS_DIR = Path(__file__).resolve().parent
+_REPO_ROOT = _SCRIPTS_DIR.parent
+for _p in (str(_REPO_ROOT), str(_SCRIPTS_DIR)):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
+from agentic_http import parse_custom_headers  # noqa: E402
 from kryon_core.vault.otp_core import OtpError, fetch_latest_otp  # noqa: E402
 
 AUTH_DIR = Path(os.environ.get("CCO_AUTH_DIR", "~/.cco/auth")).expanduser()
 PROXY = os.environ.get("CCO_PROXY", "http://127.0.0.1:8080").strip()
+DEFAULT_USER_AGENT = (
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+)
 
 OTP_CANDIDATES = [
     "input[name*=otp i]", "input[name*=code i]", "input[name*=sms i]",
@@ -88,7 +96,28 @@ def _find_otp_field(page, explicit: str):
     return None
 
 
-def main() -> int:
+def _custom_header_arg(raw: str) -> str:
+    try:
+        parse_custom_headers([raw])
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
+    return raw
+
+
+def _build_context_headers(raw_headers: Sequence[str] | None) -> tuple[str, dict[str, str]]:
+    """Return ``(user_agent, extra_http_headers)`` from validated operator header args."""
+    parsed = parse_custom_headers(raw_headers)
+    user_agent = DEFAULT_USER_AGENT
+    extra_http_headers: dict[str, str] = {}
+    for key, value in parsed.items():
+        if key.lower() == "user-agent":
+            user_agent = value
+        else:
+            extra_http_headers[key] = value
+    return user_agent, extra_http_headers
+
+
+def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--program", required=True)
     ap.add_argument("--login-url", required=True)
@@ -101,25 +130,45 @@ def main() -> int:
     ap.add_argument("--otp-wait", type=int, default=15)
     ap.add_argument("--login-file", default="")
     ap.add_argument("--storage", default="")
+    ap.add_argument(
+        "-H",
+        "--header",
+        "--custom-header",
+        action="append",
+        dest="custom_headers",
+        type=_custom_header_arg,
+        default=None,
+        metavar="NAME: VALUE",
+        help="Operator header sent on every browser request (repeatable; e.g. -H 'Pentest: Cyberbounty')",
+    )
     ap.add_argument("--headed", action="store_true")
     ap.add_argument("--timeout", type=int, default=30000)
-    a = ap.parse_args()
+    a = ap.parse_args(argv)
 
     login_file = Path(a.login_file or AUTH_DIR / f"{a.program}-login.json").expanduser()
     storage = Path(a.storage or AUTH_DIR / f"{a.program}-storage.json").expanduser()
     creds = _load_login(login_file)
+    eff_user_agent, extra_http_headers = _build_context_headers(a.custom_headers)
+    if a.custom_headers:
+        header_names = sorted(parse_custom_headers(a.custom_headers))
+        print(f"[auth] ozel basliklar aktif: {', '.join(header_names)}", flush=True)
     AUTH_DIR.mkdir(parents=True, exist_ok=True)
 
     from playwright.sync_api import sync_playwright
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=not a.headed, args=["--no-sandbox"])
-        ctx = browser.new_context(
-            viewport={"width": 1366, "height": 800},
-            locale="tr-TR", timezone_id="Europe/Istanbul",
-            user_agent=("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-                        "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"),
-            ignore_https_errors=True, **_proxy_args())
+        context_kwargs: dict = {
+            "viewport": {"width": 1366, "height": 800},
+            "locale": "tr-TR",
+            "timezone_id": "Europe/Istanbul",
+            "user_agent": eff_user_agent,
+            "ignore_https_errors": True,
+            **_proxy_args(),
+        }
+        if extra_http_headers:
+            context_kwargs["extra_http_headers"] = extra_http_headers
+        ctx = browser.new_context(**context_kwargs)
         page = ctx.new_page()
         page.set_default_timeout(a.timeout)
         print(f"[auth] login sayfasi aciliyor: {a.login_url}", flush=True)

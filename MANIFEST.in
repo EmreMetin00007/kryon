@@ -7,4 +7,5 @@ recursive-include scripts *.py *.sh
 recursive-include kryon_core *.py
 include config/llm.example.json
 include config/bounty-program-policy.json
+include config/run.example.json
 global-exclude __pycache__ *.py[cod] *.db *.sqlite *.sqlite3 .env .env.* *.pem *.key

@@ -47,6 +47,9 @@ from agentic_browser import (  # noqa: E402
     _collect_actor_secrets,
     _extract_actor_browser_auth,
     _extract_actor_local_storage,
+    _merge_browser_route_headers,
+    _operator_browser_headers,
+    _operator_user_agent,
     _parse_cookie_pairs,
     _redact_secrets,
     _resolve_and_check_scope,
@@ -2347,6 +2350,8 @@ def _crawl_actor_playwright(
 ) -> list[str]:
     """Run Layers 1-3 inside an isolated Playwright context for a single actor."""
     cookie_hdr, extra_headers = _extract_actor_browser_auth(http_client, actor)
+    operator_headers = _operator_browser_headers(http_client)
+    operator_override_names = frozenset(k.lower() for k in operator_headers)
     local_storage = _extract_actor_local_storage(http_client, actor)
     actor_secrets = _collect_actor_secrets(
         http_client,
@@ -2358,7 +2363,7 @@ def _crawl_actor_playwright(
     context = browser.new_context(
         ignore_https_errors=True,
         service_workers="block",
-        user_agent=_BROWSER_USER_AGENT,
+        user_agent=_operator_user_agent(http_client, default_ua=_BROWSER_USER_AGENT),
     )
     session_dropped = False
     form_submitting_flag = [False]
@@ -2391,20 +2396,17 @@ def _crawl_actor_playwright(
             context.route_web_socket("**/*", _on_ws_route)
 
         def _continue_route(route: Any, req: Any, *, include_extra_headers: bool) -> None:
-            if include_extra_headers and extra_headers:
+            headers_to_apply = extra_headers if include_extra_headers else operator_headers
+            if headers_to_apply:
                 try:
                     raw_hdrs = dict(req.all_headers() or {})
                 except Exception:
                     raw_hdrs = dict(getattr(req, "headers", None) or {})
-                merged = {
-                    str(k): str(v)
-                    for k, v in raw_hdrs.items()
-                    if k and not str(k).startswith(":")
-                }
-                existing_lower = {k.lower() for k in merged}
-                for hk, hv in extra_headers.items():
-                    if hk.lower() not in existing_lower:
-                        merged[hk] = hv
+                merged = _merge_browser_route_headers(
+                    raw_hdrs,
+                    headers_to_apply,
+                    override_names=operator_override_names,
+                )
                 try:
                     route.continue_(headers=merged)
                 except Exception:

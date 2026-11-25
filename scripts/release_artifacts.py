@@ -349,7 +349,7 @@ def _stage_release_source(staging: Path) -> None:
         if source.is_symlink() or not source.is_file():
             raise ValueError(f"release source file missing: {name}")
         shutil.copy2(source, staging / name)
-    config_files = {"llm.example.json", "bounty-program-policy.json"}
+    config_files = {"llm.example.json", "bounty-program-policy.json", "run.example.json"}
     for relative in (Path("scripts"), Path("kryon_core"), Path("config")):
         source_root = REPO_ROOT / relative
         if source_root.is_symlink() or not source_root.is_dir():

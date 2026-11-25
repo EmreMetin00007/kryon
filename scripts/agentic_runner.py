@@ -8,6 +8,7 @@ import math
 import os
 from pathlib import Path
 import sys
+import threading
 import time
 from typing import Any, Sequence
 import uuid
@@ -25,13 +26,24 @@ import agentic_vault  # noqa: E402
 import llm_config  # noqa: E402
 import target_bootstrap  # noqa: E402
 from provider_auth import authorize_provider  # noqa: E402
-from agentic_http import ActorManager, AgenticHTTPClient, ServiceDegradationError  # noqa: E402
+from agentic_http import (  # noqa: E402
+    ActorManager,
+    AgenticHTTPClient,
+    ServiceDegradationError,
+    normalize_global_headers,
+    parse_custom_headers,
+)
 from agentic_investigator import (  # noqa: E402
     _EPOCH_HARD_CHAR_LIMIT,
     _PROMPT_HARD_CHAR_LIMIT,
     AgenticInvestigator,
 )
 from agentic_oob import LoopbackCallbackServer  # noqa: E402
+from agentic_presets import (  # noqa: E402
+    load_run_config,
+    merge_run_options,
+    preset_names,
+)
 from agentic_receipts import ReceiptStore  # noqa: E402
 from agentic_tools import canonicalize_and_deduplicate_findings  # noqa: E402
 from full_agent_budget import SharedBudget  # noqa: E402
@@ -40,6 +52,65 @@ from full_agent_provider import MeteredProviderTransport, SessionGate, dump  # n
 SCHEMA = "agentic-target-run/1"
 DEFAULT_LOGIN_PATH = "/api/v1/access/sign-in"
 DEFAULT_SESSION_CHECK_PATH = "/api/v1/access/session"
+
+
+def _runner_defaults() -> dict[str, Any]:
+    return {
+        "target": "",
+        "credentials_file": None,
+        "provider_config": llm_config.default_config(),
+        "model": "",
+        "worker_model": "",
+        "scout_model": "",
+        "scout_turns": 22,
+        "scout_token_share": 0.40,
+        "api_key_env": None,
+        "output_dir": None,
+        "http_budget": None,
+        "token_budget": 1_000_000,
+        "seconds_budget": 900,
+        "allowed_methods": None,
+        "discovery_hints": None,
+        "login_path": DEFAULT_LOGIN_PATH,
+        "session_check_path": DEFAULT_SESSION_CHECK_PATH,
+        "max_member_accounts": 6,
+        "max_admin_accounts": 2,
+        "max_turns": 75,
+        "reasoning_effort": "low",
+        "resume": False,
+        "run_id": "",
+        "execute": False,
+        "authorize_live_provider": False,
+        "live_authorization_reason": "",
+        "use_bsag": False,
+        "scheduler": "prompt_only",
+        "verification_gate": "differential",
+        "intervention": "off",
+        "execution_mode": "monolithic",
+        "max_shards": 3,
+        "bootstrap_turns": 12,
+        "shard_turns": 25,
+        "shard_token_quota": 0,
+        "bootstrap_model": "",
+        "epoch_char_limit": 0,
+        "cache_token_weight": 0.10,
+        "scope_file": None,
+        "allow_non_loopback": False,
+        "max_degradation_streak": 5,
+        "max_rps": 0.0,
+        "vault_home": None,
+        "vault_key_name": "",
+        "storage_states": None,
+        "custom_headers": None,
+        "seed_surface_files": None,
+        "tech_hints": None,
+        "auto_crawl": False,
+        "auto_crawl_forms": False,
+        "auto_crawl_max_pages": 12,
+        "auto_crawl_max_actions": 24,
+        "oob_bind_host": "",
+        "oob_advertise_host": "",
+    }
 
 
 def _extract_bundle_auth_path(bundle: dict[str, Any], key: str) -> str:
@@ -152,6 +223,44 @@ def _parse_bool_flag(raw: Any) -> bool:
     raise argparse.ArgumentTypeError(f"invalid boolean flag value: {raw!r}; expected true|false")
 
 
+def _parse_custom_headers(raw_values: Sequence[str] | dict[str, Any] | None) -> dict[str, str]:
+    """Parse repeatable ``Name: Value`` operator headers or a dict into a validated mapping."""
+    return parse_custom_headers(raw_values)
+
+
+def _merge_header_maps(*maps: dict[str, str] | None) -> dict[str, str]:
+    """Merge header mappings left-to-right with case-insensitive replacement."""
+    merged: dict[str, str] = {}
+    for mapping in maps:
+        for hk, hv in (mapping or {}).items():
+            for existing in [ek for ek in merged if ek.lower() == hk.lower()]:
+                merged.pop(existing, None)
+            merged[hk] = hv
+    return normalize_global_headers(merged)
+
+
+def _extract_bundle_custom_headers(bundle: dict[str, Any], scope_rules: dict[str, Any]) -> dict[str, str]:
+    """Extract optional operator custom headers from a credentials bundle or its scope_rules."""
+    sources: list[dict[str, str]] = []
+    for container, keys in (
+        (scope_rules, ("headers", "request_headers", "custom_headers")),
+        (bundle, ("request_headers", "custom_headers")),
+    ):
+        for key in keys:
+            raw = container.get(key)
+            if raw is not None:
+                sources.append(_parse_custom_headers(raw))
+    return _merge_header_maps(*sources)
+
+
+def _custom_header_arg(raw: str) -> str:
+    try:
+        _parse_custom_headers([raw])
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
+    return raw
+
+
 def _parse_allowed_methods(
     cli_methods: Sequence[str] | None,
     scope_rules: dict[str, Any],
@@ -184,7 +293,7 @@ def run_agentic_target(
     scout_turns: int = 22,
     scout_token_share: float = 0.40,
     api_key_env: str | None = None,
-    output_dir: Path,
+    output_dir: Path | None = None,
     http_budget: int | None = None,
     token_budget: int = 1_000_000,
     seconds_budget: int = 900,
@@ -220,6 +329,7 @@ def run_agentic_target(
     vault_home: Path | None = None,
     vault_key_name: str = "",
     storage_states: Sequence[str] | None = None,
+    custom_headers: Sequence[str] | None = None,
     seed_surface_files: Sequence[Path] | None = None,
     tech_hints: Sequence[str] | None = None,
     auto_crawl: bool = False,
@@ -228,8 +338,89 @@ def run_agentic_target(
     auto_crawl_max_actions: int = 24,
     oob_bind_host: str = "",
     oob_advertise_host: str = "",
+    preset: str = "",
+    config_file: Path | None = None,
+    _options_resolved: bool = False,
 ) -> tuple[Path, dict[str, Any]]:
     """Run (or plan when execute=False) AgenticInvestigator against an authorized target."""
+    eff_preset = str(preset or "").strip().lower()
+    eff_config_path: Path | None = Path(config_file).expanduser().resolve() if config_file is not None else None
+    if not _options_resolved and (eff_preset or config_file is not None):
+        defaults = _runner_defaults()
+        local_vals: dict[str, Any] = {
+            "target": target,
+            "credentials_file": credentials_file,
+            "provider_config": provider_config,
+            "model": model,
+            "worker_model": worker_model,
+            "scout_model": scout_model,
+            "scout_turns": scout_turns,
+            "scout_token_share": scout_token_share,
+            "api_key_env": api_key_env,
+            "output_dir": output_dir,
+            "http_budget": http_budget,
+            "token_budget": token_budget,
+            "seconds_budget": seconds_budget,
+            "allowed_methods": allowed_methods,
+            "discovery_hints": discovery_hints,
+            "login_path": login_path,
+            "session_check_path": session_check_path,
+            "max_member_accounts": max_member_accounts,
+            "max_admin_accounts": max_admin_accounts,
+            "max_turns": max_turns,
+            "reasoning_effort": reasoning_effort,
+            "resume": resume,
+            "run_id": run_id,
+            "execute": execute,
+            "authorize_live_provider": authorize_live_provider,
+            "live_authorization_reason": live_authorization_reason,
+            "use_bsag": use_bsag,
+            "scheduler": scheduler,
+            "verification_gate": verification_gate,
+            "intervention": intervention,
+            "execution_mode": execution_mode,
+            "max_shards": max_shards,
+            "bootstrap_turns": bootstrap_turns,
+            "shard_turns": shard_turns,
+            "shard_token_quota": shard_token_quota,
+            "bootstrap_model": bootstrap_model,
+            "epoch_char_limit": epoch_char_limit,
+            "cache_token_weight": cache_token_weight,
+            "scope_file": scope_file,
+            "allow_non_loopback": allow_non_loopback,
+            "max_degradation_streak": max_degradation_streak,
+            "max_rps": max_rps,
+            "vault_home": vault_home,
+            "vault_key_name": vault_key_name,
+            "storage_states": storage_states,
+            "custom_headers": custom_headers,
+            "seed_surface_files": seed_surface_files,
+            "tech_hints": tech_hints,
+            "auto_crawl": auto_crawl,
+            "auto_crawl_forms": auto_crawl_forms,
+            "auto_crawl_max_pages": auto_crawl_max_pages,
+            "auto_crawl_max_actions": auto_crawl_max_actions,
+            "oob_bind_host": oob_bind_host,
+            "oob_advertise_host": oob_advertise_host,
+        }
+        explicit_overrides = {
+            k: v for k, v in local_vals.items() if v != defaults[k]
+        }
+        cfg_opts = load_run_config(config_file) if config_file is not None else None
+        merged, resolved_preset = merge_run_options(
+            defaults=defaults,
+            preset=eff_preset,
+            config_options=cfg_opts,
+            explicit_overrides=explicit_overrides,
+        )
+        return run_agentic_target(
+            **merged,
+            preset=resolved_preset,
+            config_file=config_file,
+            _options_resolved=True,
+        )
+    if output_dir is None:
+        raise ValueError("output_dir is required (via --output-dir or --config)")
     if isinstance(cache_token_weight, bool):
         raise ValueError("cache_token_weight must be between 0.0 and 1.0")
     eff_cache_weight = float(cache_token_weight)
@@ -240,6 +431,7 @@ def run_agentic_target(
     eff_max_rps = float(max_rps)
     if not math.isfinite(eff_max_rps) or eff_max_rps < 0.0:
         raise ValueError(f"max_rps must be a finite number >= 0.0, got {max_rps!r}")
+    cli_global_headers = _parse_custom_headers(custom_headers)
     vault_storage_payload: dict[str, Any] | None = None
     if credentials_file is not None:
         bundle = target_bootstrap.load_credentials_bundle(credentials_file)
@@ -266,6 +458,9 @@ def run_agentic_target(
     eff_run_id = str(run_id or bundle.get("run_id") or "").strip() or uuid.uuid4().hex
     raw_scope = bundle.get("scope_rules")
     scope_rules: dict[str, Any] = raw_scope if isinstance(raw_scope, dict) else {}
+    scope_file_headers = _parse_custom_headers(scope_meta.get("custom_headers"))
+    bundle_headers = _extract_bundle_custom_headers(bundle, scope_rules)
+    global_headers = _merge_header_maps(scope_file_headers, bundle_headers, cli_global_headers)
     eff_methods = _parse_allowed_methods(allowed_methods, scope_rules)
     bundle_max_req = scope_rules.get("max_requests")
     eff_http_budget = int(
@@ -418,6 +613,7 @@ def run_agentic_target(
             accounts,
             login_path=eff_login_path,
             session_check_path=eff_session_check_path,
+            global_headers=global_headers,
         )
         plan = {
             "schema": SCHEMA,
@@ -434,6 +630,7 @@ def run_agentic_target(
             "provider_kind": auth["provider_kind"],
             "provider_host": auth["provider_host"],
             "allowed_methods": eff_methods,
+            "request_headers": sorted(global_headers),
             "discovery_hints": eff_discovery_hints,
             "seed_surface": dict(seed_data.get("stats") or {}) if seed_data is not None else None,
             "stage0_crawl": dict(stage0_cfg),
@@ -449,6 +646,10 @@ def run_agentic_target(
             "llm_calls": 0,
             "target_requests": 0,
         }
+        if eff_preset:
+            plan["preset"] = eff_preset
+        if eff_config_path is not None:
+            plan["config_file"] = str(eff_config_path)
         dump(plan_path, plan)
         return plan_path, plan
 
@@ -483,6 +684,7 @@ def run_agentic_target(
         accounts,
         login_path=eff_login_path,
         session_check_path=eff_session_check_path,
+        global_headers=global_headers,
     )
     http_client = AgenticHTTPClient(
         base_url=base,
@@ -511,6 +713,7 @@ def run_agentic_target(
         "models": models,
         "provider_kind": auth["provider_kind"],
         "allowed_methods": eff_methods,
+        "request_headers": sorted(global_headers),
         "discovery_hints": list(eff_discovery_hints),
         "seed_surface": dict(seed_data.get("stats") or {}) if seed_data is not None else None,
         "stage0_crawl": dict(stage0_cfg),
@@ -520,6 +723,10 @@ def run_agentic_target(
         "sharding": sharding_cfg,
         "limits": limits,
     }
+    if eff_preset:
+        manifest["preset"] = eff_preset
+    if eff_config_path is not None:
+        manifest["config_file"] = str(eff_config_path)
     manifest_path = output / "manifest.json"
     dump(manifest_path, manifest)
 
@@ -695,215 +902,266 @@ def run_agentic_target(
     return manifest_path, manifest
 
 
-def main(argv: list[str] | None = None) -> int:
+def main(argv: list[str] | None = None, *, force_plan_only: bool = False) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--target", default="", help="Owned loopback target origin http://127.0.0.1:<port>/")
-    parser.add_argument("--credentials-file", "--credentials", dest="credentials_file", type=Path, default=None)
-    parser.add_argument("--provider-config", type=Path, default=llm_config.default_config())
-    parser.add_argument("--model", default="")
-    parser.add_argument("--worker-model", default="")
-    parser.add_argument("--scout-model", default="", help="Optional Phase 1 scout model (same provider) for 2-phase handoff")
-    parser.add_argument("--scout-turns", type=int, default=22, help="Max Phase 1 scout turns before handoff")
-    parser.add_argument("--scout-token-share", type=float, default=0.40, help="Max token budget fraction for Phase 1 scout")
-    parser.add_argument("--api-key-env", default=None)
-    parser.add_argument("--output-dir", "--output", dest="output_dir", type=Path, required=True)
-    parser.add_argument("--http-budget", "--max-requests", dest="http_budget", type=int, default=None)
-    parser.add_argument("--token-budget", type=int, default=1_000_000)
-    parser.add_argument("--seconds-budget", type=int, default=900)
-    parser.add_argument("--allowed-methods", action="append", default=None, help="Allowed HTTP methods (e.g. GET,POST,PUT)")
-    parser.add_argument("--discovery-hint", action="append", dest="discovery_hints", default=None, help="Initial discovery entry path(s)")
-    parser.add_argument("--login-path", default=DEFAULT_LOGIN_PATH)
-    parser.add_argument("--session-check-path", default=DEFAULT_SESSION_CHECK_PATH)
-    parser.add_argument("--max-member-accounts", type=int, default=6)
-    parser.add_argument("--max-admin-accounts", type=int, default=2)
-    parser.add_argument("--max-turns", type=int, default=75)
-    parser.add_argument("--reasoning-effort", default="low")
-    parser.add_argument("--resume", action="store_true")
-    parser.add_argument("--run-id", default="")
-    parser.add_argument("--execute", action="store_true")
-    parser.add_argument("--authorize-live-provider", action="store_true")
-    parser.add_argument("--live-authorization-reason", default="")
-    parser.add_argument("--use-bsag", type=_parse_bool_flag, default=False, help="Enable external BSAG (true|false)")
-    parser.add_argument("--scheduler", choices=["ucb", "prompt_only", "round_robin"], default="prompt_only")
-    parser.add_argument("--verification-gate", choices=["differential", "llm_self_judge"], default="differential")
-    parser.add_argument("--intervention", choices=["lazy", "always_on", "off"], default="off")
-    parser.add_argument("--execution-mode", choices=["ephemeral", "monolithic", "sharded"], default="monolithic")
-    parser.add_argument("--max-shards", type=int, default=3, help="Max subsystem shards for sharded mode")
-    parser.add_argument("--bootstrap-turns", type=int, default=12, help="Stage 1 bootstrap turns for sharded mode")
-    parser.add_argument("--shard-turns", type=int, default=25, help="Stage 2 per-shard turn budget for sharded mode")
+    parser.add_argument(
+        "--preset",
+        choices=list(preset_names()),
+        default=argparse.SUPPRESS,
+        help=f"Named engagement preset ({', '.join(preset_names())}); simplifies budgets and crawl defaults",
+    )
+    parser.add_argument(
+        "--config",
+        dest="config_file",
+        type=Path,
+        default=argparse.SUPPRESS,
+        help="Optional cco-run/1 JSON engagement config file (CLI flags override config values)",
+    )
+    parser.add_argument("--target", default=argparse.SUPPRESS, help="Owned loopback target origin http://127.0.0.1:<port>/")
+    parser.add_argument("--credentials-file", "--credentials", dest="credentials_file", type=Path, default=argparse.SUPPRESS)
+    parser.add_argument("--provider-config", type=Path, default=argparse.SUPPRESS)
+    parser.add_argument("--model", default=argparse.SUPPRESS)
+    parser.add_argument("--worker-model", default=argparse.SUPPRESS)
+    parser.add_argument("--scout-model", default=argparse.SUPPRESS, help="Optional Phase 1 scout model (same provider) for 2-phase handoff")
+    parser.add_argument("--scout-turns", type=int, default=argparse.SUPPRESS, help="Max Phase 1 scout turns before handoff")
+    parser.add_argument("--scout-token-share", type=float, default=argparse.SUPPRESS, help="Max token budget fraction for Phase 1 scout")
+    parser.add_argument("--api-key-env", default=argparse.SUPPRESS)
+    parser.add_argument("--output-dir", "--output", dest="output_dir", type=Path, default=argparse.SUPPRESS, help="Output directory for plan/manifest/receipts/reports (required via CLI or --config)")
+    parser.add_argument("--http-budget", "--max-requests", dest="http_budget", type=int, default=argparse.SUPPRESS)
+    parser.add_argument("--token-budget", type=int, default=argparse.SUPPRESS)
+    parser.add_argument("--seconds-budget", type=int, default=argparse.SUPPRESS)
+    parser.add_argument("--allowed-methods", action="append", default=argparse.SUPPRESS, help="Allowed HTTP methods (e.g. GET,POST,PUT)")
+    parser.add_argument("--discovery-hint", action="append", dest="discovery_hints", default=argparse.SUPPRESS, help="Initial discovery entry path(s)")
+    parser.add_argument("--login-path", default=argparse.SUPPRESS)
+    parser.add_argument("--session-check-path", default=argparse.SUPPRESS)
+    parser.add_argument("--max-member-accounts", type=int, default=argparse.SUPPRESS)
+    parser.add_argument("--max-admin-accounts", type=int, default=argparse.SUPPRESS)
+    parser.add_argument("--max-turns", type=int, default=argparse.SUPPRESS)
+    parser.add_argument("--reasoning-effort", default=argparse.SUPPRESS)
+    parser.add_argument("--resume", action="store_true", default=argparse.SUPPRESS)
+    parser.add_argument("--run-id", default=argparse.SUPPRESS)
+    parser.add_argument("--execute", action="store_true", default=argparse.SUPPRESS)
+    parser.add_argument("--authorize-live-provider", action="store_true", default=argparse.SUPPRESS)
+    parser.add_argument("--live-authorization-reason", default=argparse.SUPPRESS)
+    parser.add_argument("--use-bsag", type=_parse_bool_flag, default=argparse.SUPPRESS, help="Enable external BSAG (true|false)")
+    parser.add_argument("--scheduler", choices=["ucb", "prompt_only", "round_robin"], default=argparse.SUPPRESS)
+    parser.add_argument("--verification-gate", choices=["differential", "llm_self_judge"], default=argparse.SUPPRESS)
+    parser.add_argument("--intervention", choices=["lazy", "always_on", "off"], default=argparse.SUPPRESS)
+    parser.add_argument("--execution-mode", choices=["ephemeral", "monolithic", "sharded"], default=argparse.SUPPRESS)
+    parser.add_argument("--max-shards", type=int, default=argparse.SUPPRESS, help="Max subsystem shards for sharded mode")
+    parser.add_argument("--bootstrap-turns", type=int, default=argparse.SUPPRESS, help="Stage 1 bootstrap turns for sharded mode")
+    parser.add_argument("--shard-turns", type=int, default=argparse.SUPPRESS, help="Stage 2 per-shard turn budget for sharded mode")
     parser.add_argument(
         "--shard-token-quota",
         type=int,
-        default=0,
+        default=argparse.SUPPRESS,
         help="Optional per-shard soft token quota for sharded mode (0 = auto-balanced from remaining tokens)",
     )
     parser.add_argument(
         "--bootstrap-model",
-        default="",
+        default=argparse.SUPPRESS,
         help="Optional Stage 1 discovery-only bootstrap model (same provider) for sharded mode",
     )
     parser.add_argument(
         "--epoch-char-limit",
         type=int,
-        default=0,
+        default=argparse.SUPPRESS,
         help="Optional per-epoch serialized byte limit before advancing epoch (0 = default 80000)",
     )
     parser.add_argument(
         "--cache-token-weight",
         type=float,
-        default=0.10,
+        default=argparse.SUPPRESS,
         help="Effective token weight in [0.0, 1.0] for cached prompt tokens (default: 0.10)",
     )
     parser.add_argument(
         "--scope-file",
         type=Path,
-        default=None,
+        default=argparse.SUPPRESS,
         help="Optional explicit scope.json file (required when --allow-non-loopback is set)",
     )
     parser.add_argument(
         "--allow-non-loopback",
         action="store_true",
+        default=argparse.SUPPRESS,
         help="Allow non-loopback http(s) target origin explicitly verified by --scope-file",
     )
     parser.add_argument(
         "--max-degradation-streak",
         type=int,
-        default=5,
+        default=argparse.SUPPRESS,
         help="Stop gracefully after N consecutive 429/502/503/504 or connection-error responses (0 disables, default: 5)",
     )
     parser.add_argument(
         "--max-rps",
         type=float,
-        default=0.0,
+        default=argparse.SUPPRESS,
         help="Optional maximum HTTP/WS requests per second rate limit (0 disables, default: 0.0)",
     )
     parser.add_argument(
         "--vault-home",
         type=Path,
-        default=None,
+        default=argparse.SUPPRESS,
         help="Optional CredentialVault directory for encrypted credential bundle lookup",
     )
     parser.add_argument(
         "--vault-key-name",
-        default="",
+        default=argparse.SUPPRESS,
         help="Credential bundle key name inside --vault-home",
     )
     parser.add_argument(
         "--storage-state",
         action="append",
         dest="storage_states",
-        default=None,
+        default=argparse.SUPPRESS,
         help="Playwright storage_state.json spec (alias=/path or alias:role:tenant=/path); repeatable",
+    )
+    parser.add_argument(
+        "-H",
+        "--header",
+        "--custom-header",
+        action="append",
+        dest="custom_headers",
+        type=_custom_header_arg,
+        default=argparse.SUPPRESS,
+        metavar="NAME: VALUE",
+        help="Operator header sent on every HTTP/browser request (repeatable; e.g. -H 'Pentest: Cyberbounty')",
     )
     parser.add_argument(
         "--seed-surface",
         action="append",
         dest="seed_surface_files",
         type=Path,
-        default=None,
+        default=argparse.SUPPRESS,
         help="Offline discovery seed file (HAR/mitm_scope/ZAP/ffuf/nuclei/URL list); repeatable",
     )
     parser.add_argument(
         "--tech-hint",
         action="append",
         dest="tech_hints",
-        default=None,
+        default=argparse.SUPPRESS,
         help="Optional technology stack hint (e.g. nextjs, django, spring) to enrich initial discovery paths",
     )
     parser.add_argument(
         "--auto-crawl",
         action="store_true",
+        default=argparse.SUPPRESS,
         help="Run Stage 0 deterministic Playwright crawler before LLM discovery",
+    )
+    parser.add_argument(
+        "--no-auto-crawl",
+        action="store_false",
+        dest="auto_crawl",
+        default=argparse.SUPPRESS,
+        help="Disable Stage 0 deterministic Playwright crawler (overrides preset/config)",
     )
     parser.add_argument(
         "--auto-crawl-forms",
         action="store_true",
+        default=argparse.SUPPRESS,
         help="Opt-in non-destructive form/upload submission during Stage 0 crawl (requires POST in --allowed-methods; implies --auto-crawl)",
     )
     parser.add_argument(
         "--auto-crawl-max-pages",
         type=int,
-        default=12,
+        default=argparse.SUPPRESS,
         help="Maximum pages to visit during Stage 0 crawl (default: 12)",
     )
     parser.add_argument(
         "--auto-crawl-max-actions",
         type=int,
-        default=24,
+        default=argparse.SUPPRESS,
         help="Maximum interactive UI actions during Stage 0 crawl (default: 24)",
     )
     parser.add_argument(
         "--oob-bind-host",
-        default="",
+        default=argparse.SUPPRESS,
         help="Optional OOB callback bind IP (default 127.0.0.1; private Docker bridge IP permitted)",
     )
     parser.add_argument(
         "--oob-advertise-host",
-        default="",
+        default=argparse.SUPPRESS,
         help="Optional OOB callback advertised hostname/IP (e.g. host.docker.internal for Dockerized targets)",
     )
-    args = parser.parse_args(argv)
-    if not (0.0 <= float(args.cache_token_weight) <= 1.0):
+    parser.add_argument(
+        "--tui",
+        action="store_true",
+        default=argparse.SUPPRESS,
+        help="Display the read-only live TUI dashboard while running (or a snapshot in plan mode)",
+    )
+    explicit = vars(parser.parse_args(argv))
+    use_tui = bool(explicit.pop("tui", False))
+    if force_plan_only and explicit.get("execute"):
+        parser.error("--execute is not allowed with 'cco-agent plan'; use 'cco-agent run --execute' after reviewing the plan")
+
+    config_path: Path | None = explicit.pop("config_file", None)
+    cli_preset = str(explicit.pop("preset", "") or "")
+    try:
+        config_options = load_run_config(config_path) if config_path is not None else None
+        effective, eff_preset = merge_run_options(
+            defaults=_runner_defaults(),
+            preset=cli_preset,
+            config_options=config_options,
+            explicit_overrides=explicit,
+        )
+    except ValueError as exc:
+        parser.error(str(exc))
+
+    if force_plan_only:
+        effective["execute"] = False
+
+    if effective.get("output_dir") is None:
+        parser.error("--output-dir is required (via CLI or --config)")
+    if not (0.0 <= float(effective["cache_token_weight"]) <= 1.0):
         parser.error("--cache-token-weight must be between 0.0 and 1.0")
-    if not math.isfinite(float(args.max_rps)) or float(args.max_rps) < 0.0:
+    if not math.isfinite(float(effective["max_rps"])) or float(effective["max_rps"]) < 0.0:
         parser.error("--max-rps must be a finite number >= 0.0")
 
-    path, doc = run_agentic_target(
-        target=args.target,
-        credentials_file=args.credentials_file,
-        provider_config=args.provider_config,
-        model=args.model,
-        worker_model=args.worker_model,
-        scout_model=args.scout_model,
-        scout_turns=args.scout_turns,
-        scout_token_share=args.scout_token_share,
-        api_key_env=args.api_key_env,
-        output_dir=args.output_dir,
-        http_budget=args.http_budget,
-        token_budget=args.token_budget,
-        seconds_budget=args.seconds_budget,
-        allowed_methods=args.allowed_methods,
-        discovery_hints=args.discovery_hints,
-        login_path=args.login_path,
-        session_check_path=args.session_check_path,
-        max_member_accounts=args.max_member_accounts,
-        max_admin_accounts=args.max_admin_accounts,
-        max_turns=args.max_turns,
-        reasoning_effort=args.reasoning_effort,
-        resume=args.resume,
-        run_id=args.run_id,
-        execute=args.execute,
-        authorize_live_provider=args.authorize_live_provider,
-        live_authorization_reason=args.live_authorization_reason,
-        use_bsag=args.use_bsag,
-        scheduler=args.scheduler,
-        verification_gate=args.verification_gate,
-        intervention=args.intervention,
-        execution_mode=args.execution_mode,
-        max_shards=args.max_shards,
-        bootstrap_turns=args.bootstrap_turns,
-        shard_turns=args.shard_turns,
-        shard_token_quota=args.shard_token_quota,
-        bootstrap_model=args.bootstrap_model,
-        epoch_char_limit=args.epoch_char_limit,
-        cache_token_weight=args.cache_token_weight,
-        scope_file=args.scope_file,
-        allow_non_loopback=args.allow_non_loopback,
-        max_degradation_streak=args.max_degradation_streak,
-        max_rps=args.max_rps,
-        vault_home=args.vault_home,
-        vault_key_name=args.vault_key_name,
-        storage_states=args.storage_states,
-        seed_surface_files=args.seed_surface_files,
-        tech_hints=args.tech_hints,
-        auto_crawl=args.auto_crawl,
-        auto_crawl_forms=args.auto_crawl_forms,
-        auto_crawl_max_pages=args.auto_crawl_max_pages,
-        auto_crawl_max_actions=args.auto_crawl_max_actions,
-        oob_bind_host=args.oob_bind_host,
-        oob_advertise_host=args.oob_advertise_host,
-    )
-    print(json.dumps({
+    if use_tui and bool(effective.get("execute")):
+        import agentic_tui
+
+        done_event = threading.Event()
+        result_box: dict[str, Any] = {}
+
+        def _worker() -> None:
+            try:
+                r_path, r_doc = run_agentic_target(
+                    **effective,
+                    preset=eff_preset,
+                    config_file=config_path,
+                    _options_resolved=True,
+                )
+                result_box["result"] = (r_path, r_doc)
+            except BaseException as exc:
+                result_box["error"] = exc
+            finally:
+                done_event.set()
+
+        thread = threading.Thread(target=_worker, name="kryon-runner", daemon=True)
+        thread.start()
+        try:
+            agentic_tui.watch_run_dir(
+                effective["output_dir"],
+                refresh_seconds=0.75,
+                stop_event=done_event,
+            )
+        finally:
+            thread.join()
+        if "error" in result_box:
+            raise result_box["error"]
+        path, doc = result_box["result"]
+    else:
+        path, doc = run_agentic_target(
+            **effective,
+            preset=eff_preset,
+            config_file=config_path,
+            _options_resolved=True,
+        )
+        if use_tui:
+            import agentic_tui
+
+            agentic_tui.watch_run_dir(effective["output_dir"], once=True)
+    summary: dict[str, Any] = {
         "artifact": str(path),
         "mode": doc.get("mode"),
         "status": doc.get("status"),
@@ -912,7 +1170,10 @@ def main(argv: list[str] | None = None) -> int:
         "target_requests": doc.get("target_requests"),
         "findings_count": doc.get("findings_count"),
         "findings_artifact": doc.get("findings_artifact"),
-    }))
+    }
+    if doc.get("preset"):
+        summary["preset"] = doc["preset"]
+    print(json.dumps(summary))
     return 0
 
 
