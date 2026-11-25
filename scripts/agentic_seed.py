@@ -1503,13 +1503,23 @@ def _finalize_seed_surface(
             for mp_p in (*sanitized_mp["fields"], *sanitized_mp["files"]):
                 _add_param(mp_p)
 
-        key = (method, norm_path)
+        base_parsed = urlsplit(guard.base_origin)
+        cand_port = parsed.port or (443 if parsed.scheme.lower() == "https" else 80)
+        base_port = base_parsed.port or (443 if base_parsed.scheme.lower() == "https" else 80)
+        same_origin_as_base = (
+            parsed.scheme.lower() == base_parsed.scheme.lower()
+            and (parsed.hostname or "").lower() == (base_parsed.hostname or "").lower()
+            and cand_port == base_port
+        )
+        route_target = norm_path if same_origin_as_base else f"{parsed.scheme.lower()}://{parsed.netloc}{norm_path}"
+
+        key = (method, route_target)
         existing = accepted_by_key.get(key)
         if existing is None:
             seen_order += 1
             accepted_by_key[key] = _AcceptedRoute(
                 method=method,
-                path=norm_path,
+                path=route_target,
                 params=sorted(param_names),
                 is_form=bool(cand.is_form),
                 best_status=cand.status,
@@ -1632,11 +1642,18 @@ def load_seed_surface_files(
     *,
     base_url: str,
     excluded_paths: Sequence[str] = (),
+    in_scope_assets: Sequence[str] = (),
+    out_of_scope_assets: Sequence[str] = (),
     max_routes: int = 200,
     max_discovery_hints: int = 12,
 ) -> dict[str, Any]:
     """Load, scope-filter, secret-strip, deduplicate, and rank offline seed surface files."""
-    guard = ScopeGuard(base_origin=base_url, excluded_paths=tuple(excluded_paths or ()))
+    guard = ScopeGuard(
+        base_origin=base_url,
+        excluded_paths=tuple(excluded_paths or ()),
+        in_scope_assets=tuple(in_scope_assets or ()),
+        out_of_scope_assets=tuple(out_of_scope_assets or ()),
+    )
 
     files_loaded = 0
     formats_detected: list[str] = []
@@ -1668,11 +1685,18 @@ def merge_seed_surfaces(
     *,
     base_url: str,
     excluded_paths: Sequence[str] = (),
+    in_scope_assets: Sequence[str] = (),
+    out_of_scope_assets: Sequence[str] = (),
     max_routes: int = 200,
     max_discovery_hints: int = 12,
 ) -> dict[str, Any] | None:
     """Combine multiple in-memory seed surface dicts with full ScopeGuard filtering and deduplication."""
-    guard = ScopeGuard(base_origin=base_url, excluded_paths=tuple(excluded_paths or ()))
+    guard = ScopeGuard(
+        base_origin=base_url,
+        excluded_paths=tuple(excluded_paths or ()),
+        in_scope_assets=tuple(in_scope_assets or ()),
+        out_of_scope_assets=tuple(out_of_scope_assets or ()),
+    )
 
     all_candidates: list[_CandidateRoute] = []
     all_ws_endpoints: list[Any] = []

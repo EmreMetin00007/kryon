@@ -9,8 +9,10 @@ from urllib.parse import urlsplit
 
 from agentic_surface import (
     _HIGH_RISK_SCORE_THRESHOLD,
+    _NON_PROBE_PARAM_NAMES,
     _order_params_by_risk,
     _split_path_kv_segment,
+    is_catalog_route,
     is_id_segment,
     is_logout_or_destructive_route,
     is_non_endpoint_source_path,
@@ -157,6 +159,22 @@ _SECURITY_BUCKET_TIER1_TOKENS = frozenset({
     "users",
     "account",
     "accounts",
+    "hesabim",
+    "puanlarim",
+    "siparislerim",
+    "kuponlarim",
+    "adreslerim",
+    "oauth",
+    "oauth2",
+    "sso",
+    "session",
+    "sessions",
+    "refresh",
+    "payment",
+    "payments",
+    "checkout",
+    "billing",
+    "wallet",
     "token",
     "secret",
     "upload",
@@ -184,7 +202,13 @@ _SECURITY_BUCKET_TIER2_TOKENS = frozenset({
     "fetch",
     "redirect",
     "forward",
+    "sepetim",
+    "sepet",
+    "cart",
+    "basket",
+    "pay",
 })
+_MAX_CATALOG_ROUTES_PER_SHARD = 5
 _LOW_RISK_METADATA_TOKENS = frozenset({
     "dictionary",
     "dict",
@@ -307,12 +331,15 @@ def extract_resource_family(path: str) -> str:
     """Return the normalized top-level resource family for a URL or path.
 
     Strips leading `/api`, `/v[0-9]+`, and `/rest` prefixes before selecting the
-    first resource segment. Root `/`, root-level static files, malformed paths,
-    and punctuation-only segments map to `"root"`.
+    first resource segment. SEO/storefront catalog template paths collapse into
+    `"catalog"`. Root `/`, root-level static files, malformed paths, and
+    punctuation-only segments map to `"root"`.
     """
     raw = str(path or "")
     if is_non_endpoint_source_path(raw):
         return "root"
+    if is_catalog_route(raw):
+        return "catalog"
     raw_path = urlsplit(raw.strip()).path or "/"
     segments = [seg for seg in raw_path.split("/") if seg]
     while segments and (
@@ -493,8 +520,65 @@ def _rank_routes_by_input_risk(
     return ranked
 
 
+def _is_low_priority_catalog_route(
+    tmpl: str,
+    *,
+    methods: Sequence[str] = (),
+    params: Sequence[str] = (),
+    is_form: bool = False,
+    has_body_template: bool = False,
+    risk_score: int = 0,
+) -> bool:
+    """Return True for pure storefront/SEO catalog templates lacking mutating/high-risk inputs."""
+    if _is_api_route(tmpl):
+        return False
+    if is_form or has_body_template or int(risk_score) >= _HIGH_RISK_SCORE_THRESHOLD:
+        return False
+    norm_methods = {str(m or "").strip().upper() for m in methods if str(m or "").strip()}
+    if norm_methods & _WRITE_HTTP_METHODS:
+        return False
+    active_params = [
+        str(p or "").strip()
+        for p in params
+        if str(p or "").strip() and str(p or "").strip().lower() not in _NON_PROBE_PARAM_NAMES
+    ]
+    if active_params:
+        return False
+    return extract_resource_family(tmpl) == "catalog" or is_catalog_route(tmpl)
+
+
+def _cap_catalog_cluster_routes(
+    ranked_entries: Sequence[dict[str, Any]],
+    *,
+    form_templates: set[str] | None = None,
+    body_template_routes: set[str] | None = None,
+    max_catalog_routes: int = _MAX_CATALOG_ROUTES_PER_SHARD,
+) -> list[dict[str, Any]]:
+    """Keep all non-catalog/high-risk routes while capping low-priority catalog sample routes per shard."""
+    forms = form_templates or set()
+    bts = body_template_routes or set()
+    cap = max(1, int(max_catalog_routes))
+    kept: list[dict[str, Any]] = []
+    catalog_count = 0
+    for entry in ranked_entries:
+        tmpl = str(entry.get("route_template") or "")
+        if _is_low_priority_catalog_route(
+            tmpl,
+            methods=entry.get("methods") or (),
+            params=entry.get("params") or (),
+            is_form=tmpl in forms,
+            has_body_template=tmpl in bts,
+            risk_score=int(entry.get("risk_score") or 0),
+        ):
+            if catalog_count >= cap:
+                continue
+            catalog_count += 1
+        kept.append(dict(entry))
+    return kept
+
+
 def _is_low_risk_metadata_entry(entry: Mapping[str, Any], *, single_family: str | None) -> bool:
-    """Return True for parameterless read-only dictionary/count/metadata routes."""
+    """Return True for parameterless read-only dictionary/count/metadata or pure catalog routes."""
     if int(entry.get("risk_score") or 0) >= 8:
         return False
     methods = [str(m or "").strip().upper() for m in (entry.get("methods") or ())]
@@ -505,6 +589,13 @@ def _is_low_risk_metadata_entry(entry: Mapping[str, Any], *, single_family: str 
     tmpl = str(entry.get("route_template") or "")
     if "{id}" in tmpl or "{val}" in tmpl:
         return False
+    if _is_low_priority_catalog_route(
+        tmpl,
+        methods=methods,
+        params=entry.get("params") or (),
+        risk_score=int(entry.get("risk_score") or 0),
+    ):
+        return True
     tokens = _route_path_tokens(tmpl)
     if tokens & _LOW_RISK_METADATA_TOKENS:
         return True
@@ -867,7 +958,17 @@ def cluster_discovered_surface(
             methods_by_route=all_methods,
             form_templates=form_templates,
         )
-        all_routes = [str(item["route_template"]) for item in ranked_all]
+        all_bt_routes = {
+            route_template_of(op_key.split(" ", 1)[1])
+            for op_key in all_body_templates
+            if " " in op_key
+        }
+        capped_all = _cap_catalog_cluster_routes(
+            ranked_all,
+            form_templates=form_templates,
+            body_template_routes=all_bt_routes,
+        )
+        all_routes = [str(item["route_template"]) for item in capped_all]
         return [
             SubsystemCluster(
                 shard_id="shard-1",
@@ -886,10 +987,10 @@ def cluster_discovered_surface(
             )
         ]
 
-    # Weight interactive/API signals (write ops, concrete objects, params, API routes)
-    # higher than raw route counts, and cap pure read-only non-API route bloat so
-    # static/UI path proliferation cannot monopolize a shard over real API families.
-    scored_families: list[tuple[int, int, int, int, str]] = []
+    # Weight interactive/API/functional signals (write ops, concrete objects, params, API routes,
+    # auth/account/payment/cart/search routes) higher than raw route counts, and cap pure read-only
+    # non-API / catalog route bloat so storefront templates cannot monopolize shards.
+    scored_families: list[tuple[int, int, int, int, int, str]] = []
     for fam in all_families:
         f_routes = family_routes.get(fam, set())
         w_cnt = len(family_writes.get(fam, ()))
@@ -899,16 +1000,28 @@ def cluster_discovered_surface(
         non_api_r_cnt = len(f_routes) - api_r_cnt
         interactive_score = (w_cnt * 4) + (o_cnt * 3) + (p_cnt * 2)
         api_route_score = min(api_r_cnt, 8) * 3
-        non_api_route_score = (
-            min(non_api_r_cnt, 2)
-            if (interactive_score == 0 and api_r_cnt == 0)
-            else min(non_api_r_cnt, 4)
-        )
-        richness = interactive_score + api_route_score + non_api_route_score
-        eff_r_cnt = api_r_cnt + min(non_api_r_cnt, 3)
-        scored_families.append((richness, interactive_score, api_r_cnt, eff_r_cnt, fam))
+        functional_score = 0
+        for r in f_routes:
+            toks = _route_path_tokens(r)
+            if toks & _SECURITY_BUCKET_TIER1_TOKENS:
+                functional_score = max(functional_score, 6)
+            elif toks & _SECURITY_BUCKET_TIER2_TOKENS:
+                functional_score = max(functional_score, 3)
+        if fam == "catalog" and interactive_score == 0 and api_r_cnt == 0:
+            non_api_route_score = min(non_api_r_cnt, 1)
+            eff_r_cnt = min(non_api_r_cnt, 1)
+        else:
+            non_api_route_score = (
+                min(non_api_r_cnt, 2)
+                if (interactive_score == 0 and api_r_cnt == 0)
+                else min(non_api_r_cnt, 4)
+            )
+            eff_r_cnt = api_r_cnt + min(non_api_r_cnt, 3)
+        richness = interactive_score + api_route_score + non_api_route_score + functional_score
+        is_non_catalog = 1 if fam not in {"catalog", "root"} else 0
+        scored_families.append((richness, is_non_catalog, interactive_score, api_r_cnt, eff_r_cnt, fam))
 
-    scored_families.sort(key=lambda item: (-item[0], -item[1], -item[2], -item[3], item[4]))
+    scored_families.sort(key=lambda item: (-item[0], -item[1], -item[2], -item[3], -item[4], item[5]))
 
     num_shards = min(eff_max, len(scored_families))
     bins: list[dict[str, Any]] = [
@@ -916,7 +1029,7 @@ def cluster_discovered_surface(
         for i in range(num_shards)
     ]
 
-    for richness, _interactive, _api_r, eff_r_cnt, fam in scored_families:
+    for richness, _is_non_cat, _interactive, _api_r, eff_r_cnt, fam in scored_families:
         target_bin = min(bins, key=lambda b: (b["weight"], b["routes"], b["idx"]))
         target_bin["families"].append(fam)
         target_bin["weight"] += richness
@@ -955,7 +1068,17 @@ def cluster_discovered_surface(
             methods_by_route=c_methods,
             form_templates=form_templates,
         )
-        c_routes = [str(item["route_template"]) for item in ranked_cluster]
+        c_bt_routes = {
+            route_template_of(op_key.split(" ", 1)[1])
+            for op_key in c_body_templates
+            if " " in op_key
+        }
+        capped_cluster = _cap_catalog_cluster_routes(
+            ranked_cluster,
+            form_templates=form_templates,
+            body_template_routes=c_bt_routes,
+        )
+        c_routes = [str(item["route_template"]) for item in capped_cluster]
         c_name = "+".join(fams[:3]) + (f"+{len(fams) - 3}" if len(fams) > 3 else "")
         clusters.append(
             SubsystemCluster(
@@ -1004,14 +1127,29 @@ def build_shard_prompts(
         for tmpl, mlist in (getattr(cluster, "methods_by_route", {}) or {}).items()
         if mlist
     }
-    ranked_entries = _rank_routes_by_input_risk(
-        cluster.routes,
-        write_ops=cluster.write_ops,
-        params=cluster.params,
-        body_templates=cluster.body_templates,
-        schema_hints=cluster.schema_hints,
-        methods_by_route=methods_map or None,
-        surface_tracker=surface_tracker,
+    form_templates: set[str] = {
+        str(t)
+        for t in (getattr(surface_tracker, "discovered_form_templates", ()) or ())
+        if str(t).strip()
+    }
+    bt_routes = {
+        route_template_of(op_key.split(" ", 1)[1])
+        for op_key in (getattr(cluster, "body_templates", {}) or {})
+        if isinstance(op_key, str) and " " in op_key
+    }
+    ranked_entries = _cap_catalog_cluster_routes(
+        _rank_routes_by_input_risk(
+            cluster.routes,
+            write_ops=cluster.write_ops,
+            params=cluster.params,
+            body_templates=cluster.body_templates,
+            schema_hints=cluster.schema_hints,
+            methods_by_route=methods_map or None,
+            form_templates=form_templates,
+            surface_tracker=surface_tracker,
+        ),
+        form_templates=form_templates,
+        body_template_routes=bt_routes,
     )
     risk_score_by_route = {
         str(item["route_template"]): int(item["risk_score"])
@@ -1036,11 +1174,6 @@ def build_shard_prompts(
         )
 
     is_large_shard = len(ordered_routes) > 35
-    form_templates: set[str] = {
-        str(t)
-        for t in (getattr(surface_tracker, "discovered_form_templates", ()) or ())
-        if str(t).strip()
-    }
     if cluster.write_ops and (is_large_shard or len(cluster.write_ops) > 25):
         selected_write_ops = _rank_and_select_write_ops(
             cluster.write_ops,

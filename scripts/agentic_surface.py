@@ -6,6 +6,7 @@ write operations, and actor coverage from every HTTP receipt at 0 extra HTTP cos
 from __future__ import annotations
 
 from html import unescape
+import hashlib
 import ipaddress
 import json
 import math
@@ -287,6 +288,264 @@ _BENIGN_QUERY_VAL_RE = re.compile(r"^[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)?$")
 _BENIGN_EMAIL_VAL_RE = re.compile(r"^[A-Za-z0-9._+-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+$")
 _API_PREFIX_RE = re.compile(r"^/(api(?:/v\d+)?|v\d+)(?=/|$)", re.IGNORECASE)
 _NUMERIC_SLUG_CATEGORY_RE = re.compile(r"^\d+-[a-z]", re.IGNORECASE)
+_PRESERVED_CATALOG_PLACEHOLDERS = frozenset({
+    "{catalog_category}",
+    "{catalog_product}",
+    "{catalog_campaign}",
+    "{catalog_brand}",
+})
+_CATALOG_BRAND_PREFIX_SEGMENTS = frozenset({
+    "marka",
+    "markalar",
+    "brand",
+    "brands",
+    "magaza",
+    "magazalar",
+})
+_CATALOG_CAMPAIGN_PARENT_SEGMENTS = frozenset({
+    "firsat",
+    "firsatlar",
+    "kampanya",
+    "kampanyalar",
+    "campaigns",
+    "deals",
+    "offers",
+    "indirim",
+    "indirimler",
+})
+_CATALOG_PRODUCT_PARENT_SEGMENTS = frozenset({
+    "product",
+    "products",
+    "urun",
+    "urunler",
+})
+_CATALOG_CONTAINER_SEGMENTS = frozenset({
+    *_CATALOG_BRAND_PREFIX_SEGMENTS,
+    *_CATALOG_CAMPAIGN_PARENT_SEGMENTS,
+    *_CATALOG_PRODUCT_PARENT_SEGMENTS,
+    "kategori",
+    "kategoriler",
+    "category",
+    "categories",
+    "catalog",
+    "katalog",
+    "collection",
+    "collections",
+    "store",
+    "shop",
+    "p",
+    "c",
+    "k",
+    "b",
+    "m",
+    "s",
+})
+_FUNCTIONAL_ROOT_SEGMENTS = frozenset({
+    "api",
+    "ajax",
+    "ajax-api",
+    "rest",
+    "rpc",
+    "graphql",
+    "gql",
+    "auth",
+    "oauth",
+    "oauth2",
+    "sso",
+    "login",
+    "log-in",
+    "signin",
+    "sign-in",
+    "signup",
+    "sign-up",
+    "register",
+    "logout",
+    "log-out",
+    "signout",
+    "sign-out",
+    "session",
+    "sessions",
+    "token",
+    "refresh-token",
+    "refresh",
+    "password",
+    "forgot-password",
+    "reset-password",
+    "admin",
+    "administrator",
+    "manage",
+    "management",
+    "dashboard",
+    "panel",
+    "console",
+    "internal",
+    "debug",
+    "metrics",
+    "health",
+    "healthz",
+    "ready",
+    "readyz",
+    "livez",
+    "status",
+    "account",
+    "accounts",
+    "profile",
+    "profiles",
+    "settings",
+    "user",
+    "users",
+    "member",
+    "members",
+    "hesabim",
+    "uyelik",
+    "uye",
+    "profil",
+    "ayarlar",
+    "adreslerim",
+    "siparislerim",
+    "favorilerim",
+    "puanlarim",
+    "kuponlarim",
+    "mesajlarim",
+    "bildirimlerim",
+    "iade",
+    "iadelerim",
+    "cart",
+    "sepet",
+    "sepetim",
+    "basket",
+    "checkout",
+    "odeme",
+    "payment",
+    "payments",
+    "pay",
+    "order",
+    "orders",
+    "invoice",
+    "invoices",
+    "ticket",
+    "tickets",
+    "billing",
+    "subscription",
+    "subscriptions",
+    "wallet",
+    "cuzdan",
+    "search",
+    "arama",
+    "ara",
+    "upload",
+    "uploads",
+    "download",
+    "downloads",
+    "export",
+    "import",
+    "webhook",
+    "webhooks",
+    "callback",
+    "redirect",
+    "proxy",
+    "fetch",
+    "render",
+    "portal",
+    "sys",
+    "system",
+    "static",
+    "assets",
+    "public",
+    "media",
+    "files",
+    "images",
+    "docs",
+    "help",
+    "support",
+    "contact",
+    "about",
+    "faq",
+    "error",
+    "errors",
+    "promo",
+    "promos",
+    "coupon",
+    "coupons",
+    "voucher",
+    "vouchers",
+})
+_CATALOG_EXCLUDED_SECURITY_TOKENS = frozenset({
+    "api",
+    "auth",
+    "oauth",
+    "oauth2",
+    "sso",
+    "login",
+    "signin",
+    "signup",
+    "logout",
+    "signout",
+    "register",
+    "password",
+    "passwd",
+    "token",
+    "jwt",
+    "csrf",
+    "xsrf",
+    "session",
+    "admin",
+    "administrator",
+    "webhook",
+    "callback",
+    "redirect",
+    "proxy",
+    "upload",
+    "download",
+    "export",
+    "import",
+    "exec",
+    "eval",
+    "debug",
+    "diagnostics",
+    "diagnostic",
+    "health",
+    "healthz",
+    "readyz",
+    "metrics",
+    "swagger",
+    "openapi",
+    "graphql",
+    "checkout",
+    "billing",
+    "invoice",
+    "hesabim",
+    "sepetim",
+    "puanlarim",
+    "siparislerim",
+    "payment",
+    "payments",
+    "permission",
+    "permissions",
+    "role",
+    "roles",
+    "audit",
+    "config",
+    "settings",
+    "account",
+    "accounts",
+    "users",
+    "user",
+    "verify",
+    "verification",
+    "reset",
+})
+_CATALOG_SAFE_SLUG_SEG_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]*$")
+_CATALOG_K_CODE_RE = re.compile(r"^[a-z0-9]{2,}(?:-[a-z0-9]+)*-k-([a-z0-9]{3,})$")
+_CATALOG_CAT_CODE_RE = re.compile(r"^[a-z0-9]{2,}(?:-[a-z0-9]+)*-(?:c|cat)-([a-z0-9]{2,})$")
+_CATALOG_XC_CODE_RE = re.compile(r"^[a-z0-9]{2,}(?:-[a-z0-9]+)*-x-[cb]\d{2,}$")
+_CATALOG_PROD_CODE_RE = re.compile(r"^[a-z0-9]{2,}(?:-[a-z0-9]+)*-(?:p|i)-([a-z0-9]{3,})$")
+_VOWELS = frozenset("aeiou")
+_MAX_CATALOG_DISCOVERED_PER_TEMPLATE = 5
+_MAX_SPA_FP_BUCKETS = 64
+_MAX_SPA_FP_PATHS_PER_BUCKET = 32
+_SPA_404_MIN_BYTES = 512
+_SPA_SHELL_MIN_BYTES = 1024
 _NON_RESOURCE_UI_SEGMENTS = frozenset({
     "login",
     "logout",
@@ -943,12 +1202,115 @@ def _is_non_resource_api_subpath(api_prefix: str, path: str) -> bool:
     return first_sub in _NON_RESOURCE_UI_SEGMENTS or _is_auth_utility_path(norm_p)
 
 
+def _classify_catalog_slug_segment(seg: str, *, parent_seg: str = "") -> str | None:
+    """Classify an e-commerce/CMS SEO catalog slug segment into `'category'`, `'product'`, `'campaign'`, or `None`."""
+    raw = str(seg or "").strip()
+    if not raw or not _CATALOG_SAFE_SLUG_SEG_RE.fullmatch(raw):
+        return None
+    low = raw.lower()
+    if low in _FUNCTIONAL_ROOT_SEGMENTS or low in _NON_RESOURCE_UI_SEGMENTS:
+        return None
+    if low.isdigit() or _UUID_SEG_RE.fullmatch(low) or _HEX_ID_SEG_RE.fullmatch(low):
+        return None
+
+    m_k = _CATALOG_K_CODE_RE.fullmatch(low)
+    if m_k is not None:
+        code = m_k.group(1)
+        raw_code = raw.rsplit("-", 1)[-1]
+        if (
+            any(ch.isdigit() for ch in code)
+            or (len(code) >= 4 and not any(ch in _VOWELS for ch in code))
+            or any(ch.isupper() for ch in raw_code)
+        ):
+            return "category"
+
+    m_cat = _CATALOG_CAT_CODE_RE.fullmatch(low)
+    if m_cat is not None:
+        code = m_cat.group(1)
+        is_cat_tag = f"-cat-{code}" in low
+        if (
+            (any(ch.isdigit() for ch in code) and (len(code) >= 3 or is_cat_tag))
+            or (is_cat_tag and len(code) >= 4 and not any(ch in _VOWELS for ch in code))
+        ):
+            return "category"
+
+    if _CATALOG_XC_CODE_RE.fullmatch(low):
+        return "category"
+
+    m_prod = _CATALOG_PROD_CODE_RE.fullmatch(low)
+    if m_prod is not None:
+        code = m_prod.group(1)
+        if any(ch.isdigit() for ch in code) or (
+            len(code) >= 4 and not any(ch in _VOWELS for ch in code)
+        ):
+            return "product"
+
+    parent_low = str(parent_seg or "").strip().lower()
+    tokens = {tok for tok in low.split("-") if tok}
+    if parent_low in _CATALOG_CAMPAIGN_PARENT_SEGMENTS:
+        if low.startswith("l-") and len(low) >= 6 and (
+            "-" in low[2:] or (low[2:].isalnum() and low[2:] not in _FUNCTIONAL_ROOT_SEGMENTS)
+        ):
+            return "campaign"
+        if low.count("-") >= 1 and len(low) >= 10 and not (tokens & _CATALOG_EXCLUDED_SECURITY_TOKENS):
+            return "campaign"
+
+    if (
+        parent_low in _CATALOG_PRODUCT_PARENT_SEGMENTS
+        and low.count("-") >= 2
+        and len(low) >= 15
+        and not (tokens & _CATALOG_EXCLUDED_SECURITY_TOKENS)
+    ):
+        return "product"
+
+    if (
+        low.count("-") >= 4
+        and len(low) >= 35
+        and not (tokens & _CATALOG_EXCLUDED_SECURITY_TOKENS)
+    ):
+        return "product"
+
+    return None
+
+
+def is_catalog_route(url_or_path: str) -> bool:
+    """Return True when `url_or_path` is a non-API storefront/SEO catalog or campaign route."""
+    raw = str(url_or_path or "").strip()
+    if not raw or is_non_endpoint_source_path(raw):
+        return False
+    norm_p = normalize_path(raw)
+    if norm_p == "/" or _ROUTE_API_PATH_RE.search(norm_p):
+        return False
+    raw_segs = [seg for seg in norm_p.split("/") if seg]
+    if not raw_segs:
+        return False
+    if raw_segs[0].lower() in _FUNCTIONAL_ROOT_SEGMENTS:
+        return False
+    tmpl = route_template_of(norm_p)
+    if any(ph in tmpl for ph in _PRESERVED_CATALOG_PLACEHOLDERS):
+        return True
+    if raw_segs[0].lower() == "catalog" and not any(
+        tok in _CATALOG_EXCLUDED_SECURITY_TOKENS
+        for seg in raw_segs[1:]
+        for tok in _TOKEN_SPLIT_RE.split(seg.lower())
+        if tok
+    ):
+        return True
+    return False
+
+
 def _extract_ui_resource_info(path: str) -> tuple[str, bool, str] | None:
     """Extract `(resource, is_collection, concrete_id)` from a non-API UI route, or None."""
     if is_non_endpoint_source_path(path) or _is_passive_spec_path(path):
         return None
     norm_p = normalize_path(path)
-    if norm_p == "/" or _extract_api_prefix(norm_p) or is_static_asset_url(norm_p) or is_non_endpoint_source_path(norm_p):
+    if (
+        norm_p == "/"
+        or _extract_api_prefix(norm_p)
+        or is_static_asset_url(norm_p)
+        or is_non_endpoint_source_path(norm_p)
+        or is_catalog_route(norm_p)
+    ):
         return None
     if norm_p.lower().endswith(_NON_RESOURCE_FILE_EXTS):
         return None
@@ -978,6 +1340,8 @@ def is_id_segment(seg: str) -> bool:
     low = str(seg or "").strip().lower()
     if not low:
         return False
+    if _classify_catalog_slug_segment(seg) is not None:
+        return False
     return bool(
         low.isdigit()
         or _UUID_SEG_RE.fullmatch(low)
@@ -997,13 +1361,27 @@ def normalize_path(url_or_path: str) -> str:
 
 
 def route_template_of(url_or_path: str) -> str:
-    """Normalize concrete resource ID and `key=value` path segments into route templates."""
+    """Normalize concrete resource ID, `key=value`, and SEO/catalog slug segments into route templates."""
     path = normalize_path(url_or_path)
     if path == "/":
         return "/"
     raw_segs = [seg for seg in path.split("/") if seg]
+    if not raw_segs:
+        return "/"
+    low_segs = [seg.lower() for seg in raw_segs]
+    allow_catalog_compression = (
+        not _ROUTE_API_PATH_RE.search(path)
+        and low_segs[0] not in _FUNCTIONAL_ROOT_SEGMENTS
+        and not is_non_endpoint_source_path(path)
+    )
+
     segments: list[str] = []
-    for seg in raw_segs:
+    kv_truncated = False
+    for idx, seg in enumerate(raw_segs):
+        seg_low = seg.lower()
+        if seg_low in _PRESERVED_CATALOG_PLACEHOLDERS:
+            segments.append(seg_low)
+            continue
         kv = _split_path_kv_segment(seg)
         if kv is not None:
             key_low, val = kv
@@ -1011,11 +1389,52 @@ def route_template_of(url_or_path: str) -> str:
             if _URL_SCHEME_VAL_RE.fullmatch(val) or (
                 key_low in _PATH_INPUT_PARAM_TOKENS and val in {"", ".", ".."}
             ):
+                kv_truncated = True
                 break
+        elif allow_catalog_compression:
+            parent_seg = raw_segs[idx - 1] if idx > 0 else ""
+            cat_kind = _classify_catalog_slug_segment(seg, parent_seg=parent_seg)
+            if cat_kind == "category":
+                segments.append("{catalog_category}")
+            elif cat_kind == "product":
+                segments.append("{catalog_product}")
+            elif cat_kind == "campaign":
+                segments.append("{catalog_campaign}")
+            elif is_id_segment(seg):
+                segments.append("{id}")
+            else:
+                segments.append(seg_low)
         elif is_id_segment(seg):
             segments.append("{id}")
         else:
-            segments.append(seg.lower())
+            segments.append(seg_low)
+
+    if allow_catalog_compression and not kv_truncated and len(segments) >= 2:
+        if (
+            segments[0] in _CATALOG_BRAND_PREFIX_SEGMENTS
+            and segments[1] not in _PRESERVED_CATALOG_PLACEHOLDERS
+            and not segments[1].startswith("{")
+            and segments[1] not in _FUNCTIONAL_ROOT_SEGMENTS
+            and segments[1] not in {"all", "list", "search", "index", "new"}
+            and "." not in segments[1]
+            and "=" not in segments[1]
+        ):
+            segments[1] = "{catalog_brand}"
+
+        for idx, seg_norm in enumerate(segments):
+            if idx >= 1 and seg_norm in {"{catalog_category}", "{catalog_product}"}:
+                for j in range(idx):
+                    cand = segments[j]
+                    if (
+                        cand not in _CATALOG_CONTAINER_SEGMENTS
+                        and cand not in _FUNCTIONAL_ROOT_SEGMENTS
+                        and cand not in _PRESERVED_CATALOG_PLACEHOLDERS
+                        and (cand == "{id}" or not cand.startswith("{"))
+                        and "." not in cand
+                        and "=" not in cand
+                    ):
+                        segments[j] = "{catalog_brand}"
+
     return "/" + "/".join(segments)
 
 
@@ -1518,6 +1937,8 @@ def _extract_route_family(path: str) -> str:
     raw = str(path or "")
     if is_non_endpoint_source_path(raw):
         return "root"
+    if is_catalog_route(raw):
+        return "catalog"
     raw_path = urlsplit(raw.strip()).path or "/"
     segments = [seg for seg in raw_path.split("/") if seg]
     while segments and (
@@ -1721,6 +2142,16 @@ class SurfaceFrontierTracker:
         self._spa_route_candidates: set[str] = set()
         self._non_spa_discovered_paths: set[str] = set()
         self.pruned_spa_routes: set[str] = set()
+        self._spa_fp_paths: dict[str, set[str]] = {}
+        self._suppressed_spa_fingerprints: set[str] = set()
+        self.suppressed_spa_fallback_paths: set[str] = set()
+        self._spa_404_prefixes: set[str] = set()
+        self._spa_shell_prefixes: set[str] = set()
+        self._spa_404_templates: set[str] = set()
+        self._spa_shell_templates: set[str] = set()
+        self._non_fallback_templates: set[str] = set()
+        self._template_spa_fps: dict[str, set[str]] = {}
+        self._spa_404_candidate_fallback_seen: bool = False
 
         # Discovered attack surface
         # key: (method, normalized_path) -> sample URL or path with query hint
@@ -2236,7 +2667,27 @@ class SurfaceFrontierTracker:
         if norm_method in self.allowed_methods:
             display = f"{norm_p}?{ '&'.join(f'{k}=' for k in q_names[:4]) }" if q_names else norm_p
             key = (norm_method, norm_p)
-            if key not in self.discovered_routes or ("?" in display and "?" not in self.discovered_routes[key]):
+            should_store_route = True
+            if key not in self.discovered_routes and is_catalog_route(tmpl):
+                existing_samples = [
+                    existing_disp
+                    for (m_k, p_k), existing_disp in self.discovered_routes.items()
+                    if m_k == norm_method and route_template_of(p_k) == tmpl
+                ]
+                if len(existing_samples) >= _MAX_CATALOG_DISCOVERED_PER_TEMPLATE:
+                    existing_qkeys = {
+                        k
+                        for disp in existing_samples
+                        if "?" in disp
+                        for k, _ in parse_qsl(disp.split("?", 1)[1], keep_blank_values=True)
+                        if k
+                    }
+                    has_new_q = bool(set(q_names) - existing_qkeys)
+                    if not has_new_q:
+                        should_store_route = False
+            if should_store_route and (
+                key not in self.discovered_routes or ("?" in display and "?" not in self.discovered_routes[key])
+            ):
                 self.discovered_routes[key] = display
 
         if norm_method in {"POST", "PUT", "PATCH"} and norm_method in self.allowed_methods:
@@ -2447,10 +2898,108 @@ class SurfaceFrontierTracker:
         is_html_resp = (
             "html" in ctype
             or "<html" in body[:512].lower()
+            or "<!doctype" in body[:512].lower()
             or "<form" in body.lower()
         )
+        raw_len = receipt.get("response_length")
+        if isinstance(raw_len, int) and not isinstance(raw_len, bool) and raw_len >= 0:
+            resp_len = raw_len
+        elif isinstance(raw_len, str) and raw_len.strip().isdigit():
+            resp_len = int(raw_len.strip())
+        else:
+            resp_len = len(body.encode("utf-8", errors="replace")) if body else 0
+        raw_sha = str(receipt.get("response_sha256") or "").strip().lower()
+        if not raw_sha and body:
+            raw_sha = hashlib.sha256(body.encode("utf-8", errors="replace")).hexdigest()
+
+        is_trackable_spa_html = (
+            method == "GET"
+            and is_html_resp
+            and (
+                (status == 404 and resp_len >= _SPA_404_MIN_BYTES)
+                or (200 <= status < 400 and resp_len >= _SPA_SHELL_MIN_BYTES)
+            )
+            and bool(raw_sha or resp_len > 0)
+        )
+        is_suppressed_spa_fp = False
+        if is_trackable_spa_html:
+            fp_key = (
+                f"{status}:sha256:{raw_sha[:32]}"
+                if raw_sha
+                else f"{status}:len:{resp_len}"
+            )
+            if fp_key in self._spa_fp_paths or len(self._spa_fp_paths) < _MAX_SPA_FP_BUCKETS:
+                bucket = self._spa_fp_paths.setdefault(fp_key, set())
+                if len(bucket) < _MAX_SPA_FP_PATHS_PER_BUCKET:
+                    bucket.add(norm_p)
+            else:
+                bucket = set()
+
+            if 200 <= status < 400 and "<form" not in body.lower():
+                tmpl_fps = self._template_spa_fps.setdefault(tmpl, set())
+                if len(tmpl_fps) < 8:
+                    tmpl_fps.add(fp_key)
+                if len(tmpl_fps) >= 2:
+                    self._non_fallback_templates.add(tmpl)
+                    self._spa_shell_templates.discard(tmpl)
+
+            if fp_key in self._suppressed_spa_fingerprints or len(bucket) >= 3:
+                self._suppressed_spa_fingerprints.add(fp_key)
+                is_suppressed_spa_fp = True
+                self.suppressed_spa_fallback_paths.add(norm_p)
+                self.suppressed_spa_fallback_paths.update(bucket)
+
+                if status == 404:
+                    spa_cand_hits = 0
+                    for p in bucket:
+                        if p in self._spa_route_candidates:
+                            spa_cand_hits += 1
+                            self.pruned_spa_routes.add(p)
+                            self.discovered_routes.pop(("GET", p), None)
+                    if spa_cand_hits >= 3:
+                        self._spa_404_candidate_fallback_seen = True
+
+                prefix_counts: dict[str, int] = {}
+                tmpl_counts: dict[str, int] = {}
+                for p in bucket:
+                    p_segs = [s for s in p.split("/") if s]
+                    p_prefix = "/" + "/".join(p_segs[:-1]) if len(p_segs) > 1 else "/"
+                    if p_prefix != "/":
+                        prefix_counts[p_prefix] = prefix_counts.get(p_prefix, 0) + 1
+                    p_tmpl = route_template_of(p)
+                    tmpl_counts[p_tmpl] = tmpl_counts.get(p_tmpl, 0) + 1
+                    if 200 <= status < 400 and p_tmpl not in self._non_fallback_templates and p_tmpl not in self.discovered_form_templates:
+                        self.html_or_form_templates.discard(p_tmpl)
+                    p_info = _extract_ui_resource_info(p)
+                    if p_info is not None and p_info[0] in self.ui_resource_families:
+                        fam_entry = self.ui_resource_families[p_info[0]]
+                        if not fam_entry.get("concrete_ids") and not fam_entry.get("collection_403"):
+                            self.ui_resource_families.pop(p_info[0], None)
+
+                for p_prefix, cnt in prefix_counts.items():
+                    if cnt >= 3:
+                        if status == 404:
+                            self._spa_404_prefixes.add(p_prefix)
+                        else:
+                            self._spa_shell_prefixes.add(p_prefix)
+                for p_tmpl, cnt in tmpl_counts.items():
+                    if cnt >= 3 and p_tmpl not in self._non_fallback_templates:
+                        if status == 404:
+                            self._spa_404_templates.add(p_tmpl)
+                        else:
+                            self._spa_shell_templates.add(p_tmpl)
+        elif 200 <= status < 400:
+            self._non_fallback_templates.add(tmpl)
+            self._spa_404_templates.discard(tmpl)
+            self._spa_shell_templates.discard(tmpl)
+            self.suppressed_spa_fallback_paths.discard(norm_p)
+            p_segs = [s for s in norm_p.split("/") if s]
+            p_prefix = "/" + "/".join(p_segs[:-1]) if len(p_segs) > 1 else "/"
+            if p_prefix != "/" and actor != "anon":
+                self._spa_shell_prefixes.discard(p_prefix)
+
         is_redirect_resp = 300 <= status < 400 and bool(str(receipt.get("redirect_location") or "").strip())
-        if 200 <= status < 400 and (is_html_resp or is_redirect_resp):
+        if 200 <= status < 400 and (is_html_resp or is_redirect_resp) and not (is_suppressed_spa_fp and "<form" not in body.lower()):
             self.html_or_form_templates.add(tmpl)
             if q_pairs:
                 non_meta_keys = {k for k, _ in q_pairs if k.lower() not in _NON_PROBE_PARAM_NAMES}
@@ -2535,7 +3084,8 @@ class SurfaceFrontierTracker:
         elif status and status != 404:
             self.pruned_spa_routes.discard(norm_p)
 
-        self._observe_parity_path(norm_p, discovered=False, status=status, ctype=ctype)
+        if not is_suppressed_spa_fp:
+            self._observe_parity_path(norm_p, discovered=False, status=status, ctype=ctype)
 
         # Track concrete object visits
         if "{id}" in tmpl and "{" not in norm_p and 200 <= status < 300 and not is_soft_deny:
@@ -2993,8 +3543,9 @@ class SurfaceFrontierTracker:
 
     def unvisited_routes(self) -> list[str]:
         """Return discovered routes and parameterized endpoints not yet tested."""
-        out: list[str] = []
+        candidates: list[tuple[tuple[int, str, str], str]] = []
         seen_templates_in_out: set[tuple[str, str]] = set()
+        has_non_anon_actors = any(a != "anon" for a in self.actors)
         for (method, norm_p), display in sorted(self.discovered_routes.items()):
             if (
                 method not in self.allowed_methods
@@ -3011,6 +3562,42 @@ class SurfaceFrontierTracker:
                 or (tmpl in self.pruned_spa_routes and tmpl not in self._non_404_templates)
             ):
                 continue
+            is_api = bool(_ROUTE_API_PATH_RE.search(norm_p))
+            disc_p = self.discovered_params.get(tmpl) or set()
+            has_params = bool(disc_p) or ("?" in display)
+            is_form = tmpl in self.discovered_form_templates
+            is_write = (method in _MUTATING_HTTP_METHODS) or any(
+                w_t == tmpl for _, w_t in (*self.declared_write_ops, *self.discovered_write_ops)
+            )
+            p_segs = [s for s in norm_p.split("/") if s]
+            parent_prefix = "/" + "/".join(p_segs[:-1]) if len(p_segs) > 1 else "/"
+            is_demoted_spa = False
+            if method == "GET" and not is_api and not has_params and not is_form and not is_write:
+                if norm_p in self.suppressed_spa_fallback_paths:
+                    continue
+                if (
+                    tmpl in self._spa_404_templates or tmpl in self._spa_shell_templates
+                ) and tmpl not in self._non_fallback_templates:
+                    continue
+                if parent_prefix != "/":
+                    if parent_prefix in self._spa_404_prefixes:
+                        continue
+                    if parent_prefix in self._spa_shell_prefixes:
+                        root_seg = p_segs[0].lower() if p_segs else ""
+                        if root_seg in _FUNCTIONAL_ROOT_SEGMENTS and has_non_anon_actors:
+                            is_demoted_spa = True
+                        else:
+                            continue
+                if self._spa_404_candidate_fallback_seen and norm_p in self._spa_route_candidates:
+                    is_demoted_spa = True
+
+            if is_catalog_route(tmpl) and not has_params and not is_form and not is_write:
+                rank_tier = 2
+            elif is_demoted_spa:
+                rank_tier = 1
+            else:
+                rank_tier = 0
+
             # Skip unexpanded OpenAPI template strings `{...}` if a concrete path for that template was visited
             if "{" in norm_p and (method, tmpl) in self.visited_method_templates:
                 continue
@@ -3018,13 +3605,12 @@ class SurfaceFrontierTracker:
                 if (method, tmpl) not in seen_templates_in_out:
                     seen_templates_in_out.add((method, tmpl))
                     path_p = sorted(
-                        k for k in (self.discovered_params.get(tmpl) or ()) if str(k).startswith("path:")
+                        k for k in disc_p if str(k).startswith("path:")
                     )
                     suffix = f" [{','.join(path_p[:2])}]" if path_p else ""
-                    out.append(f"{method} {display}{suffix}")
+                    candidates.append(((rank_tier, method, norm_p), f"{method} {display}{suffix}"))
             else:
                 # Check if discovered query/form/path parameters on this route template remain completely untested
-                disc_p = self.discovered_params.get(tmpl) or set()
                 tested_p = self.tested_params_by_template.get(tmpl) or set()
                 untested_p = sorted(disc_p - tested_p)
                 if untested_p and (method, tmpl) not in seen_templates_in_out:
@@ -3033,13 +3619,15 @@ class SurfaceFrontierTracker:
                     path_untested = [k for k in untested_p if str(k).startswith("path:")]
                     if query_untested and path_untested:
                         param_hint = "&".join(f"{k}=" for k in query_untested[:4])
-                        out.append(f"{method} {norm_p}?{param_hint} [{','.join(path_untested[:2])}]")
+                        label = f"{method} {norm_p}?{param_hint} [{','.join(path_untested[:2])}]"
                     elif query_untested:
                         param_hint = "&".join(f"{k}=" for k in query_untested[:4])
-                        out.append(f"{method} {norm_p}?{param_hint}")
+                        label = f"{method} {norm_p}?{param_hint}"
                     else:
-                        out.append(f"{method} {norm_p} [{','.join(path_untested[:2])}]")
-        return out
+                        label = f"{method} {norm_p} [{','.join(path_untested[:2])}]"
+                    candidates.append(((0, method, norm_p), label))
+        candidates.sort(key=lambda pair: pair[0])
+        return [label for _, label in candidates]
 
     def unprobed_params(self) -> list[str]:
         """Return discovered query/path params on visited routes that only received a single benign value."""
@@ -3829,6 +4417,16 @@ class SurfaceFrontierTracker:
             "spa_route_candidates": sorted(self._spa_route_candidates),
             "non_spa_discovered_paths": sorted(self._non_spa_discovered_paths),
             "pruned_spa_routes": sorted(self.pruned_spa_routes),
+            "spa_fp_paths": {k: sorted(v) for k, v in sorted(self._spa_fp_paths.items())},
+            "suppressed_spa_fingerprints": sorted(self._suppressed_spa_fingerprints),
+            "suppressed_spa_fallback_paths": sorted(self.suppressed_spa_fallback_paths),
+            "spa_404_prefixes": sorted(self._spa_404_prefixes),
+            "spa_shell_prefixes": sorted(self._spa_shell_prefixes),
+            "spa_404_templates": sorted(self._spa_404_templates),
+            "spa_shell_templates": sorted(self._spa_shell_templates),
+            "non_fallback_templates": sorted(self._non_fallback_templates),
+            "template_spa_fps": {k: sorted(v) for k, v in sorted(self._template_spa_fps.items())},
+            "spa_404_candidate_fallback_seen": bool(self._spa_404_candidate_fallback_seen),
             "discovered_routes": [[k[0], k[1], v] for k, v in sorted(self.discovered_routes.items())],
             "discovered_params": {k: sorted(v) for k, v in self.discovered_params.items()},
             "discovered_objects": {
@@ -3975,6 +4573,40 @@ class SurfaceFrontierTracker:
         self.pruned_spa_routes = {
             str(x) for x in (data.get("pruned_spa_routes") or []) if str(x)
         }
+        raw_fp_paths = data.get("spa_fp_paths")
+        self._spa_fp_paths = {
+            str(k): {str(p) for p in v[:_MAX_SPA_FP_PATHS_PER_BUCKET] if str(p)}
+            for k, v in (list(raw_fp_paths.items())[:_MAX_SPA_FP_BUCKETS] if isinstance(raw_fp_paths, dict) else ())
+            if isinstance(v, list)
+        }
+        self._suppressed_spa_fingerprints = {
+            str(x) for x in (data.get("suppressed_spa_fingerprints") or []) if str(x)
+        }
+        self.suppressed_spa_fallback_paths = {
+            str(x) for x in (data.get("suppressed_spa_fallback_paths") or []) if str(x)
+        }
+        self._spa_404_prefixes = {
+            str(x) for x in (data.get("spa_404_prefixes") or []) if str(x)
+        }
+        self._spa_shell_prefixes = {
+            str(x) for x in (data.get("spa_shell_prefixes") or []) if str(x)
+        }
+        self._spa_404_templates = {
+            str(x) for x in (data.get("spa_404_templates") or []) if str(x)
+        }
+        self._spa_shell_templates = {
+            str(x) for x in (data.get("spa_shell_templates") or []) if str(x)
+        }
+        self._non_fallback_templates = {
+            str(x) for x in (data.get("non_fallback_templates") or []) if str(x)
+        }
+        raw_tmpl_fps = data.get("template_spa_fps")
+        self._template_spa_fps = {
+            str(k): {str(fp) for fp in v[:8] if str(fp)}
+            for k, v in (raw_tmpl_fps.items() if isinstance(raw_tmpl_fps, dict) else ())
+            if isinstance(v, list)
+        }
+        self._spa_404_candidate_fallback_seen = bool(data.get("spa_404_candidate_fallback_seen", False))
         self.discovered_routes = {
             (str(x[0]), str(x[1])): str(x[2])
             for x in (data.get("discovered_routes") or [])

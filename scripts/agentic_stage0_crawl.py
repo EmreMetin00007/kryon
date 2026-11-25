@@ -19,11 +19,13 @@ from contextlib import nullcontext
 from dataclasses import dataclass, field
 import hashlib
 import inspect
+import ipaddress
 import json
 import math
 import os
 from pathlib import Path
 import re
+import socket
 import sys
 import threading
 import time
@@ -279,6 +281,316 @@ _MAX_OPENAPI_SPEC_BYTES = 512 * 1024
 _MAX_JS_CHUNKS = 96
 _MAX_JS_CHUNK_BYTES = 256 * 1024
 _MAX_STAGE0_SCRIPT_ASSETS = 160
+_MAX_STAGE0_CDN_SCRIPT_ASSETS = 16
+_MAX_CDN_JS_FULFILL_BYTES = 4 * 1024 * 1024
+_MAX_DISCOVERED_API_HOSTS = 32
+_MAX_API_HOST_SAMPLE_PATHS = 12
+_MAX_SEO_ROUTES_PER_PATTERN = 6
+_MAX_SEO_COLLECTOR_BUFFER = 64
+_MAX_SEO_BFS_VISITS_PER_PATTERN = 2
+_MAX_SEO_DISCOVERY_HINTS = 2
+_CDN_STRIPPED_AUTH_HEADERS: frozenset[str] = frozenset({
+    "authorization",
+    "proxy-authorization",
+    "cookie",
+    "cookie2",
+    "x-api-key",
+    "x-auth-token",
+    "x-access-token",
+    "x-csrf-token",
+    "x-csrftoken",
+    "x-xsrf-token",
+    "xsrf-token",
+    "csrf-token",
+    "x-session-id",
+    "x-session-token",
+})
+_THIRD_PARTY_TRACKER_DOMAINS: frozenset[str] = frozenset({
+    "googletagmanager.com",
+    "google-analytics.com",
+    "analytics.google.com",
+    "googlesyndication.com",
+    "googleadservices.com",
+    "adservice.google.com",
+    "doubleclick.net",
+    "connect.facebook.net",
+    "facebook.com",
+    "facebook.net",
+    "hotjar.com",
+    "clarity.ms",
+    "mixpanel.com",
+    "mxpnl.com",
+    "segment.com",
+    "segment.io",
+    "amplitude.com",
+    "heapanalytics.com",
+    "fullstory.com",
+    "logrocket.com",
+    "sentry.io",
+    "sentry-cdn.com",
+    "datadoghq.com",
+    "datadoghq-browser-agent.com",
+    "browser-intake-datadoghq.com",
+    "newrelic.com",
+    "nr-data.net",
+    "bugsnag.com",
+    "rollbar.com",
+    "tiktok.com",
+    "twitter.com",
+    "ads-twitter.com",
+    "t.co",
+    "linkedin.com",
+    "licdn.com",
+    "bing.com",
+    "yandex.ru",
+    "yandex.com",
+    "criteo.com",
+    "criteo.net",
+    "insider.com",
+    "useinsider.com",
+    "onesignal.com",
+    "zdassets.com",
+    "zendesk.com",
+    "intercom.io",
+    "intercomcdn.com",
+    "recaptcha.net",
+    "gstatic.com",
+    "google.com",
+    "hcaptcha.com",
+    "challenges.cloudflare.com",
+    "cloudflareinsights.com",
+    "optimizely.com",
+    "launchdarkly.com",
+    "cookiebot.com",
+    "onetrust.com",
+    "cookielaw.org",
+    "snapchat.com",
+    "sc-static.net",
+    "taboola.com",
+    "outbrain.com",
+    "quantserve.com",
+    "scorecardresearch.com",
+    "braze.com",
+    "appboycdn.com",
+    "branch.io",
+    "adjust.com",
+    "appsflyer.com",
+    "hubspot.com",
+    "hs-analytics.net",
+    "hs-scripts.com",
+    "hsforms.net",
+    "demdex.net",
+    "omtrdc.net",
+    "2o7.net",
+    "adnxs.com",
+    "rubiconproject.com",
+    "pubmatic.com",
+    "openx.net",
+    "casalemedia.com",
+    "crisp.chat",
+    "tawk.to",
+    "livechatinc.com",
+})
+_KNOWN_NON_API_DOC_HOSTS: frozenset[str] = frozenset({
+    "w3.org",
+    "schema.org",
+    "reactjs.org",
+    "react.dev",
+    "vuejs.org",
+    "nuxt.com",
+    "nuxtjs.org",
+    "nextjs.org",
+    "github.com",
+    "githubusercontent.com",
+    "gitlab.com",
+    "npmjs.org",
+    "npmjs.com",
+    "mozilla.org",
+    "stackoverflow.com",
+    "wikipedia.org",
+    "opensource.org",
+    "creativecommons.org",
+    "apache.org",
+    "gnu.org",
+    "ietf.org",
+    "whatwg.org",
+    "typescriptlang.org",
+    "webpack.js.org",
+    "vitejs.dev",
+    "babeljs.io",
+    "axios-http.com",
+    "lodash.com",
+    "momentjs.com",
+    "example.org",
+    "example.net",
+})
+_MULTI_LABEL_CC_SLDS: frozenset[str] = frozenset({
+    "co",
+    "com",
+    "net",
+    "org",
+    "gov",
+    "edu",
+    "ac",
+    "mil",
+    "ne",
+    "or",
+})
+_STATIC_CDN_SUBDOMAIN_PREFIXES: frozenset[str] = frozenset({
+    "cdn",
+    "img",
+    "images",
+    "image",
+    "media",
+    "static",
+    "assets",
+    "asset",
+    "js",
+    "css",
+    "font",
+    "fonts",
+    "video",
+    "videos",
+    "thumb",
+    "thumbs",
+})
+_API_SUBDOMAIN_HINTS: frozenset[str] = frozenset({
+    "api",
+    "bff",
+    "sfapi",
+    "auth",
+    "oauth",
+    "sso",
+    "login",
+    "account",
+    "accounts",
+    "gateway",
+    "gw",
+    "graphql",
+    "rest",
+    "rpc",
+    "backend",
+    "service",
+    "services",
+    "edge",
+    "app",
+    "checkout",
+    "cart",
+    "payment",
+    "payments",
+    "order",
+    "orders",
+    "search",
+    "user",
+    "users",
+    "member",
+    "members",
+    "identity",
+    "idp",
+    "token",
+})
+_SEO_CATEGORY_K_RE = re.compile(r"^.+-[kK]-[kK]\d+$")
+_SEO_PRODUCT_P_RE = re.compile(r"^.+-[pP]-[A-Za-z0-9]{4,}$")
+_SEO_CATALOG_C_RE = re.compile(r"^.+-[cC]-\d+$")
+_SEO_UUID_SEG_RE = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+    re.IGNORECASE,
+)
+_NON_SEO_FUNCTIONAL_SEGMENTS: frozenset[str] = frozenset({
+    "api",
+    "graphql",
+    "rest",
+    "rpc",
+    "login",
+    "signin",
+    "sign-in",
+    "signup",
+    "sign-up",
+    "register",
+    "auth",
+    "oauth",
+    "sso",
+    "token",
+    "session",
+    "account",
+    "accounts",
+    "hesabim",
+    "profile",
+    "user",
+    "users",
+    "order",
+    "orders",
+    "siparis",
+    "siparislerim",
+    "cart",
+    "sepet",
+    "checkout",
+    "payment",
+    "payments",
+    "odeme",
+    "billing",
+    "admin",
+    "dashboard",
+    "settings",
+    "ayarlar",
+    "upload",
+    "download",
+    "export",
+    "import",
+    "webhook",
+    "callback",
+    "redirect",
+    "proxy",
+    "search",
+    "ara",
+    "health",
+    "status",
+    "openapi",
+    "swagger",
+    "api-docs",
+    "ws",
+    "wss",
+})
+_NON_SEO_SLUG_TOKENS: frozenset[str] = frozenset({
+    "login",
+    "signin",
+    "signup",
+    "register",
+    "auth",
+    "oauth",
+    "sso",
+    "logout",
+    "password",
+    "forgot",
+    "reset",
+    "admin",
+    "graphql",
+    "openapi",
+    "swagger",
+    "webhook",
+    "callback",
+    "upload",
+    "download",
+    "import",
+    "export",
+    "account",
+    "hesabim",
+    "checkout",
+    "billing",
+})
+_ABS_HTTP_URL_RE = re.compile(r"https?://[^\s\"'<>`\\)}\]]+", re.IGNORECASE)
+_JS_FETCH_ABS_URL_RE = re.compile(
+    r"""\bfetch\s*\(\s*(['"`])(https?://[^'"`\s]+)\1""",
+    re.IGNORECASE,
+)
+_JS_AXIOS_METHOD_ABS_URL_RE = re.compile(
+    r"""\baxios\s*\.\s*(get|post|put|patch|delete|head|options)\s*\(\s*(['"`])(https?://[^'"`\s]+)\2""",
+    re.IGNORECASE,
+)
+_JS_FETCH_METHOD_OPT_RE = re.compile(
+    r"""\bmethod\s*:\s*(['"])(GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS)\1""",
+    re.IGNORECASE,
+)
 _SCRIPT_ASSET_EXTS = (".js", ".mjs", ".cjs", ".wasm")
 _SCRIPT_BUNDLE_PATH_MARKERS = (
     "/_app/immutable/",
@@ -611,6 +923,7 @@ class _RouteRecord:
 
     method: str
     path: str
+    origin: str = ""
     params: set[str] = field(default_factory=set)
     is_form: bool = False
     best_status: int = 0
@@ -619,6 +932,22 @@ class _RouteRecord:
     multipart_fields: set[str] = field(default_factory=set)
     multipart_files: set[str] = field(default_factory=set)
     first_seen: int = 0
+
+    @property
+    def export_url(self) -> str:
+        return f"{self.origin}{self.path}" if self.origin else self.path
+
+
+@dataclass
+class _ExternalAPIHostRecord:
+    """Observed non-tracker external or sibling API origin and sample paths."""
+
+    origin: str
+    host: str
+    same_registrable_domain: bool
+    methods: set[str] = field(default_factory=set)
+    sample_paths: list[str] = field(default_factory=list)
+    observation_count: int = 0
 
 
 class _Stage0Budget:
@@ -680,9 +1009,11 @@ def _empty_result(
         "uploads_triggered": 0,
         "network_requests_captured": 0,
         "js_chunks_parsed": 0,
+        "cdn_js_chunks_parsed": 0,
         "passive_probes_sent": 0,
         "probed_paths": [],
         "discovered_auth_headers": [],
+        "external_api_hosts_seen": 0,
         "ws_endpoints_found": 0,
         "routes_accepted": 0,
         "body_templates_count": 0,
@@ -702,6 +1033,7 @@ def _empty_result(
         "body_templates": {},
         "multipart_schemas": {},
         "auth_headers": [],
+        "discovered_api_hosts": [],
         "discovery_hints": [],
         "seed_file": "",
         "stats": stats,
@@ -764,6 +1096,221 @@ def _is_browser_script_asset(req_url: str, req_path: str = "", req: Any = None) 
     if has_script_ext and (not res_type or res_type == "other" or not parsed.query):
         return True
     return False
+
+
+def _normalized_origin_parts(raw_url: str) -> tuple[str, str, int, str] | None:
+    """Parse an explicit http(s) URL into ``(scheme, host, port, formatted_origin)`` or None."""
+    raw = str(raw_url or "").strip()
+    if not raw or raw.startswith("//") or any(ord(ch) < 32 or ch.isspace() for ch in raw):
+        return None
+    try:
+        parsed = urlsplit(raw)
+        port_val = parsed.port
+    except ValueError:
+        return None
+    scheme = parsed.scheme.lower()
+    if scheme not in {"http", "https"}:
+        return None
+    if parsed.username is not None or parsed.password is not None or "@" in parsed.netloc:
+        return None
+    host = (parsed.hostname or "").strip().lower().rstrip(".")
+    if not host:
+        return None
+    if port_val is not None and port_val <= 0:
+        return None
+    default_port = 443 if scheme == "https" else 80
+    eff_port = port_val if port_val is not None else default_port
+    host_netloc = f"[{host}]" if ":" in host else host
+    formatted = f"{scheme}://{host_netloc}" if eff_port == default_port else f"{scheme}://{host_netloc}:{eff_port}"
+    return scheme, host, eff_port, formatted
+
+
+def _registrable_domain(host: str) -> str:
+    """Return a best-effort registrable domain suffix without network/PSL dependencies."""
+    clean = str(host or "").strip().lower().rstrip(".")
+    if not clean or ":" in clean:
+        return clean
+    try:
+        ipaddress.ip_address(clean)
+        return clean
+    except ValueError:
+        pass
+    labels = [lbl for lbl in clean.split(".") if lbl]
+    if len(labels) <= 2:
+        return clean
+    if len(labels[-1]) == 2 and labels[-2] in _MULTI_LABEL_CC_SLDS and len(labels) >= 3:
+        return ".".join(labels[-3:])
+    return ".".join(labels[-2:])
+
+
+def _host_matches_domain_set(host: str, domains: frozenset[str]) -> bool:
+    clean = str(host or "").strip().lower().rstrip(".")
+    if not clean:
+        return False
+    return any(clean == dom or clean.endswith("." + dom) for dom in domains)
+
+
+def _is_tracker_or_telemetry_host(host: str) -> bool:
+    """Return True if ``host`` belongs to a known third-party tracker, ad, analytics, or CAPTCHA vendor."""
+    return _host_matches_domain_set(host, _THIRD_PARTY_TRACKER_DOMAINS)
+
+
+def _parse_ip_literal(host: str) -> ipaddress.IPv4Address | ipaddress.IPv6Address | None:
+    clean = str(host or "").strip().lower().rstrip(".")
+    if not clean:
+        return None
+    try:
+        ip = ipaddress.ip_address(clean)
+        if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped is not None:
+            return ip.ipv4_mapped
+        return ip
+    except ValueError:
+        pass
+    # Catch decimal, hex, or octal IPv4 forms (e.g. 2130706433, 0x7f000001, 0177.0.0.1).
+    labels = clean.split(".")
+    if len(labels) <= 4 and all(
+        lbl.isdigit() or (lbl.startswith("0x") and len(lbl) > 2)
+        for lbl in labels
+        if lbl
+    ) and any(labels):
+        try:
+            packed = socket.inet_aton(clean)
+            return ipaddress.IPv4Address(packed)
+        except OSError:
+            pass
+    return None
+
+
+def _is_link_local_metadata_host(host: str) -> bool:
+    clean = str(host or "").strip().lower().rstrip(".")
+    if not clean:
+        return True
+    if clean in {"metadata", "metadata.google.internal"} or clean.endswith(".metadata.internal"):
+        return True
+    ip = _parse_ip_literal(clean)
+    if ip is not None:
+        return bool(ip.is_link_local or ip.is_unspecified)
+    return False
+
+
+def _is_non_public_or_internal_host(host: str) -> bool:
+    """Return True for loopback, private, link-local, CGNAT, reserved, or internal hostnames."""
+    clean = str(host or "").strip().lower().rstrip(".")
+    if not clean:
+        return True
+    if (
+        clean == "localhost"
+        or clean == "ip6-localhost"
+        or clean.endswith((".localhost", ".local", ".internal", ".localdomain", ".home.arpa"))
+        or "." not in clean
+    ):
+        return True
+    ip = _parse_ip_literal(clean)
+    if ip is not None:
+        if (
+            ip.is_loopback
+            or ip.is_private
+            or ip.is_link_local
+            or ip.is_multicast
+            or ip.is_reserved
+            or ip.is_unspecified
+            or not ip.is_global
+        ):
+            return True
+        if isinstance(ip, ipaddress.IPv4Address) and ip in ipaddress.IPv4Network("100.64.0.0/10"):
+            return True
+    return False
+
+
+def _is_allowed_cdn_script_url(req_url: str, base_url: str, req: Any = None) -> bool:
+    """Return True strictly for safe, read-only, non-tracker cross-origin CDN JS bundle fetches."""
+    req_method = str(getattr(req, "method", "GET") or "GET").strip().upper()
+    if req_method != "GET":
+        return False
+
+    origin_parts = _normalized_origin_parts(req_url)
+    if origin_parts is None:
+        return False
+    req_scheme, req_host, req_port, _req_origin = origin_parts
+
+    base_parts = _normalized_origin_parts(base_url)
+    if base_parts is not None:
+        base_scheme, base_host, base_port, _base_origin = base_parts
+        if (req_scheme, req_host, req_port) == (base_scheme, base_host, base_port):
+            return False
+
+    if _is_link_local_metadata_host(req_host):
+        return False
+    if not is_loopback_or_private_base_url(base_url) and _is_non_public_or_internal_host(req_host):
+        return False
+    if _is_tracker_or_telemetry_host(req_host):
+        return False
+
+    parsed = urlsplit(str(req_url or "").strip())
+    path = parsed.path or "/"
+    low_path = path.lower()
+    if (
+        _extract_path_embedded_params(path)
+        or _is_heavy_media_url(req_url)
+        or is_destructive_lifecycle_route(path)
+        or is_logout_route(path)
+    ):
+        return False
+
+    res_type = str(getattr(req, "resource_type", "") or "").strip().lower()
+    if res_type in {"document", "xhr", "fetch", "websocket", "eventsource", "stylesheet", "image", "media", "font"}:
+        return False
+
+    if _is_browser_script_asset(req_url, path, req):
+        return True
+    if res_type == "script":
+        return True
+    if low_path.endswith((".js", ".mjs")) and not _API_PATH_RE.search(low_path):
+        if not res_type or res_type == "other" or not parsed.query:
+            return True
+    return False
+
+
+def _classify_seo_route_pattern(
+    path: str,
+    *,
+    method: str = "GET",
+    params: Sequence[str] = (),
+    is_form: bool = False,
+    has_body_template: bool = False,
+    has_multipart_schema: bool = False,
+) -> str:
+    """Return an SEO catalog route pattern class if ``path`` is repetitive storefront/CMS SEO noise."""
+    if str(method or "GET").strip().upper() != "GET":
+        return ""
+    if is_form or has_body_template or has_multipart_schema:
+        return ""
+    if any(str(p).startswith("path:") for p in params):
+        return ""
+    raw_path = urlsplit(str(path or "")).path or "/"
+    low_path = raw_path.lower()
+    if _API_PATH_RE.search(low_path):
+        return ""
+    segments = [seg for seg in raw_path.split("/") if seg]
+    if not segments:
+        return ""
+    for seg in segments:
+        if seg.lower() in _NON_SEO_FUNCTIONAL_SEGMENTS:
+            return ""
+    for seg in segments:
+        if _SEO_CATEGORY_K_RE.fullmatch(seg):
+            return "seo_category_k"
+        if _SEO_PRODUCT_P_RE.fullmatch(seg):
+            return "seo_product_p"
+        if _SEO_CATALOG_C_RE.fullmatch(seg):
+            return "seo_catalog_c"
+    for seg in segments:
+        if seg.count("-") >= 4 and not _SEO_UUID_SEG_RE.fullmatch(seg) and not is_id_segment(seg):
+            parts = [p for p in seg.split("-") if p]
+            if len(parts) >= 5 and sum(1 for p in parts if any(ch.isalpha() for ch in p)) >= 4:
+                if not any(p.lower() in _NON_SEO_SLUG_TOKENS for p in parts):
+                    return "seo_long_slug"
+    return ""
 
 
 def _is_stage0_noise_path(norm_p: str, *, origin_url: str = "") -> bool:
@@ -1552,6 +2099,15 @@ def _route_priority_score(
     )
     if low.endswith((".js", ".mjs", ".cjs")) and not is_api_or_dynamic:
         score -= 60
+    if _classify_seo_route_pattern(
+        path,
+        method=method,
+        params=params,
+        is_form=is_form,
+        has_body_template=has_body_template,
+        has_multipart_schema=has_multipart_schema,
+    ):
+        score -= 25
     return score
 
 
@@ -1597,10 +2153,19 @@ def _select_discovery_hints(
     if not get_routes:
         get_routes = [r for r in routes if str(r.get("method") or "").upper() == "GET"]
 
-    def _hint_key(item: dict[str, Any]) -> tuple[int, int, str]:
-        p = str(item.get("url") or "/")
+    def _hint_key(item: dict[str, Any]) -> tuple[int, int, int, str]:
+        raw_u = str(item.get("url") or "/")
+        p = urlsplit(raw_u).path or "/"
         segs = [s for s in p.split("/") if s]
         has_id = 1 if any(is_id_segment(s) for s in segs) else 0
+        is_seo = 1 if _classify_seo_route_pattern(
+            p,
+            method="GET",
+            params=item.get("params") or (),
+            is_form=bool(item.get("is_form")),
+            has_body_template=bool(item.get("body_template")),
+            has_multipart_schema=bool(item.get("multipart_schema")),
+        ) else 0
         score = _route_priority_score(
             method="GET",
             path=p,
@@ -1610,31 +2175,60 @@ def _select_discovery_hints(
             has_body_template=bool(item.get("body_template")),
             has_multipart_schema=bool(item.get("multipart_schema")),
         )
-        return (has_id, -score, p)
+        return (is_seo, has_id, -score, raw_u)
 
     ranked = sorted(get_routes, key=_hint_key)
     selected: list[str] = []
     seen_paths: set[str] = set()
     seen_templates: set[str] = set()
+    seo_hints_count = 0
 
     for item in ranked:
         if len(selected) >= cap:
             return selected
         p = str(item.get("url") or "")
-        tmpl = route_template_of(p)
+        parsed_p = urlsplit(p)
+        path_only = parsed_p.path or "/"
+        is_seo = bool(_classify_seo_route_pattern(
+            path_only,
+            method="GET",
+            params=item.get("params") or (),
+            is_form=bool(item.get("is_form")),
+            has_body_template=bool(item.get("body_template")),
+            has_multipart_schema=bool(item.get("multipart_schema")),
+        ))
+        if is_seo and seo_hints_count >= _MAX_SEO_DISCOVERY_HINTS:
+            continue
+        tmpl_path = route_template_of(path_only)
+        tmpl = f"{parsed_p.scheme}://{parsed_p.netloc}{tmpl_path}" if parsed_p.netloc else tmpl_path
         if not p or p in seen_paths or tmpl in seen_templates:
             continue
         seen_paths.add(p)
         seen_templates.add(tmpl)
+        if is_seo:
+            seo_hints_count += 1
         selected.append(p)
 
     for item in ranked:
         if len(selected) >= cap:
             break
         p = str(item.get("url") or "")
+        path_only = urlsplit(p).path or "/"
+        is_seo = bool(_classify_seo_route_pattern(
+            path_only,
+            method="GET",
+            params=item.get("params") or (),
+            is_form=bool(item.get("is_form")),
+            has_body_template=bool(item.get("body_template")),
+            has_multipart_schema=bool(item.get("multipart_schema")),
+        ))
+        if is_seo and seo_hints_count >= _MAX_SEO_DISCOVERY_HINTS:
+            continue
         if not p or p in seen_paths:
             continue
         seen_paths.add(p)
+        if is_seo:
+            seo_hints_count += 1
         selected.append(p)
 
     return selected
@@ -1686,6 +2280,10 @@ class _Stage0Collector:
         self.body_snippets: list[str] = []
         self.script_assets_seen: set[str] = set()
         self.script_assets_requests = 0
+        self.cdn_script_assets_seen: set[str] = set()
+        self.cdn_script_assets_requests = 0
+        self.external_api_hosts: dict[str, _ExternalAPIHostRecord] = {}
+        self._seo_buffer_counts: dict[str, int] = {}
         self._seen_order = 0
         self._lock = threading.Lock()
 
@@ -1697,6 +2295,7 @@ class _Stage0Collector:
         self.uploads_triggered = 0
         self.network_requests_captured = 0
         self.js_chunks_parsed = 0
+        self.cdn_js_chunks_parsed = 0
         self.passive_probes_sent = 0
 
     def record_discovered_auth_header(self, header_name: str) -> bool:
@@ -1726,6 +2325,125 @@ class _Stage0Collector:
                 self.script_assets_seen.add(key)
             self.script_assets_requests += 1
             return True
+
+    def try_reserve_cdn_script_asset(self, clean_url: str) -> bool:
+        """Allow up to ``_MAX_STAGE0_CDN_SCRIPT_ASSETS`` unique cross-origin CDN JS bundles."""
+        key = str(clean_url or "").strip()
+        if not key:
+            return False
+        with self._lock:
+            if self.cdn_script_assets_requests >= _MAX_STAGE0_CDN_SCRIPT_ASSETS * 3:
+                return False
+            if self.script_assets_requests >= _MAX_STAGE0_SCRIPT_ASSETS * 3:
+                return False
+            if key not in self.cdn_script_assets_seen and len(self.cdn_script_assets_seen) >= _MAX_STAGE0_CDN_SCRIPT_ASSETS:
+                return False
+            if key not in self.script_assets_seen and len(self.script_assets_seen) >= _MAX_STAGE0_SCRIPT_ASSETS:
+                return False
+            self.cdn_script_assets_seen.add(key)
+            self.script_assets_seen.add(key)
+            self.cdn_script_assets_requests += 1
+            self.script_assets_requests += 1
+            return True
+
+    def is_reserved_cdn_script(self, clean_url: str) -> bool:
+        key = str(clean_url or "").strip()
+        if not key:
+            return False
+        with self._lock:
+            return key in self.cdn_script_assets_seen
+
+    def record_external_api_observation(self, raw_url: str, method: str = "GET") -> bool:
+        """Record a non-tracker cross-origin API/sibling host and bounded sample path."""
+        parts = _normalized_origin_parts(raw_url)
+        if parts is None:
+            return False
+        scheme, host, port, origin = parts
+        base_parts = _normalized_origin_parts(self.http.base_url)
+        if base_parts is not None and (scheme, host, port) == (base_parts[0], base_parts[1], base_parts[2]):
+            return False
+        if _is_link_local_metadata_host(host):
+            return False
+        if not is_loopback_or_private_base_url(self.http.base_url) and _is_non_public_or_internal_host(host):
+            return False
+        if _is_tracker_or_telemetry_host(host):
+            return False
+
+        parsed = urlsplit(str(raw_url or "").strip())
+        try:
+            norm_p = normalize_path(parsed.path or "/")
+        except ValueError:
+            norm_p = "/"
+        low_p = norm_p.lower()
+        is_static_file = (
+            _is_heavy_media_url(raw_url)
+            or is_static_asset_url(norm_p)
+            or low_p.endswith((".js", ".mjs", ".cjs", ".css", ".map", ".svg"))
+        )
+        if is_static_file and norm_p != "/" and not _API_PATH_RE.search(low_p):
+            return False
+
+        norm_method = str(method or "GET").strip().upper()
+        if norm_method not in _VALID_HTTP_METHODS:
+            norm_method = "GET"
+
+        base_host = base_parts[1] if base_parts is not None else ""
+        base_reg = _registrable_domain(base_host)
+        same_reg = bool(base_reg and _registrable_domain(host) == base_reg and not is_loopback_or_private_base_url(self.http.base_url))
+
+        with self._lock:
+            entry = self.external_api_hosts.get(origin)
+            if entry is None:
+                if len(self.external_api_hosts) >= _MAX_DISCOVERED_API_HOSTS:
+                    return False
+                entry = _ExternalAPIHostRecord(
+                    origin=origin,
+                    host=host,
+                    same_registrable_domain=same_reg,
+                )
+                self.external_api_hosts[origin] = entry
+            entry.methods.add(norm_method)
+            entry.observation_count += 1
+            if norm_p != "/" and "/" in entry.sample_paths:
+                entry.sample_paths.remove("/")
+            if norm_p not in entry.sample_paths and len(entry.sample_paths) < _MAX_API_HOST_SAMPLE_PATHS:
+                if norm_p != "/" or not entry.sample_paths:
+                    entry.sample_paths.append(norm_p)
+        return True
+
+    def export_discovered_api_hosts(self) -> list[dict[str, Any]]:
+        """Return a deterministic sorted summary of observed external/sibling API origins."""
+        with self._lock:
+            snapshot = [
+                _ExternalAPIHostRecord(
+                    origin=item.origin,
+                    host=item.host,
+                    same_registrable_domain=item.same_registrable_domain,
+                    methods=set(item.methods),
+                    sample_paths=list(item.sample_paths),
+                    observation_count=item.observation_count,
+                )
+                for item in self.external_api_hosts.values()
+            ]
+        snapshot.sort(
+            key=lambda item: (
+                0 if item.same_registrable_domain else 1,
+                0 if any(p != "/" for p in item.sample_paths) else 1,
+                -item.observation_count,
+                item.origin,
+            )
+        )
+        return [
+            {
+                "origin": item.origin,
+                "host": item.host,
+                "same_registrable_domain": item.same_registrable_domain,
+                "methods": sorted(item.methods),
+                "sample_paths": item.sample_paths,
+                "observation_count": item.observation_count,
+            }
+            for item in snapshot
+        ]
 
     def record_ws_endpoint(self, raw_ws_url: str) -> bool:
         """Validate and record a same-origin WebSocket URL; reject off-origin or excluded."""
@@ -1820,6 +2538,15 @@ class _Stage0Collector:
         except ValueError:
             return False
 
+        clean_origin_parts = _normalized_origin_parts(_clean_url)
+        base_origin_parts = _normalized_origin_parts(self.http.base_url)
+        is_cross_origin = bool(
+            clean_origin_parts is not None
+            and base_origin_parts is not None
+            and clean_origin_parts[:3] != base_origin_parts[:3]
+        )
+        route_origin = clean_origin_parts[3] if (is_cross_origin and clean_origin_parts is not None) else ""
+
         path_params = _extract_path_embedded_params(norm_p)
         if (
             has_double_slash_path(raw_path)
@@ -1828,6 +2555,9 @@ class _Stage0Collector:
             or _is_stage0_noise_path(norm_p, origin_url=self.http.base_url)
         ):
             return False
+
+        if is_cross_origin:
+            self.record_external_api_observation(_clean_url, method=norm_method)
 
         merged_params: list[str] = []
         if raw_query:
@@ -1867,14 +2597,29 @@ class _Stage0Collector:
             merged_params.extend(mp_fields)
             merged_params.extend(mp_files)
 
-        key = (norm_method, norm_p)
+        route_key_target = f"{route_origin}{norm_p}" if route_origin else norm_p
+        key = (norm_method, route_key_target)
+        seo_pattern = _classify_seo_route_pattern(
+            norm_p,
+            method=norm_method,
+            params=merged_params,
+            is_form=bool(is_form or mp_fields or mp_files),
+            has_body_template=san_body is not None,
+            has_multipart_schema=bool(mp_fields or mp_files),
+        )
         with self._lock:
             rec = self.routes.get(key)
             if rec is None:
+                if seo_pattern:
+                    buf_cnt = self._seo_buffer_counts.get(seo_pattern, 0)
+                    if buf_cnt >= _MAX_SEO_COLLECTOR_BUFFER:
+                        return False
+                    self._seo_buffer_counts[seo_pattern] = buf_cnt + 1
                 self._seen_order += 1
                 rec = _RouteRecord(
                     method=norm_method,
                     path=norm_p,
+                    origin=route_origin,
                     is_form=bool(is_form or mp_fields or mp_files),
                     best_status=int(status or 0),
                     first_seen=self._seen_order,
@@ -1911,7 +2656,7 @@ class _Stage0Collector:
                 if len(rec.multipart_files) < 16:
                     rec.multipart_files.add(mfl)
 
-            if 200 <= int(status or 0) < 300 and norm_method == "GET":
+            if 200 <= int(status or 0) < 300 and norm_method == "GET" and not route_origin:
                 self.fetched_2xx_paths.add(norm_p)
         return True
 
@@ -1924,18 +2669,30 @@ class _Stage0Collector:
         headers: dict[str, str],
         is_js: bool,
         is_css: bool = False,
+        is_cdn_js: bool = False,
     ) -> None:
         if not body:
             return
+        base_parts = _normalized_origin_parts(self.http.base_url)
+        doc_parts = _normalized_origin_parts(url)
+        cross_origin_doc = bool(
+            is_cdn_js
+            or (
+                doc_parts is not None
+                and base_parts is not None
+                and doc_parts[:3] != base_parts[:3]
+            )
+        )
         with self._lock:
-            srv = headers.get("server") or headers.get("Server") or ""
-            xpb = headers.get("x-powered-by") or headers.get("X-Powered-By") or ""
-            if srv and srv not in self.server_headers and len(self.server_headers) < 8:
-                self.server_headers.append(srv)
-            if xpb and xpb not in self.powered_by_headers and len(self.powered_by_headers) < 8:
-                self.powered_by_headers.append(xpb)
-            if not is_js and not is_css and len(self.body_snippets) < 4:
-                self.body_snippets.append(body[:8192])
+            if not cross_origin_doc:
+                srv = headers.get("server") or headers.get("Server") or ""
+                xpb = headers.get("x-powered-by") or headers.get("X-Powered-By") or ""
+                if srv and srv not in self.server_headers and len(self.server_headers) < 8:
+                    self.server_headers.append(srv)
+                if xpb and xpb not in self.powered_by_headers and len(self.powered_by_headers) < 8:
+                    self.powered_by_headers.append(xpb)
+                if not is_js and not is_css and len(self.body_snippets) < 4:
+                    self.body_snippets.append(body[:8192])
 
             parsed = urlsplit(url)
             try:
@@ -1948,11 +2705,13 @@ class _Stage0Collector:
                 "content_type": content_type,
                 "body": body,
                 "headers": dict(headers),
+                "is_cdn": cross_origin_doc,
             }
             if is_css:
                 store, store_key, cap = self.captured_css, norm_p, _MAX_CSS_DOCS
             elif is_js:
-                store, store_key, cap = self.captured_js, norm_p, _MAX_JS_CHUNKS
+                js_key = f"{doc_parts[3]}{norm_p}" if (cross_origin_doc and doc_parts is not None) else norm_p
+                store, store_key, cap = self.captured_js, js_key, _MAX_JS_CHUNKS
             else:
                 doc_key = f"{norm_p}?{parsed.query}" if parsed.query else norm_p
                 store, store_key, cap = self.captured_html, doc_key, _MAX_HTML_DOCS
@@ -2347,6 +3106,7 @@ def _crawl_actor_playwright(
     actor_action_limit: int,
     timeout_ms: int,
     wait_ms: int,
+    anon_request_context: Any = None,
 ) -> list[str]:
     """Run Layers 1-3 inside an isolated Playwright context for a single actor."""
     cookie_hdr, extra_headers = _extract_actor_browser_auth(http_client, actor)
@@ -2359,6 +3119,35 @@ def _crawl_actor_playwright(
         extra_headers,
         local_storage=local_storage,
     )
+    base_actor_auth_header_names: set[str] = {
+        k.strip().lower()
+        for k in extra_headers
+        if k and k.strip().lower() not in operator_override_names
+    }
+    actors_mgr = getattr(http_client, "actors", None)
+    mgr_disc_hdr = str(getattr(actors_mgr, "discovered_auth_header", "") or "").strip().lower()
+    if mgr_disc_hdr:
+        base_actor_auth_header_names.add(mgr_disc_hdr)
+    sensitive_fn = getattr(actors_mgr, "sensitive_header_names", None)
+    if callable(sensitive_fn):
+        for sh in sensitive_fn() or ():
+            low_sh = str(sh or "").strip().lower()
+            if low_sh and low_sh not in operator_override_names:
+                base_actor_auth_header_names.add(low_sh)
+    actor_obj = (getattr(actors_mgr, "actors", None) or {}).get(actor) if actors_mgr is not None else None
+    if actor_obj is not None:
+        for attr_name in ("auth_header_name", "auth_header", "csrf_header_name"):
+            attr_val = str(getattr(actor_obj, attr_name, "") or "").strip().lower()
+            if attr_val and attr_val not in operator_override_names:
+                base_actor_auth_header_names.add(attr_val)
+        for hmap_name in ("base_headers", "headers"):
+            hmap = getattr(actor_obj, hmap_name, None)
+            if isinstance(hmap, dict):
+                for hk in hmap:
+                    low_hk = str(hk or "").strip().lower()
+                    if low_hk and low_hk not in operator_override_names:
+                        base_actor_auth_header_names.add(low_hk)
+    base_origin_parts = _normalized_origin_parts(http_client.base_url)
 
     context = browser.new_context(
         ignore_https_errors=True,
@@ -2395,7 +3184,52 @@ def _crawl_actor_playwright(
         if hasattr(context, "route_web_socket"):
             context.route_web_socket("**/*", _on_ws_route)
 
-        def _continue_route(route: Any, req: Any, *, include_extra_headers: bool) -> None:
+        def _stripped_anonymous_headers(req: Any) -> dict[str, str]:
+            try:
+                raw_hdrs = dict(req.all_headers() or {})
+            except Exception:
+                raw_hdrs = dict(getattr(req, "headers", None) or {})
+            with collector._lock:
+                disc_auth = {h.strip().lower() for h in collector.discovered_auth_headers if h}
+            dyn_sensitive: set[str] = set()
+            if callable(sensitive_fn):
+                for sh in sensitive_fn() or ():
+                    low_sh = str(sh or "").strip().lower()
+                    if low_sh and low_sh not in operator_override_names:
+                        dyn_sensitive.add(low_sh)
+            blocked_low = _CDN_STRIPPED_AUTH_HEADERS | base_actor_auth_header_names | disc_auth | dyn_sensitive
+            sanitized_raw = {
+                str(k): str(v)
+                for k, v in raw_hdrs.items()
+                if k and not str(k).startswith(":") and str(k).strip().lower() not in blocked_low
+            }
+            safe_op_hdrs = {
+                k: v
+                for k, v in operator_headers.items()
+                if str(k).strip().lower() not in blocked_low
+            }
+            if safe_op_hdrs:
+                return _merge_browser_route_headers(
+                    sanitized_raw,
+                    safe_op_hdrs,
+                    override_names=operator_override_names,
+                )
+            return sanitized_raw
+
+        def _continue_route(
+            route: Any,
+            req: Any,
+            *,
+            include_extra_headers: bool,
+            strip_auth_headers: bool = False,
+        ) -> None:
+            if strip_auth_headers:
+                sanitized = _stripped_anonymous_headers(req)
+                try:
+                    route.continue_(headers=sanitized)
+                except Exception:
+                    pass
+                return
             headers_to_apply = extra_headers if include_extra_headers else operator_headers
             if headers_to_apply:
                 try:
@@ -2417,6 +3251,54 @@ def _crawl_actor_playwright(
             except Exception:
                 pass
 
+        def _continue_cdn_route_anonymously(route: Any, req: Any, cdn_url: str) -> None:
+            """Fetch CDN JS strictly anonymously (cookie-free) when Playwright APIRequestContext is available."""
+            if anon_request_context is not None and hasattr(route, "fulfill"):
+                anon_hdrs = {
+                    k: v
+                    for k, v in _stripped_anonymous_headers(req).items()
+                    if k.strip().lower() not in {"host", "content-length", "connection", "accept-encoding", "referer", "origin"}
+                }
+                curr_url = cdn_url
+                try:
+                    for _hop in range(3):
+                        resp = anon_request_context.get(
+                            curr_url,
+                            headers=anon_hdrs,
+                            timeout=min(timeout_ms, 8000),
+                            max_redirects=0,
+                        )
+                        status_code = int(getattr(resp, "status", 0) or 0)
+                        resp_hdrs = {str(k): str(v) for k, v in (getattr(resp, "headers", None) or {}).items()}
+                        if 300 <= status_code < 400:
+                            loc = next((v for k, v in resp_hdrs.items() if k.lower() == "location"), "")
+                            next_url = urljoin(curr_url, loc) if loc else ""
+                            if not next_url or not _is_allowed_cdn_script_url(next_url, http_client.base_url, req):
+                                route.abort("blockedbyclient")
+                                return
+                            curr_url = next_url
+                            continue
+                        raw_body = bytes(resp.body() or b"")
+                        if len(raw_body) > _MAX_CDN_JS_FULFILL_BYTES:
+                            route.abort("blockedbyclient")
+                            return
+                        fulfill_hdrs = {
+                            k: v
+                            for k, v in resp_hdrs.items()
+                            if k.lower() not in {"content-encoding", "content-length", "transfer-encoding"}
+                        }
+                        route.fulfill(status=status_code, headers=fulfill_hdrs, body=raw_body)
+                        return
+                    route.abort("blockedbyclient")
+                    return
+                except Exception:
+                    try:
+                        route.abort("failed")
+                    except Exception:
+                        pass
+                    return
+            _continue_route(route, req, include_extra_headers=False, strip_auth_headers=True)
+
         def _on_route(route: Any) -> None:
             req = route.request
             req_method = str(getattr(req, "method", "GET") or "GET").strip().upper()
@@ -2424,6 +3306,26 @@ def _crawl_actor_playwright(
             try:
                 _clean, req_path, _q = _check_http_scope(http_client, req_url, allow_fragment=False)
             except ScopeViolationError:
+                req_parts = _normalized_origin_parts(req_url)
+                is_cross_origin = bool(
+                    req_parts is not None
+                    and (base_origin_parts is None or req_parts[:3] != base_origin_parts[:3])
+                )
+                if is_cross_origin:
+                    if _is_allowed_cdn_script_url(req_url, http_client.base_url, req):
+                        parsed_cdn = urlsplit(req_url.strip())
+                        cdn_clean = urlunsplit(
+                            (parsed_cdn.scheme.lower(), parsed_cdn.netloc, parsed_cdn.path or "/", parsed_cdn.query, "")
+                        )
+                        if collector.try_reserve_cdn_script_asset(cdn_clean):
+                            _continue_cdn_route_anonymously(route, req, cdn_clean)
+                            return
+                    else:
+                        res_type = str(getattr(req, "resource_type", "") or "").strip().lower()
+                        if res_type in {"xhr", "fetch", "eventsource", "preflight"} or (
+                            not res_type and not _is_heavy_media_url(req_url)
+                        ):
+                            collector.record_external_api_observation(req_url, req_method)
                 try:
                     route.abort("blockedbyclient")
                 except Exception:
@@ -2547,13 +3449,37 @@ def _crawl_actor_playwright(
         def _on_response(resp: Any) -> None:
             nonlocal session_dropped
             resp_url = str(getattr(resp, "url", "") or "")
+            req_obj = getattr(resp, "request", None)
+            is_cdn_script = False
             try:
                 _clean, resp_path, _q = _check_http_scope(http_client, resp_url, allow_fragment=False)
             except ScopeViolationError:
-                return
+                resp_parts = _normalized_origin_parts(resp_url)
+                is_cross_origin = bool(
+                    resp_parts is not None
+                    and (base_origin_parts is None or resp_parts[:3] != base_origin_parts[:3])
+                )
+                if not is_cross_origin:
+                    return
+                parsed_cdn_resp = urlsplit(resp_url.strip())
+                cdn_resp_clean = urlunsplit(
+                    (
+                        parsed_cdn_resp.scheme.lower(),
+                        parsed_cdn_resp.netloc,
+                        parsed_cdn_resp.path or "/",
+                        parsed_cdn_resp.query,
+                        "",
+                    )
+                )
+                if not (
+                    _is_allowed_cdn_script_url(resp_url, http_client.base_url, req_obj)
+                    or collector.is_reserved_cdn_script(cdn_resp_clean)
+                ):
+                    return
+                is_cdn_script = True
+                resp_path = parsed_cdn_resp.path or "/"
 
             status = int(getattr(resp, "status", 0) or 0)
-            req_obj = getattr(resp, "request", None)
             req_method = str(getattr(req_obj, "method", "GET") or "GET").strip().upper()
             try:
                 resp_headers = {str(k): str(v) for k, v in (getattr(resp, "headers", None) or {}).items()}
@@ -2561,6 +3487,37 @@ def _crawl_actor_playwright(
                 resp_headers = {}
             ctype = str(resp_headers.get("content-type") or resp_headers.get("Content-Type") or "").lower()
             loc_hdr = str(resp_headers.get("location") or resp_headers.get("Location") or "")
+
+            if is_cdn_script:
+                if status < 200 or status >= 300 or "html" in ctype:
+                    return
+                low_cdn_path = resp_path.lower()
+                is_cdn_js = (
+                    "javascript" in ctype
+                    or "ecmascript" in ctype
+                    or low_cdn_path.endswith((".js", ".mjs", ".cjs"))
+                )
+                if not is_cdn_js:
+                    return
+                try:
+                    raw_cdn_body = resp.body()
+                except Exception:
+                    return
+                if not raw_cdn_body:
+                    return
+                text_cdn_body = bytes(raw_cdn_body[:_MAX_JS_CHUNK_BYTES]).decode("utf-8", errors="replace")
+                if text_cdn_body.lstrip().lower().startswith(("<!doctype html", "<html")):
+                    return
+                collector.record_document(
+                    url=resp_url,
+                    content_type=ctype or "application/javascript",
+                    body=text_cdn_body,
+                    headers=resp_headers,
+                    is_js=True,
+                    is_css=False,
+                    is_cdn_js=True,
+                )
+                return
 
             # Session-drop guard for authenticated form crawling.
             if actor != "anon" and forms_enabled and form_submitting_flag[0]:
@@ -2672,15 +3629,17 @@ def _crawl_actor_playwright(
         page.on("websocket", _on_websocket)
 
         queue: deque[str] = deque()
+        seo_queue: deque[str] = deque()
         queued_urls: set[str] = set()
         visited_urls: set[str] = set()
         template_visit_counts: dict[tuple[str, frozenset[str], str], int] = {}
+        seo_bfs_counts: dict[str, int] = {}
         seen_dom_states: set[tuple[str, str, str]] = set()
         submitted_forms: set[tuple[Any, ...]] = set()
         actor_pages_visited = 0
         actor_actions_taken = 0
 
-        def _enqueue_url(raw_candidate: str, current_page_url: str) -> None:
+        def _enqueue_url(raw_candidate: str, current_page_url: str, *, allow_seo_front: bool = False) -> None:
             cand = str(raw_candidate or "").strip()
             if not cand or cand.lower().startswith(_NON_HTTP_SCHEMES):
                 return
@@ -2721,11 +3680,19 @@ def _crawl_actor_playwright(
             tmpl_key = (route_template_of(norm_p), q_keys, _normalize_hash_route(f"#{frag}" if frag else ""))
             if template_visit_counts.get(tmpl_key, 0) >= _MAX_VISITS_PER_TEMPLATE:
                 return
+            seo_cls = _classify_seo_route_pattern(norm_p)
+            if seo_cls and not allow_seo_front:
+                if seo_bfs_counts.get(seo_cls, 0) >= _MAX_SEO_BFS_VISITS_PER_PATTERN:
+                    return
+                seo_bfs_counts[seo_cls] = seo_bfs_counts.get(seo_cls, 0) + 1
+                queued_urls.add(full_u)
+                seo_queue.append(full_u)
+                return
             queued_urls.add(full_u)
             queue.append(full_u)
 
         for start_u in start_urls:
-            _enqueue_url(start_u, http_client.base_url)
+            _enqueue_url(start_u, http_client.base_url, allow_seo_front=True)
 
         def _dom_link_base(dom_data: dict[str, Any], current_page_url: str) -> str:
             raw_base_uri = str(dom_data.get("base_uri") or "").strip()
@@ -2894,8 +3861,8 @@ def _crawl_actor_playwright(
                         except Exception:
                             break
 
-        while queue and actor_pages_visited < actor_page_limit and stage0_budget.can_spend():
-            target_url = queue.popleft()
+        while (queue or seo_queue) and actor_pages_visited < actor_page_limit and stage0_budget.can_spend():
+            target_url = queue.popleft() if queue else seo_queue.popleft()
             if target_url in visited_urls:
                 continue
             parsed_t = urlsplit(target_url)
@@ -3119,6 +4086,125 @@ def _crawl_actor_playwright(
     return actor_secrets
 
 
+_INLINE_HTML_SCRIPT_RE = re.compile(
+    r"<script\b([^>]*)>([\s\S]*?)</script>",
+    re.IGNORECASE,
+)
+
+
+def _scan_document_for_external_api_hosts(
+    collector: _Stage0Collector,
+    body_text: str,
+    *,
+    doc_url: str,
+    is_js: bool,
+) -> None:
+    """Scan HTML/SSR configs or JS chunks for sibling/external API hosts and multi-origin routes."""
+    if not body_text:
+        return
+    base_parts = _normalized_origin_parts(collector.http.base_url)
+    if base_parts is None:
+        return
+    base_scheme, base_host, base_port, _base_origin = base_parts
+    base_reg = _registrable_domain(base_host)
+    base_is_loopback = is_loopback_or_private_base_url(collector.http.base_url)
+
+    discovered_candidates: list[tuple[str, str]] = []
+    seen_url_methods: dict[str, set[str]] = {}
+    explicit_call_urls: set[str] = set()
+
+    def _add_candidate(method: str, raw_u: str, *, explicit_call: bool = False) -> None:
+        cleaned = str(raw_u or "").strip().rstrip(".,;:!?)'\"`")
+        if "${" in cleaned:
+            cleaned = re.sub(r"\$\{[^}]+\}", "{id}", cleaned)
+        if not cleaned or len(cleaned) > 1024:
+            return
+        m = str(method or "GET").strip().upper()
+        if m not in _VALID_HTTP_METHODS:
+            m = "GET"
+        if explicit_call:
+            explicit_call_urls.add(cleaned)
+        existing = seen_url_methods.setdefault(cleaned, set())
+        if m not in existing:
+            existing.add(m)
+            discovered_candidates.append((m, cleaned))
+
+    scan_text = body_text[:_MAX_JS_CHUNK_BYTES]
+    if is_js:
+        for fm in _JS_FETCH_ABS_URL_RE.finditer(scan_text):
+            tail_window = scan_text[fm.end() : fm.end() + 260]
+            # Bound method search to the current fetch(...) call arguments before the next statement/fetch.
+            next_call = re.search(r"\b(?:fetch|axios)\s*[.(]|;", tail_window)
+            tail = tail_window[: next_call.start()] if next_call else tail_window
+            mm = _JS_FETCH_METHOD_OPT_RE.search(tail)
+            _add_candidate(mm.group(2) if mm else "GET", fm.group(2), explicit_call=True)
+        for am in _JS_AXIOS_METHOD_ABS_URL_RE.finditer(scan_text):
+            _add_candidate(am.group(1), am.group(3), explicit_call=True)
+
+    for um in _ABS_HTTP_URL_RE.finditer(scan_text):
+        raw_found = um.group(0).strip().rstrip(".,;:!?)'\"`")
+        if "${" in raw_found:
+            raw_found = re.sub(r"\$\{[^}]+\}", "{id}", raw_found)
+        if raw_found and raw_found not in seen_url_methods:
+            _add_candidate("GET", raw_found, explicit_call=False)
+        if len(discovered_candidates) >= 240:
+            break
+
+    for cand_method, cand_url in discovered_candidates:
+        parts = _normalized_origin_parts(cand_url)
+        if parts is None:
+            continue
+        c_scheme, c_host, c_port, _c_origin = parts
+        if (c_scheme, c_host, c_port) == (base_scheme, base_host, base_port):
+            continue
+        if _is_link_local_metadata_host(c_host):
+            continue
+        if not base_is_loopback and _is_non_public_or_internal_host(c_host):
+            continue
+        if _is_tracker_or_telemetry_host(c_host) or _host_matches_domain_set(c_host, _KNOWN_NON_API_DOC_HOSTS):
+            continue
+
+        parsed = urlsplit(cand_url)
+        c_path = parsed.path or "/"
+        low_path = c_path.lower()
+        is_static_file = (
+            _is_heavy_media_url(cand_url)
+            or is_static_asset_url(c_path)
+            or low_path.endswith((".js", ".mjs", ".cjs", ".css", ".map", ".svg"))
+        )
+        if is_static_file and not _API_PATH_RE.search(low_path):
+            continue
+
+        c_reg = _registrable_domain(c_host)
+        is_sibling_domain = bool(
+            (base_reg and c_reg and c_reg == base_reg and not base_is_loopback)
+            or (base_is_loopback and c_host == base_host and c_port != base_port)
+        )
+        first_label = c_host.split(".", 1)[0] if "." in c_host else c_host
+        is_root_only = c_path in {"", "/"}
+        has_api_path = bool(_API_PATH_RE.search(low_path)) or any(
+            tok in low_path for tok in ("/graphql", "/oauth", "/token", "/auth", "/login", "/checkout", "/cart")
+        )
+        is_explicit_call = cand_url in explicit_call_urls
+
+        if is_sibling_domain:
+            if is_root_only and first_label in _STATIC_CDN_SUBDOMAIN_PREFIXES:
+                continue
+            if not is_js and not is_explicit_call and not is_root_only and not has_api_path:
+                if first_label not in _API_SUBDOMAIN_HINTS:
+                    continue
+            collector.record_external_api_observation(cand_url, cand_method)
+        elif is_js and (is_explicit_call or has_api_path):
+            collector.record_external_api_observation(cand_url, cand_method)
+
+        # If multi-origin scope permits this URL, also record it as an accepted route.
+        collector.record_route(
+            method=cand_method,
+            raw_url=cand_url,
+            current_url=doc_url,
+        )
+
+
 def _run_layer4_passive_fusion(
     http_client: AgenticHTTPClient,
     collector: _Stage0Collector,
@@ -3141,6 +4227,7 @@ def _run_layer4_passive_fusion(
                 )
             )
     canonical_hosts = collector.canonical_hosts_snapshot()
+    base_origin_parts = _normalized_origin_parts(http_client.base_url)
 
     idx = 0
     for docs, prefix, default_ctype, is_js_batch in (
@@ -3150,8 +4237,20 @@ def _run_layer4_passive_fusion(
     ):
         for doc in docs:
             idx += 1
+            doc_url = str(doc.get("url") or "")
+            doc_parts = _normalized_origin_parts(doc_url)
+            is_cdn_doc = bool(
+                doc.get("is_cdn")
+                or (
+                    doc_parts is not None
+                    and base_origin_parts is not None
+                    and doc_parts[:3] != base_origin_parts[:3]
+                )
+            )
             if is_js_batch:
                 collector.js_chunks_parsed += 1
+                if is_cdn_doc:
+                    collector.cdn_js_chunks_parsed += 1
             doc_body = str(doc.get("body") or "")
             if canonical_hosts and doc_body:
                 doc_body = rewrite_internal_canonical_urls_in_text(
@@ -3159,17 +4258,53 @@ def _run_layer4_passive_fusion(
                     base_url=http_client.base_url,
                     canonical_hosts=canonical_hosts,
                 )
+            if prefix == "html" and doc_body:
+                _scan_document_for_external_api_hosts(
+                    collector,
+                    doc_body,
+                    doc_url=doc_url,
+                    is_js=False,
+                )
+                for sm in _INLINE_HTML_SCRIPT_RE.finditer(doc_body):
+                    attrs, s_body = sm.group(1) or "", sm.group(2) or ""
+                    if "src=" in attrs.lower() or not s_body.strip():
+                        continue
+                    _scan_document_for_external_api_hosts(
+                        collector,
+                        s_body,
+                        doc_url=doc_url,
+                        is_js=True,
+                    )
+            elif is_js_batch and doc_body:
+                _scan_document_for_external_api_hosts(
+                    collector,
+                    doc_body,
+                    doc_url=doc_url,
+                    is_js=True,
+                )
+
+            summary_doc_url = doc_url
+            summary_source_url = doc_url
+            summary_ctype = str(doc.get("content_type") or default_ctype)
+            if is_js_batch and is_cdn_doc:
+                # Resolve relative routes in CDN JS chunks against the target origin rather than CDN origin.
+                doc_path = urlsplit(doc_url).path or "/cdn-bundle.js"
+                summary_doc_url = urljoin(http_client.base_url, doc_path)
+                summary_source_url = http_client.base_url
+                if "javascript" not in summary_ctype.lower() and "ecmascript" not in summary_ctype.lower():
+                    summary_ctype = "application/javascript"
+
             fake_rec = {
                 "receipt_id": f"stage0-{prefix}-{idx}",
-                "url": doc["url"],
-                "content_type": doc["content_type"] or default_ctype,
+                "url": summary_doc_url,
+                "content_type": summary_ctype,
                 "body": doc_body,
                 "response_headers": doc["headers"],
                 "redirect_location": "",
             }
             try:
                 summary = _extract_surface_summary(fake_rec, http_client.base_url)
-                collector.ingest_surface_summary(summary, source_url=doc["url"])
+                collector.ingest_surface_summary(summary, source_url=summary_source_url)
             except Exception:
                 continue
 
@@ -3357,7 +4492,8 @@ def _finalize_routes(
     """Cluster by ``(method, route_template)``, merge schemas, rank, and build seed lists."""
     clusters: dict[tuple[str, str], list[_RouteRecord]] = {}
     for rec in collector.routes.values():
-        tmpl = route_template_of(rec.path)
+        tmpl_path = route_template_of(rec.path)
+        tmpl = f"{rec.origin}{tmpl_path}" if rec.origin else tmpl_path
         clusters.setdefault((rec.method, tmpl), []).append(rec)
 
     body_templates_map: dict[str, dict[str, Any]] = {}
@@ -3412,13 +4548,14 @@ def _finalize_routes(
                 -_status_priority(r.best_status),
                 0 if (r.params or r.body_template or r.multipart_files or r.is_form) else 1,
                 r.first_seen,
-                r.path,
+                r.export_url,
             ),
         )
         for rep in ranked_members[:_MAX_REPS_PER_CLUSTER]:
+            rep_url = rep.export_url
             entry: dict[str, Any] = {
                 "method": method,
-                "url": rep.path,
+                "url": rep_url,
                 "params": list(sorted_params),
                 "status": int(rep.best_status),
             }
@@ -3438,10 +4575,28 @@ def _finalize_routes(
                 has_body_template=best_template is not None,
                 has_multipart_schema=mp_schema is not None,
             )
-            clustered_items.append((-score, rep.first_seen, rep.path, method, entry))
+            clustered_items.append((-score, rep.first_seen, rep_url, method, entry))
 
     clustered_items.sort(key=lambda row: (row[0], row[1], row[2], row[3]))
-    kept_entries = [row[4] for row in clustered_items[:_MAX_ROUTES_RETURNED]]
+    seo_pattern_counts: dict[str, int] = {}
+    kept_entries: list[dict[str, Any]] = []
+    for _neg_score, _seen_ord, _rep_u, _meth, entry in clustered_items:
+        seo_cls = _classify_seo_route_pattern(
+            str(entry.get("url") or ""),
+            method=str(entry.get("method") or "GET"),
+            params=entry.get("params") or (),
+            is_form=bool(entry.get("is_form")),
+            has_body_template=bool(entry.get("body_template")),
+            has_multipart_schema=bool(entry.get("multipart_schema")),
+        )
+        if seo_cls:
+            cnt = seo_pattern_counts.get(seo_cls, 0)
+            if cnt >= _MAX_SEO_ROUTES_PER_PATTERN:
+                continue
+            seo_pattern_counts[seo_cls] = cnt + 1
+        kept_entries.append(entry)
+        if len(kept_entries) >= _MAX_ROUTES_RETURNED:
+            break
 
     links: list[dict[str, Any]] = []
     forms: list[dict[str, Any]] = []
@@ -3625,6 +4780,13 @@ def run_stage0_crawl(
         actors_done: list[str] = []
         with _sync_playwright() as playwright:
             browser = playwright.chromium.launch(headless=True, args=CHROMIUM_ARGS)
+            anon_req_ctx: Any = None
+            req_api = getattr(playwright, "request", None)
+            if req_api is not None and callable(getattr(req_api, "new_context", None)):
+                try:
+                    anon_req_ctx = req_api.new_context(ignore_https_errors=True)
+                except Exception:
+                    anon_req_ctx = None
             try:
                 total_actors = len(selected_actors)
                 for idx, actor_alias in enumerate(selected_actors):
@@ -3656,10 +4818,16 @@ def run_stage0_crawl(
                         actor_action_limit=actor_actions,
                         timeout_ms=eff_timeout_ms,
                         wait_ms=eff_wait_ms,
+                        anon_request_context=anon_req_ctx,
                     )
                     collected_secrets.update(secrets_for_actor)
                     actors_done.append(actor_alias)
             finally:
+                if anon_req_ctx is not None:
+                    try:
+                        anon_req_ctx.dispose()
+                    except Exception:
+                        pass
                 try:
                     browser.close()
                 except Exception:
@@ -3689,6 +4857,7 @@ def run_stage0_crawl(
 
     links, forms, body_templates_map, multipart_schemas_map, discovery_hints = _finalize_routes(collector)
     ws_endpoints = list(collector.ws_endpoints.values())
+    discovered_api_hosts = collector.export_discovered_api_hosts()
     probed_paths_sorted = sorted(collector.probed_paths)
     auth_headers_list = list(collector.discovered_auth_headers)
     elapsed = round(time.monotonic() - started, 3)
@@ -3711,9 +4880,11 @@ def run_stage0_crawl(
         "uploads_triggered": int(collector.uploads_triggered),
         "network_requests_captured": int(collector.network_requests_captured),
         "js_chunks_parsed": int(collector.js_chunks_parsed),
+        "cdn_js_chunks_parsed": int(collector.cdn_js_chunks_parsed),
         "passive_probes_sent": int(collector.passive_probes_sent),
         "probed_paths": probed_paths_sorted,
         "discovered_auth_headers": list(auth_headers_list),
+        "external_api_hosts_seen": len(discovered_api_hosts),
         "ws_endpoints_found": len(ws_endpoints),
         "routes_accepted": len(links) + len(forms),
         "body_templates_count": len(body_templates_map),
@@ -3736,6 +4907,7 @@ def run_stage0_crawl(
         "body_templates": body_templates_map,
         "multipart_schemas": multipart_schemas_map,
         "auth_headers": auth_headers_list,
+        "discovered_api_hosts": discovered_api_hosts,
         "discovery_hints": discovery_hints,
         "seed_file": "",
         "stats": stats,

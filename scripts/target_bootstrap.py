@@ -1,7 +1,7 @@
 """Stdlib-only target origin bootstrap, credentials loading, and scope guard."""
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from fnmatch import fnmatch
 import json
 import os
@@ -498,6 +498,27 @@ def _extract_scope_custom_headers(scope_doc: dict[str, Any]) -> dict[str, str]:
     return merged
 
 
+def _extract_scope_asset_lists(scope_doc: dict[str, Any]) -> tuple[list[str], list[str]]:
+    """Extract normalized (in_scope_assets, out_of_scope_assets) host/origin rule strings."""
+    in_assets: list[str] = []
+    seen_in: set[str] = set()
+    for entry in scope_doc.get("in_scope") or []:
+        rule = _parse_scope_asset(entry)
+        if rule is not None and rule.raw not in seen_in:
+            seen_in.add(rule.raw)
+            in_assets.append(rule.raw)
+
+    out_assets: list[str] = []
+    seen_out: set[str] = set()
+    for list_key in ("out_of_scope", "excluded_assets"):
+        for entry in scope_doc.get(list_key) or []:
+            rule = _parse_scope_asset(entry)
+            if rule is not None and rule.raw not in seen_out:
+                seen_out.add(rule.raw)
+                out_assets.append(rule.raw)
+    return in_assets, out_assets
+
+
 def load_scope_file(path: Path) -> dict[str, Any]:
     """Load and strictly validate a .codex/scope.json style authorization document."""
     if path is None:
@@ -618,41 +639,119 @@ def resolve_target_origin(
         target_host=host,
         target_port=port,
     )
+    in_scope_assets, out_of_scope_assets = _extract_scope_asset_lists(scope_doc)
     return origin, {
         "loopback_only": False,
         "excluded_paths": excluded_paths,
         "scope_file": str(scope_path.resolve()),
         "matched_in_scope": matched_in_scope,
+        "in_scope_assets": in_scope_assets,
+        "out_of_scope_assets": out_of_scope_assets,
         "custom_headers": _extract_scope_custom_headers(scope_doc),
     }
 
 
 @dataclass
 class ScopeGuard:
-    """Enforce exact target origin lock, excluded path rules, and destructive lifecycle route guard."""
+    """Enforce target origin lock (single or authorized multi-origin), excluded path rules, and lifecycle guard."""
 
     base_origin: str
     excluded_paths: tuple[str, ...] = ()
     allow_lifecycle_routes: bool = False
+    in_scope_assets: tuple[str, ...] = ()
+    out_of_scope_assets: tuple[str, ...] = ()
+    _origin_key: tuple[str, str, int] = field(init=False, repr=False)
+    _in_scope_rules: tuple[_AssetRule, ...] = field(init=False, repr=False)
+    _out_of_scope_origin_rules: tuple[_AssetRule, ...] = field(init=False, repr=False)
+    _out_of_scope_path_rules: tuple[tuple[_AssetRule, str], ...] = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
         origin, scheme, host, port = _normalize_explicit_origin(self.base_origin)
         self.base_origin = origin
-        self._origin_key: tuple[str, str, int] = (scheme, host, port)
+        self._origin_key = (scheme, host, port)
         self.allow_lifecycle_routes = bool(self.allow_lifecycle_routes)
         normalized: list[str] = []
         seen: set[str] = set()
-        for pat in self.excluded_paths:
+        for pat in self.excluded_paths or ():
             if not str(pat or "").strip():
                 continue
             norm = _normalize_excluded_pattern(str(pat))
             if norm not in seen:
                 seen.add(norm)
                 normalized.append(norm)
+
+        in_rules: list[_AssetRule] = []
+        in_raws: list[str] = []
+        seen_in: set[str] = set()
+        for entry in self.in_scope_assets or ():
+            rule = _parse_scope_asset(entry)
+            if rule is None or rule.raw in seen_in:
+                continue
+            seen_in.add(rule.raw)
+            in_rules.append(rule)
+            in_raws.append(rule.raw)
+
+        out_origin_rules: list[_AssetRule] = []
+        out_path_rules: list[tuple[_AssetRule, str]] = []
+        out_raws: list[str] = []
+        seen_out: set[str] = set()
+        for entry in self.out_of_scope_assets or ():
+            raw_text, is_path_field = _extract_entry_text(entry)
+            if not raw_text:
+                continue
+            if is_path_field or raw_text.startswith("/"):
+                if not any(ch.isspace() or ord(ch) < 32 for ch in raw_text):
+                    norm_path_pat = _normalize_excluded_pattern(raw_text)
+                    if norm_path_pat not in seen:
+                        seen.add(norm_path_pat)
+                        normalized.append(norm_path_pat)
+                continue
+            rule = _parse_scope_asset(entry)
+            if rule is None:
+                continue
+            if rule.raw not in seen_out:
+                seen_out.add(rule.raw)
+                out_raws.append(rule.raw)
+            if rule.path in {"", "/"}:
+                out_origin_rules.append(rule)
+            else:
+                out_path_rules.append((rule, _normalize_excluded_pattern(rule.path)))
+
         self.excluded_paths = tuple(normalized)
+        self.in_scope_assets = tuple(in_raws)
+        self.out_of_scope_assets = tuple(out_raws)
+        self._in_scope_rules = tuple(in_rules)
+        self._out_of_scope_origin_rules = tuple(out_origin_rules)
+        self._out_of_scope_path_rules = tuple(out_path_rules)
+
+    @property
+    def is_multi_origin(self) -> bool:
+        """Return True when in_scope_assets authorizes at least one origin beyond base_origin."""
+        return any(
+            rule.scheme is None
+            or rule.port is None
+            or rule.host_pattern.startswith("*.")
+            or (rule.scheme, rule.host_pattern, rule.port) != self._origin_key
+            for rule in self._in_scope_rules
+        )
+
+    def check_origin(self, scheme: str, host: str, port: int) -> bool:
+        """Return True if ``(scheme, host, port)`` is authorized and not excluded by origin rules."""
+        norm_scheme = str(scheme or "").strip().lower()
+        norm_host = str(host or "").strip().lower().rstrip(".")
+        if norm_scheme not in {"http", "https"} or not norm_host or not _is_valid_host(norm_host):
+            return False
+        if isinstance(port, bool) or not isinstance(port, int) or port <= 0:
+            return False
+        for rule in self._out_of_scope_origin_rules:
+            if rule.matches_origin(norm_scheme, norm_host, port):
+                return False
+        if (norm_scheme, norm_host, port) == self._origin_key:
+            return True
+        return any(rule.matches_origin(norm_scheme, norm_host, port) for rule in self._in_scope_rules)
 
     def check_url(self, url: str, *, allow_lifecycle_routes: bool | None = None) -> None:
-        """Raise ValueError if URL leaves base_origin, hits excluded_paths, or hits a destructive lifecycle route."""
+        """Raise ValueError if URL leaves authorized origins, hits excluded paths, or hits a lifecycle route."""
         raw = str(url or "").strip()
         if not raw:
             raise ValueError("URL is required")
@@ -669,13 +768,18 @@ class ScopeGuard:
             raise ValueError(f"URL must not embed credentials: {resolved!r}")
         hostname = (parsed.hostname or "").strip().lower().rstrip(".")
         port = parsed.port if parsed.port is not None else _default_port(scheme)
-        if (scheme, hostname, port) != self._origin_key:
+        if not self.check_origin(scheme, hostname, port):
             raise ValueError(f"out-of-scope URL {resolved!r}; allowed origin is {self.base_origin}")
         norm_path_lower = normalize_path(parsed.path or "/").lower()
         for pattern in self.excluded_paths:
             if _path_matches_excluded(norm_path_lower, pattern):
                 raise ValueError(
                     f"URL path {parsed.path or '/'!r} is excluded by scope pattern {pattern!r}"
+                )
+        for rule, path_pattern in self._out_of_scope_path_rules:
+            if rule.matches_origin(scheme, hostname, port) and _path_matches_excluded(norm_path_lower, path_pattern):
+                raise ValueError(
+                    f"URL path {parsed.path or '/'!r} is excluded by out-of-scope rule {rule.raw!r}"
                 )
         effective_allow_lifecycle = (
             self.allow_lifecycle_routes

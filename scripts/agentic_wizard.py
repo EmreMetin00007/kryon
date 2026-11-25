@@ -108,18 +108,76 @@ def _is_sensitive_header_name(name: str) -> bool:
     return any(tok in low for tok in _SENSITIVE_HEADER_TOKENS)
 
 
+def _looks_like_inline_scope_origins(raw_input: str) -> bool:
+    """Return True when Step 2 input represents inline origin(s)/wildcard(s) rather than a file path."""
+    text = str(raw_input or "").strip()
+    if not text:
+        return False
+    cand_path = Path(text).expanduser()
+    try:
+        if cand_path.exists() or cand_path.is_symlink():
+            return False
+    except OSError:
+        pass
+    low = text.lower()
+    if "," in text or low.startswith(("http://", "https://")) or text.startswith("*."):
+        return True
+    if text.startswith(("/", "./", "../", "~")) or low.endswith(".json"):
+        return False
+    return "/" not in text and "\\" not in text and "." in text
+
+
+def _parse_inline_scope_origins(raw_input: str) -> tuple[list[str], str]:
+    """Validate comma-separated inline origin/wildcard entries; return (origins, error_msg)."""
+    tokens = [tok.strip() for tok in str(raw_input or "").split(",") if tok.strip()]
+    if not tokens:
+        return [], "en az bir origin veya wildcard girin"
+    parsed_origins: list[str] = []
+    seen: set[str] = set()
+    for tok in tokens:
+        rule = target_bootstrap._parse_scope_asset(tok)
+        if rule is None:
+            return [], f"gecersiz kapsam hedefi: {tok!r} (orn. *.hedef.com veya https://bff.hedef.com)"
+        if rule.path not in {"", "/"}:
+            return [], f"origin yol icermemeli: {tok!r}"
+        if rule.raw not in seen:
+            seen.add(rule.raw)
+            parsed_origins.append(rule.raw)
+    return parsed_origins, ""
+
+
 def _write_auto_scope_file(
     output_dir: Path,
     *,
     target_url: str,
     excluded_paths: Sequence[str] = (),
+    extra_in_scope: Sequence[str] = (),
 ) -> Path:
-    """Create a per-run scope.json locked to the exact operator-entered target origin."""
+    """Create a per-run scope.json for the operator-entered target origin and optional sibling origins."""
     parsed = urlsplit(target_url)
     origin = f"{parsed.scheme.lower()}://{parsed.netloc}/"
+    _, base_scheme, base_host, base_port = target_bootstrap._normalize_explicit_origin(origin)
+    in_scope: list[str] = [origin]
+    seen: set[str] = {origin}
+    for raw_entry in extra_in_scope:
+        clean = str(raw_entry or "").strip()
+        if not clean:
+            continue
+        rule = target_bootstrap._parse_scope_asset(clean)
+        if (
+            rule is not None
+            and not rule.host_pattern.startswith("*.")
+            and rule.scheme == base_scheme
+            and rule.host_pattern == base_host
+            and rule.port == base_port
+        ):
+            continue
+        if clean not in seen:
+            seen.add(clean)
+            in_scope.append(clean)
     clean_excluded = [p.strip() for p in excluded_paths if str(p or "").strip()]
     doc: dict[str, Any] = {
-        "in_scope": [origin],
+        "in_scope": in_scope,
         "excluded_paths": clean_excluded,
     }
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -235,13 +293,14 @@ def run_wizard(
     )
     scope_file: Path | None = None
     auto_scope_excluded: list[str] = []
+    auto_scope_extra_origins: list[str] = []
     auto_create_scope = False
     if not loopback:
         while scope_file is None and not auto_create_scope:
             if usable_detected is not None:
                 hint = f" [Enter={usable_detected}, 'yeni'=otomatik olustur]"
             else:
-                hint = " [Enter=bu hedef icin otomatik olustur]"
+                hint = " [Enter=bu hedef icin otomatik olustur, veya *.hedef.com / origin listesi]"
             entered_scope = input_fn(f"2) Kapsam dosyasi (scope.json){hint}: ").strip()
             if not entered_scope:
                 if usable_detected is not None:
@@ -250,6 +309,14 @@ def run_wizard(
                 auto_create_scope = True
                 break
             if entered_scope.lower() in {"yeni", "new", "auto", "otomatik"}:
+                auto_create_scope = True
+                break
+            if _looks_like_inline_scope_origins(entered_scope):
+                parsed_origins, inline_err = _parse_inline_scope_origins(entered_scope)
+                if inline_err:
+                    output_fn(f"   Kapsam hatasi: {inline_err} (otomatik olusturmak icin Enter'a basin)")
+                    continue
+                auto_scope_extra_origins = parsed_origins
                 auto_create_scope = True
                 break
             chosen = Path(entered_scope).expanduser()
@@ -339,6 +406,7 @@ def run_wizard(
             output_dir,
             target_url=raw_target,
             excluded_paths=auto_scope_excluded,
+            extra_in_scope=auto_scope_extra_origins,
         ).resolve()
 
     parsed_headers = parse_custom_headers(raw_custom_headers)

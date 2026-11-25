@@ -455,6 +455,9 @@ def run_agentic_target(
         allow_non_loopback=bool(allow_non_loopback),
     )
     eff_excluded_paths = list(scope_meta.get("excluded_paths") or [])
+    eff_in_scope_assets = tuple(scope_meta.get("in_scope_assets") or ())
+    eff_out_of_scope_assets = tuple(scope_meta.get("out_of_scope_assets") or ())
+    eff_loopback_only = bool(scope_meta.get("loopback_only", True))
     eff_run_id = str(run_id or bundle.get("run_id") or "").strip() or uuid.uuid4().hex
     raw_scope = bundle.get("scope_rules")
     scope_rules: dict[str, Any] = raw_scope if isinstance(raw_scope, dict) else {}
@@ -479,6 +482,8 @@ def run_agentic_target(
             seed_surface_files,
             base_url=base,
             excluded_paths=eff_excluded_paths,
+            in_scope_assets=eff_in_scope_assets,
+            out_of_scope_assets=eff_out_of_scope_assets,
         )
         for hint in seed_data.get("discovery_hints") or []:
             if hint not in eff_discovery_hints:
@@ -620,9 +625,11 @@ def run_agentic_target(
             "mode": "plan_only",
             "target": base,
             "scope": {
-                "loopback_only": bool(scope_meta.get("loopback_only", True)),
+                "loopback_only": eff_loopback_only,
                 "scope_file": scope_meta.get("scope_file"),
                 "excluded_paths_count": len(eff_excluded_paths),
+                "multi_origin": bool(len(eff_in_scope_assets) > 0 and not eff_loopback_only),
+                "in_scope_assets_count": len(eff_in_scope_assets),
                 "max_degradation_streak": max(0, int(max_degradation_streak)),
             },
             "run_id": eff_run_id,
@@ -693,14 +700,18 @@ def run_agentic_target(
         allowed_methods=eff_methods,
         max_requests=eff_http_budget,
         excluded_paths=eff_excluded_paths,
+        in_scope_assets=eff_in_scope_assets,
+        out_of_scope_assets=eff_out_of_scope_assets,
         max_degradation_streak=max(0, int(max_degradation_streak)),
         max_rps=eff_max_rps,
     )
 
     scope_summary = {
-        "loopback_only": bool(scope_meta.get("loopback_only", True)),
+        "loopback_only": eff_loopback_only,
         "scope_file": scope_meta.get("scope_file"),
         "excluded_paths_count": len(eff_excluded_paths),
+        "multi_origin": bool(len(eff_in_scope_assets) > 0 and not eff_loopback_only),
+        "in_scope_assets_count": len(eff_in_scope_assets),
         "max_degradation_streak": max(0, int(max_degradation_streak)),
     }
     manifest: dict[str, Any] = {
@@ -759,10 +770,16 @@ def run_agentic_target(
                         **stage0_stats,
                         "seed_file": str(stage0_result.get("seed_file") or ""),
                     }
+                    if stage0_result.get("discovered_api_hosts"):
+                        manifest["stage0_crawl"]["discovered_api_hosts"] = list(
+                            stage0_result["discovered_api_hosts"]
+                        )
                     merged_seed = agentic_seed.merge_seed_surfaces(
                         [seed_data, stage0_result],
                         base_url=base,
                         excluded_paths=eff_excluded_paths,
+                        in_scope_assets=eff_in_scope_assets,
+                        out_of_scope_assets=eff_out_of_scope_assets,
                     )
                     if merged_seed is not None:
                         seed_data = merged_seed

@@ -1449,6 +1449,8 @@ class AgenticHTTPClient:
         timeout_s: float = 15.0,
         max_response_bytes: int = 4 * 1024 * 1024,
         excluded_paths: Sequence[str] = (),
+        in_scope_assets: Sequence[str] = (),
+        out_of_scope_assets: Sequence[str] = (),
         max_degradation_streak: int = 5,
         max_rps: float = 0.0,
         allow_lifecycle_routes: bool = False,
@@ -1473,8 +1475,12 @@ class AgenticHTTPClient:
             self.base_url,
             tuple(excluded_paths or ()),
             allow_lifecycle_routes=self.allow_lifecycle_routes,
+            in_scope_assets=tuple(in_scope_assets or ()),
+            out_of_scope_assets=tuple(out_of_scope_assets or ()),
         )
         self.excluded_paths: tuple[str, ...] = self.scope_guard.excluded_paths
+        self.in_scope_assets: tuple[str, ...] = self.scope_guard.in_scope_assets
+        self.out_of_scope_assets: tuple[str, ...] = self.scope_guard.out_of_scope_assets
         self.max_degradation_streak: int = max(0, int(max_degradation_streak))
         self._degradation_streak: int = 0
         self.max_rps: float = eff_max_rps
@@ -1623,12 +1629,12 @@ class AgenticHTTPClient:
                 ws_port = parsed_ws.port if parsed_ws.port is not None else default_port
             except ValueError as exc:
                 raise ScopeViolationError(f"invalid WebSocket port in {raw!r}") from exc
-            if (expected_http_scheme, ws_host, ws_port) != self.scope_guard._origin_key:
+            if not self.scope_guard.check_origin(expected_http_scheme, ws_host, ws_port):
                 raise ScopeViolationError(
                     f"out-of-scope WebSocket URL {raw!r}; allowed origin is {self.base_url}"
                 )
             ws_path = parsed_ws.path or "/"
-            equiv_http_url = urlunsplit((expected_http_scheme, self._origin[1], ws_path, parsed_ws.query, ""))
+            equiv_http_url = urlunsplit((expected_http_scheme, parsed_ws.netloc, ws_path, parsed_ws.query, ""))
             try:
                 self.scope_guard.check_url(
                     equiv_http_url,
@@ -1641,18 +1647,18 @@ class AgenticHTTPClient:
 
         resolved = urljoin(self.base_url, raw)
         parsed = urlsplit(resolved)
-        if (parsed.scheme, parsed.netloc) != self._origin:
-            raise ScopeViolationError(
-                f"out-of-scope URL {resolved!r}; allowed origin is {self.base_url}"
-            )
-        clean_url = urlunsplit((parsed.scheme, parsed.netloc, parsed.path or "/", parsed.query, ""))
+        raw_clean_url = urlunsplit((parsed.scheme, parsed.netloc, parsed.path or "/", parsed.query, ""))
         try:
             self.scope_guard.check_url(
-                clean_url,
+                raw_clean_url,
                 allow_lifecycle_routes=eff_allow_lifecycle,
             )
         except ValueError as exc:
             raise ScopeViolationError(str(exc)) from exc
+        host_norm = (parsed.hostname or "").strip().lower().rstrip(".")
+        host_part = f"[{host_norm}]" if ":" in host_norm else host_norm
+        netloc_norm = f"{host_part}:{parsed.port}" if parsed.port is not None else host_part
+        clean_url = urlunsplit((parsed.scheme.lower(), netloc_norm, parsed.path or "/", parsed.query, ""))
         return clean_url, parsed.path or "/", parsed.query
 
     def _merge_query(
