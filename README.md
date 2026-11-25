@@ -86,6 +86,9 @@ cco-agent check-config --provider-config config/llm.json
 Invoke via the installed `cco-agent` entry point, `./scripts/cco.sh`, or `python3 scripts/agent_cli.py`:
 
 ```bash
+# 0. Easiest interactive zero-flag launcher (asks 5 short questions -> plan -> confirm -> live TUI)
+cco-agent start
+
 # 1. Inspect CLI commands and validate provider schema offline (0 network calls)
 cco-agent --help
 cco-agent check-config --provider-config config/llm.example.json

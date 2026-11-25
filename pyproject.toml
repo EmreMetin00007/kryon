@@ -98,6 +98,7 @@ files = [
   "scripts/agentic_tui.py",
   "scripts/agentic_vault.py",
   "scripts/agentic_waf.py",
+  "scripts/agentic_wizard.py",
   "scripts/check_repo_layout.py",
   "scripts/evidence_trust.py",
   "scripts/full_agent_budget.py",

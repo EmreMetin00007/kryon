@@ -14,6 +14,7 @@ for _p in (str(_REPO_ROOT), str(SCRIPTS)):
         sys.path.insert(0, _p)
 
 COMMANDS: dict[str, tuple[str, list[str]]] = {
+    "start": ("agentic_wizard", []),
     "agentic": ("agentic_runner", []),
     "run": ("agentic_runner", []),
     "watch": ("agentic_tui", []),
@@ -85,8 +86,8 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description=__doc__,
         epilog=(
-            "Available commands: plan (zero-traffic dry-run planner), run / agentic "
-            "(autonomous assessment runner with --preset/--config/--tui), watch (read-only live TUI monitor), "
+            "Available commands: start (interactive zero-flag launcher), plan (zero-traffic dry-run planner), "
+            "run / agentic (autonomous assessment runner with --preset/--config/--tui), watch (read-only live TUI monitor), "
             "presets (list built-in presets), status (compact JSON run summary), "
             "report (evidence-backed report renderer), save-auth (browser session capture), "
             "governance (secret/PII static audit), and check-config (offline LLM config check)."
