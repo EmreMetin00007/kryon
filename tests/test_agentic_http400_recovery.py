@@ -863,3 +863,31 @@ def test_compact_messages_for_context_strips_stale_reasoning_content() -> None:
     assert "reasoning_content" not in cutoff_compacted[2]
     assert "reasoning_content" not in cutoff_compacted[4]
     assert cutoff_compacted[6]["reasoning_content"] == msgs[6]["reasoning_content"]
+
+
+def test_assistant_history_falls_back_to_gateway_reasoning_field_and_sanitizes_both() -> None:
+    from agentic_context import _sanitize_messages_for_http400
+    from agentic_investigator import _build_assistant_history_entry
+
+    tool_calls = [{"id": "c1", "type": "function", "function": {"name": "http_request", "arguments": "{}"}}]
+    from_gateway = _build_assistant_history_entry({
+        "content": "",
+        "tool_calls": tool_calls,
+        "reasoning": "gateway normalized thought chain",
+    })
+    assert from_gateway["reasoning_content"] == "gateway normalized thought chain"
+
+    prefer_rc = _build_assistant_history_entry({
+        "content": "",
+        "tool_calls": tool_calls,
+        "reasoning_content": "native chain",
+        "reasoning": "fallback chain",
+    })
+    assert prefer_rc["reasoning_content"] == "native chain"
+
+    sanitized = _sanitize_messages_for_http400([
+        {"role": "assistant", "content": "", "tool_calls": tool_calls, "reasoning": "drop-me", "reasoning_content": "drop-me-too"},
+    ])
+    assert "reasoning" not in sanitized[0]
+    assert "reasoning_content" not in sanitized[0]
+

@@ -442,6 +442,7 @@ def _sanitize_messages_for_http400(messages: list[dict[str, Any]]) -> list[dict[
             item["content"] = _sanitize_untrusted_blocks(item["content"])
         elif item.get("role") == "assistant":
             item.pop("reasoning_content", None)
+            item.pop("reasoning", None)
         sanitized.append(item)
     return sanitized
 
@@ -658,6 +659,7 @@ def _turn_cutoff_index(messages: list[dict[str, Any]], keep_recent_turns: int) -
 def _compact_assistant_message(item: dict[str, Any]) -> None:
     """Drop stale reasoning chains and trim long assistant prose during context compaction."""
     item.pop("reasoning_content", None)
+    item.pop("reasoning", None)
     content = item.get("content")
     if isinstance(content, str) and len(content) > 160:
         item["content"] = content[:120].rstrip() + " ...[trimmed]"

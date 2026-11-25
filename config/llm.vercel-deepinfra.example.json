@@ -1,0 +1,25 @@
+{
+  "schema": "cco-llm/1",
+  "model": "vercel/deepseek/deepseek-v4.1-flash",
+  "providers": {
+    "vercel": {
+      "base_url": "https://ai-gateway.vercel.sh/v1",
+      "models": [
+        "deepseek/deepseek-v4.1-flash",
+        "deepseek/deepseek-v4.1-flash-fast",
+        "deepseek/deepseek-v4-flash",
+        "deepseek/deepseek-v4-pro",
+        "deepseek/deepseek-v3.2",
+        "deepseek/deepseek-v3.2-thinking",
+        "deepseek/deepseek-r1"
+      ],
+      "api_key_env": "AI_GATEWAY_API_KEY",
+      "api_key_header": "Authorization",
+      "provider_options": {
+        "gateway": {
+          "order": ["deepinfra", "deepseek", "fireworks"]
+        }
+      }
+    }
+  }
+}

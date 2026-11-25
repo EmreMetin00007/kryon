@@ -568,6 +568,8 @@ def _build_assistant_history_entry(msg: dict[str, Any]) -> dict[str, Any]:
     if tool_calls:
         entry["tool_calls"] = tool_calls
         reasoning_content = msg.get("reasoning_content")
+        if not (isinstance(reasoning_content, str) and reasoning_content):
+            reasoning_content = msg.get("reasoning")
         if isinstance(reasoning_content, str) and reasoning_content:
             entry["reasoning_content"] = reasoning_content
     return entry
