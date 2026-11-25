@@ -7,8 +7,11 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import re
 import sys
-from typing import Any, Callable
+import threading
+from typing import Any, Callable, Iterable, Sequence
+from urllib.parse import urlsplit
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(_REPO_ROOT) not in sys.path:
@@ -256,3 +259,218 @@ def detect_waf_block(receipt: dict[str, Any]) -> dict[str, Any] | None:
         }
 
     return None
+
+
+_WAF_UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.I)
+_WAF_HEX_RE = re.compile(r"^[0-9a-f]{16,}$", re.I)
+
+
+def _normalize_waf_path_template(url_or_path: str) -> str:
+    """Normalize a receipt path or URL into a compact `{id}` route template."""
+    raw = str(url_or_path or "").strip()
+    if not raw:
+        return "/"
+    parsed = urlsplit(raw)
+    path = (parsed.path or "/").strip()
+    if len(path) > 1:
+        path = path.rstrip("/")
+    if not path or path == "/":
+        return "/"
+    segs: list[str] = []
+    for seg in path.split("/"):
+        if not seg:
+            continue
+        low = seg.lower()
+        if low.isdigit() or _WAF_UUID_RE.fullmatch(low) or _WAF_HEX_RE.fullmatch(low):
+            segs.append("{id}")
+        else:
+            segs.append(low)
+    return "/" + "/".join(segs)
+
+
+def build_waf_pivot_guidance(
+    vendor: str,
+    blocked_paths: Sequence[str] | Iterable[str] = (),
+    total_blocks: int = 0,
+) -> str:
+    """Build a concise, actionable pivot directive when upstream WAF blocks accumulate."""
+    try:
+        count = int(total_blocks)
+    except (TypeError, ValueError):
+        count = 0
+    if count < 2:
+        return ""
+
+    clean_vendor = str(vendor or "").strip().lower() or "generic"
+    unique_paths: list[str] = []
+    seen_paths: set[str] = set()
+    for raw_path in blocked_paths or ():
+        norm = _normalize_waf_path_template(str(raw_path or ""))
+        if norm not in seen_paths:
+            seen_paths.add(norm)
+            unique_paths.append(norm)
+        if len(unique_paths) >= 5:
+            break
+
+    paths_label = ", ".join(unique_paths) if unique_paths else "/"
+    return (
+        f"WAF pivot advisory ({clean_vendor}, {count} blocks on {paths_label}): "
+        "Stop repeating signature-blocked XSS/SQLi probes against this WAF edge. "
+        "Immediately pivot to WAF-blind vulnerability classes: "
+        "(1) BOLA/IDOR cross-actor replay via replay_as, "
+        "(2) BFLA / missing function-level authorization, "
+        "(3) mass assignment & JSON business-logic / type confusion, "
+        "(4) race conditions / TOCTOU via concurrent_check, "
+        "(5) CORS / HTTP header anomalies, and "
+        "(6) client-side JS/config secret & route inspection."
+    )
+
+
+class WAFPivotTracker:
+    """Thread-safe tracker of upstream WAF blocks per `(vendor, path_template)` and overall."""
+
+    def __init__(self, *, threshold: int = 2) -> None:
+        if isinstance(threshold, bool) or int(threshold) < 1:
+            raise ValueError("threshold must be a positive integer")
+        self.threshold = int(threshold)
+        self._lock = threading.Lock()
+        self._total_blocks: int = 0
+        self._by_vendor: dict[str, int] = {}
+        self._by_pair: dict[tuple[str, str], int] = {}
+        self._paths_by_vendor: dict[str, list[str]] = {}
+        self._all_paths: list[str] = []
+
+    @property
+    def total_blocks(self) -> int:
+        with self._lock:
+            return self._total_blocks
+
+    def _record_block_locked(self, vendor: str, path_template: str) -> dict[str, Any]:
+        clean_vendor = str(vendor or "").strip().lower() or "generic"
+        norm_path = _normalize_waf_path_template(path_template)
+        self._total_blocks += 1
+        self._by_vendor[clean_vendor] = self._by_vendor.get(clean_vendor, 0) + 1
+        pair = (clean_vendor, norm_path)
+        self._by_pair[pair] = self._by_pair.get(pair, 0) + 1
+        if norm_path not in self._all_paths:
+            self._all_paths.append(norm_path)
+        vendor_paths = self._paths_by_vendor.setdefault(clean_vendor, [])
+        if norm_path not in vendor_paths:
+            vendor_paths.append(norm_path)
+        pivot = self._should_pivot_locked()
+        return {
+            "waf_blocked": True,
+            "vendor": clean_vendor,
+            "path_template": norm_path,
+            "total_blocks": self._total_blocks,
+            "vendor_blocks": self._by_vendor[clean_vendor],
+            "route_blocks": self._by_pair[pair],
+            "should_pivot": pivot,
+        }
+
+    def _should_pivot_locked(
+        self,
+        *,
+        vendor: str | None = None,
+        path_template: str | None = None,
+    ) -> bool:
+        if vendor is not None and path_template is not None:
+            clean_vendor = str(vendor).strip().lower() or "generic"
+            norm_path = _normalize_waf_path_template(path_template)
+            return self._by_pair.get((clean_vendor, norm_path), 0) >= self.threshold
+        if vendor is not None:
+            clean_vendor = str(vendor).strip().lower() or "generic"
+            return self._by_vendor.get(clean_vendor, 0) >= self.threshold
+        if path_template is not None:
+            norm_path = _normalize_waf_path_template(path_template)
+            route_total = sum(
+                count for (_v, p), count in self._by_pair.items() if p == norm_path
+            )
+            return route_total >= self.threshold
+        return (
+            self._total_blocks >= self.threshold
+            or any(count >= self.threshold for count in self._by_vendor.values())
+            or any(count >= self.threshold for count in self._by_pair.values())
+        )
+
+    def record_block(self, vendor: str = "generic", path_template: str = "/") -> dict[str, Any]:
+        """Explicitly record a confirmed WAF block event for `(vendor, path_template)`."""
+        with self._lock:
+            return self._record_block_locked(vendor, path_template)
+
+    def record_receipt(
+        self,
+        receipt: dict[str, Any],
+        *,
+        path_template: str = "",
+    ) -> dict[str, Any] | None:
+        """Inspect a receipt via `detect_waf_block` and track any upstream WAF block."""
+        waf_info = detect_waf_block(receipt)
+        if waf_info is None:
+            return None
+        raw_path = path_template or str(receipt.get("path") or receipt.get("url") or "/")
+        with self._lock:
+            recorded = self._record_block_locked(str(waf_info.get("vendor") or "generic"), raw_path)
+            return {
+                **waf_info,
+                "path_template": recorded["path_template"],
+                "total_blocks": recorded["total_blocks"],
+                "vendor_blocks": recorded["vendor_blocks"],
+                "route_blocks": recorded["route_blocks"],
+                "should_pivot": recorded["should_pivot"],
+            }
+
+    def record(
+        self,
+        receipt_or_vendor: dict[str, Any] | str,
+        *,
+        path_template: str = "",
+    ) -> dict[str, Any] | None:
+        """Record either a receipt dict (via `detect_waf_block`) or an explicit vendor name."""
+        if isinstance(receipt_or_vendor, dict):
+            return self.record_receipt(receipt_or_vendor, path_template=path_template)
+        return self.record_block(str(receipt_or_vendor or "generic"), path_template or "/")
+
+    def should_pivot(
+        self,
+        vendor: str | None = None,
+        path_template: str | None = None,
+    ) -> bool:
+        """Return True once recorded WAF blocks reach the pivot threshold."""
+        with self._lock:
+            return self._should_pivot_locked(vendor=vendor, path_template=path_template)
+
+    def guidance(self, *, vendor: str | None = None) -> str:
+        """Return a concise pivot directive once `should_pivot()` is True, else empty string."""
+        with self._lock:
+            if not self._should_pivot_locked(vendor=vendor):
+                return ""
+            if vendor is not None:
+                eff_vendor = str(vendor).strip().lower() or "generic"
+                paths = list(self._paths_by_vendor.get(eff_vendor) or self._all_paths)
+                count = self._by_vendor.get(eff_vendor, self._total_blocks)
+            elif self._by_vendor:
+                eff_vendor = max(
+                    sorted(self._by_vendor),
+                    key=lambda v: self._by_vendor[v],
+                )
+                paths = list(self._all_paths)
+                count = self._total_blocks
+            else:
+                eff_vendor = "generic"
+                paths = list(self._all_paths)
+                count = self._total_blocks
+            return build_waf_pivot_guidance(eff_vendor, paths, count)
+
+    def summary(self) -> dict[str, Any]:
+        """Return a thread-safe snapshot of tracked WAF blocks and pivot readiness."""
+        with self._lock:
+            return {
+                "total_blocks": self._total_blocks,
+                "should_pivot": self._should_pivot_locked(),
+                "vendors": dict(sorted(self._by_vendor.items())),
+                "blocked_paths": list(self._all_paths),
+                "route_counts": {
+                    f"{v}:{p}": count for (v, p), count in sorted(self._by_pair.items())
+                },
+            }

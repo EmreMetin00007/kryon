@@ -20,6 +20,8 @@ for _p in (str(_REPO_ROOT), str(SCRIPTS)):
         sys.path.insert(0, _p)
 
 import agentic_auth_import  # noqa: E402
+import agentic_har_flow  # noqa: E402
+import agentic_prescan  # noqa: E402
 import agentic_report  # noqa: E402
 import agentic_seed  # noqa: E402
 import agentic_vault  # noqa: E402
@@ -108,6 +110,8 @@ def _runner_defaults() -> dict[str, Any]:
         "auto_crawl_forms": False,
         "auto_crawl_max_pages": 12,
         "auto_crawl_max_actions": 24,
+        "prescan": False,
+        "prescan_max_requests": 24,
         "oob_bind_host": "",
         "oob_advertise_host": "",
     }
@@ -261,6 +265,83 @@ def _custom_header_arg(raw: str) -> str:
     return raw
 
 
+def _extract_har_flow_summary(
+    seed_surface_files: Sequence[Path],
+    *,
+    base_url: str,
+    excluded_paths: Sequence[str],
+    in_scope_assets: Sequence[str],
+    out_of_scope_assets: Sequence[str],
+) -> tuple[dict[str, Any] | None, str]:
+    """Extract and merge scope-filtered HAR multi-step workflows from any `.har` seed files."""
+    har_files = [Path(p) for p in seed_surface_files if Path(p).suffix.lower() == ".har"]
+    if not har_files:
+        return None, ""
+    merged_flows: list[dict[str, Any]] = []
+    merged_headers: dict[str, str] = {}
+    entries_total = 0
+    entries_accepted = 0
+    entries_dropped_scope = 0
+    entries_dropped_static = 0
+    entries_dropped_noise = 0
+    chained_steps_count = 0
+    for har_path in har_files:
+        try:
+            doc = agentic_har_flow.extract_har_flows(
+                har_path,
+                base_url=base_url,
+                excluded_paths=excluded_paths,
+                in_scope_assets=in_scope_assets,
+                out_of_scope_assets=out_of_scope_assets,
+            )
+        except (OSError, ValueError):
+            continue
+        stats = doc.get("stats") or {}
+        entries_total += int(stats.get("entries_total") or 0)
+        entries_accepted += int(stats.get("entries_accepted") or 0)
+        entries_dropped_scope += int(stats.get("entries_dropped_scope") or 0)
+        entries_dropped_static += int(stats.get("entries_dropped_static") or 0)
+        entries_dropped_noise += int(stats.get("entries_dropped_noise") or 0)
+        chained_steps_count += int(stats.get("chained_steps_count") or 0)
+        for hk, hv in (doc.get("recommended_app_headers") or {}).items():
+            merged_headers.setdefault(str(hk), str(hv))
+        for flow in doc.get("flows") or []:
+            if len(merged_flows) >= agentic_har_flow.MAX_HAR_FLOWS:
+                break
+            if isinstance(flow, dict):
+                copied = dict(flow)
+                copied["flow_id"] = f"flow_{len(merged_flows) + 1}"
+                merged_flows.append(copied)
+    if not merged_flows and entries_total == 0:
+        return None, ""
+    mutation_cases = agentic_har_flow.build_flow_mutation_cases(merged_flows)
+    combined_doc: dict[str, Any] = {
+        "schema": agentic_har_flow.HAR_FLOW_SCHEMA,
+        "base_url": base_url,
+        "flows": merged_flows,
+        "recommended_app_headers": merged_headers,
+        "mutation_cases": mutation_cases,
+        "stats": {
+            "har_files_count": len(har_files),
+            "entries_total": entries_total,
+            "entries_accepted": entries_accepted,
+            "entries_dropped_scope": entries_dropped_scope,
+            "entries_dropped_static": entries_dropped_static,
+            "entries_dropped_noise": entries_dropped_noise,
+            "flows_count": len(merged_flows),
+            "steps_count": sum(len(f.get("steps") or []) for f in merged_flows),
+            "chained_steps_count": chained_steps_count,
+            "mutation_cases_count": len(mutation_cases),
+        },
+    }
+    handoff = (
+        agentic_har_flow.format_har_flows_handoff(combined_doc, max_chars=2400)
+        if merged_flows
+        else ""
+    )
+    return combined_doc, handoff
+
+
 def _parse_allowed_methods(
     cli_methods: Sequence[str] | None,
     scope_rules: dict[str, Any],
@@ -336,6 +417,8 @@ def run_agentic_target(
     auto_crawl_forms: bool = False,
     auto_crawl_max_pages: int = 12,
     auto_crawl_max_actions: int = 24,
+    prescan: bool = False,
+    prescan_max_requests: int = 24,
     oob_bind_host: str = "",
     oob_advertise_host: str = "",
     preset: str = "",
@@ -400,6 +483,8 @@ def run_agentic_target(
             "auto_crawl_forms": auto_crawl_forms,
             "auto_crawl_max_pages": auto_crawl_max_pages,
             "auto_crawl_max_actions": auto_crawl_max_actions,
+            "prescan": prescan,
+            "prescan_max_requests": prescan_max_requests,
             "oob_bind_host": oob_bind_host,
             "oob_advertise_host": oob_advertise_host,
         }
@@ -477,6 +562,8 @@ def run_agentic_target(
         if isinstance(item, str) and str(item).strip()
     ] or ["/"]
     seed_data: dict[str, Any] | None = None
+    har_flows_doc: dict[str, Any] | None = None
+    har_flows_handoff: str = ""
     if seed_surface_files:
         seed_data = agentic_seed.load_seed_surface_files(
             seed_surface_files,
@@ -488,6 +575,13 @@ def run_agentic_target(
         for hint in seed_data.get("discovery_hints") or []:
             if hint not in eff_discovery_hints:
                 eff_discovery_hints.append(hint)
+        har_flows_doc, har_flows_handoff = _extract_har_flow_summary(
+            seed_surface_files,
+            base_url=base,
+            excluded_paths=eff_excluded_paths,
+            in_scope_assets=eff_in_scope_assets,
+            out_of_scope_assets=eff_out_of_scope_assets,
+        )
     if tech_hints:
         eff_discovery_hints = agentic_seed.enrich_tech_discovery_hints(
             tech_hints,
@@ -506,6 +600,8 @@ def run_agentic_target(
                 alias=str(vault_storage_payload.get("alias") or "browser-user"),
                 role=str(vault_storage_payload.get("role") or "member"),
                 tenant=str(vault_storage_payload.get("tenant") or ""),
+                in_scope_assets=eff_in_scope_assets,
+                out_of_scope_assets=eff_out_of_scope_assets,
             )
         )
     for raw_spec in storage_states or ():
@@ -517,6 +613,8 @@ def run_agentic_target(
                 alias=s_alias,
                 role=s_role,
                 tenant=s_tenant,
+                in_scope_assets=eff_in_scope_assets,
+                out_of_scope_assets=eff_out_of_scope_assets,
             )
         )
 
@@ -593,6 +691,12 @@ def run_agentic_target(
         "max_pages": max(1, int(auto_crawl_max_pages)),
         "max_actions": max(0, int(auto_crawl_max_actions)),
     }
+    eff_prescan = bool(prescan)
+    eff_prescan_max_requests = max(1, int(prescan_max_requests))
+    prescan_cfg: dict[str, Any] = {
+        "enabled": eff_prescan,
+        "max_requests": eff_prescan_max_requests,
+    }
 
     eff_oob_bind = str(oob_bind_host or os.environ.get("CCO_OOB_BIND_HOST") or "").strip()
     eff_oob_adv = str(oob_advertise_host or os.environ.get("CCO_OOB_ADVERTISE_HOST") or "").strip()
@@ -640,7 +744,9 @@ def run_agentic_target(
             "request_headers": sorted(global_headers),
             "discovery_hints": eff_discovery_hints,
             "seed_surface": dict(seed_data.get("stats") or {}) if seed_data is not None else None,
+            "har_flows": dict(har_flows_doc.get("stats") or {}) if har_flows_doc is not None else None,
             "stage0_crawl": dict(stage0_cfg),
+            "prescan": dict(prescan_cfg),
             "oob_listener": dict(oob_summary),
             "auth": _build_auth_metadata(plan_actors, login_path_source=login_path_source),
             "ablation": ablation_cfg,
@@ -727,7 +833,9 @@ def run_agentic_target(
         "request_headers": sorted(global_headers),
         "discovery_hints": list(eff_discovery_hints),
         "seed_surface": dict(seed_data.get("stats") or {}) if seed_data is not None else None,
+        "har_flows": dict(har_flows_doc.get("stats") or {}) if har_flows_doc is not None else None,
         "stage0_crawl": dict(stage0_cfg),
+        "prescan": dict(prescan_cfg),
         "oob_listener": dict(oob_summary),
         "auth": _build_auth_metadata(actors, login_path_source=login_path_source),
         "ablation": ablation_cfg,
@@ -739,6 +847,11 @@ def run_agentic_target(
     if eff_config_path is not None:
         manifest["config_file"] = str(eff_config_path)
     manifest_path = output / "manifest.json"
+    if har_flows_doc is not None:
+        har_flows_path = output / "har-flows.json"
+        dump(har_flows_path, har_flows_doc)
+        if isinstance(manifest.get("har_flows"), dict):
+            manifest["har_flows"]["file"] = str(har_flows_path)
     dump(manifest_path, manifest)
 
     investigator: AgenticInvestigator | None = None
@@ -799,6 +912,37 @@ def run_agentic_target(
                     manifest["auth"] = _build_auth_metadata(actors, login_path_source=login_path_source)
                     dump(manifest_path, manifest)
 
+        prescan_handoff = ""
+        if eff_prescan and not resume:
+            try:
+                prescan_doc = agentic_prescan.run_deterministic_prescan(
+                    http_client,
+                    output_dir=output,
+                    seed_surface=seed_data,
+                    candidate_urls=eff_discovery_hints,
+                    max_requests=eff_prescan_max_requests,
+                )
+                prescan_stats = dict(prescan_doc.get("stats") or {})
+                manifest["prescan"] = {
+                    **prescan_cfg,
+                    **prescan_stats,
+                    "status": str(prescan_doc.get("status") or "ok"),
+                    "leads_count": len(prescan_doc.get("leads") or []),
+                    "waf_vendors_seen": list(prescan_doc.get("waf_vendors_seen") or []),
+                    "summary_file": str(prescan_doc.get("summary_file") or ""),
+                }
+                prescan_handoff = agentic_prescan.format_prescan_handoff(prescan_doc, max_chars=2400)
+                dump(manifest_path, manifest)
+            except ServiceDegradationError:
+                raise
+            except Exception as exc:
+                manifest["prescan"] = {
+                    **prescan_cfg,
+                    "status": "error",
+                    "error": type(exc).__name__,
+                }
+                dump(manifest_path, manifest)
+
         worker_model_id = models["worker"].split("/", 1)[1]
         investigator = AgenticInvestigator(
             http_client=http_client,
@@ -830,6 +974,8 @@ def run_agentic_target(
             oob_server=configured_oob,
             stage0_post_auth_enabled=eff_auto_crawl,
             stage0_allow_forms=eff_auto_crawl_forms,
+            prescan_handoff=prescan_handoff,
+            har_flows_handoff=har_flows_handoff,
         )
         run_info = investigator.run(resume=resume)
         manifest.update(run_info)
@@ -1089,6 +1235,25 @@ def main(argv: list[str] | None = None, *, force_plan_only: bool = False) -> int
         type=int,
         default=argparse.SUPPRESS,
         help="Maximum interactive UI actions during Stage 0 crawl (default: 24)",
+    )
+    parser.add_argument(
+        "--prescan",
+        action="store_true",
+        default=argparse.SUPPRESS,
+        help="Run deterministic 0-LLM-token prescan (secrets/CORS/redirect/GraphQL + 2-actor BOLA/BFLA matrix) before Turn 1",
+    )
+    parser.add_argument(
+        "--no-prescan",
+        action="store_false",
+        dest="prescan",
+        default=argparse.SUPPRESS,
+        help="Disable deterministic 0-LLM-token prescan (overrides preset/config)",
+    )
+    parser.add_argument(
+        "--prescan-max-requests",
+        type=int,
+        default=argparse.SUPPRESS,
+        help="Maximum HTTP requests budgeted for deterministic prescan (default: 24)",
     )
     parser.add_argument(
         "--oob-bind-host",

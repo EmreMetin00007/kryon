@@ -615,6 +615,8 @@ class AgenticInvestigator:
         enable_cross_shard_synthesis: bool = True,
         stage0_post_auth_enabled: bool = False,
         stage0_allow_forms: bool = False,
+        prescan_handoff: str = "",
+        har_flows_handoff: str = "",
     ):
         self.http = http_client
         self.receipts = receipt_store
@@ -666,6 +668,8 @@ class AgenticInvestigator:
         self.enable_cross_shard_synthesis = bool(enable_cross_shard_synthesis)
         self.stage0_post_auth_enabled = bool(stage0_post_auth_enabled)
         self.stage0_allow_forms = bool(stage0_allow_forms)
+        self.prescan_handoff = str(prescan_handoff or "").strip()[:3200]
+        self.har_flows_handoff = str(har_flows_handoff or "").strip()[:3200]
 
         use_telem = bool(enable_telemetry) if enable_telemetry is not None else (
             self.execution_mode == "ephemeral" or self.use_bsag
@@ -712,6 +716,13 @@ class AgenticInvestigator:
         self._epoch_turn_start: int = 0
         self._epoch_summary_text: str = ""
         self._epoch_advancements: int = 0
+
+    def _initial_priority_brief(self) -> str:
+        """Return optional bounded Turn-1 prescan/HAR workflow handoff block (zero secrets)."""
+        blocks = [b for b in (self.prescan_handoff, self.har_flows_handoff) if b]
+        if not blocks:
+            return ""
+        return "\n\n" + "\n\n".join(blocks) + "\n"
 
     @staticmethod
     def _close_dispatcher(dispatcher: Any) -> None:
@@ -2333,6 +2344,7 @@ class AgenticInvestigator:
                 "Start by discovering the surface using the initial discovery entry points, "
                 "inspecting extracted routes/forms/JS/OpenAPI schemas, and systematically testing "
                 "authentication, authorization, tenant isolation, and input validation. "
+                + self._initial_priority_brief()
                 + self._state_banner(1)
             )
             messages = [
@@ -2781,6 +2793,7 @@ class AgenticInvestigator:
                 "populate live multi-actor sessions, and discover concrete object IDs, query/form parameters, and "
                 "write endpoints. Do NOT attempt vulnerability claims or call `record_finding`; "
                 "call `finish` once surface discovery is solid so Stage 2 shards can perform deep verification."
+                + self._initial_priority_brief()
                 + self._state_banner(
                     1,
                     max_turns_override=boot_max_turns,
@@ -2796,6 +2809,7 @@ class AgenticInvestigator:
                 "Start by discovering the surface using the initial discovery entry points, "
                 "inspecting extracted routes/forms/JS/OpenAPI schemas, executing any sign-up/login flows, "
                 "and systematically testing authentication, authorization, tenant isolation, and input validation. "
+                + self._initial_priority_brief()
                 + self._state_banner(1, max_turns_override=boot_max_turns)
             )
             boot_excluded_tools = None
@@ -2906,10 +2920,14 @@ class AgenticInvestigator:
                                 "tenant": str(row.get("tenant") or "").strip().lower(),
                             }
                         excluded_paths = tuple(getattr(self.http, "excluded_paths", ()) or ())
+                        in_scope_assets = tuple(getattr(self.http, "in_scope_assets", ()) or ())
+                        out_of_scope_assets = tuple(getattr(self.http, "out_of_scope_assets", ()) or ())
                         merged_post_seed = merge_seed_surfaces(
                             [stage0_post_result],
                             base_url=self.http.base_url,
                             excluded_paths=excluded_paths,
+                            in_scope_assets=in_scope_assets,
+                            out_of_scope_assets=out_of_scope_assets,
                         )
                         if merged_post_seed is not None:
                             post_actor = new_auth_actors[0] if len(new_auth_actors) == 1 else "stage0-post-auth"

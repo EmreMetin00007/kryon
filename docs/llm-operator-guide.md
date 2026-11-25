@@ -92,7 +92,9 @@ cco-agent report ~/cco-work/target-run --format all
 
 Düşük seviyeli ayarlar (`--epoch-char-limit`, `--cache-token-weight`, `--shard-token-quota` vb.) preset tarafından yönetilir. Dış LLM'in neredeyse her zaman yalnızca şu bayraklara ihtiyacı vardır:
 
-- `--preset quick|standard|bounty-safe|deep`
+- `--preset quick|standard|bounty-safe|deep` (`standard`, `bounty-safe` ve `deep` deterministik 0-LLM `--prescan` ön taramasını otomatik açar)
+- `--prescan` / `--no-prescan` / `--prescan-max-requests <N>` (0-LLM-token CORS/redirect/GraphQL/secret + 2-aktörlü BOLA/BFLA ön matrisi)
+- `cco-agent recon --target <url> --output-dir <dir>` (kapsam içi pasif CT + AssetGraph keşfi; `--execute` olmadan 0 trafik planı)
 - `--config <run.json>` (`cco-run/1`)
 - `--target <url>`
 - `--output-dir <dir>`

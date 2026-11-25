@@ -31,6 +31,7 @@ PRESETS: dict[str, dict[str, Any]] = {
             "seconds_budget": 300,
             "auto_crawl": False,
             "auto_crawl_forms": False,
+            "prescan": False,
             "max_rps": 0.0,
             "max_degradation_streak": 5,
         },
@@ -50,6 +51,8 @@ PRESETS: dict[str, dict[str, Any]] = {
             "auto_crawl_forms": False,
             "auto_crawl_max_pages": 12,
             "auto_crawl_max_actions": 24,
+            "prescan": True,
+            "prescan_max_requests": 20,
             "max_rps": 0.0,
             "max_degradation_streak": 5,
         },
@@ -70,6 +73,8 @@ PRESETS: dict[str, dict[str, Any]] = {
             "auto_crawl_forms": False,
             "auto_crawl_max_pages": 8,
             "auto_crawl_max_actions": 16,
+            "prescan": True,
+            "prescan_max_requests": 16,
             "max_rps": 2.0,
             "max_degradation_streak": 3,
         },
@@ -89,6 +94,8 @@ PRESETS: dict[str, dict[str, Any]] = {
             "auto_crawl_forms": False,
             "auto_crawl_max_pages": 20,
             "auto_crawl_max_actions": 40,
+            "prescan": True,
+            "prescan_max_requests": 24,
             "max_rps": 0.0,
             "max_degradation_streak": 5,
         },
@@ -139,6 +146,7 @@ _INT_FIELDS: frozenset[str] = frozenset({
     "max_degradation_streak",
     "auto_crawl_max_pages",
     "auto_crawl_max_actions",
+    "prescan_max_requests",
 })
 _FLOAT_FIELDS: frozenset[str] = frozenset({
     "scout_token_share",
@@ -150,6 +158,7 @@ _BOOL_FIELDS: frozenset[str] = frozenset({
     "use_bsag",
     "auto_crawl",
     "auto_crawl_forms",
+    "prescan",
 })
 _STR_LIST_FIELDS: frozenset[str] = frozenset({
     "allowed_methods",

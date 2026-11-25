@@ -102,7 +102,10 @@ from agentic_http import (
     is_static_asset_url as is_static_asset_url,
 )
 from agentic_oob import LoopbackCallbackServer
-from agentic_waf import detect_waf_block as detect_waf_block
+from agentic_waf import (
+    WAFPivotTracker,
+    detect_waf_block as detect_waf_block,
+)
 from agentic_oracle import (
     check_bola_false_positive,
     find_persistent_render_get_receipt,
@@ -598,6 +601,7 @@ class ToolDispatcher:
             allowed_methods=sorted(self.http.allowed_methods),
             actor_summaries=self.http.actors.summaries(),
         )
+        self.waf_pivot = WAFPivotTracker()
         self.coverage_gate_enabled: bool = True
         self.discovery_finish_gate: bool = False
         self._auth_barrier_or_write_seen: bool = False
@@ -931,6 +935,12 @@ class ToolDispatcher:
         waf_info = detect_waf_block(receipt)
         if waf_info is not None:
             preview["waf_block"] = waf_info
+            self.waf_pivot.record_block(
+                str(waf_info.get("vendor") or "generic"),
+                str(receipt.get("path") or receipt.get("url") or "/"),
+            )
+            if self.waf_pivot.should_pivot():
+                preview["waf_pivot_guidance"] = self.waf_pivot.guidance()
         return wrap_untrusted(preview)
 
     def _tool_read_receipt(self, args: dict[str, Any]) -> str:
@@ -1045,6 +1055,12 @@ class ToolDispatcher:
         waf_info = detect_waf_block(current)
         if waf_info is not None:
             replay_preview["waf_block"] = waf_info
+            self.waf_pivot.record_block(
+                str(waf_info.get("vendor") or "generic"),
+                str(current.get("path") or current.get("url") or "/"),
+            )
+            if self.waf_pivot.should_pivot():
+                replay_preview["waf_pivot_guidance"] = self.waf_pivot.guidance()
         out = {
             "baseline_receipt_id": baseline["receipt_id"],
             "baseline_actor": baseline["actor"],
