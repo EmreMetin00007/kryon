@@ -94,7 +94,9 @@ Düşük seviyeli ayarlar (`--epoch-char-limit`, `--cache-token-weight`, `--shar
 
 - `--preset quick|standard|bounty-safe|deep` (`standard`, `bounty-safe` ve `deep` deterministik 0-LLM `--prescan` ön taramasını otomatik açar)
 - `--prescan` / `--no-prescan` / `--prescan-max-requests <N>` (0-LLM-token CORS/redirect/GraphQL/secret + 2-aktörlü BOLA/BFLA ön matrisi)
-- `cco-agent recon --target <url> --output-dir <dir>` (kapsam içi pasif CT + AssetGraph keşfi; `--execute` olmadan 0 trafik planı)
+- `cco-agent recon --target <url> --output-dir <dir>` → çıkan `asset-graph.json` dosyasını `--asset-graph <path>` ile doğrudan koşuya bağla
+- `cco-agent save-auth --program <ad> --login-url <url> --manual --record-har ~/cco-work/traffic.har` (tek seferde hem çoklu-origin `storage_state` hem HAR kaydı)
+- `--refresh-path <path>` (koşu ortası `401` oturum/JWT otomatik yenileme ucu)
 - `--config <run.json>` (`cco-run/1`)
 - `--target <url>`
 - `--output-dir <dir>`

@@ -6,6 +6,7 @@ exceptions or return summaries.
 """
 from __future__ import annotations
 
+from collections import deque
 import errno
 import ipaddress
 import json
@@ -69,6 +70,54 @@ _COOKIE_CSRF_PRIORITY: tuple[str, ...] = (
     "xsrf_token",
     "_csrf",
 )
+
+_REFRESH_TOKEN_KEY_PRIORITY: tuple[str, ...] = (
+    "refresh_token",
+    "refreshtoken",
+    "refresh-token",
+)
+_REFRESH_TOKEN_KEY_RANK: dict[str, int] = {
+    key: idx for idx, key in enumerate(_REFRESH_TOKEN_KEY_PRIORITY)
+}
+
+
+def _extract_refresh_token_from_json(raw_value: Any) -> tuple[int, int, str] | None:
+    """Safely extract (depth, key_rank, refresh_token) from a JSON-encoded object without echoing secrets."""
+    if not isinstance(raw_value, str):
+        return None
+    stripped = raw_value.strip()
+    if not stripped.startswith("{"):
+        return None
+    parsed: Any = None
+    try:
+        parsed = json.loads(stripped)
+    except ValueError:
+        parsed = None
+    if not isinstance(parsed, dict):
+        return None
+
+    best: tuple[int, int, str] | None = None
+    queue: deque[tuple[dict[str, Any], int]] = deque([(parsed, 0)])
+    visited = 0
+    while queue and visited < 32:
+        obj, depth = queue.popleft()
+        visited += 1
+        for k, v in obj.items():
+            if not isinstance(k, str):
+                continue
+            k_low = k.strip().lower()
+            rank = _REFRESH_TOKEN_KEY_RANK.get(k_low)
+            if rank is None:
+                rank = _REFRESH_TOKEN_KEY_RANK.get(k_low.replace("-", "_"))
+            if rank is not None and isinstance(v, str):
+                cand = _clean_secret_value(v)
+                if cand and not cand.startswith("<REDACTED"):
+                    cand_score = (depth, rank, cand)
+                    if best is None or (cand_score[0], cand_score[1]) < (best[0], best[1]):
+                        best = cand_score
+            elif isinstance(v, dict) and depth < 3:
+                queue.append((v, depth + 1))
+    return best
 
 
 def _has_control_chars(value: str) -> bool:
@@ -429,6 +478,7 @@ def load_storage_state_actor(
     alias: str = _DEFAULT_ALIAS,
     role: str = _DEFAULT_ROLE,
     tenant: str = "",
+    refresh_path: str = "",
     now: float | None = None,
     in_scope_assets: Sequence[str] = (),
     out_of_scope_assets: Sequence[str] = (),
@@ -437,6 +487,9 @@ def load_storage_state_actor(
     clean_alias = _validate_alias(alias)
     clean_role = str(role or _DEFAULT_ROLE).strip() or _DEFAULT_ROLE
     clean_tenant = str(tenant or "").strip()
+    clean_refresh_path = str(refresh_path or "").strip()
+    if _has_control_chars(clean_refresh_path):
+        raise ValueError("refresh_path must not contain control characters")
     target_scheme, target_host, target_port = _parse_origin_tuple(base_url, label="base_url")
     clean_in_scope = tuple(str(a).strip() for a in (in_scope_assets or ()) if str(a or "").strip())
     clean_out_of_scope = tuple(str(a).strip() for a in (out_of_scope_assets or ()) if str(a or "").strip())
@@ -508,9 +561,11 @@ def load_storage_state_actor(
     for _, name, value in cookie_candidates:
         cookies_dict[name] = value
 
-    # 2. Extract bearer & CSRF tokens and preserve authorized-origin localStorage entries.
+    # 2. Extract bearer, refresh & CSRF tokens and preserve authorized-origin localStorage entries.
     best_token_rank: int | None = None
     access_token_str = ""
+    best_refresh_rank: tuple[int, int, int, int] | None = None
+    refresh_token_str = ""
     best_csrf_rank: int | None = None
     csrf_token_str = ""
     local_storage_dict: dict[str, str] = {}
@@ -543,6 +598,7 @@ def load_storage_state_actor(
     # Process base_origin entries first so base_origin wins on equal-rank tokens & key collisions.
     scoped_origin_entries.sort(key=lambda item: 0 if item[0] else 1)
     for is_base_origin, local_storage in scoped_origin_entries:
+        origin_tier = 0 if is_base_origin else 1
         for item in local_storage:
             if not isinstance(item, dict):
                 continue
@@ -580,6 +636,32 @@ def load_storage_state_actor(
                     best_token_rank = token_rank
                     access_token_str = candidate
 
+            refresh_rank = _REFRESH_TOKEN_KEY_RANK.get(key_lower)
+            if refresh_rank is None:
+                refresh_rank = _REFRESH_TOKEN_KEY_RANK.get(key_lower.replace("-", "_"))
+            if refresh_rank is not None:
+                ref_cand = _clean_secret_value(raw_val)
+                if ref_cand and not ref_cand.startswith("<REDACTED"):
+                    if ref_cand.startswith("{"):
+                        nested_ref = _extract_refresh_token_from_json(ref_cand)
+                        if nested_ref is not None:
+                            score = (origin_tier, 0, nested_ref[0], nested_ref[1])
+                            if best_refresh_rank is None or score < best_refresh_rank:
+                                best_refresh_rank = score
+                                refresh_token_str = nested_ref[2]
+                    else:
+                        score = (origin_tier, 0, 0, refresh_rank)
+                        if best_refresh_rank is None or score < best_refresh_rank:
+                            best_refresh_rank = score
+                            refresh_token_str = ref_cand
+            else:
+                nested_ref = _extract_refresh_token_from_json(raw_val)
+                if nested_ref is not None:
+                    score = (origin_tier, 1, nested_ref[0], nested_ref[1])
+                    if best_refresh_rank is None or score < best_refresh_rank:
+                        best_refresh_rank = score
+                        refresh_token_str = nested_ref[2]
+
             csrf_rank = _LOCALSTORAGE_CSRF_RANK.get(key_lower)
             if csrf_rank is not None:
                 csrf_candidate = _clean_secret_value(raw_val)
@@ -603,7 +685,7 @@ def load_storage_state_actor(
     if auth_header_str:
         extra_headers["Authorization"] = auth_header_str
 
-    return {
+    account: dict[str, Any] = {
         "alias": clean_alias,
         "role": clean_role,
         "tenant": clean_tenant,
@@ -616,6 +698,11 @@ def load_storage_state_actor(
         "authenticated": bool(cookies_dict or auth_header_str),
         "source": "storage_state",
     }
+    if refresh_token_str:
+        account["refresh_token"] = refresh_token_str
+    if clean_refresh_path:
+        account["refresh_path"] = clean_refresh_path
+    return account
 
 
 def save_storage_state_to_vault(
@@ -670,6 +757,7 @@ def load_storage_state_actor_from_vault(
     alias: str = "",
     role: str = "",
     tenant: str = "",
+    refresh_path: str = "",
     now: float | None = None,
     in_scope_assets: Sequence[str] = (),
     out_of_scope_assets: Sequence[str] = (),
@@ -685,6 +773,7 @@ def load_storage_state_actor_from_vault(
     eff_alias = str(alias or "").strip() or str(payload.get("alias") or "").strip() or _DEFAULT_ALIAS
     eff_role = str(role or "").strip() or str(payload.get("role") or "").strip() or _DEFAULT_ROLE
     eff_tenant = str(tenant or "").strip() or str(payload.get("tenant") or "").strip()
+    eff_refresh_path = str(refresh_path or "").strip() or str(payload.get("refresh_path") or "").strip()
 
     return load_storage_state_actor(
         payload["storage_state"],
@@ -692,6 +781,7 @@ def load_storage_state_actor_from_vault(
         alias=eff_alias,
         role=eff_role,
         tenant=eff_tenant,
+        refresh_path=eff_refresh_path,
         now=now,
         in_scope_assets=in_scope_assets,
         out_of_scope_assets=out_of_scope_assets,

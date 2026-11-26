@@ -79,6 +79,7 @@ files = [
   "scripts/agentic_context.py",
   "scripts/agentic_crypto.py",
   "scripts/agentic_evidence.py",
+  "scripts/agentic_graphql.py",
   "scripts/agentic_har_flow.py",
   "scripts/agentic_http.py",
   "scripts/agentic_investigator.py",

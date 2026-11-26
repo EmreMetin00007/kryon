@@ -239,7 +239,60 @@ def test_investigator_initial_priority_brief_combines_prescan_and_har_handoffs(
         root_dir=tmp_path,
         prescan_handoff="[PRESCAN LEADS] high bola_candidate /api/orders/1",
         har_flows_handoff="HAR Multi-Step Flows: flow_1 POST /api/cart -> POST /api/checkout",
+        asset_graph_handoff="[ASSET GRAPH] http://127.0.0.1:18080 | in_scope=2 api_hosts=1",
     )
     brief = inv._initial_priority_brief()
+    assert "[ASSET GRAPH]" in brief
     assert "[PRESCAN LEADS]" in brief
     assert "HAR Multi-Step Flows" in brief
+
+
+def test_runner_asset_graph_and_cli_status_wire_pipeline_metrics(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    graph_path = tmp_path / "asset-graph.json"
+    graph_path.write_text(
+        json.dumps({
+            "schema": "cco-asset-graph/1",
+            "target": "http://127.0.0.1:18080/",
+            "nodes": [
+                {
+                    "origin": "http://127.0.0.1:18080",
+                    "host": "127.0.0.1",
+                    "scheme": "http",
+                    "port": 18080,
+                    "role": "api",
+                    "alive": True,
+                    "status": 200,
+                    "sample_paths": ["/api/v1/orders", "/graphql"],
+                }
+            ],
+            "edges": [],
+        }),
+        encoding="utf-8",
+    )
+    out_dir = tmp_path / "graph-plan"
+    rc = agent_cli.main([
+        "plan",
+        "--preset", "bounty-safe",
+        "--target", "http://127.0.0.1:18080/",
+        "--provider-config", str(REPO_ROOT / "config" / "llm.example.json"),
+        "--asset-graph", str(graph_path),
+        "--refresh-path", "/api/v1/auth/refresh",
+        "--output-dir", str(out_dir),
+    ])
+    assert rc == 0
+    _ = capsys.readouterr()
+
+    plan = json.loads((out_dir / "agentic-plan.json").read_text(encoding="utf-8"))
+    assert plan["asset_graph"]["in_scope_hosts_count"] == 1
+    assert "/api/v1/orders" in plan["discovery_hints"]
+    assert "/graphql" in plan["discovery_hints"]
+
+    rc_status = agent_cli.main(["status", str(out_dir)])
+    assert rc_status == 0
+    status_doc = json.loads(capsys.readouterr().out)
+    assert status_doc["asset_graph"]["in_scope_hosts_count"] == 1
+    assert status_doc["prescan"]["enabled"] is True
+

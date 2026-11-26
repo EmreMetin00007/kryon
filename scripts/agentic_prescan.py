@@ -1204,6 +1204,29 @@ def probe_graphql_leads(
 
         if _is_graphql_introspection_200(rec):
             rid = str(rec.get("receipt_id") or "")
+            schema_extra: dict[str, Any] = {}
+            next_step = (
+                f"Read {rid} to map GraphQL types/mutations and test queries/mutations "
+                "for BOLA/BFLA/injection."
+            )
+            try:
+                import agentic_graphql  # type: ignore[import-not-found]
+
+                parsed_body = json.loads(str(rec.get("body") or ""))
+                if isinstance(parsed_body, dict):
+                    parsed_schema = agentic_graphql.parse_introspection_schema(parsed_body)
+                    gql_stats = parsed_schema.get("stats") or {}
+                    if int(gql_stats.get("queries_count") or 0) > 0 or int(gql_stats.get("mutations_count") or 0) > 0:
+                        schema_extra["graphql_schema_stats"] = dict(gql_stats)
+                        handoff_note = agentic_graphql.format_graphql_schema_handoff(
+                            parsed_schema,
+                            endpoint=str(rec.get("path") or gql_url),
+                            max_chars=400,
+                        )
+                        if handoff_note:
+                            next_step = f"{next_step} {handoff_note}"
+            except Exception:
+                pass
             leads.append(
                 _make_lead(
                     kind="graphql_introspection",
@@ -1218,10 +1241,8 @@ def probe_graphql_leads(
                         f"GraphQL introspection enabled at {rec.get('url') or gql_url} "
                         f"via {method} ({rid})."
                     ),
-                    next_step=(
-                        f"Read {rid} to map GraphQL types/mutations and test queries/mutations "
-                        "for BOLA/BFLA/injection."
-                    ),
+                    next_step=next_step,
+                    **schema_extra,
                 )
             )
 

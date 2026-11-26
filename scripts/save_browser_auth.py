@@ -121,15 +121,31 @@ def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--program", required=True)
     ap.add_argument("--login-url", required=True)
-    ap.add_argument("--user-selector", required=True)
-    ap.add_argument("--pass-selector", required=True)
-    ap.add_argument("--submit-selector", required=True)
+    ap.add_argument("--user-selector", default="")
+    ap.add_argument("--pass-selector", default="")
+    ap.add_argument("--submit-selector", default="")
     ap.add_argument("--otp-selector", default="")
     ap.add_argument("--otp-sender", default="")
     ap.add_argument("--otp-retries", type=int, default=4)
     ap.add_argument("--otp-wait", type=int, default=15)
     ap.add_argument("--login-file", default="")
     ap.add_argument("--storage", default="")
+    ap.add_argument(
+        "--record-har",
+        default="",
+        help="Optional HAR output path captured during the auth/browse context (saved with 0600 permissions)",
+    )
+    ap.add_argument(
+        "--manual",
+        action="store_true",
+        help="Open headed browser for interactive login/browsing without login-file or selectors",
+    )
+    ap.add_argument(
+        "--browse-seconds",
+        type=int,
+        default=0,
+        help="Extra seconds to wait after login (non-manual) to enrich recorded HAR in headed mode",
+    )
     ap.add_argument(
         "-H",
         "--header",
@@ -145,19 +161,42 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--timeout", type=int, default=30000)
     a = ap.parse_args(argv)
 
-    login_file = Path(a.login_file or AUTH_DIR / f"{a.program}-login.json").expanduser()
+    if not a.manual:
+        missing = [
+            flag
+            for flag, val in (
+                ("--user-selector", a.user_selector),
+                ("--pass-selector", a.pass_selector),
+                ("--submit-selector", a.submit_selector),
+            )
+            if not str(val or "").strip()
+        ]
+        if missing:
+            ap.error(f"the following arguments are required unless --manual is set: {', '.join(missing)}")
+    if a.browse_seconds < 0:
+        ap.error("--browse-seconds must be >= 0")
+
     storage = Path(a.storage or AUTH_DIR / f"{a.program}-storage.json").expanduser()
-    creds = _load_login(login_file)
+    har_raw = str(a.record_har or "").strip()
+    har_path = Path(har_raw).expanduser() if har_raw else None
+    creds: dict = {}
+    if not a.manual:
+        login_file = Path(a.login_file or AUTH_DIR / f"{a.program}-login.json").expanduser()
+        creds = _load_login(login_file)
     eff_user_agent, extra_http_headers = _build_context_headers(a.custom_headers)
     if a.custom_headers:
         header_names = sorted(parse_custom_headers(a.custom_headers))
         print(f"[auth] ozel basliklar aktif: {', '.join(header_names)}", flush=True)
     AUTH_DIR.mkdir(parents=True, exist_ok=True)
+    if har_path is not None:
+        har_path.parent.mkdir(parents=True, exist_ok=True)
+
+    eff_headed = bool(a.headed or a.manual)
 
     from playwright.sync_api import sync_playwright
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=not a.headed, args=["--no-sandbox"])
+        browser = p.chromium.launch(headless=not eff_headed, args=["--no-sandbox"])
         context_kwargs: dict = {
             "viewport": {"width": 1366, "height": 800},
             "locale": "tr-TR",
@@ -168,51 +207,67 @@ def main(argv: list[str] | None = None) -> int:
         }
         if extra_http_headers:
             context_kwargs["extra_http_headers"] = extra_http_headers
+        if har_path is not None:
+            context_kwargs["record_har_path"] = str(har_path)
+            context_kwargs["record_har_mode"] = "minimal"
+            context_kwargs["record_har_content"] = "embed"
         ctx = browser.new_context(**context_kwargs)
         page = ctx.new_page()
         page.set_default_timeout(a.timeout)
         print(f"[auth] login sayfasi aciliyor: {a.login_url}", flush=True)
         resp = page.goto(a.login_url, wait_until="domcontentloaded")
         page.wait_for_timeout(2000)
-        if (resp and resp.status == 403) or "güvenlik" in page.title().lower():
-            browser.close()
-            print("[auth] HATA: WAF headless'i yakaladi (403/Güvenlik). "
-                  "--headed ile tekrar dene.", flush=True)
-            return 3
-        page.fill(a.user_selector, creds["username"])
-        page.fill(a.pass_selector, creds["password"])
-        print("[auth] kullanici/sifre dolduruldu, gonderiliyor", flush=True)
-        page.click(a.submit_selector)
-        page.wait_for_timeout(4000)
-
-        otp_sel = _find_otp_field(page, a.otp_selector)
-        if otp_sel:
-            print(f"[auth] OTP alani bulundu ({otp_sel}), kod bekleniyor", flush=True)
-            code = None
-            for i in range(max(1, a.otp_retries)):
-                try:
-                    res = fetch_latest_otp(sender=a.otp_sender, max_age_minutes=5)
-                    code, age = res["code"], res["age_seconds"]
-                    print(f"[auth] OTP kodu alindi (yas: {age}sn)", flush=True)
-                    break
-                except OtpError as e:
-                    print(f"[auth] OTP deneme {i + 1}/{a.otp_retries}: {e}", flush=True)
-                    time.sleep(a.otp_wait)
-            if not code:
-                browser.close()
-                print("[auth] HATA: OTP kodu alinamadi", flush=True)
-                return 2
-            page.fill(otp_sel, code)
-            page.wait_for_timeout(1000)
+        if a.manual:
             try:
-                page.click(a.submit_selector, timeout=5000)
-            except Exception:
-                page.keyboard.press("Enter")
-            page.wait_for_timeout(4000)
+                input("[auth] Tarayicida giris yapip akislari gezdikten sonra Enter'a basin...")
+            except EOFError:
+                pass
         else:
-            print("[auth] OTP alani gorunmedi, direkt login varsayiliyor", flush=True)
+            if (resp and resp.status == 403) or "güvenlik" in page.title().lower():
+                browser.close()
+                print("[auth] HATA: WAF headless'i yakaladi (403/Güvenlik). "
+                      "--headed ile tekrar dene.", flush=True)
+                return 3
+            page.fill(a.user_selector, creds["username"])
+            page.fill(a.pass_selector, creds["password"])
+            print("[auth] kullanici/sifre dolduruldu, gonderiliyor", flush=True)
+            page.click(a.submit_selector)
+            page.wait_for_timeout(4000)
 
-        page.wait_for_timeout(3000)
+            otp_sel = _find_otp_field(page, a.otp_selector)
+            if otp_sel:
+                print(f"[auth] OTP alani bulundu ({otp_sel}), kod bekleniyor", flush=True)
+                code = None
+                for i in range(max(1, a.otp_retries)):
+                    try:
+                        res = fetch_latest_otp(sender=a.otp_sender, max_age_minutes=5)
+                        code, age = res["code"], res["age_seconds"]
+                        print(f"[auth] OTP kodu alindi (yas: {age}sn)", flush=True)
+                        break
+                    except OtpError as e:
+                        print(f"[auth] OTP deneme {i + 1}/{a.otp_retries}: {e}", flush=True)
+                        time.sleep(a.otp_wait)
+                if not code:
+                    browser.close()
+                    print("[auth] HATA: OTP kodu alinamadi", flush=True)
+                    return 2
+                page.fill(otp_sel, code)
+                page.wait_for_timeout(1000)
+                try:
+                    page.click(a.submit_selector, timeout=5000)
+                except Exception:
+                    page.keyboard.press("Enter")
+                page.wait_for_timeout(4000)
+            else:
+                print("[auth] OTP alani gorunmedi, direkt login varsayiliyor", flush=True)
+
+            page.wait_for_timeout(3000)
+            if a.browse_seconds > 0:
+                print(
+                    f"[auth] HAR zenginlestirme icin {a.browse_seconds}sn bekleniyor...",
+                    flush=True,
+                )
+                page.wait_for_timeout(a.browse_seconds * 1000)
         storage.parent.mkdir(parents=True, exist_ok=True)
         ctx.storage_state(path=str(storage))
         try:
@@ -223,6 +278,16 @@ def main(argv: list[str] | None = None) -> int:
         print(f"[auth] storage kaydedildi: {storage} ({len(cookies)} cookie)", flush=True)
         print(f"[auth] son URL: {page.url[:120]} | baslik: {page.title()[:80]}", flush=True)
         ctx.close()
+        if har_path is not None:
+            try:
+                har_path.chmod(0o600)
+            except OSError:
+                pass
+            try:
+                har_size = har_path.stat().st_size
+            except OSError:
+                har_size = 0
+            print(f"[auth] HAR kaydedildi: {har_path} ({har_size} byte)", flush=True)
         browser.close()
     return 0
 

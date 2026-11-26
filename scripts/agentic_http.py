@@ -312,6 +312,28 @@ def _validate_auth_header_name(raw: Any, *, strict: bool = False) -> str:
     return clean
 
 
+def _parse_set_cookie_header(raw_header: str) -> dict[str, str]:
+    """Best-effort parser for comma-joined Set-Cookie response headers."""
+    cookies: dict[str, str] = {}
+    if not raw_header or raw_header.startswith("<REDACTED"):
+        return cookies
+    for part in raw_header.split(","):
+        nv = part.strip().split(";", 1)[0]
+        if "=" in nv:
+            ck, cv = nv.split("=", 1)
+            ck_clean = ck.strip()
+            cv_clean = cv.strip()
+            if (
+                ck_clean
+                and cv_clean
+                and not cv_clean.startswith("<REDACTED")
+                and ck_clean.lower()
+                not in {"path", "expires", "max-age", "domain", "samesite", "secure", "httponly"}
+            ):
+                cookies[ck_clean] = cv_clean
+    return cookies
+
+
 def _redact_extra_sensitive_headers(
     headers: dict[str, str],
     extra_names: AbstractSet[str] = frozenset(),
@@ -414,6 +436,16 @@ class ActorSession:
     last_auth_path: str = ""
     last_auth_error: str = ""
     _lock: threading.RLock = field(default_factory=threading.RLock, init=False, repr=False, compare=False)
+    _registered_secrets: list[str] = field(default_factory=list, init=False, repr=False, compare=False)
+
+    def register_secret(self, value: str) -> None:
+        """Retain a secret value (e.g. retired or rotated token) for receipt redaction."""
+        raw = str(value or "")
+        if len(raw) < 4 or raw.startswith("<REDACTED"):
+            return
+        with self._lock:
+            if raw not in self._registered_secrets and len(self._registered_secrets) < 256:
+                self._registered_secrets.append(raw)
 
     def collect_secrets(self) -> list[str]:
         with self._lock:
@@ -448,6 +480,9 @@ class ActorSession:
                     secrets.append(val)
             for val in self.local_storage.values():
                 if val and len(val) >= 4:
+                    secrets.append(val)
+            for val in self._registered_secrets:
+                if val and len(val) >= 4 and val not in secrets:
                     secrets.append(val)
             return secrets
 
@@ -732,6 +767,7 @@ class ActorManager:
         self._lock = threading.Lock()
         self._discovered_auth_header: str = ""
         self._discovered_auth_prefix: str = ""
+        self._registered_secrets: list[str] = []
         clean_global_headers = normalize_global_headers(global_headers)
         self._global_headers: dict[str, str] = dict(clean_global_headers)
         self.actors: dict[str, ActorSession] = {
@@ -924,12 +960,37 @@ class ActorManager:
                     out.append(alias)
         return sorted(out)
 
+    def register_secrets(self, secrets: Sequence[str], *, alias: str = "") -> None:
+        """Register rotated or retired secret values so receipt redaction always covers them."""
+        clean_items = [
+            str(s)
+            for s in (secrets or ())
+            if isinstance(s, str) and len(s) >= 4 and not s.startswith("<REDACTED")
+        ]
+        if not clean_items:
+            return
+        target_session: ActorSession | None = None
+        with self._lock:
+            if alias:
+                target_session = self.actors.get(str(alias).strip())
+            if target_session is None:
+                for item in clean_items:
+                    if item not in self._registered_secrets and len(self._registered_secrets) < 512:
+                        self._registered_secrets.append(item)
+        if target_session is not None:
+            for item in clean_items:
+                target_session.register_secret(item)
+
     def all_secrets(self) -> list[str]:
         with self._lock:
             sessions = list(self.actors.values())
+            extra = list(self._registered_secrets)
         secrets: list[str] = []
         for session in sessions:
             secrets.extend(session.collect_secrets())
+        for item in extra:
+            if item not in secrets:
+                secrets.append(item)
         return secrets
 
     def register_dynamic_session(
@@ -1045,15 +1106,20 @@ class ActorManager:
             with session._lock:
                 session.source_receipt_id = str(receipt_id or "")
 
-    def update_from_response(
+    def _apply_session_material(
         self,
         alias: str,
         *,
-        headers: dict[str, str],
-        cookies: dict[str, str],
-        body_text: str,
+        cap_cookies: dict[str, str],
+        cap_bearer: str,
+        cap_refresh: str,
+        cap_csrf: str,
+        cap_csrf_header: str,
+        cap_csrf_field: str,
+        cap_auth_header: str,
+        cap_token_source: str,
     ) -> None:
-        """Capture rotated CSRF tokens, refreshed tokens, and session cookies."""
+        """Apply extracted session tokens/cookies onto an actor session and retain secrets for redaction."""
         if alias == "anon":
             return
         with self._lock:
@@ -1062,38 +1128,43 @@ class ActorManager:
             disc_pfx = self._discovered_auth_prefix
         if session is None:
             return
-        (
-            cap_cookies,
-            cap_bearer,
-            cap_refresh,
-            cap_csrf,
-            cap_csrf_header,
-            cap_csrf_field,
-            cap_auth_header,
-            cap_token_source,
-        ) = _extract_session_material_full(
-            headers=headers,
-            cookies=cookies,
-            body_text=body_text,
-        )
+        rotated_secrets: list[str] = []
         with session._lock:
             if cap_cookies:
                 for cookie_hdr_key in [k for k in session.base_headers if k.lower() == "cookie"]:
                     raw_cookie_hdr = str(session.base_headers.pop(cookie_hdr_key, "") or "")
+                    if raw_cookie_hdr:
+                        session.register_secret(raw_cookie_hdr)
                     for part in raw_cookie_hdr.split(";"):
                         if "=" in part:
                             ck, cv = part.split("=", 1)
                             if ck.strip() and cv.strip():
                                 session.cookies.setdefault(ck.strip(), cv.strip())
+                                session.register_secret(cv.strip())
                 for k, v in cap_cookies.items():
+                    prev_cookie = session.cookies.get(k, "")
+                    if prev_cookie and prev_cookie != v:
+                        session.register_secret(prev_cookie)
                     session.cookies[k] = v
+                    rotated_secrets.append(v)
             if cap_csrf:
+                if session.csrf_token and session.csrf_token != cap_csrf:
+                    session.register_secret(session.csrf_token)
+                    session.register_secret(quote_plus(session.csrf_token))
+                    session.register_secret(quote(session.csrf_token, safe=""))
                 session.csrf_token = cap_csrf
+                rotated_secrets.append(cap_csrf)
+                rotated_secrets.append(quote_plus(cap_csrf))
+                rotated_secrets.append(quote(cap_csrf, safe=""))
             if cap_csrf_header:
                 session.csrf_header_name = cap_csrf_header
             if cap_csrf_field:
                 session.csrf_field_name = cap_csrf_field
             if cap_bearer:
+                if session.access_token and session.access_token != cap_bearer:
+                    session.register_secret(session.access_token)
+                    if session.auth_header_prefix:
+                        session.register_secret(f"{session.auth_header_prefix}{session.access_token}")
                 if cap_auth_header:
                     session.auth_header_name = cap_auth_header
                     session.auth_header_prefix = ""
@@ -1110,16 +1181,66 @@ class ActorManager:
                     session.auth_header_name = disc_hdr
                     session.auth_header_prefix = disc_pfx
                 session.access_token = cap_bearer
+                rotated_secrets.append(cap_bearer)
+                if session.auth_header_prefix:
+                    rotated_secrets.append(f"{session.auth_header_prefix}{cap_bearer}")
                 target_hdr_low = (
                     session.auth_header_name.strip().lower()
                     if session.auth_header_name.strip()
                     else "authorization"
                 )
                 for auth_key in [k for k in session.base_headers if k.lower() in {"authorization", target_hdr_low}]:
-                    session.base_headers.pop(auth_key, None)
+                    popped_auth = str(session.base_headers.pop(auth_key, "") or "")
+                    if popped_auth:
+                        session.register_secret(popped_auth)
+                        extracted_prev = _extract_token_from_auth(popped_auth)
+                        if extracted_prev:
+                            session.register_secret(extracted_prev)
                 session.authenticated = True
             if cap_refresh:
+                if session.refresh_token and session.refresh_token != cap_refresh:
+                    session.register_secret(session.refresh_token)
                 session.refresh_token = cap_refresh
+                rotated_secrets.append(cap_refresh)
+        if rotated_secrets:
+            self.register_secrets(rotated_secrets, alias=alias)
+
+    def update_from_response(
+        self,
+        alias: str,
+        *,
+        headers: dict[str, str],
+        cookies: dict[str, str],
+        body_text: str,
+    ) -> None:
+        """Capture rotated CSRF tokens, refreshed tokens, and session cookies."""
+        if alias == "anon":
+            return
+        (
+            cap_cookies,
+            cap_bearer,
+            cap_refresh,
+            cap_csrf,
+            cap_csrf_header,
+            cap_csrf_field,
+            cap_auth_header,
+            cap_token_source,
+        ) = _extract_session_material_full(
+            headers=headers,
+            cookies=cookies,
+            body_text=body_text,
+        )
+        self._apply_session_material(
+            alias,
+            cap_cookies=cap_cookies,
+            cap_bearer=cap_bearer,
+            cap_refresh=cap_refresh,
+            cap_csrf=cap_csrf,
+            cap_csrf_header=cap_csrf_header,
+            cap_csrf_field=cap_csrf_field,
+            cap_auth_header=cap_auth_header,
+            cap_token_source=cap_token_source,
+        )
 
     def get_browser_auth_state(self, actor_alias: str) -> dict[str, Any]:
         """Return host-side cookies, auth headers, and local_storage for browser contexts (never expose to LLM)."""
@@ -1854,12 +1975,7 @@ class AgenticHTTPClient:
                     text = raw_bytes.decode("utf-8", errors="replace")
                 cookies = {c.name: c.value for c in resp.cookies}
                 if not cookies and "Set-Cookie" in resp_headers:
-                    for part in resp_headers["Set-Cookie"].split(","):
-                        nv = part.strip().split(";", 1)[0]
-                        if "=" in nv:
-                            ck, cv = nv.split("=", 1)
-                            if ck.strip() and cv.strip() and ck.strip().lower() not in {"path", "expires", "max-age", "domain", "samesite"}:
-                                cookies[ck.strip()] = cv.strip()
+                    cookies = _parse_set_cookie_header(resp_headers["Set-Cookie"])
                 if out_cookies is not None and cookies:
                     out_cookies.update(cookies)
                 http_session.cookies.clear()
@@ -1932,6 +2048,8 @@ class AgenticHTTPClient:
             finally:
                 http_session.cookies.clear()
                 resp.close()
+        except (BudgetExhaustedError, ServiceDegradationError):
+            raise
         except Exception as exc:
             error = f"{type(exc).__name__}: {str(exc)[:200]}"
         finally:
@@ -2502,19 +2620,30 @@ class AgenticHTTPClient:
                     was_authenticated = bool(session.authenticated)
                     refresh_tok = session.refresh_token
                     actor_refresh_path = session.refresh_path
+                    has_cookies = bool(session.cookies) or any(
+                        k.lower() == "cookie" and str(v).strip()
+                        for k, v in session.base_headers.items()
+                    )
                     has_password = bool(session.password)
                 if not was_authenticated:
                     return False
 
                 attempted_step1_refresh = False
-                if refresh_tok and actor_refresh_path:
+                eff_refresh_path = actor_refresh_path or self.actors.refresh_path
+                can_cookie_refresh = bool(actor_refresh_path) and has_cookies
+                if eff_refresh_path and (refresh_tok or can_cookie_refresh):
                     attempted_step1_refresh = True
                     try:
                         r_url, r_path, r_query = self.resolve_in_scope(
-                            actor_refresh_path,
+                            eff_refresh_path,
                             allow_websocket=False,
                         )
-                        r_body = json.dumps({"refresh_token": refresh_tok}).encode("utf-8")
+                        if refresh_tok:
+                            r_body = json.dumps({"refresh_token": refresh_tok}).encode("utf-8")
+                            r_body_preview = '{"refresh_token":"<REDACTED>"}'
+                        else:
+                            r_body = b"{}"
+                            r_body_preview = "{}"
                         r_headers = session.build_headers("POST", {"Content-Type": "application/json"})
                         r_receipt = self._send_wire(
                             actor=alias,
@@ -2524,15 +2653,61 @@ class AgenticHTTPClient:
                             query=r_query,
                             headers=r_headers,
                             body_bytes=r_body,
-                            body_preview='{"refresh_token":"<REDACTED>"}',
+                            body_preview=r_body_preview,
                             record_receipt=False,
                         )
-                        if 200 <= int(r_receipt["status"]) < 300:
+                        r_status = int(r_receipt["status"])
+                        if 200 <= r_status < 300:
+                            raw_hdrs = r_receipt.get("response_headers")
+                            r_resp_hdrs = (
+                                {str(k): str(v) for k, v in raw_hdrs.items()}
+                                if isinstance(raw_hdrs, dict)
+                                else {}
+                            )
+                            raw_cookies = r_receipt.get("cookies")
+                            r_resp_cookies = (
+                                {str(k): str(v) for k, v in raw_cookies.items() if k and v is not None}
+                                if isinstance(raw_cookies, dict)
+                                else {}
+                            )
+                            if not r_resp_cookies:
+                                for hk, hv in r_resp_hdrs.items():
+                                    if hk.strip().lower() == "set-cookie":
+                                        r_resp_cookies.update(_parse_set_cookie_header(hv))
+                            r_resp_body = str(r_receipt.get("body") or "")
+                            if r_resp_hdrs or r_resp_cookies or r_resp_body:
+                                (
+                                    cap_cookies,
+                                    cap_bearer,
+                                    cap_refresh,
+                                    cap_csrf,
+                                    cap_csrf_header,
+                                    cap_csrf_field,
+                                    cap_auth_header,
+                                    cap_token_source,
+                                ) = _extract_session_material_full(
+                                    headers=r_resp_hdrs,
+                                    cookies=r_resp_cookies,
+                                    body_text=r_resp_body,
+                                )
+                                self.actors._apply_session_material(
+                                    alias,
+                                    cap_cookies=cap_cookies,
+                                    cap_bearer=cap_bearer,
+                                    cap_refresh=cap_refresh,
+                                    cap_csrf=cap_csrf,
+                                    cap_csrf_header=cap_csrf_header,
+                                    cap_csrf_field=cap_csrf_field,
+                                    cap_auth_header=cap_auth_header,
+                                    cap_token_source=cap_token_source,
+                                )
                             with session._lock:
-                                session.last_auth_status = int(r_receipt["status"])
+                                session.last_auth_status = r_status
                                 session.last_auth_path = r_path
                                 session.last_auth_error = ""
                                 session.authenticated = True
+                                rotated_secrets = session.collect_secrets()
+                            self.actors.register_secrets(rotated_secrets, alias=alias)
                             return True
                     except (BudgetExhaustedError, ServiceDegradationError):
                         raise

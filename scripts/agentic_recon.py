@@ -1956,6 +1956,366 @@ def run_recon(
     return graph_path, live_doc
 
 
+def _is_static_hint_path(path: str) -> bool:
+    if not path or path == "/":
+        return False
+    return is_static_asset_url(path) or _SCRIPT_EXT_RE.search(path) is not None
+
+
+def _format_asset_graph_handoff(
+    *,
+    base_url: str,
+    in_scope_nodes: Sequence[AssetNode],
+    api_hosts: Sequence[str],
+    waf_vendors: Sequence[str],
+    edges: Sequence[AssetEdge],
+    dropped_out_of_scope: int,
+    max_chars: int = 1600,
+) -> str:
+    """Build a bounded, secret-free ``[ASSET GRAPH]`` topology summary for Turn-1 LLM context."""
+    budget = max(80, min(1600, int(max_chars)))
+    header = (
+        f"[ASSET GRAPH] {base_url.rstrip('/')} | "
+        f"in_scope={len(in_scope_nodes)} api_hosts={len(api_hosts)} "
+        f"dropped_oos={dropped_out_of_scope}"
+    )
+    if waf_vendors:
+        header += f" waf={','.join(waf_vendors)}"
+
+    lines: list[str] = [header]
+    used_len = len(header)
+
+    for node in in_scope_nodes:
+        if node.role == "cdn":
+            continue
+        meta_bits: list[str] = [f"role={node.role}"]
+        if node.alive is True:
+            meta_bits.append(f"alive={node.status or 'yes'}")
+        elif node.alive is False:
+            meta_bits.append("alive=no")
+        if node.waf_vendor:
+            meta_bits.append(f"waf={node.waf_vendor}")
+        tech_preview = [t for t in node.tech_signals if not t.startswith("waf:")][:4]
+        if tech_preview:
+            meta_bits.append(f"tech={','.join(tech_preview)}")
+        sample_preview = [p for p in node.sample_paths if not _is_static_hint_path(p)][:3]
+        if sample_preview:
+            meta_bits.append(f"paths={','.join(sample_preview)}")
+        line = f"- {node.origin} ({'; '.join(meta_bits)})"
+        if used_len + 1 + len(line) > budget:
+            break
+        lines.append(line)
+        used_len += 1 + len(line)
+
+    if edges and used_len + 16 < budget:
+        edge_header = "Relationships:"
+        if used_len + 1 + len(edge_header) <= budget:
+            lines.append(edge_header)
+            used_len += 1 + len(edge_header)
+            for edge in edges[:8]:
+                ev_clean = _sanitize_single_line(edge.evidence.split("?", 1)[0].split("#", 1)[0], max_len=64)
+                ev_suffix = f" ({ev_clean})" if ev_clean else ""
+                eline = f"- {edge.source} --{edge.relation}--> {edge.target}{ev_suffix}"
+                if used_len + 1 + len(eline) > budget:
+                    break
+                lines.append(eline)
+                used_len += 1 + len(eline)
+
+    rendered = "\n".join(lines)
+    if len(rendered) <= budget:
+        return rendered
+    return rendered[: max(0, budget - 3)].rstrip() + "..."
+
+
+def load_asset_graph_for_run(
+    graph_path: Path | str,
+    *,
+    base_url: str,
+    excluded_paths: Sequence[str] = (),
+    in_scope_assets: Sequence[str] = (),
+    out_of_scope_assets: Sequence[str] = (),
+    max_hints: int = 32,
+) -> dict[str, Any]:
+    """Load, validate, scope-filter, and prioritize a ``cco-asset-graph/1`` artifact for a run."""
+    if isinstance(max_hints, bool) or int(max_hints) < 0:
+        raise ValueError("max_hints must be a non-negative integer")
+    hint_cap = int(max_hints)
+
+    guard = ScopeGuard(
+        base_origin=base_url,
+        excluded_paths=tuple(excluded_paths or ()),
+        in_scope_assets=tuple(in_scope_assets or ()),
+        out_of_scope_assets=tuple(out_of_scope_assets or ()),
+    )
+    base_parts = _parse_origin_parts(guard.base_origin)
+    if base_parts is None:
+        raise ValueError(f"invalid base_url: {base_url!r}")
+    base_origin_no_slash = base_parts[0]
+    default_scheme = base_parts[1]
+
+    raw_text = _read_regular_file(graph_path, max_bytes=MAX_SEED_FILE_BYTES)
+    try:
+        data = json.loads(raw_text)
+    except ValueError as exc:
+        raise ValueError(f"asset graph file is not valid JSON: {graph_path}") from exc
+    if not isinstance(data, dict):
+        raise ValueError("asset graph payload must be a JSON object")
+    if data.get("schema") != SCHEMA:
+        raise ValueError(f"unsupported asset graph schema: {data.get('schema')!r}")
+
+    raw_nodes = data.get("nodes")
+    if raw_nodes is not None and not isinstance(raw_nodes, list):
+        raise ValueError("asset graph 'nodes' must be a JSON array")
+    raw_edges = data.get("edges")
+    if raw_edges is not None and not isinstance(raw_edges, list):
+        raise ValueError("asset graph 'edges' must be a JSON array")
+
+    nodes_list = raw_nodes or []
+    edges_list = raw_edges or []
+    nodes_total = len(nodes_list)
+    dropped_out_of_scope = 0
+    nodes_by_origin: dict[str, AssetNode] = {}
+
+    for raw_node in nodes_list:
+        if not isinstance(raw_node, dict):
+            continue
+        raw_origin = str(raw_node.get("origin") or "").strip()
+        if not raw_origin and raw_node.get("host"):
+            raw_scheme = str(raw_node.get("scheme") or default_scheme).strip().lower() or default_scheme
+            raw_host = str(raw_node.get("host") or "").strip()
+            raw_port = raw_node.get("port")
+            if isinstance(raw_port, int) and not isinstance(raw_port, bool) and raw_port > 0:
+                raw_origin = _format_origin(raw_scheme, raw_host, raw_port)
+            else:
+                raw_origin = f"{raw_scheme}://{raw_host}"
+        parts = _parse_origin_parts(raw_origin, default_scheme=default_scheme)
+        if parts is None:
+            dropped_out_of_scope += 1
+            continue
+        origin, scheme, host, port, _ = parts
+        if not guard.check_origin(scheme, host, port):
+            dropped_out_of_scope += 1
+            continue
+
+        kept_paths: list[str] = []
+        raw_sample_paths = raw_node.get("sample_paths")
+        if isinstance(raw_sample_paths, list):
+            for raw_p in raw_sample_paths:
+                if not isinstance(raw_p, str):
+                    continue
+                p_text = raw_p.strip()
+                if not p_text:
+                    continue
+                if p_text.startswith("//"):
+                    dropped_out_of_scope += 1
+                    continue
+                if "://" in p_text:
+                    p_parts = _parse_origin_parts(p_text)
+                    if p_parts is None or p_parts[0] != origin:
+                        dropped_out_of_scope += 1
+                        continue
+                    try:
+                        guard.check_url(p_text)
+                    except ValueError:
+                        dropped_out_of_scope += 1
+                        continue
+                    kept_paths.append(p_parts[4])
+                else:
+                    path_only = urlsplit(p_text).path if ("?" in p_text or "#" in p_text) else p_text
+                    try:
+                        norm_p = normalize_path(path_only or "/")
+                        guard.check_url(f"{origin}{norm_p}")
+                    except ValueError:
+                        dropped_out_of_scope += 1
+                        continue
+                    kept_paths.append(norm_p)
+
+        node_payload = dict(raw_node)
+        node_payload["origin"] = origin
+        node_payload["scheme"] = scheme
+        node_payload["host"] = host
+        node_payload["port"] = port
+        node_payload["in_scope"] = True
+        node_payload["sample_paths"] = kept_paths
+        node = AssetNode.from_dict(node_payload)
+        if node.role == "unknown":
+            inferred = _infer_host_role(node.host, node.sample_paths)
+            if inferred != "unknown":
+                node.role = inferred
+
+        existing = nodes_by_origin.get(origin)
+        if existing is None:
+            nodes_by_origin[origin] = node
+        else:
+            existing.sample_paths = _normalize_sample_paths([*existing.sample_paths, *node.sample_paths])
+            existing.tech_signals = sorted({*existing.tech_signals, *node.tech_signals})
+            existing.sources = sorted({*existing.sources, *node.sources})
+            if node.waf_vendor and not existing.waf_vendor:
+                existing.waf_vendor = node.waf_vendor
+            if node.alive is True or (existing.alive is None and node.alive is not None):
+                existing.alive = node.alive
+            if node.status is not None and existing.status is None:
+                existing.status = node.status
+            if node.title and not existing.title:
+                existing.title = node.title
+            if node.server and not existing.server:
+                existing.server = node.server
+            if node.powered_by and not existing.powered_by:
+                existing.powered_by = node.powered_by
+            if existing.role == "unknown" and node.role != "unknown":
+                existing.role = node.role
+            elif existing.role == "storefront" and node.role in {"api", "graphql", "auth", "admin"}:
+                existing.role = node.role
+
+    def _prioritize_key(node: AssetNode) -> tuple[int, int, int, int, int, int, int, str]:
+        unreachable_rank = 1 if node.alive is False else 0
+        role_rank = ROLE_PRIORITY.get(node.role, ROLE_PRIORITY["unknown"])
+        alive_rank = 0 if node.alive is True else (1 if node.alive is None else 2)
+        if node.status is not None and (200 <= node.status < 400 or node.status in {401, 403}):
+            status_rank = 0
+        elif node.status is not None:
+            status_rank = 1
+        else:
+            status_rank = 2
+        primary_rank = 0 if node.origin == base_origin_no_slash else 1
+        return (
+            unreachable_rank,
+            role_rank,
+            alive_rank,
+            status_rank,
+            primary_rank,
+            -len([p for p in node.sample_paths if p != "/"]),
+            -len(node.tech_signals),
+            node.origin,
+        )
+
+    prioritized_nodes = sorted(nodes_by_origin.values(), key=_prioritize_key)
+
+    edges_by_key: dict[tuple[str, str, str], AssetEdge] = {}
+    for raw_edge in edges_list:
+        if not isinstance(raw_edge, dict):
+            continue
+        edge = AssetEdge.from_dict(raw_edge)
+        src_parts = _parse_origin_parts(edge.source, default_scheme=default_scheme)
+        dst_parts = _parse_origin_parts(edge.target, default_scheme=default_scheme)
+        if src_parts is None or dst_parts is None or src_parts[0] == dst_parts[0]:
+            continue
+        if not (
+            guard.check_origin(src_parts[1], src_parts[2], src_parts[3])
+            and guard.check_origin(dst_parts[1], dst_parts[2], dst_parts[3])
+        ):
+            continue
+        edge.source = src_parts[0]
+        edge.target = dst_parts[0]
+        edge.evidence = _sanitize_single_line(edge.evidence.split("?", 1)[0].split("#", 1)[0], max_len=160)
+        edges_by_key.setdefault((edge.source, edge.target, edge.relation), edge)
+    in_scope_edges = [
+        edges_by_key[k] for k in sorted(edges_by_key)
+    ]
+
+    discovery_hints: list[str] = []
+    seen_hints: set[str] = set()
+    deferred_same_origin_roots: list[str] = []
+
+    def _push_hint(candidate: str) -> None:
+        if len(discovery_hints) >= hint_cap or candidate in seen_hints:
+            return
+        try:
+            guard.check_url(candidate)
+        except ValueError:
+            return
+        seen_hints.add(candidate)
+        discovery_hints.append(candidate)
+
+    for node in prioritized_nodes:
+        if len(discovery_hints) >= hint_cap:
+            break
+        if node.role == "cdn":
+            continue
+        concrete_paths = [p for p in node.sample_paths if p != "/" and not _is_static_hint_path(p)]
+        if node.origin == base_origin_no_slash:
+            if concrete_paths:
+                for p in concrete_paths:
+                    _push_hint(p)
+                    if len(discovery_hints) >= hint_cap:
+                        break
+                if "/" in node.sample_paths:
+                    deferred_same_origin_roots.append("/")
+            elif "/" in node.sample_paths or not node.sample_paths:
+                _push_hint("/")
+        else:
+            if concrete_paths:
+                for p in concrete_paths:
+                    _push_hint(f"{node.origin}{p}")
+                    if len(discovery_hints) >= hint_cap:
+                        break
+            else:
+                _push_hint(f"{node.origin}/")
+
+    for root_hint in deferred_same_origin_roots:
+        if len(discovery_hints) >= hint_cap:
+            break
+        _push_hint(root_hint)
+
+    waf_vendor_set: set[str] = set()
+    for node in prioritized_nodes:
+        if node.waf_vendor:
+            waf_vendor_set.add(node.waf_vendor.lower())
+        for sig in node.tech_signals:
+            if sig.startswith("waf:") and len(sig) > 4:
+                waf_vendor_set.add(sig[4:].strip().lower())
+    waf_vendors = sorted(v for v in waf_vendor_set if v)
+
+    in_scope_hosts: list[dict[str, Any]] = [
+        {
+            "origin": node.origin,
+            "host": node.host,
+            "role": node.role,
+            "alive": node.alive,
+            "status": node.status,
+            "title": node.title,
+            "server": node.server,
+            "powered_by": node.powered_by,
+            "waf_vendor": node.waf_vendor,
+            "tech_signals": list(node.tech_signals),
+            "sample_paths": list(node.sample_paths),
+        }
+        for node in prioritized_nodes
+    ]
+    api_hosts = [
+        node.origin
+        for node in prioritized_nodes
+        if node.role in {"api", "graphql", "auth", "admin"}
+    ]
+    handoff = _format_asset_graph_handoff(
+        base_url=guard.base_origin,
+        in_scope_nodes=prioritized_nodes,
+        api_hosts=api_hosts,
+        waf_vendors=waf_vendors,
+        edges=in_scope_edges,
+        dropped_out_of_scope=dropped_out_of_scope,
+        max_chars=1600,
+    )
+
+    return {
+        "schema": SCHEMA,
+        "base_url": guard.base_origin,
+        "discovery_hints": discovery_hints,
+        "in_scope_hosts": in_scope_hosts,
+        "api_hosts": api_hosts,
+        "waf_vendors": waf_vendors,
+        "handoff": handoff,
+        "stats": {
+            "nodes_total": nodes_total,
+            "in_scope_hosts_count": len(in_scope_hosts),
+            "api_hosts_count": len(api_hosts),
+            "dropped_out_of_scope": dropped_out_of_scope,
+            "hints_count": len(discovery_hints),
+            "edges_count": len(in_scope_edges),
+        },
+    }
+
+
 def _custom_header_arg(raw: str) -> str:
     try:
         parse_custom_headers([raw])
@@ -2033,6 +2393,7 @@ __all__ = [
     "SCOPE_RECOMMENDED_SCHEMA",
     "VALID_ROLES",
     "fetch_ct_subdomains",
+    "load_asset_graph_for_run",
     "main",
     "run_recon",
 ]

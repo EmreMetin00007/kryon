@@ -22,6 +22,7 @@ for _p in (str(_REPO_ROOT), str(SCRIPTS)):
 import agentic_auth_import  # noqa: E402
 import agentic_har_flow  # noqa: E402
 import agentic_prescan  # noqa: E402
+import agentic_recon  # noqa: E402
 import agentic_report  # noqa: E402
 import agentic_seed  # noqa: E402
 import agentic_vault  # noqa: E402
@@ -75,6 +76,7 @@ def _runner_defaults() -> dict[str, Any]:
         "discovery_hints": None,
         "login_path": DEFAULT_LOGIN_PATH,
         "session_check_path": DEFAULT_SESSION_CHECK_PATH,
+        "refresh_path": "",
         "max_member_accounts": 6,
         "max_admin_accounts": 2,
         "max_turns": 75,
@@ -105,6 +107,7 @@ def _runner_defaults() -> dict[str, Any]:
         "storage_states": None,
         "custom_headers": None,
         "seed_surface_files": None,
+        "asset_graph_file": None,
         "tech_hints": None,
         "auto_crawl": False,
         "auto_crawl_forms": False,
@@ -382,6 +385,7 @@ def run_agentic_target(
     discovery_hints: Sequence[str] | None = None,
     login_path: str = DEFAULT_LOGIN_PATH,
     session_check_path: str = DEFAULT_SESSION_CHECK_PATH,
+    refresh_path: str = "",
     max_member_accounts: int = 6,
     max_admin_accounts: int = 2,
     max_turns: int = 75,
@@ -412,6 +416,7 @@ def run_agentic_target(
     storage_states: Sequence[str] | None = None,
     custom_headers: Sequence[str] | None = None,
     seed_surface_files: Sequence[Path] | None = None,
+    asset_graph_file: Path | None = None,
     tech_hints: Sequence[str] | None = None,
     auto_crawl: bool = False,
     auto_crawl_forms: bool = False,
@@ -448,6 +453,7 @@ def run_agentic_target(
             "discovery_hints": discovery_hints,
             "login_path": login_path,
             "session_check_path": session_check_path,
+            "refresh_path": refresh_path,
             "max_member_accounts": max_member_accounts,
             "max_admin_accounts": max_admin_accounts,
             "max_turns": max_turns,
@@ -478,6 +484,7 @@ def run_agentic_target(
             "storage_states": storage_states,
             "custom_headers": custom_headers,
             "seed_surface_files": seed_surface_files,
+            "asset_graph_file": asset_graph_file,
             "tech_hints": tech_hints,
             "auto_crawl": auto_crawl,
             "auto_crawl_forms": auto_crawl_forms,
@@ -534,6 +541,7 @@ def run_agentic_target(
         session_check_path=session_check_path,
         bundle=bundle,
     )
+    eff_refresh_path = str(refresh_path or "").strip() or _extract_bundle_auth_path(bundle, "refresh_path")
     base, scope_meta = target_bootstrap.resolve_target_origin(
         target or str(bundle.get("target_url") or ""),
         scope_file=scope_file,
@@ -564,6 +572,20 @@ def run_agentic_target(
     seed_data: dict[str, Any] | None = None
     har_flows_doc: dict[str, Any] | None = None
     har_flows_handoff: str = ""
+    asset_graph_doc: dict[str, Any] | None = None
+    asset_graph_handoff: str = ""
+    if asset_graph_file is not None:
+        asset_graph_doc = agentic_recon.load_asset_graph_for_run(
+            asset_graph_file,
+            base_url=base,
+            excluded_paths=eff_excluded_paths,
+            in_scope_assets=eff_in_scope_assets,
+            out_of_scope_assets=eff_out_of_scope_assets,
+        )
+        for hint in asset_graph_doc.get("discovery_hints") or []:
+            if hint not in eff_discovery_hints:
+                eff_discovery_hints.append(hint)
+        asset_graph_handoff = str(asset_graph_doc.get("handoff") or "")
     if seed_surface_files:
         seed_data = agentic_seed.load_seed_surface_files(
             seed_surface_files,
@@ -602,6 +624,7 @@ def run_agentic_target(
                 tenant=str(vault_storage_payload.get("tenant") or ""),
                 in_scope_assets=eff_in_scope_assets,
                 out_of_scope_assets=eff_out_of_scope_assets,
+                refresh_path=eff_refresh_path,
             )
         )
     for raw_spec in storage_states or ():
@@ -615,6 +638,7 @@ def run_agentic_target(
                 tenant=s_tenant,
                 in_scope_assets=eff_in_scope_assets,
                 out_of_scope_assets=eff_out_of_scope_assets,
+                refresh_path=eff_refresh_path,
             )
         )
 
@@ -745,6 +769,7 @@ def run_agentic_target(
             "discovery_hints": eff_discovery_hints,
             "seed_surface": dict(seed_data.get("stats") or {}) if seed_data is not None else None,
             "har_flows": dict(har_flows_doc.get("stats") or {}) if har_flows_doc is not None else None,
+            "asset_graph": dict(asset_graph_doc.get("stats") or {}) if asset_graph_doc is not None else None,
             "stage0_crawl": dict(stage0_cfg),
             "prescan": dict(prescan_cfg),
             "oob_listener": dict(oob_summary),
@@ -793,12 +818,14 @@ def run_agentic_target(
         cache_token_weight=eff_cache_weight,
     )
     receipt_store = ReceiptStore(output)
-    actors = ActorManager(
-        accounts,
-        login_path=eff_login_path,
-        session_check_path=eff_session_check_path,
-        global_headers=global_headers,
-    )
+    actor_mgr_kwargs: dict[str, Any] = {
+        "login_path": eff_login_path,
+        "session_check_path": eff_session_check_path,
+        "global_headers": global_headers,
+    }
+    if eff_refresh_path:
+        actor_mgr_kwargs["refresh_path"] = eff_refresh_path
+    actors = ActorManager(accounts, **actor_mgr_kwargs)
     http_client = AgenticHTTPClient(
         base_url=base,
         receipt_store=receipt_store,
@@ -834,6 +861,7 @@ def run_agentic_target(
         "discovery_hints": list(eff_discovery_hints),
         "seed_surface": dict(seed_data.get("stats") or {}) if seed_data is not None else None,
         "har_flows": dict(har_flows_doc.get("stats") or {}) if har_flows_doc is not None else None,
+        "asset_graph": dict(asset_graph_doc.get("stats") or {}) if asset_graph_doc is not None else None,
         "stage0_crawl": dict(stage0_cfg),
         "prescan": dict(prescan_cfg),
         "oob_listener": dict(oob_summary),
@@ -976,6 +1004,7 @@ def run_agentic_target(
             stage0_allow_forms=eff_auto_crawl_forms,
             prescan_handoff=prescan_handoff,
             har_flows_handoff=har_flows_handoff,
+            asset_graph_handoff=asset_graph_handoff,
         )
         run_info = investigator.run(resume=resume)
         manifest.update(run_info)
@@ -1026,6 +1055,9 @@ def run_agentic_target(
         if investigator is not None:
             if isinstance(findings_list, list):
                 investigator.dispatcher.findings = findings_list
+            waf_pivot_tracker = getattr(investigator.dispatcher, "waf_pivot", None)
+            if waf_pivot_tracker is not None and callable(getattr(waf_pivot_tracker, "summary", None)):
+                manifest["waf_pivot"] = waf_pivot_tracker.summary()
             try:
                 m_json, m_md, metrics_doc = investigator.write_metrics(manifest=manifest)
             except TypeError:
@@ -1097,6 +1129,7 @@ def main(argv: list[str] | None = None, *, force_plan_only: bool = False) -> int
     parser.add_argument("--discovery-hint", action="append", dest="discovery_hints", default=argparse.SUPPRESS, help="Initial discovery entry path(s)")
     parser.add_argument("--login-path", default=argparse.SUPPRESS)
     parser.add_argument("--session-check-path", default=argparse.SUPPRESS)
+    parser.add_argument("--refresh-path", default=argparse.SUPPRESS, help="Optional token refresh endpoint path for automatic mid-run 401 session renewal")
     parser.add_argument("--max-member-accounts", type=int, default=argparse.SUPPRESS)
     parser.add_argument("--max-admin-accounts", type=int, default=argparse.SUPPRESS)
     parser.add_argument("--max-turns", type=int, default=argparse.SUPPRESS)
@@ -1197,6 +1230,13 @@ def main(argv: list[str] | None = None, *, force_plan_only: bool = False) -> int
         type=Path,
         default=argparse.SUPPRESS,
         help="Offline discovery seed file (HAR/mitm_scope/ZAP/ffuf/nuclei/URL list); repeatable",
+    )
+    parser.add_argument(
+        "--asset-graph",
+        dest="asset_graph_file",
+        type=Path,
+        default=argparse.SUPPRESS,
+        help="Optional cco-asset-graph/1 JSON file produced by 'cco-agent recon' to seed prioritized in-scope hosts/paths",
     )
     parser.add_argument(
         "--tech-hint",

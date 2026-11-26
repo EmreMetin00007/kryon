@@ -108,6 +108,7 @@ _PATH_FIELDS: frozenset[str] = frozenset({
     "output_dir",
     "scope_file",
     "vault_home",
+    "asset_graph_file",
 })
 _PATH_LIST_FIELDS: frozenset[str] = frozenset({"seed_surface_files"})
 _STRING_FIELDS: frozenset[str] = frozenset({
@@ -120,6 +121,7 @@ _STRING_FIELDS: frozenset[str] = frozenset({
     "api_key_env",
     "login_path",
     "session_check_path",
+    "refresh_path",
     "reasoning_effort",
     "run_id",
     "scheduler",

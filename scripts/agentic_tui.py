@@ -84,6 +84,15 @@ class RunSnapshot:
     max_degradation_streak: int = 0
     stage0_enabled: bool = False
     stage0_status: str = ""
+    prescan_enabled: bool = False
+    prescan_status: str = ""
+    prescan_leads: int = 0
+    prescan_waf_vendors: list[str] = field(default_factory=list)
+    har_flows_count: int = 0
+    har_chained_steps: int = 0
+    asset_graph_hosts: int = 0
+    asset_graph_api_hosts: int = 0
+    waf_pivot_active: bool = False
     shards: list[dict[str, Any]] = field(default_factory=list)
     findings: list[dict[str, Any]] = field(default_factory=list)
     recent_receipts: list[dict[str, Any]] = field(default_factory=list)
@@ -170,6 +179,56 @@ def _format_event_detail(ev: dict[str, Any]) -> str:
     return " ".join(parts)
 
 
+def _as_dict(value: Any) -> dict[str, Any]:
+    return value if isinstance(value, dict) else {}
+
+
+def _extract_asset_graph_counts(ag_doc: dict[str, Any]) -> tuple[int, int]:
+    """Extract (in_scope_hosts_count, api_hosts_count) from an asset_graph metadata or JSON dict."""
+    ag_stats = _as_dict(ag_doc.get("stats"))
+    raw_in_scope = ag_doc.get("in_scope_hosts")
+    raw_nodes = ag_doc.get("nodes")
+    nodes_list: list[dict[str, Any]] = (
+        [n for n in raw_nodes if isinstance(n, dict)]
+        if isinstance(raw_nodes, list)
+        else []
+    )
+    in_scope_nodes = [n for n in nodes_list if n.get("in_scope")]
+
+    hosts_count = 0
+    if ag_doc.get("in_scope_hosts_count") is not None:
+        hosts_count = max(0, int(ag_doc.get("in_scope_hosts_count") or 0))
+    elif isinstance(raw_in_scope, int):
+        hosts_count = max(0, raw_in_scope)
+    elif isinstance(raw_in_scope, list):
+        hosts_count = len(raw_in_scope)
+    elif ag_doc.get("hosts") is not None:
+        hosts_count = max(0, int(ag_doc.get("hosts") or 0))
+    elif ag_stats.get("in_scope_hosts_count") is not None:
+        hosts_count = max(0, int(ag_stats.get("in_scope_hosts_count") or 0))
+    elif ag_stats.get("in_scope_hosts") is not None:
+        hosts_count = max(0, int(ag_stats.get("in_scope_hosts") or 0))
+    elif in_scope_nodes:
+        hosts_count = len(in_scope_nodes)
+
+    api_count = 0
+    raw_api_hosts = ag_doc.get("api_hosts")
+    if ag_doc.get("api_hosts_count") is not None:
+        api_count = max(0, int(ag_doc.get("api_hosts_count") or 0))
+    elif isinstance(raw_api_hosts, int):
+        api_count = max(0, raw_api_hosts)
+    elif isinstance(raw_api_hosts, list):
+        api_count = len(raw_api_hosts)
+    elif ag_stats.get("api_hosts_count") is not None:
+        api_count = max(0, int(ag_stats.get("api_hosts_count") or 0))
+    elif in_scope_nodes:
+        api_count = sum(
+            1 for n in in_scope_nodes if n.get("role") in {"api", "graphql", "auth", "admin"}
+        )
+
+    return hosts_count, api_count
+
+
 def load_run_snapshot(
     run_dir: Path | str,
     *,
@@ -238,6 +297,23 @@ def load_run_snapshot(
         if isinstance(stage0, dict):
             snap.stage0_enabled = bool(stage0.get("enabled"))
             snap.stage0_status = str(stage0.get("status") or ("enabled" if snap.stage0_enabled else "off"))
+        prescan = meta.get("prescan")
+        if isinstance(prescan, dict):
+            snap.prescan_enabled = bool(prescan.get("enabled"))
+            snap.prescan_status = str(prescan.get("status") or ("enabled" if snap.prescan_enabled else "off"))
+            raw_leads = prescan.get("leads_count") if prescan.get("leads_count") is not None else prescan.get("leads_total")
+            if raw_leads is not None:
+                snap.prescan_leads = max(0, int(raw_leads or 0))
+            vendors = prescan.get("waf_vendors_seen")
+            if isinstance(vendors, list):
+                snap.prescan_waf_vendors = [str(v).strip() for v in vendors if str(v).strip()]
+        har_flows = meta.get("har_flows")
+        if isinstance(har_flows, dict):
+            snap.har_flows_count = max(0, int(har_flows.get("flows_count") or 0))
+            snap.har_chained_steps = max(0, int(har_flows.get("chained_steps_count") or 0))
+        ag_meta = meta.get("asset_graph")
+        if isinstance(ag_meta, dict):
+            snap.asset_graph_hosts, snap.asset_graph_api_hosts = _extract_asset_graph_counts(ag_meta)
         sharding_summary = meta.get("sharding_summary")
         if isinstance(sharding_summary, dict) and isinstance(sharding_summary.get("shards"), list):
             for idx, item in enumerate(sharding_summary["shards"]):
@@ -342,6 +418,58 @@ def load_run_snapshot(
                 "detail": _format_event_detail(ev),
             })
 
+    # Optional fallback reads for Faz A-C summary artifacts when not yet mirrored in manifest.json
+    prescan_summary = _read_json_safe(root / "prescan-summary.json")
+    if isinstance(prescan_summary, dict):
+        snap.prescan_enabled = True
+        if not snap.prescan_status or snap.prescan_status in {"enabled", "off"}:
+            snap.prescan_status = str(prescan_summary.get("status") or "ok")
+        p_stats = _as_dict(prescan_summary.get("stats"))
+        fallback_leads = p_stats.get("leads_total")
+        raw_p_leads = prescan_summary.get("leads")
+        if fallback_leads is None and isinstance(raw_p_leads, list):
+            fallback_leads = len(raw_p_leads)
+        if fallback_leads is not None:
+            snap.prescan_leads = max(snap.prescan_leads, int(fallback_leads or 0))
+        summary_vendors = prescan_summary.get("waf_vendors_seen")
+        if isinstance(summary_vendors, list):
+            seen_v = set(snap.prescan_waf_vendors)
+            for v in summary_vendors:
+                vs = str(v).strip()
+                if vs and vs not in seen_v:
+                    seen_v.add(vs)
+                    snap.prescan_waf_vendors.append(vs)
+
+    har_flows_file = _read_json_safe(root / "har-flows.json")
+    if isinstance(har_flows_file, dict):
+        h_stats = _as_dict(har_flows_file.get("stats"))
+        raw_h_flows = har_flows_file.get("flows")
+        h_flows: list[dict[str, Any]] = (
+            [fl for fl in raw_h_flows if isinstance(fl, dict)]
+            if isinstance(raw_h_flows, list)
+            else []
+        )
+        fallback_flows = int(h_stats.get("flows_count") or len(h_flows))
+        chained_from_steps = 0
+        for fl in h_flows:
+            raw_steps = fl.get("steps")
+            if not isinstance(raw_steps, list):
+                continue
+            for st in raw_steps:
+                if isinstance(st, dict) and st.get("chained_from_step") is not None:
+                    chained_from_steps += 1
+        fallback_chained = int(h_stats.get("chained_steps_count") or chained_from_steps)
+        snap.har_flows_count = max(snap.har_flows_count, fallback_flows)
+        snap.har_chained_steps = max(snap.har_chained_steps, fallback_chained)
+
+    if snap.asset_graph_hosts == 0:
+        ag_file = _read_json_safe(root / "asset-graph.json")
+        if isinstance(ag_file, dict) and ag_file.get("schema") == "cco-asset-graph/1":
+            snap.asset_graph_hosts, snap.asset_graph_api_hosts = _extract_asset_graph_counts(ag_file)
+
+    waf_pivot_meta = _as_dict(meta.get("waf_pivot")) if isinstance(meta, dict) else {}
+    snap.waf_pivot_active = bool(waf_pivot_meta.get("should_pivot")) or snap.waf_blocks >= 2
+
     if snap.status == "starting" and (snap.receipt_count > 0 or snap.recent_events):
         snap.status = "running"
 
@@ -355,6 +483,23 @@ def _progress_bar(used: float, limit: float, *, width: int = 18) -> str:
     filled = int(round(ratio * width))
     pct = int(round(ratio * 100))
     return f"[{'#' * filled}{'.' * (width - filled)}] {pct:3d}% ({int(used)}/{int(limit)})"
+
+
+def _pipeline_summary_parts(snap: RunSnapshot) -> list[str]:
+    parts: list[str] = []
+    if snap.prescan_enabled:
+        p_state = snap.prescan_status or "on"
+        waf_suffix = f", waf={','.join(snap.prescan_waf_vendors)}" if snap.prescan_waf_vendors else ""
+        parts.append(f"Prescan={p_state}({snap.prescan_leads} leads{waf_suffix})")
+    else:
+        parts.append(f"Prescan={snap.prescan_status or 'off'}")
+    if snap.har_flows_count > 0:
+        parts.append(f"HAR Flows={snap.har_flows_count}({snap.har_chained_steps} chained)")
+    if snap.asset_graph_hosts > 0:
+        parts.append(f"AssetGraph={snap.asset_graph_hosts}({snap.asset_graph_api_hosts} api)")
+    if snap.waf_pivot_active:
+        parts.append("WAF Pivot: ACTIVE")
+    return parts
 
 
 def render_plain_dashboard(snap: RunSnapshot) -> str:
@@ -385,6 +530,7 @@ def render_plain_dashboard(snap: RunSnapshot) -> str:
         f"degraded_tail={snap.degraded_responses} waf_events={snap.waf_blocks} "
         f"stage0={snap.stage0_status or ('on' if snap.stage0_enabled else 'off')}"
     )
+    lines.append(f"Pipeline: {' | '.join(_pipeline_summary_parts(snap))}")
 
     if snap.shards:
         lines.append("")
@@ -500,6 +646,14 @@ def build_rich_dashboard(snap: RunSnapshot) -> Any:
         f"receipts={snap.receipt_count}  llm={snap.llm_calls}  degraded={snap.degraded_responses}  waf={snap.waf_blocks}",
     )
     budget_table.add_row("Stage 0", snap.stage0_status or ("enabled" if snap.stage0_enabled else "off"))
+    pipeline_parts = _pipeline_summary_parts(snap)
+    pipeline_text = Text()
+    for idx, part in enumerate(pipeline_parts):
+        if idx > 0:
+            pipeline_text.append("\n")
+        style = "bold yellow" if part == "WAF Pivot: ACTIVE" else ""
+        pipeline_text.append(part, style=style)
+    budget_table.add_row("Pipeline", pipeline_text)
     if snap.shards:
         shard_str = ", ".join(f"{s['name']}:{s['status']}({s['turns']}t)" for s in snap.shards[:6])
         budget_table.add_row("Shards", shard_str)

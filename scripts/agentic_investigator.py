@@ -617,6 +617,7 @@ class AgenticInvestigator:
         stage0_allow_forms: bool = False,
         prescan_handoff: str = "",
         har_flows_handoff: str = "",
+        asset_graph_handoff: str = "",
     ):
         self.http = http_client
         self.receipts = receipt_store
@@ -670,6 +671,7 @@ class AgenticInvestigator:
         self.stage0_allow_forms = bool(stage0_allow_forms)
         self.prescan_handoff = str(prescan_handoff or "").strip()[:3200]
         self.har_flows_handoff = str(har_flows_handoff or "").strip()[:3200]
+        self.asset_graph_handoff = str(asset_graph_handoff or "").strip()[:2000]
 
         use_telem = bool(enable_telemetry) if enable_telemetry is not None else (
             self.execution_mode == "ephemeral" or self.use_bsag
@@ -718,8 +720,8 @@ class AgenticInvestigator:
         self._epoch_advancements: int = 0
 
     def _initial_priority_brief(self) -> str:
-        """Return optional bounded Turn-1 prescan/HAR workflow handoff block (zero secrets)."""
-        blocks = [b for b in (self.prescan_handoff, self.har_flows_handoff) if b]
+        """Return optional bounded Turn-1 asset-graph/prescan/HAR workflow handoff block (zero secrets)."""
+        blocks = [b for b in (self.asset_graph_handoff, self.prescan_handoff, self.har_flows_handoff) if b]
         if not blocks:
             return ""
         return "\n\n" + "\n\n".join(blocks) + "\n"

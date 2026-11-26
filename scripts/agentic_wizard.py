@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 from datetime import datetime, timezone
+import inspect
 import json
 import os
 from pathlib import Path
@@ -19,6 +20,7 @@ for _p in (str(_REPO_ROOT), str(_SCRIPTS_DIR)):
         sys.path.insert(0, _p)
 
 import agentic_presets  # noqa: E402
+import agentic_recon  # noqa: E402
 import agentic_runner  # noqa: E402
 import llm_config  # noqa: E402
 import target_bootstrap  # noqa: E402
@@ -80,7 +82,7 @@ def _default_output_dir(target_url: str, *, workdir: Path | None = None) -> Path
 
 
 def _classify_auth_file(raw_spec: str) -> tuple[str, str]:
-    """Return ``('storage_state', spec)`` or ``('credentials_file', path)``."""
+    """Classify Step 6 file input as storage_state, asset_graph, seed_surface, or credentials_file."""
     text = raw_spec.strip()
     if "=" in text:
         alias_part, path_part = text.split("=", 1)
@@ -94,8 +96,15 @@ def _classify_auth_file(raw_spec: str) -> tuple[str, str]:
         data = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError) as exc:
         raise ValueError(f"gecersiz JSON dosyasi: {path}") from exc
-    if isinstance(data, dict) and ("cookies" in data or "origins" in data):
-        return "storage_state", f"member={path}"
+    if isinstance(data, dict):
+        if "cookies" in data or "origins" in data:
+            return "storage_state", f"member={path}"
+        if data.get("schema") == agentic_recon.SCHEMA:
+            return "asset_graph", str(path)
+        if isinstance(data.get("log"), dict) and isinstance(data["log"].get("entries"), list):
+            return "seed_surface", str(path)
+        if any(k in data for k in ("links", "forms", "routes", "endpoints", "discovery_hints")):
+            return "seed_surface", str(path)
     return "credentials_file", str(path)
 
 
@@ -213,6 +222,8 @@ def _write_reusable_run_config(
     custom_headers: dict[str, str],
     storage_states: list[str],
     credentials_file: Path | None,
+    seed_surface_files: Sequence[Path] | None = None,
+    discovery_hints: Sequence[str] | None = None,
 ) -> Path:
     """Save a safe ``cco-run/1`` config (chmod 0600, omitting sensitive header values)."""
     cfg: dict[str, Any] = {
@@ -233,6 +244,11 @@ def _write_reusable_run_config(
         cfg["storage_states"] = list(storage_states)
     if credentials_file is not None:
         cfg["credentials_file"] = str(credentials_file)
+    if seed_surface_files:
+        cfg["seed_surface_files"] = [str(p) for p in seed_surface_files]
+    clean_hints = [str(h).strip() for h in (discovery_hints or ()) if str(h).strip()]
+    if clean_hints:
+        cfg["discovery_hints"] = clean_hints
 
     output_dir.mkdir(parents=True, exist_ok=True)
     cfg_path = output_dir / "run.json"
@@ -253,6 +269,8 @@ def run_wizard(
     workdir: Path | None = None,
     cwd: Path | None = None,
     environ: dict[str, str] | None = None,
+    asset_graph_file: Path | None = None,
+    seed_surface_files: Sequence[Path | str] | None = None,
 ) -> int:
     """Guide the operator through a zero-flag plan + optional confirmed live TUI run."""
     env_map = os.environ if environ is None else environ
@@ -378,9 +396,13 @@ def run_wizard(
             continue
         raw_custom_headers.append(hdr)
 
-    # 6. Optional test account / Playwright storage_state
+    # 6. Optional test account / Playwright storage_state (also accepts AssetGraph or HAR seed)
     storage_states: list[str] = []
     credentials_file: Path | None = None
+    eff_asset_graph_file: Path | None = Path(asset_graph_file).expanduser() if asset_graph_file is not None else None
+    eff_seed_files: list[Path] = [
+        Path(p).expanduser() for p in (seed_surface_files or ()) if str(p).strip()
+    ]
     while True:
         auth_raw = input_fn("6) Test hesabi (storage_state.json veya credentials.json yolu) [bos=anonim]: ").strip()
         if not auth_raw:
@@ -392,6 +414,12 @@ def run_wizard(
             continue
         if kind == "storage_state":
             storage_states.append(value)
+        elif kind == "asset_graph":
+            eff_asset_graph_file = Path(value)
+        elif kind == "seed_surface":
+            seed_cand = Path(value)
+            if seed_cand not in eff_seed_files:
+                eff_seed_files.append(seed_cand)
         else:
             credentials_file = Path(value)
         break
@@ -411,6 +439,27 @@ def run_wizard(
 
     parsed_headers = parse_custom_headers(raw_custom_headers)
 
+    asset_graph_info: dict[str, Any] | None = None
+    ag_hints: list[str] = []
+    if eff_asset_graph_file is not None:
+        try:
+            resolved_origin, scope_meta = target_bootstrap.resolve_target_origin(
+                raw_target,
+                scope_file=scope_file,
+                allow_non_loopback=not loopback,
+            )
+            asset_graph_info = agentic_recon.load_asset_graph_for_run(
+                eff_asset_graph_file,
+                base_url=resolved_origin,
+                excluded_paths=tuple(scope_meta.get("excluded_paths") or ()),
+                in_scope_assets=tuple(scope_meta.get("in_scope_assets") or ()),
+                out_of_scope_assets=tuple(scope_meta.get("out_of_scope_assets") or ()),
+            )
+            ag_hints = [str(h).strip() for h in (asset_graph_info.get("discovery_hints") or ()) if str(h).strip()]
+        except (ValueError, OSError, TypeError) as exc:
+            output_fn(f"[HATA] AssetGraph dosyasi gecersiz ({eff_asset_graph_file}): {type(exc).__name__}")
+            return 2
+
     # Save reusable run.json & generate zero-traffic plan first
     cfg_path = _write_reusable_run_config(
         output_dir,
@@ -422,21 +471,38 @@ def run_wizard(
         custom_headers=parsed_headers,
         storage_states=storage_states,
         credentials_file=credentials_file,
+        seed_surface_files=eff_seed_files or None,
+        discovery_hints=ag_hints or None,
     )
 
-    plan_path, plan = agentic_runner.run_agentic_target(
-        target=raw_target,
-        provider_config=eff_provider_cfg,
-        output_dir=output_dir,
-        preset=preset,
-        allowed_methods=allowed_methods,
-        custom_headers=raw_custom_headers or None,
-        scope_file=scope_file,
-        allow_non_loopback=not loopback,
-        storage_states=storage_states or None,
-        credentials_file=credentials_file,
-        execute=False,
-    )
+    runner_kwargs: dict[str, Any] = {
+        "target": raw_target,
+        "provider_config": eff_provider_cfg,
+        "output_dir": output_dir,
+        "preset": preset,
+        "allowed_methods": allowed_methods,
+        "custom_headers": raw_custom_headers or None,
+        "scope_file": scope_file,
+        "allow_non_loopback": not loopback,
+        "storage_states": storage_states or None,
+        "credentials_file": credentials_file,
+        "execute": False,
+    }
+    if eff_seed_files:
+        runner_kwargs["seed_surface_files"] = eff_seed_files
+    if ag_hints:
+        runner_kwargs["discovery_hints"] = ag_hints
+    if eff_asset_graph_file is not None:
+        try:
+            runner_param_names = set(inspect.signature(agentic_runner.run_agentic_target).parameters)
+        except (TypeError, ValueError):
+            runner_param_names = set()
+        if "asset_graph_file" in runner_param_names:
+            runner_kwargs["asset_graph_file"] = eff_asset_graph_file
+        elif "asset_graph" in runner_param_names:
+            runner_kwargs["asset_graph"] = eff_asset_graph_file
+
+    plan_path, plan = agentic_runner.run_agentic_target(**runner_kwargs)
 
     auth_probe = authorize_provider(
         eff_provider_cfg,
@@ -454,6 +520,23 @@ def run_wizard(
     output_fn(f"Metotlar    : {', '.join(plan.get('allowed_methods') or [])}")
     hdr_names = plan.get("request_headers") or []
     output_fn(f"Basliklar   : {', '.join(hdr_names) if hdr_names else '(yok)'}")
+    prescan_meta = plan.get("prescan")
+    if isinstance(prescan_meta, dict):
+        p_enabled = bool(prescan_meta.get("enabled"))
+        p_max = prescan_meta.get("max_requests")
+        p_label = f"acik (max {p_max} istek)" if (p_enabled and p_max) else ("acik" if p_enabled else "kapali")
+        output_fn(f"Prescan     : {p_label}")
+    har_meta = plan.get("har_flows")
+    if isinstance(har_meta, dict) and int(har_meta.get("flows_count") or 0) > 0:
+        flows_cnt = int(har_meta.get("flows_count") or 0)
+        chained_cnt = int(har_meta.get("chained_steps_count") or 0)
+        output_fn(f"HAR Akis    : {flows_cnt} akis ({chained_cnt} zincirli adim)")
+    if asset_graph_info is not None:
+        ag_stats = asset_graph_info.get("stats") or {}
+        output_fn(
+            f"AssetGraph  : {ag_stats.get('in_scope_hosts_count', 0)} host "
+            f"({ag_stats.get('api_hosts_count', 0)} API/servis, {len(ag_hints)} ipucu)"
+        )
     output_fn(f"Cikti       : {output_dir}")
     output_fn(f"Plan / Ayar : {plan_path} | {cfg_path}")
     output_fn("")
@@ -494,6 +577,10 @@ def run_wizard(
         exec_argv.extend(["--storage-state", spec])
     if credentials_file is not None:
         exec_argv.extend(["--credentials-file", str(credentials_file)])
+    for seed_path in eff_seed_files:
+        exec_argv.extend(["--seed-surface", str(seed_path)])
+    for hint in ag_hints:
+        exec_argv.extend(["--discovery-hint", hint])
 
     runner = runner_main or agentic_runner.main
     return int(runner(exec_argv))
@@ -510,9 +597,27 @@ def main(argv: Sequence[str] | None = None) -> int:
         default=None,
         help="Optional cco-llm/1 provider config path (default: CCO_LLM_CONFIG or config/llm.json)",
     )
+    parser.add_argument(
+        "--asset-graph",
+        type=Path,
+        default=None,
+        help="Optional cco-asset-graph/1 JSON file produced by cco-agent recon",
+    )
+    parser.add_argument(
+        "--seed-surface",
+        action="append",
+        dest="seed_surface_files",
+        type=Path,
+        default=None,
+        help="Optional offline discovery seed file (HAR/stage0/ZAP/ffuf/URL list); repeatable",
+    )
     args = parser.parse_args(list(argv) if argv is not None else None)
     try:
-        return run_wizard(provider_config=args.provider_config)
+        return run_wizard(
+            provider_config=args.provider_config,
+            asset_graph_file=args.asset_graph,
+            seed_surface_files=args.seed_surface_files,
+        )
     except (KeyboardInterrupt, EOFError):
         print("\nIptal edildi.")
         return 130
