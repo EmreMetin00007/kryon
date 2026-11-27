@@ -84,7 +84,7 @@ def _runner_defaults() -> dict[str, Any]:
         "max_member_accounts": 6,
         "max_admin_accounts": 2,
         "max_turns": 75,
-        "reasoning_effort": "low",
+        "reasoning_effort": "max",
         "resume": False,
         "run_id": "",
         "execute": False,
@@ -100,6 +100,10 @@ def _runner_defaults() -> dict[str, Any]:
         "shard_turns": 25,
         "shard_token_quota": 0,
         "bootstrap_model": "",
+        "max_shard_retries": 1,
+        "retry_model": "",
+        "retry_budget_ratio": 0.15,
+        "max_retry_shards": 2,
         "epoch_char_limit": 0,
         "cache_token_weight": 0.10,
         "scope_file": None,
@@ -496,7 +500,7 @@ def run_agentic_target(
     max_member_accounts: int = 6,
     max_admin_accounts: int = 2,
     max_turns: int = 75,
-    reasoning_effort: str = "low",
+    reasoning_effort: str = "max",
     resume: bool = False,
     run_id: str = "",
     execute: bool = False,
@@ -512,6 +516,10 @@ def run_agentic_target(
     shard_turns: int = 25,
     shard_token_quota: int = 0,
     bootstrap_model: str = "",
+    max_shard_retries: int = 1,
+    retry_model: str = "",
+    retry_budget_ratio: float = 0.15,
+    max_retry_shards: int = 2,
     epoch_char_limit: int = 0,
     cache_token_weight: float = 0.10,
     scope_file: Path | None = None,
@@ -582,6 +590,10 @@ def run_agentic_target(
             "shard_turns": shard_turns,
             "shard_token_quota": shard_token_quota,
             "bootstrap_model": bootstrap_model,
+            "max_shard_retries": max_shard_retries,
+            "retry_model": retry_model,
+            "retry_budget_ratio": retry_budget_ratio,
+            "max_retry_shards": max_retry_shards,
             "epoch_char_limit": epoch_char_limit,
             "cache_token_weight": cache_token_weight,
             "scope_file": scope_file,
@@ -629,6 +641,14 @@ def run_agentic_target(
     eff_cache_weight = float(cache_token_weight)
     if not (0.0 <= eff_cache_weight <= 1.0):
         raise ValueError(f"cache_token_weight must be between 0.0 and 1.0, got {cache_token_weight!r}")
+    if isinstance(retry_budget_ratio, bool):
+        raise ValueError("retry_budget_ratio must be a finite number between 0.0 and 0.35")
+    raw_retry_ratio = float(retry_budget_ratio)
+    if not math.isfinite(raw_retry_ratio):
+        raise ValueError(f"retry_budget_ratio must be a finite number, got {retry_budget_ratio!r}")
+    eff_retry_budget_ratio = min(0.35, max(0.0, raw_retry_ratio))
+    eff_max_shard_retries = max(0, int(max_shard_retries))
+    eff_max_retry_shards = max(1, int(max_retry_shards))
     if isinstance(max_rps, bool):
         raise ValueError("max_rps must be a finite number >= 0.0")
     eff_max_rps = float(max_rps)
@@ -801,6 +821,22 @@ def run_agentic_target(
         provider["models"] = set(provider["models"]) | set(boot_provider["models"])
         models = {**models, "bootstrap": boot_sel["worker"]}
         bootstrap_model_id = boot_sel["worker"].split("/", 1)[1]
+    eff_retry_model = str(retry_model or "").strip()
+    retry_model_id = ""
+    if eff_retry_model:
+        retry_sel = llm_config.model_selection(provider_config, model=models["worker"], worker_model=eff_retry_model)
+        retry_provider = llm_config.provider_settings(provider_config, retry_sel)
+        provider["models"] = set(provider["models"]) | set(retry_provider["models"])
+        models = {**models, "retry": retry_sel["worker"]}
+        retry_model_id = retry_sel["worker"].split("/", 1)[1]
+    eff_reasoning_effort = llm_config.normalize_reasoning_effort(reasoning_effort)
+    effective_provider_options, provider_routing = llm_config.adapt_provider_options_for_effort(
+        provider.get("provider_options"),
+        models=list(models.values()),
+        provider_name=str(provider.get("name") or ""),
+        provider_url=str(provider.get("url") or ""),
+        reasoning_effort=eff_reasoning_effort,
+    )
 
     raw_epoch_limit = int(epoch_char_limit)
     eff_epoch_char_limit = max(
@@ -832,11 +868,19 @@ def run_agentic_target(
         "bootstrap_turns": max(1, int(bootstrap_turns)),
         "shard_turns": max(1, int(shard_turns)),
     }
+    if eff_max_shard_retries != 1:
+        sharding_cfg["max_shard_retries"] = eff_max_shard_retries
+    if abs(eff_retry_budget_ratio - 0.15) > 1e-9:
+        sharding_cfg["retry_budget_ratio"] = eff_retry_budget_ratio
+    if eff_max_retry_shards != 2:
+        sharding_cfg["max_retry_shards"] = eff_max_retry_shards
     eff_shard_token_quota = max(0, int(shard_token_quota))
     if eff_shard_token_quota > 0:
         sharding_cfg["shard_token_quota"] = eff_shard_token_quota
     if eff_bootstrap_model:
         sharding_cfg["bootstrap_model"] = models["bootstrap"]
+    if eff_retry_model:
+        sharding_cfg["retry_model"] = models["retry"]
 
     eff_auto_crawl = bool(auto_crawl or auto_crawl_forms)
     eff_auto_crawl_forms = bool(auto_crawl_forms and "POST" in eff_methods)
@@ -900,6 +944,8 @@ def run_agentic_target(
             },
             "run_id": eff_run_id,
             "models": models,
+            "reasoning_effort": eff_reasoning_effort or None,
+            "provider_routing": provider_routing,
             "provider_kind": auth["provider_kind"],
             "provider_host": auth["provider_host"],
             "allowed_methods": eff_methods,
@@ -952,7 +998,7 @@ def run_agentic_target(
         api_key=api_key,
         api_key_header=provider.get("api_key_header", "Authorization"),
         session_gate=session_gate,
-        provider_options=provider.get("provider_options"),
+        provider_options=effective_provider_options,
         cache_token_weight=eff_cache_weight,
     )
     receipt_store = ReceiptStore(output)
@@ -1039,6 +1085,8 @@ def run_agentic_target(
         "target": base,
         "scope": scope_summary,
         "models": models,
+        "reasoning_effort": eff_reasoning_effort or None,
+        "provider_routing": provider_routing,
         "provider_kind": auth["provider_kind"],
         "allowed_methods": eff_methods,
         "request_headers": sorted(global_headers),
@@ -1230,7 +1278,7 @@ def run_agentic_target(
             root_dir=output,
             discovery_hints=eff_discovery_hints,
             max_turns=max_turns,
-            reasoning_effort=reasoning_effort,
+            reasoning_effort=eff_reasoning_effort,
             use_bsag=ablation_cfg["use_bsag"],
             scheduler_mode=ablation_cfg["scheduler"],
             verification_gate=ablation_cfg["verification_gate"],
@@ -1245,6 +1293,10 @@ def run_agentic_target(
             shard_turns=sharding_cfg["shard_turns"],
             shard_token_quota=eff_shard_token_quota,
             bootstrap_model=bootstrap_model_id or None,
+            max_shard_retries=eff_max_shard_retries,
+            retry_model=retry_model_id or None,
+            retry_budget_ratio=eff_retry_budget_ratio,
+            max_retry_shards=eff_max_retry_shards,
             epoch_char_limit=eff_epoch_char_limit,
             cache_token_weight=eff_cache_weight,
             seed_surface=seed_data,
@@ -1490,6 +1542,29 @@ def main(argv: list[str] | None = None, *, force_plan_only: bool = False) -> int
         help="Optional Stage 1 discovery-only bootstrap model (same provider) for sharded mode",
     )
     parser.add_argument(
+        "--max-shard-retries",
+        type=int,
+        default=argparse.SUPPRESS,
+        help="Max Stage 2.5 selective fresh-context retries per shard (0 disables, default: 1)",
+    )
+    parser.add_argument(
+        "--retry-model",
+        default=argparse.SUPPRESS,
+        help="Optional Stage 2.5 selective retry model (same provider) for sharded mode",
+    )
+    parser.add_argument(
+        "--retry-budget-ratio",
+        type=float,
+        default=argparse.SUPPRESS,
+        help="Stage 2.5 retry budget reservation ratio in [0.0, 0.35] (default: 0.15)",
+    )
+    parser.add_argument(
+        "--max-retry-shards",
+        type=int,
+        default=argparse.SUPPRESS,
+        help="Maximum Stage 2.5 shards retried per run (default: 2)",
+    )
+    parser.add_argument(
         "--epoch-char-limit",
         type=int,
         default=argparse.SUPPRESS,
@@ -1680,6 +1755,8 @@ def main(argv: list[str] | None = None, *, force_plan_only: bool = False) -> int
         parser.error("--output-dir is required (via CLI or --config)")
     if not (0.0 <= float(effective["cache_token_weight"]) <= 1.0):
         parser.error("--cache-token-weight must be between 0.0 and 1.0")
+    if isinstance(effective["retry_budget_ratio"], bool) or not math.isfinite(float(effective["retry_budget_ratio"])):
+        parser.error("--retry-budget-ratio must be a finite number in [0.0, 0.35]")
     if not math.isfinite(float(effective["max_rps"])) or float(effective["max_rps"]) < 0.0:
         parser.error("--max-rps must be a finite number >= 0.0")
 

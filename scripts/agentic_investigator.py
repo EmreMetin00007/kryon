@@ -5,6 +5,7 @@ import concurrent.futures
 import copy
 import inspect
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -89,6 +90,14 @@ from agentic_sharding import (
     cluster_discovered_surface,
     collect_cross_shard_synthesis_context,
 )
+from agentic_stage25 import (
+    _cluster_route_and_family_sets,
+    _count_tracker_metrics,
+    _lead_matches_shard,
+    build_dead_end_digest,
+    build_stage25_retry_prompts,
+    evaluate_stage25_retry_candidates,
+)
 from agentic_surface import (
     SurfaceFrontierTracker,
     is_id_segment,
@@ -102,6 +111,7 @@ from agentic_tools import (
     canonicalize_and_deduplicate_findings,
     canonicalize_and_deduplicate_leads,
     reconcile_late_oob_hits,
+    reconcile_promoted_leads,
 )
 from full_agent_budget import (
     FRAMING_TOKENS,
@@ -112,6 +122,7 @@ from full_agent_budget import (
 )
 from full_agent_provider import MeteredProviderTransport, SessionGate
 from kryon_core.surface.extract import has_double_slash_path
+from llm_config import normalize_reasoning_effort
 from target_bootstrap import (
     is_destructive_lifecycle_route,
     is_logout_route,
@@ -691,6 +702,10 @@ class AgenticInvestigator:
         shard_turns: int = 25,
         shard_token_quota: int = 0,
         bootstrap_model: str | None = None,
+        max_shard_retries: int = 1,
+        retry_model: str | None = None,
+        retry_budget_ratio: float = 0.15,
+        max_retry_shards: int = 2,
         epoch_char_limit: int = _EPOCH_HARD_CHAR_LIMIT,
         cache_token_weight: float = 0.10,
         seed_surface: dict[str, Any] | None = None,
@@ -717,6 +732,19 @@ class AgenticInvestigator:
         self.shard_turns = max(1, int(shard_turns))
         self.shard_token_quota = max(0, int(shard_token_quota))
         self.bootstrap_model = str(bootstrap_model or "").strip()
+        self.max_shard_retries = max(0, int(max_shard_retries))
+        self.retry_model = str(retry_model or "").strip()
+        if isinstance(retry_budget_ratio, bool):
+            raise ValueError("retry_budget_ratio must be a finite number between 0.0 and 0.35")
+        raw_retry_ratio = float(retry_budget_ratio)
+        if not math.isfinite(raw_retry_ratio):
+            raise ValueError("retry_budget_ratio must be finite")
+        self.retry_budget_ratio = (
+            min(0.35, max(0.0, raw_retry_ratio))
+            if self.max_shard_retries > 0
+            else 0.0
+        )
+        self.max_retry_shards = max(1, int(max_retry_shards))
         raw_epoch_limit = int(_EPOCH_HARD_CHAR_LIMIT if epoch_char_limit is None else epoch_char_limit)
         self.epoch_char_limit = max(
             _PROMPT_HARD_CHAR_LIMIT,
@@ -739,7 +767,7 @@ class AgenticInvestigator:
         self.checkpoint_path = self.root_dir / "checkpoint.json"
         self.discovery_hints = [str(h) for h in (discovery_hints or ["/"]) if str(h).strip()] or ["/"]
         self.max_turns = max(1, int(max_turns))
-        self.reasoning_effort = reasoning_effort
+        self.reasoning_effort = normalize_reasoning_effort(reasoning_effort)
         self.max_provider_retries = max(0, int(max_provider_retries))
         self.sleep_fn = sleep_fn
         self._min_call_interval_seconds = 0.0
@@ -826,6 +854,8 @@ class AgenticInvestigator:
         self._stage1_post_auth_summary: dict[str, Any] | None = None
         self._stage1_surface_frontier: dict[str, Any] | None = None
         self._completed_shards: dict[str, dict[str, Any]] = {}
+        self._completed_retry_shards: dict[str, dict[str, Any]] = {}
+        self._stage2_receipt_to_shard: dict[str, str] = {}
 
     def _get_or_create_shared_oob_server(self, *, start: bool = False) -> LoopbackCallbackServer | None:
         """Return the single run-level LoopbackCallbackServer, creating it lazily on demand."""
@@ -881,6 +911,87 @@ class AgenticInvestigator:
             for row in self.http.actors.summaries()
         }
 
+    @staticmethod
+    def _session_gate_is_closed(transport: Any) -> bool:
+        gate = getattr(transport, "session_gate", None)
+        if gate is None:
+            return False
+        closed_attr = getattr(gate, "closed", None)
+        is_set_fn = getattr(closed_attr, "is_set", None)
+        is_closed = bool(is_set_fn()) if callable(is_set_fn) else bool(closed_attr)
+        return is_closed or bool(getattr(gate, "stop_reason", ""))
+
+    def _reconcile_and_archive_promoted_leads(self) -> list[dict[str, Any]]:
+        """Promote active leads confirmed in `self.dispatcher.findings`, prune leads files, and archive."""
+        findings_snapshot = list(self.dispatcher.findings)
+        if not findings_snapshot:
+            return []
+        actor_meta_map = self._actor_meta_map()
+        newly_promoted: list[dict[str, Any]] = []
+        existing_sigs = {
+            (
+                str(p.get("class_type") or ""),
+                str(p.get("method") or ""),
+                str(p.get("route_template") or ""),
+                str(p.get("signal_type") or ""),
+                str(p.get("promoted_to_finding_id") or ""),
+            )
+            for p in getattr(self.dispatcher, "promoted_leads", [])
+            if isinstance(p, dict)
+        }
+
+        def _archive(items: list[dict[str, Any]]) -> None:
+            for item in items:
+                sig = (
+                    str(item.get("class_type") or ""),
+                    str(item.get("method") or ""),
+                    str(item.get("route_template") or ""),
+                    str(item.get("signal_type") or ""),
+                    str(item.get("promoted_to_finding_id") or ""),
+                )
+                if sig not in existing_sigs:
+                    existing_sigs.add(sig)
+                    self.dispatcher.promoted_leads.append(item)
+                    newly_promoted.append(item)
+
+        with self.dispatcher._leads_lock:
+            if self.dispatcher.leads:
+                active_leads, promoted_batch = reconcile_promoted_leads(
+                    findings_snapshot,
+                    self.dispatcher.leads,
+                )
+                if promoted_batch:
+                    self.dispatcher.leads = active_leads
+                    self.dispatcher._save_leads()
+                    _archive(promoted_batch)
+
+        shards_root = self.root_dir / "shards"
+        if shards_root.is_dir():
+            for shard_leads_path in sorted(shards_root.glob("*/leads.json")):
+                try:
+                    disk_leads = json.loads(shard_leads_path.read_text(encoding="utf-8"))
+                except (OSError, ValueError):
+                    continue
+                if not isinstance(disk_leads, list) or not disk_leads:
+                    continue
+                dict_leads = [item for item in disk_leads if isinstance(item, dict)]
+                active_shard_leads, shard_promoted = reconcile_promoted_leads(
+                    findings_snapshot,
+                    dict_leads,
+                )
+                if shard_promoted:
+                    _atomic_write_json(shard_leads_path, active_shard_leads)
+                    _archive(shard_promoted)
+
+        if self.dispatcher.leads:
+            self.dispatcher.leads = canonicalize_and_deduplicate_leads(
+                self.dispatcher.leads,
+                actor_meta_map=actor_meta_map,
+                receipt_store=self.receipts,
+            )
+            self.dispatcher._save_leads()
+        return newly_promoted
+
     def _finalize_leads_and_reconcile_oob(self) -> None:
         """Merge persisted shard leads, reconcile late OOB hits before server shutdown, and save leads.json."""
         collected_leads: list[dict[str, Any]] = list(getattr(self.dispatcher, "leads", []) or [])
@@ -912,14 +1023,49 @@ class AgenticInvestigator:
             leads=canonical_leads,
             receipts=self.receipts,
             base_url=self.http.base_url,
+            receipt_to_shard=self._stage2_receipt_to_shard or None,
         )
-        if late_leads or canonical_leads or getattr(self.dispatcher, "leads", None):
-            self.dispatcher.leads = canonicalize_and_deduplicate_leads(
+        combined_leads = (
+            canonicalize_and_deduplicate_leads(
                 [*canonical_leads, *late_leads],
                 actor_meta_map=actor_meta_map,
                 receipt_store=self.receipts,
             )
+            if (canonical_leads or late_leads)
+            else []
+        )
+        active_leads, newly_promoted = reconcile_promoted_leads(
+            self.dispatcher.findings,
+            combined_leads,
+        )
+        if newly_promoted:
+            existing_sigs = {
+                (
+                    str(p.get("class_type") or ""),
+                    str(p.get("method") or ""),
+                    str(p.get("route_template") or ""),
+                    str(p.get("signal_type") or ""),
+                    str(p.get("promoted_to_finding_id") or ""),
+                )
+                for p in getattr(self.dispatcher, "promoted_leads", [])
+                if isinstance(p, dict)
+            }
+            for item in newly_promoted:
+                sig = (
+                    str(item.get("class_type") or ""),
+                    str(item.get("method") or ""),
+                    str(item.get("route_template") or ""),
+                    str(item.get("signal_type") or ""),
+                    str(item.get("promoted_to_finding_id") or ""),
+                )
+                if sig not in existing_sigs:
+                    existing_sigs.add(sig)
+                    self.dispatcher.promoted_leads.append(item)
+        if active_leads or newly_promoted or late_leads or canonical_leads or getattr(self.dispatcher, "leads", None):
+            self.dispatcher.leads = active_leads
             self.dispatcher._save_leads()
+        if self.dispatcher.findings and shards_root.is_dir():
+            self._reconcile_and_archive_promoted_leads()
 
     def _make_surface_tracker(self) -> SurfaceFrontierTracker:
         tracker_extra = _supported_kwargs(
@@ -1250,10 +1396,14 @@ class AgenticInvestigator:
         messages: list[dict[str, Any]],
         *,
         omit_reasoning_effort: bool = False,
+        reasoning_effort_override: str | None = None,
         keep_recent_turns_override: int | None = None,
         epoch_state: dict[str, Any] | None = None,
         model_override: str | None = None,
         excluded_tools: frozenset[str] | None = None,
+        sampling_seed: int | None = None,
+        temperature_override: float | None = None,
+        omit_sampling_params: bool = False,
     ) -> dict[str, Any]:
         avail = self.budget.available("tokens")
         schemas = (
@@ -1395,8 +1545,18 @@ class AgenticInvestigator:
             "tool_choice": "auto",
             "max_tokens": max_out,
         }
-        if self.reasoning_effort and not omit_reasoning_effort:
-            body["reasoning_effort"] = self.reasoning_effort
+        eff_reasoning = (
+            self.reasoning_effort
+            if reasoning_effort_override is None
+            else str(reasoning_effort_override or "").strip().lower()
+        )
+        if eff_reasoning and not omit_reasoning_effort:
+            body["reasoning_effort"] = eff_reasoning
+        if not omit_sampling_params:
+            if sampling_seed is not None:
+                body["seed"] = int(sampling_seed)
+            if temperature_override is not None:
+                body["temperature"] = float(temperature_override)
         return body
 
     def _complete_with_retry(
@@ -1408,11 +1568,16 @@ class AgenticInvestigator:
         usage_sink: dict[str, int] | None = None,
         calls_sink: list[int] | None = None,
         excluded_tools: frozenset[str] | None = None,
+        sampling_seed: int | None = None,
+        temperature_override: float | None = None,
+        omit_sampling_params: bool = False,
     ) -> dict[str, Any]:
         attempt = 0
         http400_attempts = 0
         wire_messages = messages
         omit_reasoning_effort = False
+        reasoning_effort_override: str | None = None
+        eff_omit_sampling = bool(omit_sampling_params)
         keep_recent_turns_override: int | None = None
         while True:
             with self._stats_lock:
@@ -1430,10 +1595,14 @@ class AgenticInvestigator:
             body = self._prepare_bounded_body(
                 wire_messages,
                 omit_reasoning_effort=omit_reasoning_effort,
+                reasoning_effort_override=reasoning_effort_override,
                 keep_recent_turns_override=keep_recent_turns_override,
                 epoch_state=epoch_state,
                 model_override=model_override,
                 excluded_tools=excluded_tools,
+                sampling_seed=sampling_seed,
+                temperature_override=temperature_override,
+                omit_sampling_params=eff_omit_sampling,
             )
             clock_fn = getattr(self.budget, "clock", time.monotonic)
             with self._stats_lock:
@@ -1456,8 +1625,27 @@ class AgenticInvestigator:
                 ):
                     http400_attempts += 1
                     self._clear_transient_gates()
-                    wire_messages = _sanitize_messages_for_http400(messages)
-                    if http400_attempts >= 2:
+                    sanitized_msgs = _sanitize_messages_for_http400(messages)
+                    content_changed = sanitized_msgs != wire_messages
+                    wire_messages = sanitized_msgs
+                    had_sampling = (not eff_omit_sampling) and (
+                        sampling_seed is not None or temperature_override is not None
+                    )
+                    eff_omit_sampling = True
+                    cur_effort = (
+                        reasoning_effort_override
+                        if reasoning_effort_override is not None
+                        else self.reasoning_effort
+                    ).strip().lower()
+                    if (
+                        http400_attempts == 1
+                        and not content_changed
+                        and not had_sampling
+                        and not omit_reasoning_effort
+                        and cur_effort in {"max", "xhigh"}
+                    ):
+                        reasoning_effort_override = "high"
+                    elif http400_attempts >= 2:
                         keep_recent_turns_override = 1
                         omit_reasoning_effort = True
                     continue
@@ -1530,6 +1718,7 @@ class AgenticInvestigator:
                     "stage1_post_auth_summary": self._stage1_post_auth_summary,
                     "stage1_surface_frontier": self._stage1_surface_frontier,
                     "completed_shards": copy.deepcopy(self._completed_shards),
+                    "completed_retry_shards": copy.deepcopy(self._completed_retry_shards),
                 },
             )
 
@@ -1606,6 +1795,12 @@ class AgenticInvestigator:
         self._completed_shards = (
             {str(k): dict(v) for k, v in raw_comp_shards.items() if isinstance(v, dict)}
             if isinstance(raw_comp_shards, dict)
+            else {}
+        )
+        raw_comp_retry_shards = data.get("completed_retry_shards")
+        self._completed_retry_shards = (
+            {str(k): dict(v) for k, v in raw_comp_retry_shards.items() if isinstance(v, dict)}
+            if isinstance(raw_comp_retry_shards, dict)
             else {}
         )
         self.dispatcher.finished = bool(data.get("finished", False))
@@ -2347,6 +2542,10 @@ class AgenticInvestigator:
         calls_sink: list[int] | None = None,
         shard_token_quota: int | None = None,
         excluded_tools: frozenset[str] | None = None,
+        sampling_seed: int | None = None,
+        temperature_override: float | None = None,
+        omit_sampling_params: bool = False,
+        allow_high_risk_nudge: bool = True,
     ) -> tuple[str, int, list[dict[str, Any]]]:
         """Run a bounded ReAct monolithic loop over a caller-supplied dispatcher and message list."""
         status = "running"
@@ -2465,6 +2664,9 @@ class AgenticInvestigator:
                     usage_sink=usage_sink,
                     calls_sink=calls_sink,
                     excluded_tools=excluded_tools,
+                    sampling_seed=sampling_seed,
+                    temperature_override=temperature_override,
+                    omit_sampling_params=omit_sampling_params,
                 )
                 if self.telemetry is not None:
                     with self._stats_lock:
@@ -2524,7 +2726,7 @@ class AgenticInvestigator:
                                 },
                                 ensure_ascii=False,
                             )
-                        elif name == "finish" and shard_cluster is not None:
+                        elif name == "finish" and shard_cluster is not None and allow_high_risk_nudge:
                             nudge_reply = self._maybe_nudge_shard_high_risk_finish(
                                 dispatcher=dispatcher,
                                 shard_cluster=shard_cluster,
@@ -3131,6 +3333,8 @@ class AgenticInvestigator:
             fallback_to_monolithic: bool,
             fallback_reason: str | None = None,
             shards: list[dict[str, Any]] | None = None,
+            stage2_5_retries: list[dict[str, Any]] | None = None,
+            promoted_leads_count: int = 0,
             stage3_synthesis: dict[str, Any] | None = None,
             post_auth_stage0_crawl: dict[str, Any] | None = None,
         ) -> dict[str, Any]:
@@ -3151,6 +3355,12 @@ class AgenticInvestigator:
                 "fallback_to_monolithic": fallback_to_monolithic,
                 "shards": shards or [],
             }
+            if self.retry_model:
+                summary["retry_model"] = self.retry_model
+            if stage2_5_retries:
+                summary["stage2_5_retries"] = list(stage2_5_retries)
+            if promoted_leads_count > 0:
+                summary["promoted_leads"] = int(promoted_leads_count)
             if fallback_reason is not None:
                 summary["fallback_reason"] = fallback_reason
             if post_auth_stage0_crawl is not None:
@@ -3508,6 +3718,11 @@ class AgenticInvestigator:
 
             # Stage 2: Parallel monolithic subsystem shards
             self._active_model = self.model
+            stage1_actor_aliases = {
+                str(r.get("alias") or "").strip()
+                for r in self.http.actors.summaries()
+                if str(r.get("alias") or "").strip()
+            }
             rem_http_after_boot = self.http.budget.limit - self.http.budget.used
             rem_tok_after_boot = self.budget.available("tokens")
             rem_tokens = rem_tok_after_boot
@@ -3523,10 +3738,23 @@ class AgenticInvestigator:
                 if reserve_for_stage3
                 else 0
             )
+            stage3_token_reserve = (
+                max(20_000, int(rem_tok_after_boot * 0.12))
+                if reserve_for_stage3
+                else 0
+            )
+            eff_retry_ratio = self.retry_budget_ratio if self.max_shard_retries > 0 else 0.0
+            retry_http_reserve = (
+                min(30, max(6, int(rem_http_after_boot * eff_retry_ratio)))
+                if (eff_retry_ratio > 0.0 and rem_http_after_boot >= 50)
+                else 0
+            )
+            stage2_http_reserve_floor = stage3_http_reserve + retry_http_reserve
             if self.shard_token_quota > 0:
                 eff_shard_token_quota = self.shard_token_quota
             else:
-                token_share = 0.85 if stage3_http_reserve > 0 else 0.90
+                stage3_tok_frac = 0.15 if stage3_http_reserve > 0 else 0.10
+                token_share = max(0.50, 1.0 - stage3_tok_frac - eff_retry_ratio)
                 eff_shard_token_quota = max(25_000, int((rem_tokens * token_share) / num_shards))
             shard_base_sys_prompt = build_system_prompt(
                 base_url=self.http.base_url,
@@ -3574,6 +3802,21 @@ class AgenticInvestigator:
                     restored_tracker.load_dict(copy.deepcopy(saved["surface_tracker"]))
                 else:
                     restored_tracker.load_dict(copy.deepcopy(bootstrap_surface_snap))
+                saved_sc = saved.get("surface_counts")
+                if not isinstance(saved_sc, dict):
+                    route_set, family_set, cluster_routes, _ = _cluster_route_and_family_sets(cluster)[:4]
+                    t_metrics = _count_tracker_metrics(
+                        restored_tracker,
+                        route_set=route_set,
+                        family_set=family_set,
+                    )
+                    saved_sc = {
+                        "routes": max(len(cluster_routes), t_metrics["routes"]),
+                        "write_ops": t_metrics["write_ops"],
+                        "untested_writes": t_metrics["untested_writes"],
+                        "opaque_slices": t_metrics["opaque_slices"],
+                        "auth_barriers": t_metrics["auth_barriers"],
+                    }
                 return {
                     "shard_id": cluster.shard_id,
                     "name": str(saved.get("name") or cluster.name),
@@ -3586,6 +3829,12 @@ class AgenticInvestigator:
                     "reasoning_tokens": int(saved.get("reasoning_tokens") or 0),
                     "epoch_advancements": int(saved.get("epoch_advancements") or 0),
                     "shard_token_quota": int(saved.get("shard_token_quota") or eff_shard_token_quota),
+                    "turns_used": int(saved.get("turns_used") or 0),
+                    "closed_at_seq": int(saved.get("closed_at_seq") or 0),
+                    "receipt_ids": [str(r) for r in (saved.get("receipt_ids") or ())],
+                    "mutated_paths": [str(p) for p in (saved.get("mutated_paths") or ())],
+                    "oracle_rejections": [dict(r) for r in (saved.get("oracle_rejections") or ()) if isinstance(r, dict)],
+                    "surface_counts": dict(saved_sc),
                     "findings": saved_findings,
                     "leads": saved_leads,
                     "status": str(saved.get("status") or "finished"),
@@ -3608,7 +3857,7 @@ class AgenticInvestigator:
                     oob_server=shared_oob,
                     oob_provider=self._get_or_create_shared_oob_server,
                     waf_pivot=self.dispatcher.waf_pivot,
-                    http_reserve_floor=stage3_http_reserve,
+                    http_reserve_floor=stage2_http_reserve_floor,
                     shared_facts=self.shared_facts,
                 )
                 try:
@@ -3620,6 +3869,7 @@ class AgenticInvestigator:
                     shard_epoch_state: dict[str, Any] = {"turn_start": 0, "summary_text": "", "advancements": 0}
                     shard_usage: dict[str, int] = _new_usage_dict()
                     shard_calls = [0]
+                    shard_last_turn = 0
                     init_banner = self._state_banner(
                         1,
                         dispatcher=shard_dispatcher,
@@ -3683,7 +3933,7 @@ class AgenticInvestigator:
                         s_status = "interrupted"
                     else:
                         try:
-                            s_status, _, _ = self._execute_monolithic_loop(
+                            s_status, shard_last_turn, _ = self._execute_monolithic_loop(
                                 dispatcher=shard_dispatcher,
                                 messages=shard_messages,
                                 start_turn=1,
@@ -3704,6 +3954,19 @@ class AgenticInvestigator:
                         except Exception as exc:
                             s_status = f"error:{type(exc).__name__}"
 
+                    route_set, family_set, cluster_routes, _ = _cluster_route_and_family_sets(cluster)[:4]
+                    t_metrics = _count_tracker_metrics(
+                        shard_dispatcher.surface_tracker,
+                        route_set=route_set,
+                        family_set=family_set,
+                    )
+                    surface_counts = {
+                        "routes": max(len(cluster_routes), t_metrics["routes"]),
+                        "write_ops": t_metrics["write_ops"],
+                        "untested_writes": t_metrics["untested_writes"],
+                        "opaque_slices": t_metrics["opaque_slices"],
+                        "auth_barriers": t_metrics["auth_barriers"],
+                    }
                     result_doc = {
                         "shard_id": cluster.shard_id,
                         "name": cluster.name,
@@ -3716,6 +3979,12 @@ class AgenticInvestigator:
                         "reasoning_tokens": shard_usage["reasoning_tokens"],
                         "epoch_advancements": int(shard_epoch_state.get("advancements", 0)),
                         "shard_token_quota": eff_shard_token_quota,
+                        "turns_used": int(shard_last_turn),
+                        "closed_at_seq": self.shared_facts.current_seq(),
+                        "receipt_ids": list(shard_dispatcher.shard_receipt_ids)[-120:],
+                        "mutated_paths": sorted(shard_dispatcher.mutated_paths)[:100],
+                        "oracle_rejections": list(shard_dispatcher.oracle_rejections)[-30:],
+                        "surface_counts": surface_counts,
                         "findings": list(shard_dispatcher.findings),
                         "leads": list(shard_dispatcher.leads),
                         "status": s_status,
@@ -3858,6 +4127,8 @@ class AgenticInvestigator:
                 self.cancel_event is not None and self.cancel_event.is_set()
             ):
                 overall_status = "interrupted"
+            elif any(st == "service_degraded" for st in shard_statuses):
+                overall_status = "service_degraded"
             elif all(st == "finished" for st in shard_statuses):
                 overall_status = "finished"
             elif any(st == "finished" for st in shard_statuses):
@@ -3866,6 +4137,361 @@ class AgenticInvestigator:
                 overall_status = "budget_exhausted"
             else:
                 overall_status = shard_statuses[0] if shard_statuses else "finished"
+
+            self._stage2_receipt_to_shard = {}
+            for sres in shard_results:
+                sid = str(sres.get("shard_id") or "").strip()
+                for rid in sres.get("receipt_ids") or ():
+                    if rid and sid:
+                        self._stage2_receipt_to_shard[str(rid)] = sid
+
+            if overall_status != "interrupted" and not (
+                self.cancel_event is not None and self.cancel_event.is_set()
+            ):
+                shared_oob_mid = self._get_or_create_shared_oob_server(start=False)
+                if shared_oob_mid is not None:
+                    mid_late_leads = reconcile_late_oob_hits(
+                        shared_oob_mid,
+                        findings=self.dispatcher.findings,
+                        leads=self.dispatcher.leads,
+                        receipts=self.receipts,
+                        base_url=self.http.base_url,
+                        receipt_to_shard=self._stage2_receipt_to_shard or None,
+                    )
+                    if mid_late_leads:
+                        self.dispatcher.leads = canonicalize_and_deduplicate_leads(
+                            [*self.dispatcher.leads, *mid_late_leads],
+                            actor_meta_map=actor_meta_map,
+                            receipt_store=self.receipts,
+                        )
+                        self.dispatcher._save_leads()
+                self._reconcile_and_archive_promoted_leads()
+
+            # Stage 2.5: Selective fresh-context shard retry + optional same-provider escalation
+            stage2_5_retry_summaries: list[dict[str, Any]] = []
+            if (
+                self.max_shard_retries > 0
+                and overall_status not in {"interrupted", "service_degraded"}
+                and not (self.cancel_event is not None and self.cancel_event.is_set())
+                and not self._session_gate_is_closed(self.transport)
+            ):
+                retry_candidates = evaluate_stage25_retry_candidates(
+                    clusters=clusters,
+                    shard_results=shard_results,
+                    active_leads=self.dispatcher.leads,
+                    shared_facts=self.shared_facts,
+                    remaining_http=max(0, self.http.budget.limit - self.http.budget.used),
+                    remaining_tokens=self.budget.available("tokens"),
+                    remaining_seconds=float(self.budget.remaining_seconds()),
+                    stage3_http_reserve=stage3_http_reserve,
+                    stage3_token_reserve=stage3_token_reserve,
+                    retry_budget_ratio=eff_retry_ratio,
+                    max_retry_shards=self.max_retry_shards,
+                    max_shard_retries=self.max_shard_retries,
+                    retry_model=self.retry_model,
+                    primary_model=self.model,
+                    default_shard_turns=self.shard_turns,
+                )
+                if retry_candidates:
+                    mutated_and_parents: set[str] = set()
+                    for sres in shard_results:
+                        for raw_mp in sres.get("mutated_paths") or ():
+                            norm_mp = str(raw_mp or "").rstrip("/") or "/"
+                            mutated_and_parents.add(norm_mp)
+                            if "/" in norm_mp.lstrip("/"):
+                                parent_mp = norm_mp.rsplit("/", 1)[0] or "/"
+                                mutated_and_parents.add(parent_mp)
+                    current_actor_aliases = {
+                        str(r.get("alias") or "").strip()
+                        for r in self.http.actors.summaries()
+                        if str(r.get("alias") or "").strip()
+                    }
+                    new_stage2_actors = sorted(current_actor_aliases - stage1_actor_aliases)
+                    if (mutated_and_parents or new_stage2_actors) and hasattr(
+                        self.http, "invalidate_get_cache"
+                    ):
+                        self.http.invalidate_get_cache(
+                            paths=sorted(mutated_and_parents) or None,
+                            actors=new_stage2_actors or None,
+                        )
+
+                    cluster_map = {c.shard_id: c for c in clusters}
+                    sres_map = {str(r.get("shard_id") or ""): r for r in shard_results}
+                    for cand in retry_candidates:
+                        cand_sid = str(cand.get("shard_id") or "")
+                        cluster_obj = cluster_map.get(cand_sid)
+                        orig_sres = sres_map.get(cand_sid)
+                        if cluster_obj is None or orig_sres is None:
+                            continue
+
+                        saved_retry = self._completed_retry_shards.get(cand_sid)
+                        if (
+                            resume
+                            and isinstance(saved_retry, dict)
+                            and str(saved_retry.get("status") or "") in _terminal_done_shard_statuses
+                        ):
+                            stage2_5_retry_summaries.append({
+                                "shard_id": cand_sid,
+                                "attempt": int(saved_retry.get("attempt") or 1),
+                                "families": list(saved_retry.get("families") or cluster_obj.families),
+                                "status": str(saved_retry.get("status") or "finished"),
+                                "triggers": list(saved_retry.get("triggers") or cand.get("triggers") or []),
+                                "retry_model": str(saved_retry.get("retry_model") or cand.get("retry_model") or self.model),
+                                "calls": int(saved_retry.get("calls") or 0),
+                                "tokens": int(saved_retry.get("tokens") or 0),
+                                "effective_tokens": int(saved_retry.get("effective_tokens") or 0),
+                                "cached_tokens": int(saved_retry.get("cached_tokens") or 0),
+                                "uncached_tokens": int(saved_retry.get("uncached_tokens") or 0),
+                                "reasoning_tokens": int(saved_retry.get("reasoning_tokens") or 0),
+                                "findings": int(saved_retry.get("findings") or 0),
+                                "promoted_leads": int(saved_retry.get("promoted_leads") or 0),
+                            })
+                            continue
+
+                        if (
+                            self._session_gate_is_closed(self.transport)
+                            or (self.cancel_event is not None and self.cancel_event.is_set())
+                            or (self.http.budget.limit - self.http.budget.used) <= stage3_http_reserve + 2
+                            or self.budget.available("tokens") <= stage3_token_reserve + 8_000
+                            or self.budget.remaining_seconds() <= 15
+                        ):
+                            break
+
+                        retry_worker_id = f"{cand_sid}-retry1"
+                        retry_dir = self.root_dir / "shards" / retry_worker_id
+                        retry_dir.mkdir(parents=True, exist_ok=True)
+                        shared_oob_r = self._get_or_create_shared_oob_server(start=False)
+                        retry_dispatcher = ToolDispatcher(
+                            http_client=self.http,
+                            receipt_store=self.receipts,
+                            root_dir=retry_dir,
+                            bsag=None,
+                            oracle=self.oracle,
+                            telemetry=self.telemetry,
+                            oob_server=shared_oob_r,
+                            oob_provider=self._get_or_create_shared_oob_server,
+                            waf_pivot=self.dispatcher.waf_pivot,
+                            http_reserve_floor=stage3_http_reserve,
+                            shared_facts=self.shared_facts,
+                        )
+                        try:
+                            retry_dispatcher.surface_tracker.load_dict(
+                                copy.deepcopy(self.dispatcher.surface_tracker.to_dict())
+                            )
+                            retry_dispatcher.coverage_gate_enabled = False
+                            retry_dispatcher.discovery_finish_gate = False
+                            retry_dispatcher.set_active_context(
+                                worker_id=retry_worker_id,
+                                category=cluster_obj.name,
+                            )
+
+                            route_set_c, family_set_c = _cluster_route_and_family_sets(cluster_obj)[:2]
+                            active_leads_for_shard = [
+                                ld
+                                for ld in self.dispatcher.leads
+                                if _lead_matches_shard(
+                                    ld,
+                                    shard_id=cand_sid,
+                                    route_set=route_set_c,
+                                    family_set=family_set_c,
+                                )
+                            ]
+                            newly_unlocked = self.shared_facts.facts_after(
+                                int(orig_sres.get("closed_at_seq") or 0),
+                                exclude_shard=cand_sid,
+                                families=cluster_obj.families,
+                            )
+                            dead_end_digest = build_dead_end_digest(
+                                shard_id=cand_sid,
+                                receipts=self.receipts,
+                                shard_receipt_ids=orig_sres.get("receipt_ids") or (),
+                                oracle_rejections=orig_sres.get("oracle_rejections") or (),
+                                waf_pivot=self.dispatcher.waf_pivot,
+                                surface_tracker=self.dispatcher.surface_tracker,
+                                cluster_families=cluster_obj.families,
+                                active_actors=self.http.actors.summaries(),
+                                newly_unlocked_facts=newly_unlocked,
+                                max_chars=1200,
+                                secret_values=self.http.actors.all_secrets(),
+                            )
+                            r_max_turns = int(cand.get("allocated_max_turns") or 12)
+                            r_token_quota = int(cand.get("allocated_token_quota") or 20_000)
+                            r_banner = self._state_banner(
+                                1,
+                                dispatcher=retry_dispatcher,
+                                max_turns_override=r_max_turns,
+                                shard_cluster=cluster_obj,
+                                allow_coverage_gate=False,
+                                shard_token_quota=r_token_quota,
+                                shard_tokens_used=0,
+                            )
+                            r_sys, r_usr = build_stage25_retry_prompts(
+                                cluster=cluster_obj,
+                                candidate=cand,
+                                base_system_prompt=shard_base_sys_prompt,
+                                shared_facts_snapshot=self.shared_facts.epoch_snapshot(),
+                                dead_end_digest=dead_end_digest,
+                                active_actors=self.http.actors.summaries(),
+                                state_banner=r_banner,
+                                active_leads_for_shard=active_leads_for_shard,
+                            )
+                            r_messages: list[dict[str, Any]] = [
+                                {"role": "system", "content": r_sys},
+                                {"role": "user", "content": r_usr},
+                            ]
+                            r_epoch_state: dict[str, Any] = {
+                                "turn_start": 0,
+                                "summary_text": "",
+                                "advancements": 0,
+                            }
+                            r_usage: dict[str, int] = _new_usage_dict()
+                            r_calls = [0]
+
+                            def _retry_ckpt(
+                                t: int,
+                                st: str,
+                                _msgs: list[dict[str, Any]],
+                                *,
+                                _dir: Path = retry_dir,
+                                _sid: str = retry_worker_id,
+                                _fams: list[str] = list(cluster_obj.families),
+                                _disp: ToolDispatcher = retry_dispatcher,
+                            ) -> None:
+                                _atomic_write_json(
+                                    _dir / "checkpoint.json",
+                                    {
+                                        "schema": "agentic-shard-checkpoint/1",
+                                        "shard_id": _sid,
+                                        "families": _fams,
+                                        "turn": t,
+                                        "status": st,
+                                        "findings": _disp.findings,
+                                    },
+                                )
+
+                            eff_retry_model = str(
+                                cand.get("retry_model") or self.retry_model or self.model
+                            )
+                            temp_ovr = (
+                                0.2
+                                if "reasoner" not in eff_retry_model.lower()
+                                else None
+                            )
+                            try:
+                                r_status, _, _ = self._execute_monolithic_loop(
+                                    dispatcher=retry_dispatcher,
+                                    messages=r_messages,
+                                    start_turn=1,
+                                    max_turns=r_max_turns,
+                                    epoch_state=r_epoch_state,
+                                    model_name=eff_retry_model,
+                                    allow_coverage_gate=False,
+                                    allow_discovery_gate=False,
+                                    checkpoint_fn=_retry_ckpt,
+                                    shard_cluster=cluster_obj,
+                                    usage_sink=r_usage,
+                                    calls_sink=r_calls,
+                                    shard_token_quota=r_token_quota,
+                                    excluded_tools=None,
+                                    sampling_seed=cand.get("sampling_seed"),
+                                    temperature_override=temp_ovr,
+                                )
+                            except BudgetError as exc:
+                                r_status = self._classify_budget_error(exc, is_shard=True)
+                            except Exception as exc:
+                                r_status = f"error:{type(exc).__name__}"
+
+                            self._merge_surface_trackers(
+                                self.dispatcher.surface_tracker,
+                                retry_dispatcher.surface_tracker,
+                            )
+                            actor_meta_map = self._actor_meta_map()
+                            for row in self.http.actors.summaries():
+                                self.dispatcher.surface_tracker.actors[row["alias"]] = {
+                                    "alias": row["alias"],
+                                    "role": str(row.get("role") or "").strip().lower(),
+                                    "tenant": str(row.get("tenant") or "").strip().lower(),
+                                }
+                            if retry_dispatcher.findings:
+                                self.dispatcher.findings = canonicalize_and_deduplicate_findings(
+                                    [*self.dispatcher.findings, *retry_dispatcher.findings],
+                                    actor_meta_map=actor_meta_map,
+                                    receipt_store=self.receipts,
+                                )
+                                self.dispatcher._save_findings()
+                                existing_ids = {
+                                    str(f.get("finding_id") or "")
+                                    for f in (orig_sres.get("findings") or ())
+                                    if isinstance(f, dict)
+                                }
+                                extra_orig = [
+                                    f
+                                    for f in retry_dispatcher.findings
+                                    if str(f.get("finding_id") or "") not in existing_ids
+                                ]
+                                if extra_orig:
+                                    orig_sres["findings"] = [*(orig_sres.get("findings") or []), *extra_orig]
+                            if retry_dispatcher.leads:
+                                self.dispatcher.leads = canonicalize_and_deduplicate_leads(
+                                    [*self.dispatcher.leads, *retry_dispatcher.leads],
+                                    actor_meta_map=actor_meta_map,
+                                    receipt_store=self.receipts,
+                                )
+                                self.dispatcher._save_leads()
+                            for rid in retry_dispatcher.shard_receipt_ids:
+                                if rid:
+                                    self._stage2_receipt_to_shard[str(rid)] = cand_sid
+                            if retry_dispatcher.finish_summary:
+                                prefix = (
+                                    (self.dispatcher.finish_summary + " | ")
+                                    if self.dispatcher.finish_summary
+                                    else ""
+                                )
+                                self.dispatcher.finish_summary = (
+                                    prefix + f"[{retry_worker_id}] {retry_dispatcher.finish_summary}"
+                                )
+                            for area in retry_dispatcher.untested_areas:
+                                if area not in self.dispatcher.untested_areas:
+                                    self.dispatcher.untested_areas.append(area)
+                            retry_promoted = self._reconcile_and_archive_promoted_leads()
+                            if r_status == "interrupted":
+                                overall_status = "interrupted"
+                            elif r_status == "service_degraded":
+                                overall_status = "service_degraded"
+                            elif overall_status != "finished" and r_status == "finished":
+                                overall_status = "finished"
+
+                            retry_summary_doc = {
+                                "shard_id": cand_sid,
+                                "attempt": 1,
+                                "families": list(cluster_obj.families),
+                                "status": r_status,
+                                "triggers": list(cand.get("triggers") or []),
+                                "retry_model": eff_retry_model,
+                                "calls": r_calls[0],
+                                "tokens": r_usage["total_tokens"],
+                                "effective_tokens": effective_tokens_from_usage(
+                                    r_usage, self.cache_token_weight
+                                ),
+                                "cached_tokens": r_usage["cached_prompt_tokens"],
+                                "uncached_tokens": r_usage["uncached_prompt_tokens"],
+                                "reasoning_tokens": r_usage["reasoning_tokens"],
+                                "findings": len(retry_dispatcher.findings),
+                                "promoted_leads": len(retry_promoted),
+                            }
+                            stage2_5_retry_summaries.append(retry_summary_doc)
+                            if r_status in _terminal_done_shard_statuses:
+                                self._completed_retry_shards[cand_sid] = retry_summary_doc
+                                self._save_checkpoint(
+                                    turn=boot_last_turn,
+                                    status="stage2_5_in_progress",
+                                    messages=[],
+                                )
+                        finally:
+                            self._save_shared_facts()
+                            self._close_dispatcher(retry_dispatcher)
+                        if overall_status in {"interrupted", "service_degraded"}:
+                            break
 
             synth_ctx = collect_cross_shard_synthesis_context(
                 shard_results=shard_results,
@@ -4101,6 +4727,8 @@ class AgenticInvestigator:
                     }
                     for r in shard_results
                 ],
+                stage2_5_retries=stage2_5_retry_summaries,
+                promoted_leads_count=len(getattr(self.dispatcher, "promoted_leads", []) or []),
                 stage3_synthesis=stage3_summary,
                 post_auth_stage0_crawl=post_auth_stage0_summary,
             )

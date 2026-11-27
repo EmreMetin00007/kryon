@@ -70,6 +70,8 @@ def _cmd_status(remainder: list[str]) -> int:
         "status": doc.get("status") or ("planned" if doc.get("mode") == "plan_only" else None),
         "target": doc.get("target"),
         "preset": doc.get("preset"),
+        "reasoning_effort": doc.get("reasoning_effort"),
+        "provider_routing": doc.get("provider_routing"),
         "allowed_methods": doc.get("allowed_methods"),
         "request_headers": doc.get("request_headers"),
         "findings_count": doc.get("findings_count", 0),

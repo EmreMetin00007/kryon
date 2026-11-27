@@ -11,7 +11,7 @@ from pathlib import Path
 import re
 import tempfile
 import threading
-from typing import Any, Callable, Sequence
+from typing import Any, Callable, Mapping, Sequence
 from urllib.parse import parse_qsl, unquote, urlencode, urljoin, urlsplit, urlunsplit
 import uuid
 
@@ -1093,6 +1093,8 @@ def canonicalize_and_deduplicate_leads(
 
     grouped: dict[tuple[str, str, str, str, str], dict[str, Any]] = {}
     for item in raw_items:
+        if item.get("promoted_to_finding_id") or str(item.get("status") or "").strip().lower() == "promoted":
+            continue
         redacted = _redact_lead_record(item)
         raw_class = str(redacted.get("class_type") or "").strip()
         method = str(redacted.get("method") or "GET").strip().upper() or "GET"
@@ -1164,6 +1166,10 @@ def canonicalize_and_deduplicate_leads(
             existing["oob_hit_count"] = int(redacted.get("oob_hit_count") or 0)
         if not existing.get("oob_token") and redacted.get("oob_token"):
             existing["oob_token"] = redacted["oob_token"]
+        if not existing.get("source_shard") and redacted.get("source_shard"):
+            existing["source_shard"] = redacted["source_shard"]
+        if not existing.get("promoted_to_finding_id") and redacted.get("promoted_to_finding_id"):
+            existing["promoted_to_finding_id"] = redacted["promoted_to_finding_id"]
         if redacted.get("oob_hits_preview") and len(redacted["oob_hits_preview"]) > len(existing.get("oob_hits_preview") or []):
             existing["oob_hits_preview"] = redacted["oob_hits_preview"]
         if _severity_rank(redacted) < _severity_rank(existing):
@@ -1216,6 +1222,7 @@ def reconcile_late_oob_hits(
     leads: Sequence[dict[str, Any]],
     receipts: Any,
     base_url: str = "",
+    receipt_to_shard: Mapping[str, str] | None = None,
 ) -> list[dict[str, Any]]:
     """Convert late-arriving unconfirmed OOB hits into redacted NEEDS_VERIFICATION leads."""
     if oob_server is None or not hasattr(oob_server, "poll"):
@@ -1349,6 +1356,15 @@ def reconcile_late_oob_hits(
             if rec_excerpt:
                 oob_summary = f"{oob_summary}\n{rec_excerpt}"
 
+        best_proof_rid = str(primary_rec.get("receipt_id") or "").strip() if primary_rec else ""
+        shard_map = receipt_to_shard or {}
+        if (not best_proof_rid or not shard_map.get(best_proof_rid)) and matched_rids:
+            for cand_rid in matched_rids:
+                if shard_map.get(cand_rid):
+                    best_proof_rid = cand_rid
+                    break
+        source_shard = str(shard_map.get(best_proof_rid) or "bootstrap")
+
         lead_entry: dict[str, Any] = {
             "title": f"Late asynchronous OOB callback hit ({inferred_class})",
             "class_type": inferred_class,
@@ -1358,6 +1374,7 @@ def reconcile_late_oob_hits(
             "path": url_path,
             "actor": actor,
             "actor_alias": actor,
+            "source_shard": source_shard,
             "severity": "high",
             "status": "needs_verification",
             "verification_tier": "NEEDS_VERIFICATION",
@@ -1388,6 +1405,134 @@ def reconcile_late_oob_hits(
         new_leads.append(_redact_lead_record(lead_entry))
 
     return new_leads
+
+
+def _normalize_item_match_fields(item: dict[str, Any]) -> dict[str, Any]:
+    raw_class = str(item.get("class_type") or "").strip()
+    method = str(item.get("method") or "").strip().upper()
+    canon_class = (
+        normalize_vuln_class(
+            raw_class,
+            method=method,
+            title=str(item.get("title") or ""),
+            summary=str(item.get("summary") or ""),
+        )
+        if raw_class
+        else ""
+    )
+    raw_url = str(item.get("url") or item.get("path") or "").strip()
+    raw_origin = str(item.get("origin") or "").strip()
+    origin = (
+        _extract_finding_origin(raw_origin)
+        if raw_origin
+        else _extract_finding_origin(raw_url)
+    )
+    raw_route = str(item.get("route_template") or raw_url).strip()
+    route_tmpl = normalize_route_template(raw_route) if raw_route else ""
+    route_set = {route_tmpl} if route_tmpl else set()
+    for alias in (item.get("route_aliases") or ()):
+        alias_str = str(alias or "").strip()
+        if alias_str:
+            route_set.add(normalize_route_template(alias_str))
+    norm_path = _norm_path(raw_url) if raw_url else (_norm_path(route_tmpl) if route_tmpl else "")
+    proof_ids = {str(r).strip() for r in (item.get("proof_receipt_ids") or ()) if str(r).strip()}
+    graphql_op = str(item.get("graphql_op") or "").strip()
+    return {
+        "class_type": canon_class,
+        "method": method,
+        "origin": origin,
+        "route_template": route_tmpl,
+        "route_set": route_set,
+        "norm_path": norm_path,
+        "proof_ids": proof_ids,
+        "graphql_op": graphql_op,
+    }
+
+
+def reconcile_promoted_leads(
+    findings: Sequence[dict[str, Any]],
+    leads: Sequence[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Partition leads into `(active_leads, promoted_leads)` against confirmed `findings`."""
+    finding_entries: list[tuple[dict[str, Any], dict[str, Any]]] = []
+    for f in findings:
+        if isinstance(f, dict):
+            finding_entries.append((f, _normalize_item_match_fields(f)))
+
+    raw_active: list[dict[str, Any]] = []
+    promoted_leads: list[dict[str, Any]] = []
+
+    for lead in leads:
+        if not isinstance(lead, dict):
+            continue
+        if str(lead.get("promoted_to_finding_id") or "").strip():
+            marked = copy.deepcopy(lead)
+            marked["status"] = "promoted"
+            promoted_leads.append(marked)
+            continue
+
+        l_meta = _normalize_item_match_fields(lead)
+        l_class = l_meta["class_type"]
+        l_oob = str(lead.get("oob_token") or "").strip()
+        matched_finding: dict[str, Any] | None = None
+
+        for f, f_meta in finding_entries:
+            f_class = f_meta["class_type"]
+            if f_class and l_class and f_class == l_class:
+                origin_ok = (
+                    not f_meta["origin"]
+                    or not l_meta["origin"]
+                    or f_meta["origin"] == l_meta["origin"]
+                )
+                gql_ok = (
+                    not f_meta["graphql_op"]
+                    or not l_meta["graphql_op"]
+                    or f_meta["graphql_op"] == l_meta["graphql_op"]
+                )
+                route_ok = bool(
+                    l_meta["route_template"]
+                    and l_meta["route_template"] in f_meta["route_set"]
+                )
+                path_method_ok = bool(
+                    f_meta["norm_path"]
+                    and l_meta["norm_path"]
+                    and f_meta["norm_path"] == l_meta["norm_path"]
+                    and f_meta["method"]
+                    and f_meta["method"] == l_meta["method"]
+                )
+                if origin_ok and gql_ok and (route_ok or path_method_ok):
+                    matched_finding = f
+                    break
+                if f_meta["proof_ids"] and l_meta["proof_ids"] and (f_meta["proof_ids"] & l_meta["proof_ids"]):
+                    matched_finding = f
+                    break
+
+            if l_oob and any(
+                l_oob in str(f.get(field_name) or "")
+                for field_name in ("evidence", "marker", "evidence_value")
+            ):
+                matched_finding = f
+                break
+
+        if matched_finding is not None:
+            marked = copy.deepcopy(lead)
+            marked["promoted_to_finding_id"] = str(matched_finding.get("finding_id") or "confirmed")
+            marked["status"] = "promoted"
+            promoted_leads.append(marked)
+        elif str(lead.get("status") or "").strip().lower() == "promoted":
+            promoted_leads.append(copy.deepcopy(lead))
+        else:
+            raw_active.append(copy.deepcopy(lead))
+
+    active_leads = (
+        canonicalize_and_deduplicate_leads(
+            raw_active,
+            max_leads=max(15, len(raw_active)),
+        )
+        if raw_active
+        else []
+    )
+    return active_leads, promoted_leads
 
 
 class ToolDispatcher:
@@ -1433,6 +1578,12 @@ class ToolDispatcher:
         self._findings_lock = threading.RLock()
         self._leads_lock = threading.RLock()
         self._notebook_lock = threading.RLock()
+        self._rejections_lock = threading.RLock()
+        self._hooks_lock = threading.RLock()
+        self.shard_receipt_ids: list[str] = []
+        self.mutated_paths: set[str] = set()
+        self.oracle_rejections: list[dict[str, Any]] = []
+        self.promoted_leads: list[dict[str, Any]] = []
         self.persist_findings: bool = bool(persist_findings)
         self.notebook_path = self.root_dir / "notebook.json"
         self.findings_path = (
@@ -1501,6 +1652,23 @@ class ToolDispatcher:
     def _ingest_receipt_hooks(self, receipt: dict[str, Any]) -> None:
         self.surface_tracker.ingest_receipt(receipt)
         source_shard = self.active_worker_id or "bootstrap"
+        rid = str(receipt.get("receipt_id") or "").strip()
+        req_method = str(receipt.get("method") or "").upper()
+        mutated_path = ""
+        if req_method in {"POST", "PUT", "PATCH", "DELETE"}:
+            raw_mut_url = str(receipt.get("url") or receipt.get("path") or "")
+            try:
+                parsed_mut_path = urlsplit(raw_mut_url).path
+            except ValueError:
+                parsed_mut_path = str(receipt.get("path") or "")
+            mutated_path = parsed_mut_path.rstrip("/") or "/"
+        with self._hooks_lock:
+            if rid and rid not in self.shard_receipt_ids:
+                self.shard_receipt_ids.append(rid)
+                if len(self.shard_receipt_ids) > 200:
+                    del self.shard_receipt_ids[:-200]
+            if mutated_path and len(self.mutated_paths) < 100:
+                self.mutated_paths.add(mutated_path)
         saved = receipt.get("saved_session")
         if isinstance(saved, dict) and saved.get("alias"):
             alias = str(saved["alias"])
@@ -1696,6 +1864,7 @@ class ToolDispatcher:
             "path": clean_path,
             "actor": best_actor,
             "actor_alias": best_actor,
+            "source_shard": self.active_worker_id or "bootstrap",
             "observed_status": primary.get("status"),
             "status": "needs_verification",
             "verification_tier": "NEEDS_VERIFICATION",
@@ -1783,6 +1952,53 @@ class ToolDispatcher:
                 assigned_id = str(self.leads[-1].get("lead_id") or "L-001")
             total_leads = len(self.leads)
         return assigned_id or "L-001", total_leads
+
+    def _record_oracle_rejection(
+        self,
+        *,
+        class_type: str,
+        method: str,
+        route_template: str,
+        actor: str,
+        verdict: str,
+        reason: str,
+        deception_detected: bool = False,
+        stage: str = "",
+    ) -> None:
+        """Record a compact secret-redacted rejection entry (at most last 30 entries)."""
+        secrets = self.http.actors.all_secrets()
+        clean_reason = redact_secrets(str(reason or "").strip(), secrets)
+        if len(clean_reason) > 500:
+            clean_reason = clean_reason[:500].rstrip()
+        clean_route = redact_secrets(str(route_template or "").strip(), secrets)[:240]
+        entry: dict[str, Any] = {
+            "class_type": str(class_type or "").strip(),
+            "method": str(method or "").strip().upper(),
+            "route_template": clean_route,
+            "actor": str(actor or "").strip(),
+            "verdict": str(verdict or "REFUTED").strip(),
+            "deception_detected": bool(deception_detected),
+            "stage": str(stage or "").strip()[:120],
+            "reason": clean_reason,
+        }
+        with self._rejections_lock:
+            self.oracle_rejections.append(entry)
+            if len(self.oracle_rejections) > 30:
+                del self.oracle_rejections[:-30]
+
+    def _reconcile_leads_against_findings(self, findings_snapshot: Sequence[dict[str, Any]]) -> None:
+        """Promote and remove any active leads matched by newly confirmed findings."""
+        if not findings_snapshot:
+            return
+        with self._leads_lock:
+            if not self.leads:
+                return
+            active_leads, newly_promoted = reconcile_promoted_leads(findings_snapshot, self.leads)
+            if not newly_promoted:
+                return
+            self.leads = active_leads
+            self._save_leads()
+            self.promoted_leads.extend(newly_promoted)
 
     def _get_oob_server(self, *, start: bool = False) -> LoopbackCallbackServer | None:
         with self._oob_lock:
@@ -3351,11 +3567,24 @@ class ToolDispatcher:
         route_template = normalize_route_template(raw_url)
         actor_meta = self._actor_meta_map()
 
+        def _pre_reject(reason_msg: str, *, stage: str, actor_val: str = "") -> str:
+            self._record_oracle_rejection(
+                class_type=canonical_class,
+                method=method,
+                route_template=route_template,
+                actor=actor_val or actor_alias,
+                verdict="REFUTED",
+                deception_detected=False,
+                stage=stage,
+                reason=reason_msg,
+            )
+            return json.dumps({"rejected": True, "reason": reason_msg})
+
         try:
             proof_receipts = [self.receipts.get(rid) for rid in proof_ids]
             control_receipts = [self.receipts.get(rid) for rid in control_ids]
         except (KeyError, ValueError) as exc:
-            return json.dumps({"rejected": True, "reason": str(exc)})
+            return _pre_reject(str(exc), stage="pre_oracle:receipt_lookup")
 
         # Resolve proof matching claimed actor_alias and target URL/path (anti-hallucination check).
         target_norm_path = _norm_path(raw_url)
@@ -3374,31 +3603,31 @@ class ToolDispatcher:
             )
         ]
         if not matching_proofs:
-            return json.dumps({
-                "rejected": True,
-                "reason": (
+            return _pre_reject(
+                (
                     f"no proof receipt matches actor_alias={actor_alias!r} and path={target_norm_path!r}; "
                     f"proof receipts had: {[(r['receipt_id'], r['actor'], r['path']) for r in proof_receipts]}"
                 ),
-            })
+                stage="pre_oracle:matching_proof",
+            )
         write_primary = matching_proofs[0]
         primary = write_primary
         primary_origin = _extract_finding_origin(primary["url"], self.http.base_url)
         if primary["method"] != method and not (canonical_class == "mass_assignment" and primary["method"] == "GET"):
-            return json.dumps({
-                "rejected": True,
-                "reason": f"proof receipt {primary['receipt_id']} method {primary['method']} does not match {method}",
-            })
+            return _pre_reject(
+                f"proof receipt {primary['receipt_id']} method {primary['method']} does not match {method}",
+                stage="pre_oracle:method_mismatch",
+            )
         allow_5xx_lead_probe = (
             self.oracle is not None
             and getattr(self.oracle, "mode", "") == "differential"
             and 500 <= int(primary["status"]) < 600
         )
         if not (200 <= primary["status"] < 400) and not allow_5xx_lead_probe:
-            return json.dumps({
-                "rejected": True,
-                "reason": f"primary proof receipt {primary['receipt_id']} has non-success status {primary['status']}",
-            })
+            return _pre_reject(
+                f"primary proof receipt {primary['receipt_id']} has non-success status {primary['status']}",
+                stage="pre_oracle:non_success_status",
+            )
 
         # For persistent Write -> Read classes, auto-attach a newer 2xx GET render/persistence
         # receipt from ReceiptStore when the caller passed only the mutating write receipt.
@@ -3460,13 +3689,13 @@ class ToolDispatcher:
             )
             if oob_status in {"missing_server", "zero_hits"}:
                 class_label = "SSRF" if canonical_class == "ssrf" else canonical_class.upper()
-                return json.dumps({
-                    "rejected": True,
-                    "reason": (
+                return _pre_reject(
+                    (
                         f"{class_label} callback claim rejected: callback_listener poll recorded 0 hits "
                         f"for submitted token(s) {oob_matched_tokens}"
                     ),
-                })
+                    stage="pre_oracle:oob_zero_hits",
+                )
 
         is_empty_delete_204 = (
             str(primary.get("method") or "").upper() == "DELETE"
@@ -3525,7 +3754,10 @@ class ToolDispatcher:
                     excerpt = build_receipt_excerpt(primary, evidence_value, max_chars=MAX_PROOF_EXCERPT_CHARS)
                     found_in_proof = True
             if not evidence_value or evidence_value.lower() in _TRIVIAL_EVIDENCE or len(evidence_value) < 3:
-                return json.dumps({"rejected": True, "reason": "evidence_value must be a real observed value, not a status/placeholder"})
+                return _pre_reject(
+                    "evidence_value must be a real observed value, not a status/placeholder",
+                    stage="pre_oracle:trivial_evidence",
+                )
 
         if not found_in_proof:
             if is_cors_wildcard:
@@ -3581,13 +3813,13 @@ class ToolDispatcher:
                         get_candidates.append(r)
                 html_get_candidates = [r for r in get_candidates if is_html_receipt(r)]
                 if not html_get_candidates:
-                    return json.dumps({
-                        "rejected": True,
-                        "reason": (
+                    return _pre_reject(
+                        (
                             "stored_xss requires a 2xx text/html GET render receipt "
                             "containing evidence_value unescaped verbatim"
                         ),
-                    })
+                        stage="pre_oracle:stored_xss_html",
+                    )
                 for r in html_get_candidates:
                     if receipt_body_contains_verbatim(r, evidence_value):
                         found_in_proof = True
@@ -3595,13 +3827,13 @@ class ToolDispatcher:
                         excerpt = build_receipt_excerpt(r, evidence_value, max_chars=MAX_PROOF_EXCERPT_CHARS)
                         break
                 if not found_in_proof:
-                    return json.dumps({
-                        "rejected": True,
-                        "reason": (
+                    return _pre_reject(
+                        (
                             f"evidence_value {evidence_value!r} was not found unescaped verbatim "
                             "in HTML GET render receipt(s)"
                         ),
-                    })
+                        stage="pre_oracle:stored_xss_verbatim",
+                    )
             elif not found_in_proof:
                 # Verify evidence_value appears verbatim in matching_proofs first, then any compatible proof receipt.
                 for r in matching_proofs:
@@ -3625,10 +3857,10 @@ class ToolDispatcher:
                     status_line = f"HTTP 204 No Content (DELETE {primary.get('url') or primary.get('path') or ''})"
                     excerpt = f"{status_line}\n{hdr_lines}"[:MAX_PROOF_EXCERPT_CHARS] if hdr_lines else status_line
         if not found_in_proof:
-            return json.dumps({
-                "rejected": True,
-                "reason": f"evidence_value {evidence_value!r} was not found verbatim in proof receipt(s) for {actor_alias}",
-            })
+            return _pre_reject(
+                f"evidence_value {evidence_value!r} was not found verbatim in proof receipt(s) for {actor_alias}",
+                stage="pre_oracle:evidence_not_in_proof",
+            )
 
         # Multi-receipt specificity promotion: upgrade generic/low-specificity evidence when another
         # class-eligible proof receipt exposes a strictly higher-specificity unique secret (not in controls).
@@ -3672,7 +3904,11 @@ class ToolDispatcher:
         if canonical_class == "open_redirect":
             loc = primary.get("redirect_location") or ""
             if not (300 <= primary["status"] < 400 and loc):
-                return json.dumps({"rejected": True, "reason": "open_redirect requires 3xx status with Location header"})
+                return _pre_reject(
+                    "open_redirect requires 3xx status with Location header",
+                    stage="pre_oracle:open_redirect",
+                    actor_val=effective_actor,
+                )
             loc_str = str(loc).strip()
             if loc_str.startswith("//"):
                 base_scheme = urlsplit(str(primary.get("url") or self.http.base_url)).scheme or "https"
@@ -3682,7 +3918,11 @@ class ToolDispatcher:
             loc_host = parsed_loc.netloc
             base_host = urlsplit(self.http.base_url).netloc
             if not loc_host or loc_host == base_host:
-                return json.dumps({"rejected": True, "reason": f"redirect Location {loc!r} is not an external host"})
+                return _pre_reject(
+                    f"redirect Location {loc!r} is not an external host",
+                    stage="pre_oracle:open_redirect",
+                    actor_val=effective_actor,
+                )
             scope_guard = getattr(self.http, "scope_guard", None)
             if scope_guard is not None:
                 loc_scheme = (parsed_loc.scheme or urlsplit(self.http.base_url).scheme or "http").lower()
@@ -3699,21 +3939,38 @@ class ToolDispatcher:
                     and isinstance(loc_port, int)
                     and scope_guard.check_origin(loc_scheme, loc_hostname, loc_port)
                 ):
-                    return json.dumps({
-                        "rejected": True,
-                        "reason": f"redirect Location {loc!r} targets an authorized in-scope origin, not an external host",
-                    })
+                    return _pre_reject(
+                        f"redirect Location {loc!r} targets an authorized in-scope origin, not an external host",
+                        stage="pre_oracle:open_redirect",
+                        actor_val=effective_actor,
+                    )
             if all(urlsplit(c.get("redirect_location") or "").netloc == loc_host for c in control_receipts):
-                return json.dumps({"rejected": True, "reason": "control receipt also redirected to same external host"})
+                return _pre_reject(
+                    "control receipt also redirected to same external host",
+                    stage="pre_oracle:open_redirect",
+                    actor_val=effective_actor,
+                )
 
         elif canonical_class in {"reflected_xss", "stored_xss"}:
             ctype = (primary.get("content_type") or "").lower()
             if "json" in ctype:
-                return json.dumps({"rejected": True, "reason": "JSON content-type reflection is not executable HTML XSS"})
+                return _pre_reject(
+                    "JSON content-type reflection is not executable HTML XSS",
+                    stage="pre_oracle:xss",
+                    actor_val=effective_actor,
+                )
             if canonical_class == "stored_xss" and not is_html_receipt(primary):
-                return json.dumps({"rejected": True, "reason": "stored_xss requires HTML (text/html) content-type on render GET receipt"})
+                return _pre_reject(
+                    "stored_xss requires HTML (text/html) content-type on render GET receipt",
+                    stage="pre_oracle:xss",
+                    actor_val=effective_actor,
+                )
             if not any(c.get("response_sha256") != primary.get("response_sha256") for c in control_receipts):
-                return json.dumps({"rejected": True, "reason": "control receipt is identical to proof receipt"})
+                return _pre_reject(
+                    "control receipt is identical to proof receipt",
+                    stage="pre_oracle:xss",
+                    actor_val=effective_actor,
+                )
             p_body = str(primary.get("body") or "")
             needle_low = evidence_value.lower()
             p_count = p_body.lower().count(needle_low)
@@ -3724,44 +3981,56 @@ class ToolDispatcher:
             )
             c_counts = [str(c.get("body") or "").lower().count(needle_low) for c in ctrl_pool]
             if c_counts and p_count <= min(c_counts):
-                return json.dumps({
-                    "rejected": True,
-                    "reason": (
+                return _pre_reject(
+                    (
                         f"evidence_value {evidence_value!r} appears {p_count} time(s) in proof and "
                         f"{min(c_counts)} time(s) in control receipt (static template markup); "
                         "specify the exact reflected payload string that only appears in the proof response"
                     ),
-                })
+                    stage="pre_oracle:xss",
+                    actor_val=effective_actor,
+                )
 
         elif canonical_class in {"sqli", "sqli_read"}:
             if not any(
                 c.get("response_sha256") != primary.get("response_sha256") or c.get("status") != primary.get("status")
                 for c in control_receipts
             ):
-                return json.dumps({"rejected": True, "reason": "SQLi requires differential between proof and control receipts"})
+                return _pre_reject(
+                    "SQLi requires differential between proof and control receipts",
+                    stage="pre_oracle:sqli",
+                    actor_val=effective_actor,
+                )
 
         elif canonical_class == "auth_bypass":
             # Strictly require primary proof receipt executed by 'anon' with substantive 2xx response.
             if effective_actor != "anon" or str(primary.get("actor") or "") != "anon":
-                return json.dumps({
-                    "rejected": True,
-                    "reason": (
+                return _pre_reject(
+                    (
                         f"auth_bypass requires primary proof receipt executed by 'anon' (got actor_alias={effective_actor!r}); "
                         "use 'bfla' when anon is denied (401/403) and a non-admin authenticated actor gets 200"
                     ),
-                })
+                    stage="pre_oracle:auth_bypass",
+                    actor_val=effective_actor,
+                )
             if not (200 <= int(primary.get("status") or 0) < 300):
-                return json.dumps({
-                    "rejected": True,
-                    "reason": f"auth_bypass requires a substantive 2xx response from 'anon' (got status {primary.get('status')})",
-                })
+                return _pre_reject(
+                    f"auth_bypass requires a substantive 2xx response from 'anon' (got status {primary.get('status')})",
+                    stage="pre_oracle:auth_bypass",
+                    actor_val=effective_actor,
+                )
             if not self._is_genuine_anon_proof(primary, actor_meta):
-                return json.dumps({
-                    "rejected": True,
-                    "reason": "auth_bypass rejected: public HTML landing/login page, empty body, or non-anon actor identity header present",
-                })
+                return _pre_reject(
+                    "auth_bypass rejected: public HTML landing/login page, empty body, or non-anon actor identity header present",
+                    stage="pre_oracle:auth_bypass",
+                    actor_val=effective_actor,
+                )
             if not any(c["actor"] != "anon" for c in control_receipts):
-                return json.dumps({"rejected": True, "reason": "anon auth_bypass requires an authenticated baseline control receipt"})
+                return _pre_reject(
+                    "anon auth_bypass requires an authenticated baseline control receipt",
+                    stage="pre_oracle:auth_bypass",
+                    actor_val=effective_actor,
+                )
 
         elif canonical_class in {"bfla", "bola", "tenant_isolation"}:
             if canonical_class == "bfla" and effective_actor == "anon":
@@ -3769,20 +4038,29 @@ class ToolDispatcher:
                 if _is_genuine_anon_2xx(primary, actor_meta):
                     canonical_class = "auth_bypass"
                 else:
-                    return json.dumps({
-                        "rejected": True,
-                        "reason": "bfla requires an authenticated non-admin proof receipt (not 'anon')",
-                    })
+                    return _pre_reject(
+                        "bfla requires an authenticated non-admin proof receipt (not 'anon')",
+                        stage="pre_oracle:access_control",
+                        actor_val=effective_actor,
+                    )
             if effective_actor != "anon":
                 if not any(
                     c["actor"] != effective_actor or _norm_path(c["url"]) != effective_norm_path or c["status"] != primary["status"]
                     for c in control_receipts
                 ):
-                    return json.dumps({"rejected": True, "reason": "access-control finding requires cross-actor or differential control receipt"})
+                    return _pre_reject(
+                        "access-control finding requires cross-actor or differential control receipt",
+                        stage="pre_oracle:access_control",
+                        actor_val=effective_actor,
+                    )
 
         elif canonical_class == "mass_assignment":
             if not any(c.get("response_sha256") != primary.get("response_sha256") or c["method"] != primary["method"] or c["actor"] == effective_actor for c in control_receipts):
-                return json.dumps({"rejected": True, "reason": "mass_assignment requires baseline control receipt"})
+                return _pre_reject(
+                    "mass_assignment requires baseline control receipt",
+                    stage="pre_oracle:mass_assignment",
+                    actor_val=effective_actor,
+                )
 
         elif canonical_class in {"race_condition", "business_logic"}:
             if canonical_class == "race_condition":
@@ -3792,10 +4070,11 @@ class ToolDispatcher:
                     if r.get("receipt_id") and 200 <= int(r.get("status") or 0) < 400
                 }
                 if len(distinct_success_rids) < 2:
-                    return json.dumps({
-                        "rejected": True,
-                        "reason": "race_condition requires at least 2 distinct 2xx/3xx proof receipts (e.g. from concurrent_check)",
-                    })
+                    return _pre_reject(
+                        "race_condition requires at least 2 distinct 2xx/3xx proof receipts (e.g. from concurrent_check)",
+                        stage="pre_oracle:state_race",
+                        actor_val=effective_actor,
+                    )
             if not any(
                 c.get("status") != primary.get("status")
                 or c.get("response_sha256") != primary.get("response_sha256")
@@ -3803,10 +4082,11 @@ class ToolDispatcher:
                 or c.get("actor") != effective_actor
                 for c in control_receipts
             ):
-                return json.dumps({
-                    "rejected": True,
-                    "reason": f"{canonical_class} requires a differential sequential or state control receipt",
-                })
+                return _pre_reject(
+                    f"{canonical_class} requires a differential sequential or state control receipt",
+                    stage="pre_oracle:state_race",
+                    actor_val=effective_actor,
+                )
 
         # Collect all valid proofs among proof_receipts (across actors) on the same route_template.
         valid_proof_records: list[tuple[dict[str, Any], str]] = [(primary, excerpt)]
@@ -3853,26 +4133,28 @@ class ToolDispatcher:
             eff_owner = explicit_owner or inferred_owner
             inferred_bola_owner = eff_owner
             if eff_owner and all(str(r.get("actor") or "") == eff_owner for r in valid_receipts_only):
-                return json.dumps({
-                    "rejected": True,
-                    "reason": (
+                return _pre_reject(
+                    (
                         f"proof receipt shows {eff_owner!r}'s own record accessed by {eff_owner!r}; "
                         f"{canonical_class} requires a proof receipt executed by a non-owner peer/cross-tenant actor accessing another owner's data"
                     ),
-                })
+                    stage="pre_oracle:bola_owner",
+                    actor_val=effective_actor,
+                )
             if canonical_class == "tenant_isolation" and explicit_tenant:
                 caller_tenant = str((actor_meta.get(effective_actor) or {}).get("tenant") or "").lower()
                 if caller_tenant and caller_tenant == explicit_tenant:
                     if eff_owner and eff_owner != effective_actor:
                         canonical_class = "bola"
                     else:
-                        return json.dumps({
-                            "rejected": True,
-                            "reason": (
+                        return _pre_reject(
+                            (
                                 f"proof receipt record belongs to caller's own tenant ({explicit_tenant!r}); "
                                 "tenant_isolation requires accessing a record owned by a different tenant"
                             ),
-                        })
+                            stage="pre_oracle:bola_owner",
+                            actor_val=effective_actor,
+                        )
 
         # Resolve auth_bypass <-> bfla bidirectionally and deterministically from observed receipts.
         if canonical_class == "bfla":
@@ -3915,13 +4197,14 @@ class ToolDispatcher:
                 method=method,
             )
             if resolved_cls == "bfla":
-                return json.dumps({
-                    "rejected": True,
-                    "reason": (
+                return _pre_reject(
+                    (
                         f"route {route_template} denied 'anon' (401/403) in observed receipts while allowing authenticated non-admin access; "
                         "record this finding as 'bfla' with the non-admin authenticated actor"
                     ),
-                })
+                    stage="pre_oracle:auth_bypass_vs_bfla",
+                    actor_val=effective_actor,
+                )
             canonical_class = resolved_cls
 
         excerpt_by_rid = {r["receipt_id"]: ex for r, ex in valid_proof_records}
@@ -3929,6 +4212,7 @@ class ToolDispatcher:
         # Deduplicate & merge by (origin, route_template, graphql_op), cross-class overlap, or alias/family root cause.
         norm_severity = severity if severity in {"critical", "high", "medium", "low"} else "high"
         if not allow_5xx_lead_probe:
+            merged_snapshot: list[dict[str, Any]] | None = None
             with self._findings_lock:
                 merged_resp = self._try_merge_existing_finding_locked(
                     canonical_class=canonical_class,
@@ -3948,7 +4232,10 @@ class ToolDispatcher:
                     graphql_op=finding_graphql_op,
                 )
                 if merged_resp is not None:
-                    return json.dumps(merged_resp)
+                    merged_snapshot = list(self.findings)
+            if merged_snapshot is not None:
+                self._reconcile_leads_against_findings(merged_snapshot)
+                return json.dumps(merged_resp)
 
         best_primary, ordered_actors = select_primary_proof(
             canonical_class,
@@ -3972,7 +4259,11 @@ class ToolDispatcher:
                 inferred_owner=inferred_bola_owner,
             )
             if bola_fp is not None:
-                return json.dumps({"rejected": True, "reason": bola_fp[1]})
+                return _pre_reject(
+                    bola_fp[1],
+                    stage="pre_oracle:bola_fp",
+                    actor_val=best_actor,
+                )
 
         self._step_claim_submitted = True
         oracle_verdict_str = "verified"
@@ -4046,6 +4337,23 @@ class ToolDispatcher:
                     clean_replay_receipt_id=verdict.clean_replay_receipt_id,
                 )
             if not verdict.verified:
+                stages_map = getattr(verdict, "stages", None) or {}
+                rej_stage = str(
+                    stages_map.get("stage3_clean_replay")
+                    or stages_map.get("stage2_diff")
+                    or stages_map.get("stage1_control")
+                    or ""
+                )
+                self._record_oracle_rejection(
+                    class_type=canonical_class,
+                    method=method,
+                    route_template=route_template,
+                    actor=best_actor,
+                    verdict=str(getattr(verdict, "verdict", "") or "REFUTED"),
+                    deception_detected=bool(getattr(verdict, "deception_detected", False)),
+                    stage=rej_stage,
+                    reason=str(getattr(verdict, "reason", "") or ""),
+                )
                 if getattr(verdict, "needs_verification", False):
                     lead_id, total_leads = self._record_needs_verification_lead(
                         verdict=verdict,
@@ -4132,6 +4440,8 @@ class ToolDispatcher:
             valid_receipts_only,
             raw_url=resolved_url,
         ) or finding_graphql_op
+        finding_id = ""
+        total_findings = 0
         with self._findings_lock:
             merged_resp = self._try_merge_existing_finding_locked(
                 canonical_class=canonical_class,
@@ -4150,74 +4460,62 @@ class ToolDispatcher:
                 origin=resolved_origin,
                 graphql_op=resolved_graphql_op,
             )
-            if merged_resp is not None:
-                if self.shared_facts is not None:
-                    self.shared_facts.publish(
-                        "verified_primitive",
-                        f"{canonical_class}:{best_primary['method']}:{route_template}",
-                        f"{canonical_class} {best_primary['method']} {route_template} actor={best_actor}",
-                        source_shard=self.active_worker_id or "bootstrap",
-                        source_receipt_id=str(best_primary.get("receipt_id") or ""),
-                        provenance="host_extracted",
-                        target_families=("*",),
-                        confidence="deterministic",
-                        secret_values=self.http.actors.all_secrets(),
-                    )
-                return json.dumps(merged_resp)
-
-            finding_id = f"F-{len(self.findings) + 1:03d}"
-            finding: dict[str, Any] = {
-                "finding_id": finding_id,
-                "title": title,
-                "class_type": canonical_class,
-                "route_template": route_template,
-                "method": best_primary["method"],
-                "url": resolved_url,
-                "path": clean_path,
-                "actor": best_actor,
-                "actor_alias": best_actor,
-                "observed_status": best_primary["status"],
-                "status": "verified",
-                "oracle_verdict": oracle_verdict_str,
-                "clean_replay_receipt_id": clean_replay_rid,
-                "severity": severity if severity in {"critical", "high", "medium", "low"} else "high",
-                "evidence_value": evidence_value,
-                "marker": evidence_value,
-                "evidence": best_evidence or excerpt_by_rid.get(best_primary["receipt_id"], excerpt),
-                "summary": summary,
-                "proof_receipt_ids": proof_ids,
-                "control_receipt_ids": control_ids,
-                "supporting_actors": ordered_actors,
-                "evidence_excerpts": [
-                    {
-                        "receipt_id": r["receipt_id"],
-                        "actor": r["actor"],
-                        "method": r["method"],
-                        "url": r["url"],
-                        "status": r["status"],
-                        "excerpt": ex[:MAX_PROOF_EXCERPT_CHARS],
-                    }
-                    for r, ex in valid_proof_records
-                ],
-                "control_excerpts": [
-                    {
-                        "receipt_id": c["receipt_id"],
-                        "actor": c["actor"],
-                        "method": c["method"],
-                        "url": c["url"],
-                        "status": c["status"],
-                        "excerpt": build_receipt_excerpt(c, "", max_chars=MAX_CONTROL_EXCERPT_CHARS),
-                    }
-                    for c in control_receipts
-                ],
-            }
-            if resolved_origin:
-                finding["origin"] = resolved_origin
-            if resolved_graphql_op:
-                finding["graphql_op"] = resolved_graphql_op
-            self.findings.append(finding)
-            self._save_findings()
-            total_findings = len(self.findings)
+            if merged_resp is None:
+                finding_id = f"F-{len(self.findings) + 1:03d}"
+                finding: dict[str, Any] = {
+                    "finding_id": finding_id,
+                    "title": title,
+                    "class_type": canonical_class,
+                    "route_template": route_template,
+                    "method": best_primary["method"],
+                    "url": resolved_url,
+                    "path": clean_path,
+                    "actor": best_actor,
+                    "actor_alias": best_actor,
+                    "observed_status": best_primary["status"],
+                    "status": "verified",
+                    "oracle_verdict": oracle_verdict_str,
+                    "clean_replay_receipt_id": clean_replay_rid,
+                    "severity": severity if severity in {"critical", "high", "medium", "low"} else "high",
+                    "evidence_value": evidence_value,
+                    "marker": evidence_value,
+                    "evidence": best_evidence or excerpt_by_rid.get(best_primary["receipt_id"], excerpt),
+                    "summary": summary,
+                    "proof_receipt_ids": proof_ids,
+                    "control_receipt_ids": control_ids,
+                    "supporting_actors": ordered_actors,
+                    "evidence_excerpts": [
+                        {
+                            "receipt_id": r["receipt_id"],
+                            "actor": r["actor"],
+                            "method": r["method"],
+                            "url": r["url"],
+                            "status": r["status"],
+                            "excerpt": ex[:MAX_PROOF_EXCERPT_CHARS],
+                        }
+                        for r, ex in valid_proof_records
+                    ],
+                    "control_excerpts": [
+                        {
+                            "receipt_id": c["receipt_id"],
+                            "actor": c["actor"],
+                            "method": c["method"],
+                            "url": c["url"],
+                            "status": c["status"],
+                            "excerpt": build_receipt_excerpt(c, "", max_chars=MAX_CONTROL_EXCERPT_CHARS),
+                        }
+                        for c in control_receipts
+                    ],
+                }
+                if resolved_origin:
+                    finding["origin"] = resolved_origin
+                if resolved_graphql_op:
+                    finding["graphql_op"] = resolved_graphql_op
+                self.findings.append(finding)
+                self._save_findings()
+                total_findings = len(self.findings)
+            findings_snapshot = list(self.findings)
+        self._reconcile_leads_against_findings(findings_snapshot)
         if self.shared_facts is not None:
             self.shared_facts.publish(
                 "verified_primitive",
@@ -4230,6 +4528,8 @@ class ToolDispatcher:
                 confidence="deterministic",
                 secret_values=self.http.actors.all_secrets(),
             )
+        if merged_resp is not None:
+            return json.dumps(merged_resp)
         return json.dumps({
             "accepted": True,
             "finding_id": finding_id,

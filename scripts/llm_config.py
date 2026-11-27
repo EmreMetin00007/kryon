@@ -5,15 +5,118 @@ by the operator at execution time and never enter snapshots or model context.
 """
 from __future__ import annotations
 
+from collections.abc import Sequence
+import copy
 import json
 import os
 from pathlib import Path
 import re
+from typing import Any
 from urllib.parse import urlsplit
 
 from runtime_paths import runtime_root
 
 SCHEMA = "cco-llm/1"
+REASONING_EFFORT_LEVELS: frozenset[str] = frozenset(
+    {"none", "minimal", "low", "medium", "high", "xhigh", "max"}
+)
+MAX_REASONING_EFFORT_LEVELS: frozenset[str] = frozenset({"xhigh", "max"})
+DEEPSEEK_MAX_INCOMPATIBLE_GATEWAY_PROVIDERS: frozenset[str] = frozenset({"deepinfra"})
+DEEPSEEK_MAX_PREFERRED_GATEWAY_PROVIDERS: tuple[str, ...] = ("deepseek", "fireworks", "baseten")
+
+
+def normalize_reasoning_effort(value: str | None) -> str:
+    """Normalize and validate an optional OpenAI/gateway reasoning_effort string."""
+    if value is None:
+        return ""
+    clean = str(value).strip().lower()
+    if not clean:
+        return ""
+    if clean not in REASONING_EFFORT_LEVELS:
+        allowed = ", ".join(sorted(REASONING_EFFORT_LEVELS))
+        raise ValueError(f"unsupported reasoning_effort {value!r}; expected one of: {allowed}")
+    return clean
+
+
+def adapt_provider_options_for_effort(
+    provider_options: dict[str, Any] | None,
+    *,
+    models: Sequence[str] = (),
+    provider_name: str = "",
+    provider_url: str = "",
+    reasoning_effort: str = "",
+) -> tuple[dict[str, Any] | None, dict[str, Any]]:
+    """Avoid max-incompatible gateway backends (e.g. deepinfra) when DeepSeek runs at max/xhigh effort."""
+    effort = normalize_reasoning_effort(reasoning_effort)
+    opts: dict[str, Any] | None = (
+        copy.deepcopy(provider_options)
+        if isinstance(provider_options, dict) and provider_options
+        else None
+    )
+    gw_raw = opts.get("gateway") if isinstance(opts, dict) else None
+    has_gateway_opts = isinstance(gw_raw, dict)
+    is_deepseek = any("deepseek" in str(m or "").lower() for m in models if str(m or "").strip())
+    is_vercel_gateway = (
+        str(provider_name or "").strip().lower() == "vercel"
+        or "ai-gateway.vercel" in str(provider_url or "").lower()
+        or "vercel.sh" in str(provider_url or "").lower()
+    )
+    meta: dict[str, Any] = {
+        "provider": str(provider_name or "").strip() or None,
+        "reasoning_effort": effort or None,
+        "adapted": False,
+        "reason": None,
+        "excluded_providers": [],
+    }
+    if effort in MAX_REASONING_EFFORT_LEVELS and is_deepseek and (is_vercel_gateway or has_gateway_opts):
+        gw: dict[str, Any] = dict(gw_raw) if isinstance(gw_raw, dict) else {}
+        only_raw = gw.get("only")
+        order_raw = gw.get("order")
+        if isinstance(only_raw, list):
+            clean_only = [str(p).strip() for p in only_raw if str(p).strip()]
+            removed = [p for p in clean_only if p.lower() in DEEPSEEK_MAX_INCOMPATIBLE_GATEWAY_PROVIDERS]
+            kept = [p for p in clean_only if p.lower() not in DEEPSEEK_MAX_INCOMPATIBLE_GATEWAY_PROVIDERS]
+            if removed and not kept:
+                raise ValueError(
+                    f"provider_options.gateway.only={clean_only!r} does not support reasoning_effort={effort!r} "
+                    "for DeepSeek models; use --reasoning-effort high or include deepseek/fireworks/baseten"
+                )
+            if removed:
+                gw["only"] = kept
+                opts = {**(opts or {}), "gateway": gw}
+                meta.update(
+                    adapted=True,
+                    reason="effort_max_excluded_incompatible_gateway_providers",
+                    excluded_providers=removed,
+                )
+        elif isinstance(order_raw, list) and any(str(p).strip() for p in order_raw):
+            clean_order = [str(p).strip() for p in order_raw if str(p).strip()]
+            removed = [p for p in clean_order if p.lower() in DEEPSEEK_MAX_INCOMPATIBLE_GATEWAY_PROVIDERS]
+            kept = [p for p in clean_order if p.lower() not in DEEPSEEK_MAX_INCOMPATIBLE_GATEWAY_PROVIDERS]
+            if removed:
+                kept_low = {p.lower() for p in kept}
+                next_order = [*kept, *(p for p in DEEPSEEK_MAX_PREFERRED_GATEWAY_PROVIDERS if p not in kept_low)]
+                gw["order"] = next_order
+                opts = {**(opts or {}), "gateway": gw}
+                meta.update(
+                    adapted=True,
+                    reason="effort_max_excluded_deepinfra_fallback_order",
+                    excluded_providers=removed,
+                )
+        elif is_vercel_gateway:
+            gw["order"] = list(DEEPSEEK_MAX_PREFERRED_GATEWAY_PROVIDERS)
+            opts = {**(opts or {}), "gateway": gw}
+            meta.update(
+                adapted=True,
+                reason="effort_max_pinned_max_capable_gateway_order",
+            )
+    final_gw = opts.get("gateway") if isinstance(opts, dict) else None
+    if isinstance(final_gw, dict):
+        if isinstance(final_gw.get("order"), list):
+            meta["gateway_order"] = [str(p) for p in final_gw["order"]]
+        if isinstance(final_gw.get("only"), list):
+            meta["gateway_only"] = [str(p) for p in final_gw["only"]]
+    return opts, meta
 
 
 def default_config() -> Path:

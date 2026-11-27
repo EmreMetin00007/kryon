@@ -25,6 +25,7 @@ PRESETS: dict[str, dict[str, Any]] = {
         "description": "Fast single-pass triage with tight HTTP/token/time budgets.",
         "options": {
             "execution_mode": "monolithic",
+            "reasoning_effort": "low",
             "max_turns": 25,
             "http_budget": 120,
             "token_budget": 250_000,
@@ -40,6 +41,7 @@ PRESETS: dict[str, dict[str, Any]] = {
         "description": "Balanced sharded assessment with Stage 0 Playwright surface discovery.",
         "options": {
             "execution_mode": "sharded",
+            "reasoning_effort": "high",
             "max_shards": 3,
             "bootstrap_turns": 12,
             "shard_turns": 25,
@@ -61,6 +63,7 @@ PRESETS: dict[str, dict[str, Any]] = {
         "description": "Conservative bug-bounty profile: paced RPS, read-only default methods, strict degradation stop.",
         "options": {
             "execution_mode": "sharded",
+            "reasoning_effort": "high",
             "max_shards": 2,
             "bootstrap_turns": 10,
             "shard_turns": 20,
@@ -80,9 +83,10 @@ PRESETS: dict[str, dict[str, Any]] = {
         },
     },
     "deep": {
-        "description": "Thorough multi-shard assessment with expanded budgets and Stage 0 crawl.",
+        "description": "Thorough multi-shard assessment with expanded budgets, max reasoning effort, and Stage 0 crawl.",
         "options": {
             "execution_mode": "sharded",
+            "reasoning_effort": "max",
             "max_shards": 5,
             "bootstrap_turns": 16,
             "shard_turns": 35,
@@ -118,6 +122,7 @@ _STRING_FIELDS: frozenset[str] = frozenset({
     "worker_model",
     "scout_model",
     "bootstrap_model",
+    "retry_model",
     "api_key_env",
     "login_path",
     "session_check_path",
@@ -144,6 +149,8 @@ _INT_FIELDS: frozenset[str] = frozenset({
     "bootstrap_turns",
     "shard_turns",
     "shard_token_quota",
+    "max_shard_retries",
+    "max_retry_shards",
     "epoch_char_limit",
     "max_degradation_streak",
     "auto_crawl_max_pages",
@@ -152,6 +159,7 @@ _INT_FIELDS: frozenset[str] = frozenset({
 })
 _FLOAT_FIELDS: frozenset[str] = frozenset({
     "scout_token_share",
+    "retry_budget_ratio",
     "cache_token_weight",
     "max_rps",
 })

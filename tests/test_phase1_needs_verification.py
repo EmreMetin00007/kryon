@@ -1076,6 +1076,7 @@ def test_investigator_sharded_reconciles_late_oob_before_closing_server(
             root_dir=tmp_path,
             execution_mode="sharded",
             seed_surface=seed_surface,
+            max_shard_retries=0,
         )
         oob_ref: dict[str, Any] = {}
         s1_ready = threading.Event()

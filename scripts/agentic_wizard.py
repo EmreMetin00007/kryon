@@ -529,7 +529,11 @@ def run_wizard(
     output_fn("=== Plan Hazir (0 Ag Istegi) ===")
     output_fn(f"Hedef       : {plan.get('target')}")
     output_fn(f"Profil      : {plan.get('preset') or preset} ({plan.get('ablation', {}).get('execution_mode')})")
-    output_fn(f"Model       : {plan.get('models', {}).get('worker')} ({provider_kind})")
+    effort_lbl = str(plan.get("reasoning_effort") or "default")
+    routing_meta = plan.get("provider_routing") if isinstance(plan.get("provider_routing"), dict) else {}
+    gw_order = routing_meta.get("gateway_order") if isinstance(routing_meta, dict) else None
+    gw_suffix = f" [gateway={','.join(str(x) for x in gw_order)}]" if isinstance(gw_order, list) and gw_order else ""
+    output_fn(f"Model       : {plan.get('models', {}).get('worker')} ({provider_kind}, effort={effort_lbl}{gw_suffix})")
     output_fn(f"Metotlar    : {', '.join(plan.get('allowed_methods') or [])}")
     hdr_names = plan.get("request_headers") or []
     output_fn(f"Basliklar   : {', '.join(hdr_names) if hdr_names else '(yok)'}")

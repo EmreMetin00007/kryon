@@ -309,6 +309,7 @@ def test_sharded_soft_quota_injects_budget_wrapup_and_finishes_cleanly(
             max_shards=3,
             bootstrap_turns=6,
             shard_turns=10,
+            max_shard_retries=0,
             verification_gate="llm_self_judge",
         )
         res = inv.run()

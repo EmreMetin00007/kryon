@@ -1211,16 +1211,21 @@ def _extract_run_metadata(artifacts: dict[str, Any], secret_values: Sequence[str
 
     models_raw = manifest.get("models")
     models: dict[str, Any] = models_raw if isinstance(models_raw, dict) else {}
+    reasoning_effort_raw = str(manifest.get("reasoning_effort") or "").strip()
+    provider_routing_raw = manifest.get("provider_routing")
+    provider_routing: dict[str, Any] = provider_routing_raw if isinstance(provider_routing_raw, dict) else {}
     sharding_raw = manifest.get("sharding_summary")
     sharding_summary: dict[str, Any] | None = sharding_raw if isinstance(sharding_raw, dict) else None
     handoff_raw = manifest.get("handoff_summary")
     handoff_summary: dict[str, Any] | None = handoff_raw if isinstance(handoff_raw, dict) else None
 
     model_entries: dict[str, str] = {}
-    for key in ("worker", "model", "scout", "bootstrap_model", "shard_model"):
+    for key in ("worker", "model", "scout", "bootstrap_model", "shard_model", "retry_model"):
         val = models.get(key)
         if val:
             model_entries[key] = str(val)
+    if models.get("retry") and "retry_model" not in model_entries:
+        model_entries["retry_model"] = str(models["retry"])
     if handoff_summary:
         if handoff_summary.get("scout_model") and "scout" not in model_entries:
             model_entries["scout"] = str(handoff_summary["scout_model"])
@@ -1231,6 +1236,8 @@ def _extract_run_metadata(artifacts: dict[str, Any], secret_values: Sequence[str
             model_entries["bootstrap_model"] = str(sharding_summary["bootstrap_model"])
         if sharding_summary.get("shard_model"):
             model_entries["shard_model"] = str(sharding_summary["shard_model"])
+        if sharding_summary.get("retry_model"):
+            model_entries["retry_model"] = str(sharding_summary["retry_model"])
 
     wall_clock = manifest.get("wall_clock_seconds")
     budget_raw = manifest.get("budget")
@@ -1336,6 +1343,8 @@ def _extract_run_metadata(artifacts: dict[str, Any], secret_values: Sequence[str
         "finished": finished_flag,
         "execution_mode": execution_mode,
         "models": model_entries,
+        "reasoning_effort": reasoning_effort_raw,
+        "provider_routing": provider_routing,
         "wall_clock_seconds": wall_clock,
         "http_used": http_used,
         "http_limit": http_limit,
@@ -1413,6 +1422,8 @@ def _sorted_leads(artifacts: dict[str, Any], secret_values: Sequence[str], *, ba
 
     for idx, lead in enumerate(raw_leads):
         if not isinstance(lead, dict):
+            continue
+        if bool(lead.get("promoted_to_finding_id")) or str(lead.get("status") or "").strip().lower() == "promoted":
             continue
         cls_type = _normalize_class_type(lead.get("class_type"))
         severity = _normalize_severity(lead.get("severity"), cls_type)
@@ -1687,6 +1698,20 @@ def render_markdown_report(artifacts: dict[str, Any]) -> str:
     else:
         exposure_str = "unavailable (no process_metrics.json)"
 
+    routing_raw = meta.get("provider_routing")
+    routing: dict[str, Any] = routing_raw if isinstance(routing_raw, dict) else {}
+    routing_bits: list[str] = []
+    if meta.get("reasoning_effort"):
+        routing_bits.append(f"reasoning_effort=`{meta['reasoning_effort']}`")
+    gw_only = routing.get("gateway_only")
+    gw_order = routing.get("gateway_order")
+    if isinstance(gw_only, list) and gw_only:
+        routing_bits.append(f"gateway.only=`{','.join(str(x) for x in gw_only)}`")
+    elif isinstance(gw_order, list) and gw_order:
+        routing_bits.append(f"gateway.order=`{','.join(str(x) for x in gw_order)}`")
+    if routing.get("adapted") and routing.get("reason"):
+        routing_bits.append(f"adapted=`{routing['reason']}`")
+
     lines: list[str] = [
         f"# Security QA Report: {meta['target']}",
         "",
@@ -1699,6 +1724,11 @@ def render_markdown_report(artifacts: dict[str, Any]) -> str:
         f"| Status | `{meta['status']}` |",
         f"| Execution Mode | `{meta['execution_mode']}` |",
         f"| Model(s) | {models_str} |",
+        *(
+            [f"| Reasoning & Routing | {', '.join(routing_bits)} |"]
+            if routing_bits
+            else []
+        ),
         f"| Wall-Clock Seconds | {meta['wall_clock_seconds'] if meta['wall_clock_seconds'] is not None else 'unknown'} |",
         f"| HTTP Requests (used / limit) | {http_str} |",
         f"| LLM Calls | {meta['llm_calls'] if meta['llm_calls'] is not None else 'unknown'} |",
@@ -1833,6 +1863,39 @@ def render_markdown_report(artifacts: dict[str, Any]) -> str:
             lines.append(
                 f"| `{shard.get('shard_id', 'shard')}` | `{fams}` | `{shard.get('status', 'unknown')}` | "
                 f"{shard.get('calls', 0)} | {shard.get('tokens', 0)} | {s_findings_cnt} |"
+            )
+        for retry in sharding.get("stage2_5_retries") or []:
+            if not isinstance(retry, dict):
+                continue
+            r_shard_id = _sanitize_text(str(retry.get("shard_id") or "shard"), secret_values)
+            r_attempt = retry.get("attempt") if retry.get("attempt") is not None else 1
+            fams = _sanitize_text(
+                ", ".join(str(x) for x in (retry.get("families") or [])) or "-",
+                secret_values,
+            )
+            r_status = _sanitize_text(str(retry.get("status") or "unknown"), secret_values)
+            raw_triggers = retry.get("triggers")
+            if isinstance(raw_triggers, (list, tuple)):
+                triggers_raw = ", ".join(str(x) for x in raw_triggers if str(x).strip()) or "none"
+            elif isinstance(raw_triggers, set):
+                triggers_raw = ", ".join(sorted(str(x) for x in raw_triggers if str(x).strip())) or "none"
+            elif raw_triggers:
+                triggers_raw = str(raw_triggers)
+            else:
+                triggers_raw = "none"
+            triggers_str = _sanitize_text(triggers_raw, secret_values)
+            model_str = _sanitize_text(
+                str(retry.get("retry_model") or meta["models"].get("retry_model") or "default"),
+                secret_values,
+            )
+            r_calls = int(retry.get("calls") or 0)
+            r_tokens = int(retry.get("tokens") or 0)
+            r_findings_raw = retry.get("findings", 0)
+            r_findings_cnt = len(r_findings_raw) if isinstance(r_findings_raw, list) else int(r_findings_raw or 0)
+            lines.append(
+                f"| `stage2.5:{r_shard_id}-retry{r_attempt}` | `{fams}` | "
+                f"`{r_status}` (triggers={triggers_str}; model=`{model_str}`) | "
+                f"{r_calls} | {r_tokens} | {r_findings_cnt} |"
             )
         stage3 = sharding.get("stage3_synthesis")
         if isinstance(stage3, dict) and stage3.get("triggered"):

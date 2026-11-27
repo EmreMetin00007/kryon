@@ -2426,6 +2426,51 @@ class AgenticHTTPClient:
             for key in [k for k in self._cache if k and k[0] == target]:
                 self._cache.pop(key, None)
 
+    def invalidate_get_cache(
+        self,
+        *,
+        paths: Sequence[str] | None = None,
+        actors: Sequence[str] | None = None,
+    ) -> int:
+        """Selectively or fully invalidate cached GET/HEAD responses under lock."""
+        with self._lock:
+            if paths is None and actors is None:
+                removed = len(self._cache)
+                self._cache.clear()
+                return removed
+
+            raw_paths: Sequence[str] = (paths,) if isinstance(paths, str) else (paths or ())
+            raw_actors: Sequence[str] = (actors,) if isinstance(actors, str) else (actors or ())
+            path_set = {
+                (urlsplit(str(p).strip()).path.rstrip("/") or "/")
+                for p in raw_paths
+                if str(p).strip()
+            }
+            actor_set = {
+                str(a).strip()
+                for a in raw_actors
+                if str(a).strip()
+            }
+            if not path_set and not actor_set:
+                return 0
+
+            stale_keys = [
+                key
+                for key in self._cache
+                if key
+                and (
+                    (actor_set and str(key[0] or "").strip() in actor_set)
+                    or (
+                        path_set
+                        and len(key) >= 3
+                        and (urlsplit(str(key[2] or "")).path.rstrip("/") or "/") in path_set
+                    )
+                )
+            ]
+            for key in stale_keys:
+                self._cache.pop(key, None)
+            return len(stale_keys)
+
     def close(self) -> None:
         with self._sessions_lock:
             sessions = list(self._sessions)

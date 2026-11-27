@@ -302,6 +302,52 @@ class SharedFactGraph:
                 out = out[: eff_chars - 3].rstrip() + "..."
             return out
 
+    def current_seq(self) -> int:
+        """Return the current global monotonic fact sequence number."""
+        with self._lock:
+            return int(self._seq)
+
+    def cursor_for(self, shard_id: str) -> int:
+        """Return the last evaluated sequence cursor for `shard_id` without modifying it."""
+        clean_shard = str(shard_id or "").strip()
+        with self._lock:
+            return int(self._cursors.get(clean_shard, 0))
+
+    def facts_after(
+        self,
+        after_seq: int,
+        *,
+        exclude_shard: str = "",
+        families: Sequence[str] = (),
+    ) -> list[dict[str, Any]]:
+        """Return deep copies of facts with `seq > after_seq` without advancing cursors."""
+        eff_after = 0 if (after_seq is None or isinstance(after_seq, bool)) else int(after_seq)
+        clean_exclude = str(exclude_shard or "").strip()
+        if isinstance(families, str):
+            raw_fams: Sequence[str] = [s for s in families.split(",")]
+        else:
+            raw_fams = families or ()
+        shard_fams = {str(f).strip().lower() for f in raw_fams if str(f).strip()}
+
+        with self._lock:
+            matched: list[dict[str, Any]] = []
+            for fact in self._facts:
+                seq = int(fact.get("seq") or 0)
+                if seq <= eff_after:
+                    continue
+                if clean_exclude and str(fact.get("source_shard") or "") == clean_exclude:
+                    continue
+                if shard_fams:
+                    tf_set = {
+                        str(x).strip().lower()
+                        for x in (fact.get("target_families") or ("*",))
+                        if str(x).strip()
+                    } or {"*"}
+                    if "*" not in tf_set and not (shard_fams & tf_set):
+                        continue
+                matched.append(copy.deepcopy(fact))
+            return matched
+
     def epoch_snapshot(self, *, max_items: int = 15, max_chars: int = 1200) -> str:
         """Return a deterministic compact summary of top active facts for 80K epoch compaction."""
         eff_items = max(0, int(max_items))
