@@ -15,6 +15,7 @@ from typing import Any
 
 from .compose import MAX_SOURCE, compose_js_routes
 from kryon_core.surface.normalize import is_third_party_sdk_static_route
+from .opacity import assess_js_opacity
 from .parsers import (
     _bounded_diagnostics,
     _coverage_gap,
@@ -392,6 +393,7 @@ def build_client_logic_map(
     source: str,
     source_map: Any = None,
     parser: str = "auto",
+    source_url: str = "",
 ) -> dict[str, Any]:
     """Build Client Logic Map v1 from JavaScript source text."""
     original_source = source or ""
@@ -492,7 +494,13 @@ def build_client_logic_map(
     parser_meta["truncated"] = bool(
         parser_meta.get("truncated") or truncated_input
     )
-    coverage_gaps = _dedupe_gaps(parser_gaps + original_coverage_gaps)
+    opacity_assessment = assess_js_opacity(
+        text,
+        url=source_url,
+        endpoints_found=len(endpoints),
+    )
+    opacity_gaps = opacity_assessment.get("coverage_gaps") or []
+    coverage_gaps = _dedupe_gaps(parser_gaps + original_coverage_gaps + opacity_gaps)
     if parser_meta.get("ast_available") and not coverage_gaps:
         unknowns_first = (
             "AST backend parsed the source; dynamic expressions are still "
@@ -525,6 +533,7 @@ def build_client_logic_map(
         "validation_rules": _validation_rules(text),
         "storage_keys": sorted(set(STORAGE_RE.findall(text))),
         "source_map": source_map_meta,
+        "opacity_assessment": opacity_assessment,
         "inventory": {
             "literals": inventory.get("literals", []),
             "templates": inventory.get("templates", []),

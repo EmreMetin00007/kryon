@@ -22,6 +22,7 @@ from agentic_bsag import (
     STATUS_VERIFIED,
     BeliefStateAttackGraph,
 )
+from agentic_fact_graph import SharedFactGraph
 from agentic_context import (
     CHARS_PER_TOKEN as CHARS_PER_TOKEN,
     _ANGLE_QUOTE_TRANS as _ANGLE_QUOTE_TRANS,
@@ -95,7 +96,13 @@ from agentic_surface import (
     route_template_of,
 )
 from agentic_telemetry import TelemetryLogger, write_process_metrics
-from agentic_tools import TOOL_SCHEMAS, ToolDispatcher, canonicalize_and_deduplicate_findings
+from agentic_tools import (
+    TOOL_SCHEMAS,
+    ToolDispatcher,
+    canonicalize_and_deduplicate_findings,
+    canonicalize_and_deduplicate_leads,
+    reconcile_late_oob_hits,
+)
 from full_agent_budget import (
     FRAMING_TOKENS,
     BudgetError,
@@ -785,6 +792,8 @@ class AgenticInvestigator:
             mode=self.intervention_mode,
             micro_budget=self.micro_budget,
         )
+        self.shared_facts = SharedFactGraph()
+        self.shared_facts_path = self.root_dir / "shared_facts.json"
         self.dispatcher = ToolDispatcher(
             http_client=http_client,
             receipt_store=receipt_store,
@@ -794,6 +803,7 @@ class AgenticInvestigator:
             telemetry=self.telemetry,
             oob_server=self._oob_server,
             oob_provider=self._get_or_create_shared_oob_server,
+            shared_facts=self.shared_facts,
         )
         for vendor in self.initial_waf_vendors:
             self.dispatcher.waf_pivot.record_block(vendor, "/")
@@ -860,6 +870,56 @@ class AgenticInvestigator:
                     self.dispatcher._oob_server = None
         if srv is not None and owns:
             srv.close()
+
+    def _actor_meta_map(self) -> dict[str, dict[str, str]]:
+        return {
+            row["alias"]: {
+                "alias": row["alias"],
+                "role": str(row.get("role") or "").lower(),
+                "tenant": str(row.get("tenant") or "").lower(),
+            }
+            for row in self.http.actors.summaries()
+        }
+
+    def _finalize_leads_and_reconcile_oob(self) -> None:
+        """Merge persisted shard leads, reconcile late OOB hits before server shutdown, and save leads.json."""
+        collected_leads: list[dict[str, Any]] = list(getattr(self.dispatcher, "leads", []) or [])
+        shards_root = self.root_dir / "shards"
+        if shards_root.is_dir():
+            for shard_leads_path in sorted(shards_root.glob("*/leads.json")):
+                try:
+                    disk_leads = json.loads(shard_leads_path.read_text(encoding="utf-8"))
+                except (OSError, ValueError):
+                    continue
+                if isinstance(disk_leads, list):
+                    collected_leads.extend(item for item in disk_leads if isinstance(item, dict))
+
+        actor_meta_map = self._actor_meta_map()
+        canonical_leads = canonicalize_and_deduplicate_leads(
+            collected_leads,
+            actor_meta_map=actor_meta_map,
+            receipt_store=self.receipts,
+        )
+
+        active_oob = (
+            self._shared_oob_server
+            or getattr(self.dispatcher, "_oob_server", None)
+            or getattr(self.oracle, "oob_server", None)
+        )
+        late_leads = reconcile_late_oob_hits(
+            active_oob,
+            findings=self.dispatcher.findings,
+            leads=canonical_leads,
+            receipts=self.receipts,
+            base_url=self.http.base_url,
+        )
+        if late_leads or canonical_leads or getattr(self.dispatcher, "leads", None):
+            self.dispatcher.leads = canonicalize_and_deduplicate_leads(
+                [*canonical_leads, *late_leads],
+                actor_meta_map=actor_meta_map,
+                receipt_store=self.receipts,
+            )
+            self.dispatcher._save_leads()
 
     def _make_surface_tracker(self) -> SurfaceFrontierTracker:
         tracker_extra = _supported_kwargs(
@@ -1068,6 +1128,18 @@ class AgenticInvestigator:
             waf_guidance = str(waf_pivot.guidance() or "").strip()
             if waf_guidance:
                 waf_line = f"\n[WAF-PIVOT] {waf_guidance}"
+        sf_delta = ""
+        eff_shared_facts = getattr(eff_disp, "shared_facts", None)
+        if eff_shared_facts is None:
+            eff_shared_facts = getattr(self, "shared_facts", None)
+        if shard_cluster is not None and eff_shared_facts is not None:
+            sf_delta = str(
+                eff_shared_facts.delta_for_shard(
+                    shard_cluster.shard_id,
+                    families=shard_cluster.families,
+                )
+                or ""
+            )
         return (
             f"\n[STATE] http_budget: {http_rem}/{self.http.budget.limit} left | "
             f"llm_tokens: {tok_rem}/{tok_lim} left | time_left: {sec_rem}s | turn: {turn}/{eff_max_turns} | "
@@ -1079,6 +1151,7 @@ class AgenticInvestigator:
             f"{waf_line}"
             f"{write_nudge}"
             f"{wrapup_line}"
+            f"{sf_delta}"
         )
 
     def _last_provider_status(self) -> int | None:
@@ -1237,9 +1310,12 @@ class AgenticInvestigator:
                 serialized_raw = epoch_raw
             elif len(turn_groups) - cur_epoch_start > 1:
                 cand_start = max(cur_epoch_start + 1, len(turn_groups) - 1)
+                sf_obj = getattr(self, "shared_facts", None)
+                sf_snapshot = sf_obj.epoch_snapshot() if sf_obj is not None else ""
                 cand_summary = _build_rolled_history_summary(
                     turn_groups[:cand_start],
-                    max_chars=1800,
+                    max_chars=2400 if sf_snapshot else 1800,
+                    shared_facts_snapshot=sf_snapshot,
                 )
                 cand_msgs = self._project_epoch_messages(
                     messages,
@@ -1402,10 +1478,16 @@ class AgenticInvestigator:
                     continue
                 raise
 
+    def _save_shared_facts(self) -> None:
+        sf_obj = getattr(self, "shared_facts", None)
+        if sf_obj is not None:
+            sf_obj.save(self.shared_facts_path)
+
     def _save_checkpoint(self, *, turn: int, status: str, messages: list[dict[str, Any]]) -> None:
         with self._checkpoint_lock:
             if self.bsag is not None:
                 self.bsag.save()
+            self._save_shared_facts()
             waf_pivot_summary = (
                 self.dispatcher.waf_pivot.summary()
                 if getattr(self.dispatcher, "waf_pivot", None) is not None
@@ -1424,6 +1506,7 @@ class AgenticInvestigator:
                     "findings": self.dispatcher.findings,
                     "surface_frontier": self.dispatcher.surface_tracker.to_dict(),
                     "bsag": self.bsag.to_dict() if self.bsag is not None else None,
+                    "shared_facts": self.shared_facts.to_dict(),
                     "scheduler": self.scheduler.to_dict() if self.execution_mode == "ephemeral" else None,
                     "finish_rejections": self.dispatcher.finish_rejections,
                     "http_used": self.http.budget.used,
@@ -1472,6 +1555,10 @@ class AgenticInvestigator:
                 self.bsag.load_dict(data["bsag"])
             else:
                 self.bsag.load_sqlite()
+        if isinstance(data.get("shared_facts"), dict):
+            self.shared_facts.load_dict(data["shared_facts"])
+        elif self.shared_facts_path.is_file():
+            self.shared_facts.load_file(self.shared_facts_path)
         if isinstance(data.get("scheduler"), dict):
             self.scheduler.load_dict(data["scheduler"])
         if type(data.get("finish_rejections")) is int:
@@ -1965,6 +2052,8 @@ class AgenticInvestigator:
             self._save_checkpoint(turn=total_turns, status=status, messages=[])
             raise
         finally:
+            self._finalize_leads_and_reconcile_oob()
+            self._save_shared_facts()
             self._close_dispatcher(self.dispatcher)
             self._close_shared_oob_server()
             if self.telemetry is not None or self.bsag is not None:
@@ -2143,6 +2232,24 @@ class AgenticInvestigator:
                 existing.setdefault("listed_by", set()).update(entry.get("listed_by") or ())
                 existing["tested_by"].update(entry.get("tested_by") or ())
                 existing["verified_2xx"] = bool(existing.get("verified_2xx") or entry.get("verified_2xx"))
+
+        record_slice_fn = getattr(dst, "_record_opaque_js_slice", None)
+        for reg in (getattr(src, "opaque_js_slices", ()) or ()):
+            if isinstance(reg, dict):
+                if callable(record_slice_fn):
+                    record_slice_fn(reg)
+                elif reg not in dst.opaque_js_slices:
+                    dst.opaque_js_slices.append(dict(reg))
+
+        record_wasm_fn = getattr(dst, "_record_opaque_wasm_refs", None)
+        src_wasm = getattr(src, "opaque_wasm_refs", ()) or ()
+        if src_wasm:
+            if callable(record_wasm_fn):
+                record_wasm_fn(src_wasm)
+            else:
+                for ref in src_wasm:
+                    if ref and ref not in dst.opaque_wasm_refs:
+                        dst.opaque_wasm_refs.append(ref)
 
     def _maybe_nudge_shard_high_risk_finish(
         self,
@@ -2576,7 +2683,9 @@ class AgenticInvestigator:
             if loaded is not None:
                 last_turn, loaded_msgs = loaded
                 if self.dispatcher.finished:
+                    self._finalize_leads_and_reconcile_oob()
                     self._close_dispatcher(self.dispatcher)
+                    self._close_shared_oob_server()
                     return self._result_summary("finished")
                 start_turn = last_turn + 1
                 messages = loaded_msgs
@@ -2642,6 +2751,8 @@ class AgenticInvestigator:
                 handoff_scout_cfg=handoff_cfg,
             )
         finally:
+            self._finalize_leads_and_reconcile_oob()
+            self._save_shared_facts()
             self._close_dispatcher(self.dispatcher)
             self._close_shared_oob_server()
             if self._handoff_summary is not None:
@@ -2998,6 +3109,7 @@ class AgenticInvestigator:
         if resume:
             loaded = self._load_checkpoint()
             if loaded is not None and self.dispatcher.finished:
+                self._finalize_leads_and_reconcile_oob()
                 self._close_dispatcher(self.dispatcher)
                 self._close_shared_oob_server()
                 return self._result_summary("finished")
@@ -3446,6 +3558,17 @@ class AgenticInvestigator:
                         saved_findings = []
                 if not saved_findings and isinstance(saved.get("findings"), list):
                     saved_findings = [f for f in saved["findings"] if isinstance(f, dict)]
+                shard_leads_file = shard_dir / "leads.json"
+                saved_leads: list[dict[str, Any]] = []
+                if shard_leads_file.is_file():
+                    try:
+                        loaded_l = json.loads(shard_leads_file.read_text(encoding="utf-8"))
+                        if isinstance(loaded_l, list):
+                            saved_leads = [item for item in loaded_l if isinstance(item, dict)]
+                    except (OSError, ValueError):
+                        saved_leads = []
+                if not saved_leads and isinstance(saved.get("leads"), list):
+                    saved_leads = [item for item in saved["leads"] if isinstance(item, dict)]
                 restored_tracker = self._make_surface_tracker()
                 if isinstance(saved.get("surface_tracker"), dict):
                     restored_tracker.load_dict(copy.deepcopy(saved["surface_tracker"]))
@@ -3464,6 +3587,7 @@ class AgenticInvestigator:
                     "epoch_advancements": int(saved.get("epoch_advancements") or 0),
                     "shard_token_quota": int(saved.get("shard_token_quota") or eff_shard_token_quota),
                     "findings": saved_findings,
+                    "leads": saved_leads,
                     "status": str(saved.get("status") or "finished"),
                     "surface_tracker": restored_tracker,
                     "finish_summary": str(saved.get("finish_summary") or ""),
@@ -3485,6 +3609,7 @@ class AgenticInvestigator:
                     oob_provider=self._get_or_create_shared_oob_server,
                     waf_pivot=self.dispatcher.waf_pivot,
                     http_reserve_floor=stage3_http_reserve,
+                    shared_facts=self.shared_facts,
                 )
                 try:
                     shard_dispatcher.surface_tracker.load_dict(copy.deepcopy(bootstrap_surface_snap))
@@ -3592,6 +3717,7 @@ class AgenticInvestigator:
                         "epoch_advancements": int(shard_epoch_state.get("advancements", 0)),
                         "shard_token_quota": eff_shard_token_quota,
                         "findings": list(shard_dispatcher.findings),
+                        "leads": list(shard_dispatcher.leads),
                         "status": s_status,
                         "surface_tracker": shard_dispatcher.surface_tracker,
                         "finish_summary": shard_dispatcher.finish_summary,
@@ -3604,8 +3730,10 @@ class AgenticInvestigator:
                                 "surface_tracker": shard_dispatcher.surface_tracker.to_dict(),
                             }
                         self._save_checkpoint(turn=boot_last_turn, status="stage2_in_progress", messages=[])
+                    self._save_shared_facts()
                     return result_doc
                 finally:
+                    self._save_shared_facts()
                     self._close_dispatcher(shard_dispatcher)
 
             pending_clusters: list[SubsystemCluster] = []
@@ -3649,8 +3777,10 @@ class AgenticInvestigator:
                     *boot_findings_snap,
                     *self.dispatcher.findings,
                 ]
+                rescued_leads: list[dict[str, Any]] = [*self.dispatcher.leads]
                 for sres in shard_results:
                     rescued_findings.extend(sres.get("findings") or [])
+                    rescued_leads.extend(sres.get("leads") or [])
                 shards_root = self.root_dir / "shards"
                 if shards_root.is_dir():
                     for shard_findings_path in sorted(shards_root.glob("*/findings.json")):
@@ -3660,6 +3790,13 @@ class AgenticInvestigator:
                             continue
                         if isinstance(disk_items, list):
                             rescued_findings.extend(item for item in disk_items if isinstance(item, dict))
+                    for shard_leads_path in sorted(shards_root.glob("*/leads.json")):
+                        try:
+                            disk_leads = json.loads(shard_leads_path.read_text(encoding="utf-8"))
+                        except (OSError, ValueError):
+                            continue
+                        if isinstance(disk_leads, list):
+                            rescued_leads.extend(item for item in disk_leads if isinstance(item, dict))
                 if rescued_findings:
                     self.dispatcher.findings = canonicalize_and_deduplicate_findings(
                         rescued_findings,
@@ -3667,14 +3804,23 @@ class AgenticInvestigator:
                         receipt_store=self.receipts,
                     )
                     self.dispatcher._save_findings()
+                if rescued_leads:
+                    self.dispatcher.leads = canonicalize_and_deduplicate_leads(
+                        rescued_leads,
+                        actor_meta_map=actor_meta_map,
+                        receipt_store=self.receipts,
+                    )
+                    self.dispatcher._save_leads()
 
-            # Merge surface trackers and findings from bootstrap + all shards.
+            # Merge surface trackers, findings, and leads from bootstrap + all shards.
             merged_findings: list[dict[str, Any]] = [*boot_findings_snap, *self.dispatcher.findings]
+            merged_leads: list[dict[str, Any]] = [*self.dispatcher.leads]
             shard_summaries_text: list[str] = []
             merged_untested: list[str] = list(self.dispatcher.untested_areas)
             for sres in shard_results:
                 self._merge_surface_trackers(self.dispatcher.surface_tracker, sres["surface_tracker"])
                 merged_findings.extend(sres["findings"])
+                merged_leads.extend(sres.get("leads") or [])
                 if sres["finish_summary"]:
                     shard_summaries_text.append(f"[{sres['shard_id']}] {sres['finish_summary']}")
                 for area in sres["untested_areas"]:
@@ -3694,6 +3840,13 @@ class AgenticInvestigator:
                 receipt_store=self.receipts,
             )
             self.dispatcher._save_findings()
+            if merged_leads:
+                self.dispatcher.leads = canonicalize_and_deduplicate_leads(
+                    merged_leads,
+                    actor_meta_map=actor_meta_map,
+                    receipt_store=self.receipts,
+                )
+                self.dispatcher._save_leads()
 
             if shard_summaries_text:
                 prefix = (self.dispatcher.finish_summary + " | ") if self.dispatcher.finish_summary else ""
@@ -3720,6 +3873,10 @@ class AgenticInvestigator:
                 receipts=self.receipts,
                 surface_tracker=self.dispatcher.surface_tracker,
                 actor_summaries=self.http.actors.summaries(),
+                **_supported_kwargs(
+                    collect_cross_shard_synthesis_context,
+                    {"shared_facts": self.shared_facts},
+                ),
             )
             stage3_summary: dict[str, Any] | None = None
             if (
@@ -3746,6 +3903,7 @@ class AgenticInvestigator:
                     waf_pivot=self.dispatcher.waf_pivot,
                     bootstrap_stage1_virgin_guard=False,
                     http_reserve_floor=0,
+                    shared_facts=self.shared_facts,
                 )
                 try:
                     stage3_dispatcher.surface_tracker.load_dict(
@@ -3880,6 +4038,14 @@ class AgenticInvestigator:
                             receipt_store=self.receipts,
                         )
                         self.dispatcher._save_findings()
+                    if stage3_dispatcher.leads:
+                        merged_leads_s3 = list(self.dispatcher.leads) + list(stage3_dispatcher.leads)
+                        self.dispatcher.leads = canonicalize_and_deduplicate_leads(
+                            merged_leads_s3,
+                            actor_meta_map=s3_actor_meta,
+                            receipt_store=self.receipts,
+                        )
+                        self.dispatcher._save_leads()
                     if stage3_dispatcher.finish_summary:
                         prefix = (
                             (self.dispatcher.finish_summary + " | ")
@@ -3938,9 +4104,12 @@ class AgenticInvestigator:
                 stage3_synthesis=stage3_summary,
                 post_auth_stage0_crawl=post_auth_stage0_summary,
             )
+            self._finalize_leads_and_reconcile_oob()
             self._save_checkpoint(turn=boot_last_turn, status=overall_status, messages=[])
             return self._result_summary(overall_status)
         finally:
+            self._finalize_leads_and_reconcile_oob()
+            self._save_shared_facts()
             self._close_dispatcher(self.dispatcher)
             self._close_shared_oob_server()
             if self.telemetry is not None or self.bsag is not None:
@@ -3965,6 +4134,8 @@ class AgenticInvestigator:
             "untested_areas": self.dispatcher.untested_areas,
             "findings_count": len(self.dispatcher.findings),
             "findings_path": str(self.dispatcher.findings_path),
+            "leads_count": len(self.dispatcher.leads),
+            "leads_path": str(self.dispatcher.leads_path),
             "receipts_count": self.receipts.count(),
             "http_requests_used": self.http.budget.used,
             "http_requests_limit": self.http.budget.limit,

@@ -122,6 +122,8 @@ _OWNER_FIELD_KEYS = (
 _PRIMARY_ID_KEYS = ("id", "uuid")
 _MAX_OBJECTS_PER_TEMPLATE = 6
 _MAX_PARAM_VALUES_TRACKED = 6
+_MAX_OPAQUE_JS_SLICES = 15
+_MAX_OPAQUE_WASM_REFS = 20
 _PLAIN_ALNUM_VAL_RE = re.compile(r"^[A-Za-z0-9_-]*$")
 _NON_PROBE_PARAM_NAMES = frozenset({
     "page",
@@ -2284,6 +2286,9 @@ class SurfaceFrontierTracker:
         self.discovered_body_templates: dict[tuple[str, str], dict[str, Any]] = {}
         # key: route_template -> set of validation field hints (e.g. "body.data:list_type")
         self.discovered_schema_hints: dict[str, set[str]] = {}
+        # Bounded opaque JS slices and non-endpoint WASM references for LLM escalation
+        self.opaque_js_slices: list[dict[str, Any]] = []
+        self.opaque_wasm_refs: list[str] = []
 
     def _is_primary_origin(self, scheme: str, netloc: str) -> bool:
         low_s = str(scheme or "").strip().lower()
@@ -3691,6 +3696,55 @@ class SurfaceFrontierTracker:
                     current_url=target_origin,
                 )
 
+    def _record_opaque_js_slice(
+        self,
+        region: dict[str, Any],
+        *,
+        default_receipt_id: str = "",
+        default_url: str = "",
+    ) -> None:
+        """Record a bounded, deduplicated opaque JS offset slice without polluting endpoint routes."""
+        if not isinstance(region, dict) or len(self.opaque_js_slices) >= _MAX_OPAQUE_JS_SLICES:
+            return
+        receipt_id = str(region.get("receipt_id") or default_receipt_id or "").strip()[:80]
+        url_val = str(region.get("url") or default_url or "").strip()[:240]
+        try:
+            c_start = max(0, int(region.get("char_start") or 0))
+            c_end = max(0, int(region.get("char_end") or 0))
+        except (TypeError, ValueError):
+            return
+        if c_end <= c_start:
+            return
+        dedupe_key = (receipt_id, "" if receipt_id else url_val, c_start, c_end)
+        for existing in self.opaque_js_slices:
+            ex_rid = str(existing.get("receipt_id") or "")
+            ex_url = str(existing.get("url") or "")
+            ex_key = (ex_rid, "" if ex_rid else ex_url, int(existing.get("char_start") or 0), int(existing.get("char_end") or 0))
+            if ex_key == dedupe_key:
+                return
+        entry: dict[str, Any] = {
+            "receipt_id": receipt_id,
+            "url": url_val,
+            "region_id": str(region.get("region_id") or "")[:64],
+            "anchor": str(region.get("anchor") or "")[:64],
+            "char_start": c_start,
+            "char_end": c_end,
+            "reason": str(region.get("reason") or "")[:80],
+            "recommended_action": str(
+                region.get("recommended_action") or "llm_reverse_engineer_slice"
+            )[:64],
+        }
+        if region.get("source_type"):
+            entry["source_type"] = str(region["source_type"])[:32]
+        self.opaque_js_slices.append(entry)
+
+    def _record_opaque_wasm_refs(self, refs: Sequence[Any]) -> None:
+        """Record bounded non-endpoint WASM references as passive metadata only."""
+        for ref in refs or ():
+            clean = str(ref or "").strip()[:200]
+            if clean and clean not in self.opaque_wasm_refs and len(self.opaque_wasm_refs) < _MAX_OPAQUE_WASM_REFS:
+                self.opaque_wasm_refs.append(clean)
+
     def ingest_surface(self, surface: dict[str, Any], *, actor: str = "") -> None:
         """Ingest structured output of `extract_surface` tool into the frontier tracker."""
         if not isinstance(surface, dict):
@@ -3840,6 +3894,17 @@ class SurfaceFrontierTracker:
                         actor=actor,
                         current_url=curr_url,
                     )
+            opacity_meta = client_logic.get("opacity_assessment")
+            if isinstance(opacity_meta, dict):
+                self._record_opaque_wasm_refs(opacity_meta.get("wasm_refs") or ())
+                surf_rid = str(surface.get("receipt_id") or "")
+                for reg in (opacity_meta.get("opaque_regions") or []):
+                    if isinstance(reg, dict):
+                        self._record_opaque_js_slice(
+                            reg,
+                            default_receipt_id=surf_rid,
+                            default_url=curr_url,
+                        )
         if surface.get("graphql_ops") and curr_url:
             self._register_discovered_url(
                 curr_url,
@@ -4697,6 +4762,25 @@ class SurfaceFrontierTracker:
                 items.append(f"{sample_p}?{pname} ({b_stat}->{e_stat}, verify SQLi/SSTI/injection)")
         return f"500-delta injection candidates: {'; '.join(items)}" if items else ""
 
+    def _format_compact_opaque_js(self, *, max_items: int = 2) -> str:
+        """Render compact opaque JS slice guidance for targeted ``read_receipt`` escalation."""
+        if not self.opaque_js_slices:
+            return ""
+        if max_items <= 0:
+            return f"opaque_js: {len(self.opaque_js_slices)} slice(s) (use read_receipt)"
+        items: list[str] = []
+        for entry in self.opaque_js_slices[:max_items]:
+            rid = str(entry.get("receipt_id") or "").strip()
+            raw_url = str(entry.get("url") or "").strip()
+            path = urlsplit(raw_url).path or raw_url or "js"
+            c_start = int(entry.get("char_start") or 0)
+            c_end = int(entry.get("char_end") or 0)
+            limit = max(0, c_end - c_start)
+            anchor = str(entry.get("anchor") or entry.get("region_id") or "slice")
+            loc = f"{rid} {path}@{c_start}+{limit}({anchor})" if rid else f"{path}@{c_start}+{limit}({anchor})"
+            items.append(loc)
+        return f"opaque_js: [{'; '.join(items)}] (use read_receipt)"
+
     def format_frontier_banner(self, *, max_chars: int = 1000) -> str:
         """Render a compact (~1 KB) `[SURFACE FRONTIER]` block for turn state injection."""
         if max_chars <= 0:
@@ -4712,6 +4796,12 @@ class SurfaceFrontierTracker:
             for extra in (self._format_compact_schema_hints(), self._format_compact_body_templates()):
                 if extra and len(result) + 3 + len(extra) <= max_chars:
                     result = f"{result} | {extra}"
+            if self.opaque_js_slices:
+                for slice_cap in (2, 1, 0):
+                    extra = self._format_compact_opaque_js(max_items=slice_cap)
+                    if extra and len(result) + 3 + len(extra) <= max_chars:
+                        result = f"{result} | {extra}"
+                        break
             return result[:max_chars]
 
         if not any(
@@ -4881,6 +4971,8 @@ class SurfaceFrontierTracker:
             "discovered_schema_hints": {
                 k: sorted(v) for k, v in sorted(self.discovered_schema_hints.items()) if v
             },
+            "opaque_js_slices": [dict(x) for x in self.opaque_js_slices[:_MAX_OPAQUE_JS_SLICES]],
+            "opaque_wasm_refs": list(self.opaque_wasm_refs[:_MAX_OPAQUE_WASM_REFS]),
         }
         if self.in_scope_assets:
             payload["in_scope_assets"] = list(self.in_scope_assets)
@@ -5208,6 +5300,12 @@ class SurfaceFrontierTracker:
             cleaned = {str(h).strip() for h in raw_hints if str(h).strip()}
             if cleaned and len(self.discovered_schema_hints) < _MAX_SCHEMA_HINT_TEMPLATES:
                 self.discovered_schema_hints[str(tmpl_key)] = set(sorted(cleaned)[:_MAX_SCHEMA_HINTS_PER_TEMPLATE])
+        self.opaque_js_slices = []
+        for reg in (data.get("opaque_js_slices") or []):
+            if isinstance(reg, dict):
+                self._record_opaque_js_slice(reg)
+        self.opaque_wasm_refs = []
+        self._record_opaque_wasm_refs(data.get("opaque_wasm_refs") or ())
 
     @classmethod
     def from_dict(

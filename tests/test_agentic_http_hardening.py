@@ -902,7 +902,7 @@ def test_multipart_upload_live_server_auth_csrf_retry_and_tool_dispatcher(tmp_pa
 def test_tool_schemas_size_and_files_property_bounds() -> None:
     serialized = json.dumps(TOOL_SCHEMAS, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
     assert len(serialized) <= 16_384
-    assert len(TOOL_SCHEMAS) == 11
+    assert len(TOOL_SCHEMAS) == 12
 
     http_tool = next(t["function"] for t in TOOL_SCHEMAS if t["function"]["name"] == "http_request")
     files_prop = http_tool["parameters"]["properties"]["files"]

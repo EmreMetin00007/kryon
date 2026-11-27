@@ -544,7 +544,7 @@ def test_system_and_worker_prompts_cover_uploads_delete_oob_concurrency_cors_and
 
 
 def test_tool_schemas_count_size_and_all_property_descriptions_bounded() -> None:
-    assert len(TOOL_SCHEMAS) == 11
+    assert len(TOOL_SCHEMAS) == 12
     serialized = json.dumps(TOOL_SCHEMAS, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
     assert len(serialized) <= 16_384
 

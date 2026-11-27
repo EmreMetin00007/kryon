@@ -1,9 +1,11 @@
 """Layer 4: Protocol-level, vuln-class-agnostic 3-stage Clean-Replay Differential Oracle."""
 from __future__ import annotations
 
+import base64
 from collections import Counter
 from dataclasses import dataclass, field
 from datetime import datetime
+import hashlib
 import html
 import json
 import math
@@ -26,6 +28,7 @@ from agentic_http import (
 )
 from agentic_receipts import ReceiptStore, redact_header_value
 from agentic_surface import is_id_segment, normalize_path, route_template_of
+from kryon_core.protocol.grpc_web import decode_grpc_web_frames, is_grpc_web_content_type
 from target_bootstrap import is_destructive_lifecycle_route, is_logout_route
 
 VALID_VERIFICATION_GATES = frozenset({"differential", "llm_self_judge"})
@@ -2788,6 +2791,302 @@ class OracleVerdict:
     stages: dict[str, Any] = field(default_factory=dict)
     clean_replay_receipt_id: str = ""
     control_probe_receipt_id: str = ""
+    needs_verification: bool = False
+    signal_type: str = ""
+    verification_blocker: str = ""
+    suggested_manual_verification: str = ""
+
+    @property
+    def verification_tier(self) -> str:
+        """Return two-tier verification classification (CONFIRMED, NEEDS_VERIFICATION, DECEPTION_DETECTED, or REFUTED)."""
+        if self.verified:
+            return "CONFIRMED"
+        if self.needs_verification:
+            return "NEEDS_VERIFICATION"
+        if self.deception_detected or self.verdict == "DECEPTION_DETECTED":
+            return "DECEPTION_DETECTED"
+        return "REFUTED"
+
+
+_ONE_SHOT_EXHAUSTED_STATUSES = frozenset({404, 409, 410, 429})
+_MULTISTEP_BLOCKED_STAGE_CODES = frozenset({
+    "failed_multistep_precursor_404",
+    "failed_multistep_precursor_409",
+    "failed_multistep_precursor_410",
+    "failed_multistep_precursor_429",
+})
+_GET_HARD_DISQUALIFIER_STAGES = frozenset({
+    "failed_redirect_host",
+    "failed_cors_origin",
+    "failed_non_html_replay",
+    "failed_graphql_error_envelope",
+})
+
+
+def _collect_prior_resource_observations(
+    *,
+    primary_proof: dict[str, Any],
+    proof_receipts: Sequence[dict[str, Any]],
+    control_receipts: Sequence[dict[str, Any]],
+    receipt_store: ReceiptStore | None,
+    replay_rec: dict[str, Any] | None = None,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Return `(prior_gets, prior_observations)` strictly before `primary_proof` on the target resource."""
+    p_url = str(primary_proof.get("url") or primary_proof.get("path") or "")
+    p_norm_path = _norm_url_path(p_url)
+    p_origin = _extract_origin(p_url)
+    p_rid = str(primary_proof.get("receipt_id") or "")
+    r_rid = str(replay_rec.get("receipt_id") or "") if isinstance(replay_rec, dict) else ""
+    p_seq = _receipt_seq_num(primary_proof)
+    r_seq = _receipt_seq_num(replay_rec) if isinstance(replay_rec, dict) else 0
+    p_ts = str(primary_proof.get("timestamp") or "")
+
+    prior_gets: list[dict[str, Any]] = []
+    prior_observations: list[dict[str, Any]] = []
+    seen_prior_rids: set[str] = set()
+    cand_pool: list[dict[str, Any]] = []
+    if receipt_store is not None:
+        for rid in receipt_store.list_ids():
+            if rid in {p_rid, r_rid}:
+                continue
+            try:
+                cand_pool.append(receipt_store.get(rid))
+            except (KeyError, ValueError):
+                continue
+    for extra_rec in (*proof_receipts, *control_receipts):
+        if isinstance(extra_rec, dict):
+            cand_pool.append(extra_rec)
+
+    for cand in cand_pool:
+        c_rid = str(cand.get("receipt_id") or "")
+        dedup_key = c_rid or f"obj:{id(cand)}"
+        if dedup_key in seen_prior_rids or (c_rid and c_rid in {p_rid, r_rid}) or cand is primary_proof:
+            continue
+        c_seq = _receipt_seq_num(cand)
+        c_ts = str(cand.get("timestamp") or "")
+        if p_seq > 0 and c_seq > 0:
+            if c_seq >= p_seq:
+                continue
+        elif p_ts and c_ts:
+            if c_ts >= p_ts:
+                continue
+        elif r_seq > 0 and c_seq >= r_seq:
+            continue
+        if not (200 <= int(cand.get("status") or 0) < 300):
+            continue
+        c_url = str(cand.get("url") or cand.get("path") or "")
+        c_origin = _extract_origin(c_url)
+        if p_origin and c_origin and p_origin != c_origin:
+            continue
+        c_method = str(cand.get("method") or "").upper()
+        c_norm_path = _norm_url_path(c_url)
+        if c_method == "GET" and c_norm_path == p_norm_path:
+            seen_prior_rids.add(dedup_key)
+            prior_gets.append(cand)
+            prior_observations.append(cand)
+        elif _receipt_observes_resource_before_delete(cand, p_norm_path):
+            seen_prior_rids.add(dedup_key)
+            prior_observations.append(cand)
+    return prior_gets, prior_observations
+
+
+def _maybe_needs_verification_verdict(
+    *,
+    canonical_class: str,
+    primary_proof: dict[str, Any],
+    replay_target: dict[str, Any] | None = None,
+    replay_rec: dict[str, Any] | None = None,
+    control_receipts: Sequence[dict[str, Any]] = (),
+    evidence_value: str = "",
+    stages: dict[str, Any],
+    deception_detected: bool = False,
+    is_oob_verified: bool = False,
+    oob_hits: Sequence[dict[str, Any]] = (),
+    ev_in_oob: bool = False,
+    timing_min_delta_ms: float = 1500.0,
+    delete_readback_alive: bool = False,
+    has_prior_observation: bool = False,
+    has_same_path_non404_control: bool = False,
+    original_evidence_ok: bool = True,
+) -> tuple[bool, str, str, str]:
+    """Evaluate deterministic Tier-2 NEEDS_VERIFICATION qualifiers on non-verified oracle paths.
+
+    Returns ``(needs_verification, signal_type, verification_blocker, suggested_manual_verification)``.
+    Hard disqualifiers always return ``(False, "", "", "")``.
+    """
+    if deception_detected:
+        return False, "", "", ""
+
+    s1 = str(stages.get("stage1_control") or "")
+    s2 = str(stages.get("stage2_diff") or "")
+    s3 = str(stages.get("stage3_clean_replay") or "")
+    stages_1_2_passed = s1.startswith("passed") and s2.startswith("passed")
+
+    target_rec = replay_target if replay_target is not None else primary_proof
+    target_method = str(target_rec.get("method") or primary_proof.get("method") or "GET").upper()
+    p_url = str(primary_proof.get("url") or primary_proof.get("path") or "")
+    t_url = str(target_rec.get("url") or target_rec.get("path") or p_url)
+    url_path = _norm_url_path(t_url or p_url) or "/"
+    p_status = int(primary_proof.get("status") or 0)
+    t_status = int(target_rec.get("status") or 0)
+    r_status = int(replay_rec.get("status") or 0) if replay_rec is not None else 0
+    has_oob_signal = bool(is_oob_verified or oob_hits or ev_in_oob)
+
+    # Hard disqualifier: idempotent GET protocol/content refutations remain REFUTED.
+    if target_method == "GET":
+        if s3 in _GET_HARD_DISQUALIFIER_STAGES:
+            return False, "", "", ""
+        if (
+            not has_oob_signal
+            and s3 in {"failed_missing_evidence", "failed_ephemeral_evidence"}
+            and 200 <= r_status < 300
+        ):
+            return False, "", "", ""
+
+    # Q5: Verified OOB callback hits yet Stage 3 (or Stage 1/2) failed without deception.
+    if has_oob_signal and (s3.startswith("failed_") or s1.startswith("failed_") or s2.startswith("failed_")):
+        blocker = (
+            f"stage3_clean_replay:{s3}"
+            if s3
+            else (f"stage2_diff:{s2}" if s2.startswith("failed_") else f"stage1_control:{s1}")
+        )
+        return (
+            True,
+            "async_oob_unreplayed",
+            blocker,
+            (
+                f"Replay {target_method} {url_path} with a fresh callback_listener URL and allow extra "
+                f"time for asynchronous/queued OOB callback delivery (observed {len(oob_hits)} callback hit(s))."
+            ),
+        )
+
+    # Q6: Unexpected server 5xx differential on same path/route without deception.
+    if 500 <= p_status < 600:
+        p_norm_path = _norm_url_path(p_url)
+        p_tmpl = route_template_of(normalize_path(p_url or "/"))
+        p_origin = _extract_origin(p_url)
+        same_path_controls: list[int] = []
+        for ctrl in control_receipts:
+            c_status = int(ctrl.get("status") or 0)
+            if not (100 <= c_status < 500):
+                continue
+            c_url = str(ctrl.get("url") or ctrl.get("path") or "")
+            c_origin = _extract_origin(c_url)
+            if p_origin and c_origin and p_origin != c_origin:
+                continue
+            c_norm_path = _norm_url_path(c_url)
+            c_tmpl = route_template_of(normalize_path(c_url or "/"))
+            if c_norm_path == p_norm_path or c_tmpl == p_tmpl:
+                same_path_controls.append(c_status)
+
+        if same_path_controls:
+            reproduced_5xx = replay_rec is not None and 500 <= r_status < 600
+            non_auth_denial_ctrl = any(cs not in {401, 403, 404} for cs in same_path_controls)
+            if reproduced_5xx or non_auth_denial_ctrl:
+                ctrl_desc = ",".join(str(cs) for cs in sorted(set(same_path_controls)))
+                stage_ref = (
+                    f"stage3_clean_replay:{s3}"
+                    if s3
+                    else (f"stage2_diff:{s2}" if s2.startswith("failed_") else f"stage1_control:{s1}")
+                )
+                return (
+                    True,
+                    "server_5xx_differential",
+                    f"{stage_ref}|proof_{p_status}_vs_control_{ctrl_desc}",
+                    (
+                        f"Manually replay {target_method} {url_path} and compare server error/stack behavior "
+                        f"against the same-route control (proof HTTP {p_status} vs control HTTP {ctrl_desc})."
+                    ),
+                )
+
+    # Hard disqualifier: Stage 1 or Stage 2 failure without OOB hit or qualifying 5xx differential.
+    if not stages_1_2_passed:
+        return False, "", "", ""
+
+    # Q1: Multi-step clean replay skipped due to HTTP budget constraint.
+    if s3 == "failed_multistep_budget":
+        steps = int(stages.get("stage3_multistep_count") or 2)
+        return (
+            True,
+            "multistep_budget_exceeded",
+            "stage3_clean_replay:failed_multistep_budget",
+            (
+                f"Manually replay the {steps}-step precursor sequence followed by {target_method} "
+                f"{url_path}, or re-run with a larger --http-budget."
+            ),
+        )
+
+    # Q2: Multi-step precursor step blocked by 404/409/410/429 state/rate-limit response.
+    if s3 in _MULTISTEP_BLOCKED_STAGE_CODES:
+        blocked_code = s3.rsplit("_", 1)[-1]
+        failed_step = int(stages.get("stage3_multistep_failed_step") or 1)
+        return (
+            True,
+            "multistep_precursor_blocked",
+            f"stage3_clean_replay:{s3}",
+            (
+                f"Re-seed fresh state/tokens before precursor step {failed_step} (returned HTTP "
+                f"{blocked_code}) and manually replay the workflow through {target_method} {url_path}."
+            ),
+        )
+
+    # Q4: Timing anomaly borderline (strictly non-overlapping, median delta >= min_delta, ratio >= 1.5).
+    if s3 == "failed_timing_overlap":
+        ts = stages.get("timing_summary")
+        if isinstance(ts, dict):
+            c_samples = [
+                float(x)
+                for x in (ts.get("control_samples_ms") or ())
+                if isinstance(x, (int, float)) and not isinstance(x, bool)
+            ]
+            p_samples = [
+                float(x)
+                for x in (ts.get("proof_samples_ms") or ())
+                if isinstance(x, (int, float)) and not isinstance(x, bool)
+            ]
+            if c_samples and p_samples:
+                c_med = float(statistics.median(c_samples))
+                p_med = float(statistics.median(p_samples))
+                no_overlap = min(p_samples) > max(c_samples)
+                delta_ok = (p_med - c_med) >= float(timing_min_delta_ms)
+                ratio_ok = p_med >= 1.5 * max(c_med, 20.0)
+                if no_overlap and delta_ok and ratio_ok:
+                    return (
+                        True,
+                        "timing_anomaly_borderline",
+                        "stage3_clean_replay:failed_timing_overlap",
+                        (
+                            f"Manually verify blind timing differential on {target_method} {url_path} with "
+                            f"a larger sleep payload (non-overlapping replay medians: control={c_med:.1f}ms, "
+                            f"proof={p_med:.1f}ms, delta={p_med - c_med:.1f}ms)."
+                        ),
+                    )
+
+    # Q3: Non-idempotent write returning 404/409/410/429 on clean replay after passing Stages 1-2.
+    if (
+        target_method in _MUTATING_METHODS
+        and 200 <= t_status < 400
+        and replay_rec is not None
+        and r_status in _ONE_SHOT_EXHAUSTED_STATUSES
+        and s3 == f"failed_status_{r_status}"
+        and not _has_redacted_credential_body(target_rec)
+        and not delete_readback_alive
+        and original_evidence_ok
+        and not _is_unrelated_route_not_found(replay_rec, target_method)
+        and (r_status != 404 or has_prior_observation or has_same_path_non404_control)
+    ):
+        return (
+            True,
+            "one_shot_state_exhausted",
+            f"stage3_clean_replay:failed_status_{r_status}",
+            (
+                f"Create a fresh target resource/token first and manually replay {target_method} "
+                f"{url_path} (clean replay returned HTTP {r_status} after single-use state transition)."
+            ),
+        )
+
+    _ = canonical_class, evidence_value
+    return False, "", "", ""
 
 
 class DifferentialOracle:
@@ -2828,6 +3127,7 @@ class DifferentialOracle:
         url: str,
         headers: dict[str, str] | None = None,
         raw_body: str = "",
+        raw_body_base64: str = "",
     ) -> dict[str, Any]:
         """Execute a single HTTP request inside a brand-new isolated requests.Session()."""
         allowed, reason = self.http.budget.consume()
@@ -2844,7 +3144,18 @@ class DifferentialOracle:
         req_headers = session_obj.build_headers(method, safe_extra)
         if not any(k.lower() == "user-agent" for k in req_headers):
             req_headers["User-Agent"] = DEFAULT_BROWSER_USER_AGENT
-        body_bytes = raw_body.encode("utf-8") if raw_body else None
+        req_body_b64 = ""
+        clean_b64_arg = "".join(str(raw_body_base64 or "").split())
+        body_bytes: bytes | None
+        if clean_b64_arg:
+            decoded_req_bytes = base64.b64decode(clean_b64_arg, validate=True)
+            body_bytes = decoded_req_bytes
+            req_body_b64 = base64.b64encode(decoded_req_bytes).decode("ascii")
+            body_sha = hashlib.sha256(decoded_req_bytes).hexdigest()
+            rec_req_body = raw_body or f"<binary {len(decoded_req_bytes)} bytes sha256={body_sha[:16]}>"
+        else:
+            body_bytes = raw_body.encode("utf-8") if raw_body else None
+            rec_req_body = raw_body
 
         fresh = requests.Session()
         fresh.trust_env = False
@@ -2876,7 +3187,11 @@ class DifferentialOracle:
                 if len(raw_stream) > self.http.max_response_bytes:
                     raw_stream = raw_stream[: self.http.max_response_bytes]
                 raw_bytes = _decode_raw_response(raw_stream, _header_get(resp_headers, "Content-Encoding"))
-                text = raw_bytes.decode("utf-8", errors="replace")
+                if is_grpc_web_content_type(content_type):
+                    decoded_grpc = decode_grpc_web_frames(raw_bytes, content_type=content_type)
+                    text = json.dumps(decoded_grpc, ensure_ascii=False)
+                else:
+                    text = raw_bytes.decode("utf-8", errors="replace")
             finally:
                 resp.close()
         except Exception as exc:
@@ -2886,6 +3201,9 @@ class DifferentialOracle:
             fresh.close()
         elapsed_ms = max(0.0, (time.monotonic() - started) * 1000.0)
 
+        record_extra: dict[str, Any] = {}
+        if req_body_b64:
+            record_extra["request_body_base64"] = req_body_b64
         return self.receipts.record(
             actor=actor,
             method=method,
@@ -2893,7 +3211,7 @@ class DifferentialOracle:
             path=path,
             query=query,
             request_headers=req_headers,
-            request_body=raw_body,
+            request_body=rec_req_body,
             status=status,
             elapsed_ms=elapsed_ms,
             content_type=content_type,
@@ -2903,6 +3221,63 @@ class DifferentialOracle:
             response_text=text,
             error=error,
             secret_values=self.http.actors.all_secrets(),
+            **record_extra,
+        )
+
+    def _build_refuted_verdict(
+        self,
+        *,
+        canonical_class: str,
+        primary_proof: dict[str, Any],
+        reason: str,
+        stages: dict[str, Any],
+        verdict: str = "REFUTED",
+        control_receipts: Sequence[dict[str, Any]] = (),
+        evidence_value: str = "",
+        replay_target: dict[str, Any] | None = None,
+        replay_rec: dict[str, Any] | None = None,
+        deception_detected: bool = False,
+        is_oob_verified: bool = False,
+        oob_hits: Sequence[dict[str, Any]] = (),
+        ev_in_oob: bool = False,
+        clean_replay_receipt_id: str = "",
+        control_probe_receipt_id: str = "",
+        delete_readback_alive: bool = False,
+        has_prior_observation: bool = False,
+        has_same_path_non404_control: bool = False,
+        original_evidence_ok: bool = True,
+    ) -> OracleVerdict:
+        needs_verif, signal_type, blocker, suggested = _maybe_needs_verification_verdict(
+            canonical_class=canonical_class,
+            primary_proof=primary_proof,
+            replay_target=replay_target,
+            replay_rec=replay_rec,
+            control_receipts=control_receipts,
+            evidence_value=evidence_value,
+            stages=stages,
+            deception_detected=deception_detected,
+            is_oob_verified=is_oob_verified,
+            oob_hits=oob_hits,
+            ev_in_oob=ev_in_oob,
+            timing_min_delta_ms=self.timing_min_delta_ms,
+            delete_readback_alive=delete_readback_alive,
+            has_prior_observation=has_prior_observation,
+            has_same_path_non404_control=has_same_path_non404_control,
+            original_evidence_ok=original_evidence_ok,
+        )
+        return OracleVerdict(
+            verified=False,
+            verdict=verdict,
+            reason=reason,
+            deception_detected=deception_detected,
+            mode=self.mode,
+            stages=stages,
+            clean_replay_receipt_id=clean_replay_receipt_id,
+            control_probe_receipt_id=control_probe_receipt_id,
+            needs_verification=needs_verif,
+            signal_type=signal_type,
+            verification_blocker=blocker,
+            suggested_manual_verification=suggested,
         )
 
     def _run_timing_statistical_replay(
@@ -2913,20 +3288,26 @@ class DifferentialOracle:
         timing_control: dict[str, Any],
         stages: dict[str, Any],
         ctrl_probe_rid: str,
+        primary_proof: dict[str, Any] | None = None,
+        control_receipts: Sequence[dict[str, Any]] = (),
+        evidence_value: str = "",
     ) -> OracleVerdict:
         """Execute fail-closed alternating clean-session timing replay pairs in Stage 3."""
+        p_proof = primary_proof if primary_proof is not None else diff_target
         pairs = max(1, int(self.timing_replay_pairs))
         needed_requests = 2 * pairs
         if not self._has_budget(needed_requests):
             stages["stage3_clean_replay"] = "failed_timing_budget"
-            return OracleVerdict(
-                verified=False,
-                verdict="REFUTED",
+            return self._build_refuted_verdict(
+                canonical_class=canonical_class,
+                primary_proof=p_proof,
+                replay_target=diff_target,
+                control_receipts=control_receipts,
+                evidence_value=evidence_value,
                 reason=(
                     f"Statistical timing verification requires {needed_requests} HTTP requests for "
                     f"{pairs} alternating clean-session replay pairs, but remaining budget is insufficient."
                 ),
-                mode=self.mode,
                 stages=stages,
                 control_probe_receipt_id=ctrl_probe_rid,
             )
@@ -2935,14 +3316,16 @@ class DifferentialOracle:
         proof_method = str(diff_target.get("method") or "GET").upper()
         if ctrl_method not in self.http.allowed_methods or proof_method not in self.http.allowed_methods:
             stages["stage3_clean_replay"] = "failed_timing_method_not_allowed"
-            return OracleVerdict(
-                verified=False,
-                verdict="REFUTED",
+            return self._build_refuted_verdict(
+                canonical_class=canonical_class,
+                primary_proof=p_proof,
+                replay_target=diff_target,
+                control_receipts=control_receipts,
+                evidence_value=evidence_value,
                 reason=(
                     f"Statistical timing verification skipped: HTTP method(s) "
                     f"{ctrl_method!r}/{proof_method!r} not in allowed_methods."
                 ),
-                mode=self.mode,
                 stages=stages,
                 control_probe_receipt_id=ctrl_probe_rid,
             )
@@ -2988,16 +3371,20 @@ class DifferentialOracle:
                     url=str(timing_control.get("url") or "/"),
                     headers=timing_control.get("request_headers") or {},
                     raw_body=str(timing_control.get("request_body") or ""),
+                    **({"raw_body_base64": str(timing_control.get("request_body_base64") or "").strip()} if str(timing_control.get("request_body_base64") or "").strip() else {}),
                 )
                 c_wall_ms = max(0.0, (time.monotonic() - t0) * 1000.0)
             except BudgetExhaustedError:
                 _record_summary()
                 stages["stage3_clean_replay"] = "failed_timing_budget"
-                return OracleVerdict(
-                    verified=False,
-                    verdict="REFUTED",
+                return self._build_refuted_verdict(
+                    canonical_class=canonical_class,
+                    primary_proof=p_proof,
+                    replay_target=diff_target,
+                    replay_rec=proof_recs[-1] if proof_recs else None,
+                    control_receipts=control_receipts,
+                    evidence_value=evidence_value,
                     reason="HTTP budget exhausted during statistical timing differential replay.",
-                    mode=self.mode,
                     stages=stages,
                     control_probe_receipt_id=ctrl_probe_rid,
                 )
@@ -3012,14 +3399,17 @@ class DifferentialOracle:
             ):
                 _record_summary()
                 stages["stage3_clean_replay"] = "failed_timing_status"
-                return OracleVerdict(
-                    verified=False,
-                    verdict="REFUTED",
+                return self._build_refuted_verdict(
+                    canonical_class=canonical_class,
+                    primary_proof=p_proof,
+                    replay_target=diff_target,
+                    replay_rec=proof_recs[-1] if proof_recs else None,
+                    control_receipts=control_receipts,
+                    evidence_value=evidence_value,
                     reason=(
                         f"Timing control replay returned inconsistent/error status {c_status} "
                         f"(expected {orig_ctrl_status // 100}xx)."
                     ),
-                    mode=self.mode,
                     stages=stages,
                     clean_replay_receipt_id=proof_recs[-1]["receipt_id"] if proof_recs else "",
                     control_probe_receipt_id=ctrl_probe_rid or str(c_rec.get("receipt_id") or ""),
@@ -3033,16 +3423,20 @@ class DifferentialOracle:
                     url=str(diff_target.get("url") or "/"),
                     headers=diff_target.get("request_headers") or {},
                     raw_body=str(diff_target.get("request_body") or ""),
+                    **({"raw_body_base64": str(diff_target.get("request_body_base64") or "").strip()} if str(diff_target.get("request_body_base64") or "").strip() else {}),
                 )
                 p_wall_ms = max(0.0, (time.monotonic() - t1) * 1000.0)
             except BudgetExhaustedError:
                 _record_summary()
                 stages["stage3_clean_replay"] = "failed_timing_budget"
-                return OracleVerdict(
-                    verified=False,
-                    verdict="REFUTED",
+                return self._build_refuted_verdict(
+                    canonical_class=canonical_class,
+                    primary_proof=p_proof,
+                    replay_target=diff_target,
+                    replay_rec=proof_recs[-1] if proof_recs else None,
+                    control_receipts=control_receipts,
+                    evidence_value=evidence_value,
                     reason="HTTP budget exhausted during statistical timing differential replay.",
-                    mode=self.mode,
                     stages=stages,
                     clean_replay_receipt_id=proof_recs[-1]["receipt_id"] if proof_recs else "",
                     control_probe_receipt_id=ctrl_probe_rid or str(c_rec.get("receipt_id") or ""),
@@ -3058,14 +3452,17 @@ class DifferentialOracle:
             ):
                 _record_summary()
                 stages["stage3_clean_replay"] = "failed_timing_status"
-                return OracleVerdict(
-                    verified=False,
-                    verdict="REFUTED",
+                return self._build_refuted_verdict(
+                    canonical_class=canonical_class,
+                    primary_proof=p_proof,
+                    replay_target=diff_target,
+                    replay_rec=p_rec,
+                    control_receipts=control_receipts,
+                    evidence_value=evidence_value,
                     reason=(
                         f"Timing proof replay returned inconsistent/error status {p_status} "
                         f"(expected {orig_proof_status // 100}xx)."
                     ),
-                    mode=self.mode,
                     stages=stages,
                     clean_replay_receipt_id=str(p_rec.get("receipt_id") or ""),
                     control_probe_receipt_id=ctrl_probe_rid or str(c_rec.get("receipt_id") or ""),
@@ -3094,15 +3491,18 @@ class DifferentialOracle:
             )
 
         stages["stage3_clean_replay"] = "failed_timing_overlap"
-        return OracleVerdict(
-            verified=False,
-            verdict="REFUTED",
+        return self._build_refuted_verdict(
+            canonical_class=canonical_class,
+            primary_proof=p_proof,
+            replay_target=diff_target,
+            replay_rec=proof_recs[-1],
+            control_receipts=control_receipts,
+            evidence_value=evidence_value,
             reason=(
                 f"Statistical timing differential refuted across {pairs} alternating clean-session "
                 f"replay pairs (control_median={ctrl_med:.1f}ms, proof_median={proof_med:.1f}ms, "
                 f"min_gap={min_gap:.1f}ms < {self.timing_min_delta_ms:.1f}ms or ratio < {self.timing_min_ratio:.1f}x)."
             ),
-            mode=self.mode,
             stages=stages,
             clean_replay_receipt_id=last_proof_rid,
             control_probe_receipt_id=last_ctrl_rid,
@@ -3168,11 +3568,12 @@ class DifferentialOracle:
             if oob_tokens_submitted and not effective_oob_hits:
                 stages["stage1_control"] = "failed_oob_zero_hits"
                 class_label = "SSRF" if canonical_class == "ssrf" else canonical_class
-                return OracleVerdict(
-                    verified=False,
-                    verdict="REFUTED",
+                return self._build_refuted_verdict(
+                    canonical_class=canonical_class,
+                    primary_proof=primary_proof,
+                    control_receipts=control_receipts,
+                    evidence_value=ev,
                     reason=f"{class_label} callback claim rejected: callback_listener recorded 0 hits for submitted token(s).",
-                    mode=self.mode,
                     stages=stages,
                 )
         is_oob_verified = canonical_class in _OOB_ELIGIBLE_CLASSES and bool(effective_oob_hits)
@@ -3189,29 +3590,38 @@ class DifferentialOracle:
                 )
             if render_proof is None:
                 stages["stage1_control"] = "failed_missing_render_get"
-                return OracleVerdict(
-                    verified=False,
-                    verdict="REFUTED",
+                return self._build_refuted_verdict(
+                    canonical_class=canonical_class,
+                    primary_proof=primary_proof,
+                    control_receipts=control_receipts,
+                    evidence_value=ev,
+                    is_oob_verified=is_oob_verified,
+                    oob_hits=effective_oob_hits,
                     reason="stored_xss requires a 2xx text/html GET render receipt containing evidence_value unescaped verbatim.",
-                    mode=self.mode,
                     stages=stages,
                 )
             if not is_html_receipt(render_proof):
                 stages["stage1_control"] = "failed_non_html_render"
-                return OracleVerdict(
-                    verified=False,
-                    verdict="REFUTED",
+                return self._build_refuted_verdict(
+                    canonical_class=canonical_class,
+                    primary_proof=primary_proof,
+                    control_receipts=control_receipts,
+                    evidence_value=ev,
+                    is_oob_verified=is_oob_verified,
+                    oob_hits=effective_oob_hits,
                     reason="stored_xss render GET receipt must have HTML (text/html) content-type.",
-                    mode=self.mode,
                     stages=stages,
                 )
             if ev and not receipt_body_contains_verbatim(render_proof, ev):
                 stages["stage1_control"] = "failed_missing_unescaped_evidence"
-                return OracleVerdict(
-                    verified=False,
-                    verdict="REFUTED",
+                return self._build_refuted_verdict(
+                    canonical_class=canonical_class,
+                    primary_proof=primary_proof,
+                    control_receipts=control_receipts,
+                    evidence_value=ev,
+                    is_oob_verified=is_oob_verified,
+                    oob_hits=effective_oob_hits,
                     reason="stored_xss render GET receipt does not contain evidence_value unescaped verbatim in HTML body.",
-                    mode=self.mode,
                     stages=stages,
                 )
         elif canonical_class in _PERSISTENT_CLASSES:
@@ -3337,14 +3747,16 @@ class DifferentialOracle:
         if input_diff_eligible and not is_oob_verified:
             if canonical_class == "weak_credentials" and not eff_controls:
                 stages["stage1_control"] = "failed_missing_control"
-                return OracleVerdict(
-                    verified=False,
-                    verdict="REFUTED",
+                return self._build_refuted_verdict(
+                    canonical_class=canonical_class,
+                    primary_proof=primary_proof,
+                    replay_target=diff_target,
+                    control_receipts=eff_controls,
+                    evidence_value=ev,
                     reason=(
                         "weak_credentials requires at least one comparative control receipt "
                         "(e.g. failed login with invalid credentials or unauthenticated denial on a protected endpoint)."
                     ),
-                    mode=self.mode,
                     stages=stages,
                 )
             if canonical_class == "stored_xss" and ev:
@@ -3353,11 +3765,13 @@ class DifferentialOracle:
                     c_count = str(ctrl.get("body") or "").lower().count(ev.lower())
                     if c_count >= p_count or c_count > 0 and p_count <= c_count:
                         stages["stage1_control"] = "failed_evidence_in_baseline"
-                        return OracleVerdict(
-                            verified=False,
-                            verdict="REFUTED",
+                        return self._build_refuted_verdict(
+                            canonical_class=canonical_class,
+                            primary_proof=primary_proof,
+                            replay_target=diff_target,
+                            control_receipts=eff_controls,
+                            evidence_value=ev,
                             reason="Benign baseline GET control already contains the claimed stored_xss evidence_value.",
-                            mode=self.mode,
                             stages=stages,
                             control_probe_receipt_id=ctrl_probe_rid,
                         )
@@ -3436,20 +3850,28 @@ class DifferentialOracle:
                         if "at least 2 distinct" in race_reason
                         else "failed_missing_concurrency_evidence"
                     )
-                    return OracleVerdict(
-                        verified=False,
-                        verdict="REFUTED",
+                    return self._build_refuted_verdict(
+                        canonical_class=canonical_class,
+                        primary_proof=primary_proof,
+                        replay_target=diff_target,
+                        control_receipts=eff_controls,
+                        evidence_value=ev,
+                        is_oob_verified=is_oob_verified,
+                        oob_hits=effective_oob_hits,
                         reason=race_reason,
-                        mode=self.mode,
                         stages=stages,
                     )
             if not eff_controls:
                 stages["stage1_control"] = "failed_missing_control"
-                return OracleVerdict(
-                    verified=False,
-                    verdict="REFUTED",
+                return self._build_refuted_verdict(
+                    canonical_class=canonical_class,
+                    primary_proof=primary_proof,
+                    replay_target=diff_target,
+                    control_receipts=eff_controls,
+                    evidence_value=ev,
+                    is_oob_verified=is_oob_verified,
+                    oob_hits=effective_oob_hits,
                     reason=f"{canonical_class} requires at least one sequential or baseline control receipt.",
-                    mode=self.mode,
                     stages=stages,
                 )
             p_method = str(diff_target.get("method") or "").upper()
@@ -3472,11 +3894,15 @@ class DifferentialOracle:
         elif canonical_class in _ACCESS_CLASSES:
             if _is_graphql_error_envelope(primary_proof):
                 stages["stage1_control"] = "failed_graphql_error_proof"
-                return OracleVerdict(
-                    verified=False,
-                    verdict="REFUTED",
+                return self._build_refuted_verdict(
+                    canonical_class=canonical_class,
+                    primary_proof=primary_proof,
+                    replay_target=diff_target,
+                    control_receipts=eff_controls,
+                    evidence_value=ev,
+                    is_oob_verified=is_oob_verified,
+                    oob_hits=effective_oob_hits,
                     reason=f"{canonical_class} primary proof returned a GraphQL error-only envelope.",
-                    mode=self.mode,
                     stages=stages,
                     control_probe_receipt_id=ctrl_probe_rid,
                 )
@@ -3602,11 +4028,15 @@ class DifferentialOracle:
                 role = str((meta_map.get(p_actor) or {}).get("role") or "").lower()
                 if any(tok in role for tok in ("admin", "superadmin", "superuser")):
                     stages["stage2_diff"] = "failed_admin_actor_for_bfla"
-                    return OracleVerdict(
-                        verified=False,
-                        verdict="REFUTED",
+                    return self._build_refuted_verdict(
+                        canonical_class=canonical_class,
+                        primary_proof=primary_proof,
+                        replay_target=diff_target,
+                        control_receipts=eff_controls,
+                        evidence_value=ev,
+                        is_oob_verified=is_oob_verified,
+                        oob_hits=effective_oob_hits,
                         reason="BFLA proof cannot rely on an admin actor.",
-                        mode=self.mode,
                         stages=stages,
                     )
             elif canonical_class == "bola":
@@ -3622,11 +4052,15 @@ class DifferentialOracle:
                 if bola_fp is not None:
                     stage_code, reason = bola_fp
                     stages["stage2_diff"] = stage_code
-                    return OracleVerdict(
-                        verified=False,
-                        verdict="REFUTED",
+                    return self._build_refuted_verdict(
+                        canonical_class=canonical_class,
+                        primary_proof=primary_proof,
+                        replay_target=diff_target,
+                        control_receipts=eff_controls,
+                        evidence_value=ev,
+                        is_oob_verified=is_oob_verified,
+                        oob_hits=effective_oob_hits,
                         reason=reason,
-                        mode=self.mode,
                         stages=stages,
                         control_probe_receipt_id=ctrl_probe_rid,
                     )
@@ -3638,6 +4072,7 @@ class DifferentialOracle:
         # --- Stage 3: Clean-Session Replay in fresh isolated requests.Session() ---
         if canonical_class == "race_condition" or (
             canonical_class == "business_logic"
+            and 200 <= int(primary_proof.get("status") or 0) < 400
             and (
                 len(proof_receipts) >= 2
                 or (
@@ -3674,6 +4109,9 @@ class DifferentialOracle:
                 timing_control=timing_differential_control,
                 stages=stages,
                 ctrl_probe_rid=ctrl_probe_rid,
+                primary_proof=primary_proof,
+                control_receipts=eff_controls,
+                evidence_value=ev,
             )
 
         # Prefer replaying a 2xx GET persistence proof receipt when one is present
@@ -3729,8 +4167,9 @@ class DifferentialOracle:
         multistep_substitutions: dict[str, str] = {}
         attempted_precursor_chain = False
 
-        replay_raw_body = str(replay_target.get("request_body") or "")
-        if canonical_class != "csrf" and "<REDACTED" in replay_raw_body:
+        replay_raw_body_b64 = str(replay_target.get("request_body_base64") or "").strip()
+        replay_raw_body = "" if replay_raw_body_b64 else str(replay_target.get("request_body") or "")
+        if not replay_raw_body_b64 and canonical_class != "csrf" and "<REDACTED" in replay_raw_body:
             try:
                 csrf_session_obj = self.http.actors.get(str(replay_target.get("actor") or "anon"))
             except ValueError:
@@ -3744,6 +4183,7 @@ class DifferentialOracle:
                 url=str(replay_target.get("url") or "/"),
                 headers=replay_target.get("request_headers") or {},
                 raw_body=replay_raw_body,
+                **({"raw_body_base64": replay_raw_body_b64} if replay_raw_body_b64 else {}),
             )
         except BudgetExhaustedError:
             stages["stage3_clean_replay"] = "skipped_budget"
@@ -3886,6 +4326,7 @@ class DifferentialOracle:
         #       when GET budget/method is unavailable) while rejecting any 2xx "still
         #       alive" readback or unrelated route errors
         #       (`passed_one_shot_delete_state_transition`).
+        delete_readback_alive = False
         if (
             replay_target is primary_proof
             and str(primary_proof.get("method") or "").upper() == "DELETE"
@@ -3894,11 +4335,6 @@ class DifferentialOracle:
             and not _is_unrelated_route_not_found(replay_rec, "DELETE")
         ):
             p_norm_path = _norm_url_path(str(primary_proof.get("url") or primary_proof.get("path") or ""))
-            p_rid = str(primary_proof.get("receipt_id") or "")
-            r_rid = str(replay_rec.get("receipt_id") or "")
-            p_seq = _receipt_seq_num(primary_proof)
-            r_seq = _receipt_seq_num(replay_rec)
-            p_ts = str(primary_proof.get("timestamp") or "")
             ctrl_actors = {
                 str(c.get("actor") or "").strip()
                 for c in eff_controls
@@ -3918,55 +4354,19 @@ class DifferentialOracle:
                 if isinstance(obj_entry, dict):
                     eff_owner = str(obj_entry.get("owner_actor") or "").strip()
 
-            prior_gets: list[dict[str, Any]] = []
-            prior_observations: list[dict[str, Any]] = []
-            seen_prior_rids: set[str] = set()
-            cand_pool: list[dict[str, Any]] = []
-            for rid in self.receipts.list_ids():
-                if rid in {p_rid, r_rid}:
-                    continue
-                try:
-                    cand_pool.append(self.receipts.get(rid))
-                except (KeyError, ValueError):
-                    continue
-            for extra_rec in (*proof_receipts, *eff_controls):
-                if isinstance(extra_rec, dict):
-                    cand_pool.append(extra_rec)
-
-            for cand in cand_pool:
-                c_rid = str(cand.get("receipt_id") or "")
-                dedup_key = c_rid or f"obj:{id(cand)}"
-                if dedup_key in seen_prior_rids or (c_rid and c_rid in {p_rid, r_rid}) or cand is primary_proof:
-                    continue
-                c_seq = _receipt_seq_num(cand)
-                c_ts = str(cand.get("timestamp") or "")
-                if p_seq > 0 and c_seq > 0:
-                    if c_seq >= p_seq:
-                        continue
-                elif p_ts and c_ts:
-                    if c_ts >= p_ts:
-                        continue
-                elif r_seq > 0 and c_seq >= r_seq:
-                    continue
-                if not (200 <= int(cand.get("status") or 0) < 300):
-                    continue
-                c_method = str(cand.get("method") or "").upper()
-                c_norm_path = _norm_url_path(str(cand.get("url") or cand.get("path") or ""))
-                if c_method == "GET" and c_norm_path == p_norm_path:
-                    seen_prior_rids.add(dedup_key)
-                    prior_gets.append(cand)
-                    prior_observations.append(cand)
-                    if not eff_owner:
-                        cand_owner, _ = _extract_owner_and_tenant_from_receipt(cand, meta_map)
-                        if cand_owner:
-                            eff_owner = cand_owner
-                elif _receipt_observes_resource_before_delete(cand, p_norm_path):
-                    seen_prior_rids.add(dedup_key)
-                    prior_observations.append(cand)
-                    if not eff_owner:
-                        cand_owner, _ = _extract_owner_and_tenant_from_receipt(cand, meta_map)
-                        if cand_owner:
-                            eff_owner = cand_owner
+            prior_gets, prior_observations = _collect_prior_resource_observations(
+                primary_proof=primary_proof,
+                proof_receipts=proof_receipts,
+                control_receipts=eff_controls,
+                receipt_store=self.receipts,
+                replay_rec=replay_rec,
+            )
+            if not eff_owner:
+                for cand in prior_observations:
+                    cand_owner, _ = _extract_owner_and_tenant_from_receipt(cand, meta_map)
+                    if cand_owner:
+                        eff_owner = cand_owner
+                        break
 
             same_path_denied_controls = [
                 c
@@ -4161,15 +4561,21 @@ class DifferentialOracle:
                     if total_chain_steps >= 3 or target_method_upper != "GET":
                         stages["stage3_clean_replay"] = "failed_multistep_budget"
                         stages["stage3_multistep_count"] = total_chain_steps
-                        return OracleVerdict(
-                            verified=False,
-                            verdict="REFUTED",
+                        return self._build_refuted_verdict(
+                            canonical_class=canonical_class,
+                            primary_proof=primary_proof,
+                            replay_target=replay_target,
+                            replay_rec=replay_rec,
+                            control_receipts=eff_controls,
+                            evidence_value=ev,
+                            is_oob_verified=is_oob_verified,
+                            oob_hits=effective_oob_hits,
+                            ev_in_oob=ev_in_oob,
                             reason=(
                                 f"Multi-step replay requires {total_chain_steps} HTTP requests "
                                 f"({len(precursor_chain)} precursor step(s) + final step), "
                                 "but remaining budget is insufficient."
                             ),
-                            mode=self.mode,
                             stages=stages,
                             clean_replay_receipt_id=replay_rec["receipt_id"],
                             control_probe_receipt_id=ctrl_probe_rid,
@@ -4190,13 +4596,16 @@ class DifferentialOracle:
                             id_map,
                         )
                         step_method = str(orig_step.get("method") or "POST").upper()
+                        step_b64 = str(orig_step.get("request_body_base64") or "").strip()
+                        step_extra_b64 = {"raw_body_base64": step_b64} if (step_b64 and not id_map) else {}
                         try:
                             step_replay_rec = self._run_clean_session_request(
                                 actor=str(orig_step.get("actor") or "anon"),
                                 method=step_method,
                                 url=sub_url,
                                 headers=orig_step.get("request_headers") or {},
-                                raw_body=sub_body,
+                                raw_body="" if step_extra_b64 else sub_body,
+                                **step_extra_b64,
                             )
                         except (BudgetExhaustedError, ValueError):
                             precursor_failed = True
@@ -4232,14 +4641,20 @@ class DifferentialOracle:
                         stages["stage3_multistep_failed_step"] = failed_step_num
                         if replayed_rids:
                             stages["stage3_precursor_replay_receipt_ids"] = replayed_rids
-                        return OracleVerdict(
-                            verified=False,
-                            verdict="REFUTED",
+                        return self._build_refuted_verdict(
+                            canonical_class=canonical_class,
+                            primary_proof=primary_proof,
+                            replay_target=replay_target,
+                            replay_rec=replay_rec,
+                            control_receipts=eff_controls,
+                            evidence_value=ev,
+                            is_oob_verified=is_oob_verified,
+                            oob_hits=effective_oob_hits,
+                            ev_in_oob=ev_in_oob,
                             reason=(
                                 f"Multi-step replay precursor step {failed_step_num}/{total_chain_steps} "
                                 f"failed with status {failed_step_status}."
                             ),
-                            mode=self.mode,
                             stages=stages,
                             clean_replay_receipt_id=failed_step_rid or replay_rec["receipt_id"],
                             control_probe_receipt_id=ctrl_probe_rid,
@@ -4250,13 +4665,16 @@ class DifferentialOracle:
                         str(replay_target.get("request_body") or ""),
                         id_map,
                     )
+                    final_b64 = str(replay_target.get("request_body_base64") or "").strip()
+                    final_extra_b64 = {"raw_body_base64": final_b64} if (final_b64 and not id_map) else {}
                     try:
                         final_replay_rec = self._run_clean_session_request(
                             actor=str(replay_target.get("actor") or "anon"),
                             method=target_method_upper,
                             url=final_url,
                             headers=replay_target.get("request_headers") or {},
-                            raw_body=final_body,
+                            raw_body="" if final_extra_b64 else final_body,
+                            **final_extra_b64,
                         )
                     except (BudgetExhaustedError, ValueError):
                         final_replay_rec = None
@@ -4383,11 +4801,72 @@ class DifferentialOracle:
 
         if not (200 <= r_status < 400) or (r_status // 100) != (t_status // 100):
             stages["stage3_clean_replay"] = f"failed_status_{r_status}"
-            return OracleVerdict(
-                verified=False,
-                verdict="REFUTED",
+            p_norm_url_path = _norm_url_path(str(primary_proof.get("url") or primary_proof.get("path") or ""))
+            p_origin_url = _extract_origin(str(primary_proof.get("url") or primary_proof.get("path") or ""))
+            prior_obs_for_404: list[dict[str, Any]] = []
+            if target_method_upper in _MUTATING_METHODS and (
+                r_status == 404 or (target_method_upper == "DELETE" and int(primary_proof.get("status") or 0) == 204)
+            ):
+                _, prior_obs_for_404 = _collect_prior_resource_observations(
+                    primary_proof=primary_proof,
+                    proof_receipts=proof_receipts,
+                    control_receipts=eff_controls,
+                    receipt_store=self.receipts,
+                    replay_rec=replay_rec,
+                )
+            if (
+                not ev
+                or ev_in_oob
+                or _receipt_contains_evidence(primary_proof, ev, canonical_class=canonical_class)
+                or (
+                    replay_target is not primary_proof
+                    and _receipt_contains_evidence(replay_target, ev, canonical_class=canonical_class)
+                )
+            ):
+                original_ev_ok = True
+            elif target_method_upper == "DELETE" and int(primary_proof.get("status") or 0) == 204:
+                same_denied = any(
+                    _is_denied_control_receipt(c)
+                    and _norm_url_path(str(c.get("url") or c.get("path") or "")) == p_norm_url_path
+                    for c in eff_controls
+                )
+                original_ev_ok = _delete_original_evidence_ok(
+                    primary_proof=primary_proof,
+                    evidence_value=ev,
+                    ev_in_oob=ev_in_oob,
+                    canonical_class=canonical_class,
+                    prior_observations=prior_obs_for_404,
+                    eff_controls=eff_controls,
+                    has_same_path_denied_control=same_denied,
+                )
+            else:
+                original_ev_ok = False
+            has_same_non404_ctrl = any(
+                100 <= int(c.get("status") or 0) < 500
+                and int(c.get("status") or 0) != 404
+                and _norm_url_path(str(c.get("url") or c.get("path") or "")) == p_norm_url_path
+                and (
+                    not p_origin_url
+                    or not _extract_origin(str(c.get("url") or c.get("path") or ""))
+                    or _extract_origin(str(c.get("url") or c.get("path") or "")) == p_origin_url
+                )
+                for c in eff_controls
+            )
+            return self._build_refuted_verdict(
+                canonical_class=canonical_class,
+                primary_proof=primary_proof,
+                replay_target=replay_target,
+                replay_rec=replay_rec,
+                control_receipts=eff_controls,
+                evidence_value=ev,
+                is_oob_verified=is_oob_verified,
+                oob_hits=effective_oob_hits,
+                ev_in_oob=ev_in_oob,
+                delete_readback_alive=delete_readback_alive,
+                has_prior_observation=bool(prior_obs_for_404),
+                has_same_path_non404_control=has_same_non404_ctrl,
+                original_evidence_ok=original_ev_ok,
                 reason=f"Clean-session replay returned status {r_status} (expected {t_status // 100}xx).",
-                mode=self.mode,
                 stages=stages,
                 clean_replay_receipt_id=replay_rec["receipt_id"],
                 control_probe_receipt_id=ctrl_probe_rid,
@@ -4395,11 +4874,17 @@ class DifferentialOracle:
 
         if not _is_graphql_error_envelope(replay_target) and _is_graphql_error_envelope(replay_rec):
             stages["stage3_clean_replay"] = "failed_graphql_error_envelope"
-            return OracleVerdict(
-                verified=False,
-                verdict="REFUTED",
+            return self._build_refuted_verdict(
+                canonical_class=canonical_class,
+                primary_proof=primary_proof,
+                replay_target=replay_target,
+                replay_rec=replay_rec,
+                control_receipts=eff_controls,
+                evidence_value=ev,
+                is_oob_verified=is_oob_verified,
+                oob_hits=effective_oob_hits,
+                ev_in_oob=ev_in_oob,
                 reason="Clean-session replay returned a GraphQL error-only envelope.",
-                mode=self.mode,
                 stages=stages,
                 clean_replay_receipt_id=replay_rec["receipt_id"],
                 control_probe_receipt_id=ctrl_probe_rid,
@@ -4410,11 +4895,17 @@ class DifferentialOracle:
             rep_host = urlsplit(str(replay_rec.get("redirect_location") or "")).netloc
             if not rep_host or rep_host != orig_host:
                 stages["stage3_clean_replay"] = "failed_redirect_host"
-                return OracleVerdict(
-                    verified=False,
-                    verdict="REFUTED",
+                return self._build_refuted_verdict(
+                    canonical_class=canonical_class,
+                    primary_proof=primary_proof,
+                    replay_target=replay_target,
+                    replay_rec=replay_rec,
+                    control_receipts=eff_controls,
+                    evidence_value=ev,
+                    is_oob_verified=is_oob_verified,
+                    oob_hits=effective_oob_hits,
+                    ev_in_oob=ev_in_oob,
                     reason="Clean-session replay did not reproduce external redirect Location host.",
-                    mode=self.mode,
                     stages=stages,
                     clean_replay_receipt_id=replay_rec["receipt_id"],
                     control_probe_receipt_id=ctrl_probe_rid,
@@ -4431,14 +4922,20 @@ class DifferentialOracle:
             )
             if not valid_acao:
                 stages["stage3_clean_replay"] = "failed_cors_origin"
-                return OracleVerdict(
-                    verified=False,
-                    verdict="REFUTED",
+                return self._build_refuted_verdict(
+                    canonical_class=canonical_class,
+                    primary_proof=primary_proof,
+                    replay_target=replay_target,
+                    replay_rec=replay_rec,
+                    control_receipts=eff_controls,
+                    evidence_value=ev,
+                    is_oob_verified=is_oob_verified,
+                    oob_hits=effective_oob_hits,
+                    ev_in_oob=ev_in_oob,
                     reason=(
                         "Clean-session replay did not reproduce Access-Control-Allow-Origin "
                         "matching proof (* or reflected Origin)."
                     ),
-                    mode=self.mode,
                     stages=stages,
                     clean_replay_receipt_id=replay_rec["receipt_id"],
                     control_probe_receipt_id=ctrl_probe_rid,
@@ -4446,22 +4943,34 @@ class DifferentialOracle:
         elif canonical_class == "stored_xss":
             if not is_html_receipt(replay_rec):
                 stages["stage3_clean_replay"] = "failed_non_html_replay"
-                return OracleVerdict(
-                    verified=False,
-                    verdict="REFUTED",
+                return self._build_refuted_verdict(
+                    canonical_class=canonical_class,
+                    primary_proof=primary_proof,
+                    replay_target=replay_target,
+                    replay_rec=replay_rec,
+                    control_receipts=eff_controls,
+                    evidence_value=ev,
+                    is_oob_verified=is_oob_verified,
+                    oob_hits=effective_oob_hits,
+                    ev_in_oob=ev_in_oob,
                     reason="Clean-session GET replay did not return HTML (text/html) content-type.",
-                    mode=self.mode,
                     stages=stages,
                     clean_replay_receipt_id=replay_rec["receipt_id"],
                     control_probe_receipt_id=ctrl_probe_rid,
                 )
             if ev and not receipt_body_contains_verbatim(replay_rec, ev):
                 stages["stage3_clean_replay"] = "failed_missing_evidence"
-                return OracleVerdict(
-                    verified=False,
-                    verdict="REFUTED",
+                return self._build_refuted_verdict(
+                    canonical_class=canonical_class,
+                    primary_proof=primary_proof,
+                    replay_target=replay_target,
+                    replay_rec=replay_rec,
+                    control_receipts=eff_controls,
+                    evidence_value=ev,
+                    is_oob_verified=is_oob_verified,
+                    oob_hits=effective_oob_hits,
+                    ev_in_oob=ev_in_oob,
                     reason="Clean-session GET replay did not persist unescaped evidence_value in HTML body.",
-                    mode=self.mode,
                     stages=stages,
                     clean_replay_receipt_id=replay_rec["receipt_id"],
                     control_probe_receipt_id=ctrl_probe_rid,
@@ -4475,11 +4984,17 @@ class DifferentialOracle:
                     or _norm_url_path(rep_loc) != _norm_url_path(orig_loc)
                 ):
                     stages["stage3_clean_replay"] = "failed_login_redirect_mismatch"
-                    return OracleVerdict(
-                        verified=False,
-                        verdict="REFUTED",
+                    return self._build_refuted_verdict(
+                        canonical_class=canonical_class,
+                        primary_proof=primary_proof,
+                        replay_target=replay_target,
+                        replay_rec=replay_rec,
+                        control_receipts=eff_controls,
+                        evidence_value=ev,
+                        is_oob_verified=is_oob_verified,
+                        oob_hits=effective_oob_hits,
+                        ev_in_oob=ev_in_oob,
                         reason="Clean-session login replay did not reproduce expected authenticated redirect destination.",
-                        mode=self.mode,
                         stages=stages,
                         clean_replay_receipt_id=replay_rec["receipt_id"],
                         control_probe_receipt_id=ctrl_probe_rid,
@@ -4489,22 +5004,34 @@ class DifferentialOracle:
                 and not _weak_credentials_controls_equivalent(replay_target, replay_rec, ev=ev)
             ):
                 stages["stage3_clean_replay"] = "failed_replay_matched_control"
-                return OracleVerdict(
-                    verified=False,
-                    verdict="REFUTED",
+                return self._build_refuted_verdict(
+                    canonical_class=canonical_class,
+                    primary_proof=primary_proof,
+                    replay_target=replay_target,
+                    replay_rec=replay_rec,
+                    control_receipts=eff_controls,
+                    evidence_value=ev,
+                    is_oob_verified=is_oob_verified,
+                    oob_hits=effective_oob_hits,
+                    ev_in_oob=ev_in_oob,
                     reason="Clean-session login replay matched failed-login control instead of authenticated proof.",
-                    mode=self.mode,
                     stages=stages,
                     clean_replay_receipt_id=replay_rec["receipt_id"],
                     control_probe_receipt_id=ctrl_probe_rid,
                 )
             if ev and not _weak_credentials_replay_matches_evidence(ev, replay_target, replay_rec):
                 stages["stage3_clean_replay"] = "failed_missing_evidence"
-                return OracleVerdict(
-                    verified=False,
-                    verdict="REFUTED",
+                return self._build_refuted_verdict(
+                    canonical_class=canonical_class,
+                    primary_proof=primary_proof,
+                    replay_target=replay_target,
+                    replay_rec=replay_rec,
+                    control_receipts=eff_controls,
+                    evidence_value=ev,
+                    is_oob_verified=is_oob_verified,
+                    oob_hits=effective_oob_hits,
+                    ev_in_oob=ev_in_oob,
                     reason="Clean-session login replay did not reproduce claimed evidence or session behavior.",
-                    mode=self.mode,
                     stages=stages,
                     clean_replay_receipt_id=replay_rec["receipt_id"],
                     control_probe_receipt_id=ctrl_probe_rid,
@@ -4513,26 +5040,39 @@ class DifferentialOracle:
             if ev and not _receipt_contains_evidence(replay_rec, ev, canonical_class=canonical_class):
                 if not ev_in_oob:
                     if _detect_ephemeral_evidence_mismatch(ev, replay_target, replay_rec):
-                        return OracleVerdict(
-                            verified=False,
-                            verdict="REFUTED",
+                        stages["stage3_clean_replay"] = "failed_ephemeral_evidence"
+                        return self._build_refuted_verdict(
+                            canonical_class=canonical_class,
+                            primary_proof=primary_proof,
+                            replay_target=replay_target,
+                            replay_rec=replay_rec,
+                            control_receipts=eff_controls,
+                            evidence_value=ev,
+                            is_oob_verified=is_oob_verified,
+                            oob_hits=effective_oob_hits,
+                            ev_in_oob=ev_in_oob,
                             reason=(
                                 "Clean-session replay reproduced the same response structure, "
                                 "but evidence_value appears to be a per-request dynamic/ephemeral ID "
                                 "(UUID/event_id/request_id) that changes on every request; re-submit "
                                 "with a static or structural evidence_value from the response body instead."
                             ),
-                            mode=self.mode,
-                            stages={**stages, "stage3_clean_replay": "failed_ephemeral_evidence"},
+                            stages=stages,
                             clean_replay_receipt_id=replay_rec["receipt_id"],
                             control_probe_receipt_id=ctrl_probe_rid,
                         )
                     stages["stage3_clean_replay"] = "failed_missing_evidence"
-                    return OracleVerdict(
-                        verified=False,
-                        verdict="REFUTED",
+                    return self._build_refuted_verdict(
+                        canonical_class=canonical_class,
+                        primary_proof=primary_proof,
+                        replay_target=replay_target,
+                        replay_rec=replay_rec,
+                        control_receipts=eff_controls,
+                        evidence_value=ev,
+                        is_oob_verified=is_oob_verified,
+                        oob_hits=effective_oob_hits,
+                        ev_in_oob=ev_in_oob,
                         reason="Clean-session replay did not reproduce the claimed evidence_value.",
-                        mode=self.mode,
                         stages=stages,
                         clean_replay_receipt_id=replay_rec["receipt_id"],
                         control_probe_receipt_id=ctrl_probe_rid,

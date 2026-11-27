@@ -1,6 +1,8 @@
 """Lossless redacted HTTP receipt store for the agentic investigator."""
 from __future__ import annotations
 
+import base64
+import binascii
 import hashlib
 import json
 import os
@@ -209,6 +211,7 @@ class ReceiptStore:
         query: str = "",
         request_headers: dict[str, str] | None = None,
         request_body: str = "",
+        request_body_base64: str = "",
         status: int,
         elapsed_ms: float,
         content_type: str = "",
@@ -223,6 +226,26 @@ class ReceiptStore:
         safe_req_headers = redact_headers(request_headers)
         safe_resp_headers = redact_headers(response_headers)
         safe_req_body = redact_secrets(request_body or "", secret_values)[:16384]
+        safe_req_body_b64 = ""
+        raw_req_b64 = "".join(str(request_body_base64 or "").split())
+        if raw_req_b64:
+            try:
+                decoded_req_bytes = base64.b64decode(raw_req_b64, validate=True)
+            except (binascii.Error, ValueError):
+                decoded_req_bytes = b""
+                raw_req_b64 = ""
+            if raw_req_b64:
+                decoded_req_text = decoded_req_bytes.decode("utf-8", errors="replace")
+                has_secret = any(
+                    isinstance(s, str)
+                    and len(s) >= 4
+                    and (s in decoded_req_text or s.encode("utf-8", errors="ignore") in decoded_req_bytes)
+                    for s in secret_values
+                )
+                if not has_secret and redact_secrets(decoded_req_text, secret_values) != decoded_req_text:
+                    has_secret = True
+                if not has_secret:
+                    safe_req_body_b64 = base64.b64encode(decoded_req_bytes).decode("ascii")
         safe_resp_body = redact_secrets(response_text or "", secret_values)
         truncated = len(safe_resp_body) > self.max_disk_body_chars
         if truncated:
@@ -255,6 +278,8 @@ class ReceiptStore:
                 "body_truncated": truncated,
                 "error": str(error or ""),
             }
+            if safe_req_body_b64:
+                receipt["request_body_base64"] = safe_req_body_b64
             _atomic_write_json(self.receipts_dir / f"{receipt_id}.json", receipt)
             self._cache[receipt_id] = receipt
             return dict(receipt)

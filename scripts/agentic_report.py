@@ -27,6 +27,7 @@ from agentic_receipts import (  # noqa: E402
     redact_secrets,
 )
 from agentic_surface import SurfaceFrontierTracker  # noqa: E402
+from agentic_tools import canonicalize_and_deduplicate_leads  # noqa: E402
 
 SARIF_SCHEMA_URI = "https://json.schemastore.org/sarif-2.1.0.json"
 SARIF_VERSION = "2.1.0"
@@ -757,6 +758,14 @@ def _collect_secret_values(artifacts: dict[str, Any]) -> tuple[str, ...]:
         for f in findings:
             if isinstance(f, dict):
                 _extract_secrets_from_url(str(f.get("url") or ""), secrets)
+    leads = artifacts.get("leads") or []
+    if isinstance(leads, list):
+        for lead in leads:
+            if isinstance(lead, dict):
+                _extract_secrets_from_url(str(lead.get("url") or ""), secrets)
+                for hit in lead.get("oob_hits_preview") or ():
+                    if isinstance(hit, dict):
+                        _extract_secrets_from_headers(hit.get("headers"), secrets)
     return tuple(sorted(secrets, key=len, reverse=True))
 
 
@@ -973,26 +982,43 @@ def load_run_artifacts(run_dir: Path) -> dict[str, Any]:
 
     # Recover verified shard findings from crashed/aborted Stage-2 runs when missing from root findings.json.
     shard_findings: list[dict[str, Any]] = []
+    shard_leads: list[dict[str, Any]] = []
     shards_dir = root / "shards"
     if shards_dir.is_dir():
         for spath in sorted(shards_dir.glob("*/findings.json")):
             sdata = _read_json_safe(spath)
             if isinstance(sdata, list):
                 shard_findings.extend(dict(item) for item in sdata if isinstance(item, dict))
-    if shard_findings:
+        for slpath in sorted(shards_dir.glob("*/leads.json")):
+            sldata = _read_json_safe(slpath)
+            if isinstance(sldata, list):
+                shard_leads.extend(dict(item) for item in sldata if isinstance(item, dict))
+
+    leads_raw = _read_json_safe(root / "leads.json")
+    leads = [dict(item) for item in leads_raw if isinstance(item, dict)] if isinstance(leads_raw, list) else []
+
+    if shard_findings or leads or shard_leads:
         actor_meta_map = _extract_actor_meta_map(manifest, checkpoint)
         receipt_store = ReceiptStore(root) if has_receipts_dir else None
-        findings = canonicalize_and_deduplicate_findings(
-            [*findings, *shard_findings],
-            actor_meta_map=actor_meta_map,
-            receipt_store=receipt_store,
-        )
+        if shard_findings:
+            findings = canonicalize_and_deduplicate_findings(
+                [*findings, *shard_findings],
+                actor_meta_map=actor_meta_map,
+                receipt_store=receipt_store,
+            )
+        if leads or shard_leads:
+            leads = canonicalize_and_deduplicate_leads(
+                [*leads, *shard_leads],
+                actor_meta_map=actor_meta_map,
+                receipt_store=receipt_store,
+            )
 
     return {
         "run_dir": str(root),
         "manifest": manifest,
         "checkpoint": checkpoint,
         "findings": findings,
+        "leads": leads,
         "process_metrics": process_metrics,
         "receipts": receipts,
         "missing_artifacts": missing_artifacts,
@@ -1364,6 +1390,109 @@ def _extract_surface_gaps(
     return gaps
 
 
+def _apply_multi_origin_display(enriched: list[dict[str, Any]], *, base_url: str) -> None:
+    target_origin = _extract_origin(base_url)
+    item_origins = {str(item.get("origin") or "") for item in enriched if str(item.get("origin") or "")}
+    is_multi_origin = len(item_origins) > 1 or bool(
+        target_origin and any(o != target_origin for o in item_origins)
+    )
+    for item in enriched:
+        item_origin = str(item.get("origin") or "")
+        if item_origin and (is_multi_origin or (target_origin and item_origin != target_origin)):
+            item["display_location"] = f"{item_origin}{item['sanitized_path']}"
+            tmpl = str(item.get("route_template") or "/")
+            if not tmpl.startswith("/"):
+                tmpl = "/" + tmpl
+            item["canonical_scope_route"] = f"{item_origin}{tmpl}"
+
+
+def _sorted_leads(artifacts: dict[str, Any], secret_values: Sequence[str], *, base_url: str) -> list[dict[str, Any]]:
+    raw_leads = artifacts.get("leads") or []
+    receipts = artifacts.get("receipts") or {}
+    enriched: list[dict[str, Any]] = []
+
+    for idx, lead in enumerate(raw_leads):
+        if not isinstance(lead, dict):
+            continue
+        cls_type = _normalize_class_type(lead.get("class_type"))
+        severity = _normalize_severity(lead.get("severity"), cls_type)
+        meta = _class_metadata(cls_type)
+        lid = str(lead.get("lead_id") or f"L-{idx + 1:03d}").strip()
+        title = _sanitize_text(str(lead.get("title") or meta["name"]), secret_values)
+        method = str(lead.get("method") or "GET").strip().upper()
+        raw_endpoint = str(lead.get("path") or lead.get("url") or "/").strip()
+        safe_endpoint = _sanitize_url(raw_endpoint, secret_values) or "/"
+        raw_url = str(lead.get("url") or raw_endpoint).strip()
+        safe_url = _sanitize_url(raw_url, secret_values) or safe_endpoint
+        route_template = _sanitize_text(str(lead.get("route_template") or safe_endpoint), secret_values)
+        actor = str(lead.get("actor") or lead.get("actor_alias") or "unknown").strip() or "unknown"
+        supporting_actors = [str(a) for a in (lead.get("supporting_actors") or []) if str(a).strip()]
+        signal_type = _sanitize_text(str(lead.get("signal_type") or "unverified_signal").strip(), secret_values)
+        passed_stages = [_sanitize_text(str(s).strip(), secret_values) for s in (lead.get("passed_stages") or []) if str(s).strip()]
+        verification_blocker = _sanitize_text(str(lead.get("verification_blocker") or "").strip(), secret_values)
+        suggested_manual = _sanitize_text(str(lead.get("suggested_manual_verification") or "").strip(), secret_values)
+        summary = _sanitize_text(str(lead.get("summary") or lead.get("oracle_reason") or meta["description"]), secret_values)
+        safe_evidence = _sanitize_text(str(lead.get("evidence") or "").strip(), secret_values)
+
+        proof_ids = [str(x).strip() for x in (lead.get("proof_receipt_ids") or []) if str(x).strip()]
+        control_ids = [str(x).strip() for x in (lead.get("control_receipt_ids") or []) if str(x).strip()]
+        clean_replay_id = str(lead.get("clean_replay_receipt_id") or "").strip()
+        proof_rec = _select_proof_receipt(lead, receipts)
+        curl_cmd, curl_from_receipt = _build_curl_reproduction(
+            lead, proof_rec, base_url=base_url, secret_values=secret_values
+        )
+
+        parsed_ep = urlsplit(safe_url if "://" in safe_url else safe_endpoint)
+        sanitized_path = parsed_ep.path or "/"
+        if parsed_ep.query:
+            sanitized_path = f"{sanitized_path}?{parsed_ep.query}"
+        l_origin = _extract_origin(safe_url) or _extract_origin(safe_endpoint)
+        if not l_origin and proof_rec is not None:
+            l_origin = _extract_origin(str(proof_rec.get("url") or ""))
+
+        enriched.append({
+            "index": idx,
+            "lead_id": lid,
+            "title": title,
+            "class_type": cls_type,
+            "severity": severity,
+            "owasp": meta["owasp"],
+            "cwe": meta["cwe"],
+            "rule_name": meta["name"],
+            "rule_description": meta["description"],
+            "remediation": str(meta.get("remediation") or ""),
+            "method": method,
+            "endpoint": safe_endpoint,
+            "url": safe_url,
+            "origin": l_origin,
+            "sanitized_path": sanitized_path,
+            "display_location": sanitized_path,
+            "route_template": route_template,
+            "canonical_scope_route": route_template,
+            "actor": actor,
+            "supporting_actors": supporting_actors,
+            "verification_tier": "NEEDS_VERIFICATION",
+            "signal_type": signal_type,
+            "passed_stages": passed_stages,
+            "verification_blocker": verification_blocker,
+            "suggested_manual_verification": suggested_manual,
+            "oob_token": _sanitize_text(str(lead.get("oob_token") or "").strip(), secret_values),
+            "oob_hit_count": int(lead.get("oob_hit_count") or 0),
+            "summary": summary,
+            "evidence": safe_evidence,
+            "proof_receipt_ids": proof_ids,
+            "control_receipt_ids": control_ids,
+            "clean_replay_receipt_id": clean_replay_id,
+            "reproduction_curl": curl_cmd,
+            "curl_from_receipt": curl_from_receipt,
+            "primary_proof_receipt": str(proof_rec.get("receipt_id") if proof_rec else (proof_ids[0] if proof_ids else "")),
+            "primary_control_receipt": control_ids[0] if control_ids else "",
+        })
+
+    _apply_multi_origin_display(enriched, base_url=base_url)
+    return enriched
+
+
 def _sorted_findings(artifacts: dict[str, Any], secret_values: Sequence[str], *, base_url: str) -> list[dict[str, Any]]:
     raw_findings = artifacts.get("findings") or []
     receipts = artifacts.get("receipts") or {}
@@ -1487,20 +1616,7 @@ def _sorted_findings(artifacts: dict[str, Any], secret_values: Sequence[str], *,
             "primary_control_receipt": control_ids[0] if control_ids else "",
         })
 
-    target_origin = _extract_origin(base_url)
-    finding_origins = {str(item.get("origin") or "") for item in enriched if str(item.get("origin") or "")}
-    is_multi_origin = len(finding_origins) > 1 or bool(
-        target_origin and any(o != target_origin for o in finding_origins)
-    )
-    for item in enriched:
-        item_origin = str(item.get("origin") or "")
-        if item_origin and (is_multi_origin or (target_origin and item_origin != target_origin)):
-            item["display_location"] = f"{item_origin}{item['sanitized_path']}"
-            tmpl = str(item.get("route_template") or "/")
-            if not tmpl.startswith("/"):
-                tmpl = "/" + tmpl
-            item["canonical_scope_route"] = f"{item_origin}{tmpl}"
-
+    _apply_multi_origin_display(enriched, base_url=base_url)
     enriched.sort(key=lambda item: (_SEVERITY_ORDER.get(item["severity"], 99), item["finding_id"], item["index"]))
     return enriched
 
@@ -1540,6 +1656,7 @@ def render_markdown_report(artifacts: dict[str, Any]) -> str:
     secret_values = _collect_secret_values(artifacts)
     meta = _extract_run_metadata(artifacts, secret_values)
     findings = _sorted_findings(artifacts, secret_values, base_url=meta["raw_target"])
+    leads = _sorted_leads(artifacts, secret_values, base_url=meta["raw_target"])
 
     sev_counts = Counter(f["severity"] for f in findings)
     severity_summary = ", ".join(
@@ -1587,6 +1704,11 @@ def render_markdown_report(artifacts: dict[str, Any]) -> str:
         f"| LLM Calls | {meta['llm_calls'] if meta['llm_calls'] is not None else 'unknown'} |",
         *_format_token_usage(meta["token_usage"]),
         f"| Findings Breakdown | total={len(findings)} ({severity_summary}) |",
+        *(
+            [f"| Leads Requiring Verification | total={len(leads)} (`NEEDS_VERIFICATION`) |"]
+            if leads
+            else []
+        ),
         f"| Surface Exposure Rate | {exposure_str} |",
         "",
         "## 2. Findings Summary",
@@ -1726,9 +1848,65 @@ def render_markdown_report(artifacts: dict[str, Any]) -> str:
             )
         lines.append("")
 
-    not_tested_section_num = 5 if isinstance(sharding, dict) else 4
+    next_section_num = 5 if isinstance(sharding, dict) else 4
+    if leads:
+        lines.extend([
+            f"## {next_section_num}. Leads Requiring Manual Verification (NEEDS_VERIFICATION)",
+            "",
+            "> **Two-Tier Verification Notice:** Entries below exhibited partial anomaly signals (`verification_tier=NEEDS_VERIFICATION`, `verified=False`) "
+            "that could not be automatically promoted to `CONFIRMED` by clean-session replay. They require manual confirmation before escalation.",
+            "",
+            "| Lead ID | Signal Type | Class | Endpoint | Blocker | Proof Receipt(s) |",
+            "| :--- | :--- | :--- | :--- | :--- | :--- |",
+        ])
+        for lead in leads:
+            ep_display = f"{lead['method']} {lead['display_location']}"
+            proof_str = ", ".join(f"`{r}`" for r in lead["proof_receipt_ids"]) or "none"
+            blocker_str = lead["verification_blocker"] or "none"
+            lines.append(
+                f"| {lead['lead_id']} | `{lead['signal_type']}` | `{lead['class_type']}` | "
+                f"`{ep_display}` | `{blocker_str}` | {proof_str} |"
+            )
+        lines.append("")
+        for lead in leads:
+            passed_str = ", ".join(f"`{s}`" for s in lead["passed_stages"]) or "none"
+            lines.extend([
+                f"### {lead['lead_id']}: {lead['title']}",
+                "",
+                "- **Verification Tier:** `NEEDS_VERIFICATION`",
+                f"- **Signal Type:** `{lead['signal_type']}`",
+                f"- **Class:** `{lead['class_type']}` ({lead['rule_name']})",
+                f"- **Endpoint:** `{lead['method']} {lead['url']}`",
+                f"- **Actor:** `{lead['actor']}`",
+                f"- **Passed Stages:** {passed_str}",
+                f"- **Verification Blocker:** `{lead['verification_blocker'] or 'unspecified'}`",
+                f"- **Suggested Manual Verification:** {lead['suggested_manual_verification'] or 'Manually replay against fresh state and verify differential behavior.'}",
+                f"- **Receipts:** proof={', '.join(f'`{r}`' for r in lead['proof_receipt_ids']) or 'none'}"
+                + (f"; control={', '.join(f'`{r}`' for r in lead['control_receipt_ids'])}" if lead["control_receipt_ids"] else "")
+                + (f"; clean_replay=`{lead['clean_replay_receipt_id']}`" if lead["clean_replay_receipt_id"] else ""),
+                "",
+            ])
+            if lead["evidence"]:
+                lines.extend([
+                    "**Redacted Signal Excerpt:**",
+                    "",
+                    "```text",
+                    lead["evidence"],
+                    "```",
+                    "",
+                ])
+            lines.extend([
+                "**Minimal Reproduction (`curl`):**",
+                "",
+                "```bash",
+                lead["reproduction_curl"],
+                "```",
+                "",
+            ])
+        next_section_num += 1
+
     lines.extend([
-        f"## {not_tested_section_num}. NOT TESTED & Coverage Visibility",
+        f"## {next_section_num}. NOT TESTED & Coverage Visibility",
         "",
         f"> **Closure vs. Coverage:** Run closure status is `{meta['status']}` (`finished={meta['finished']}`), "
         f"which is distinct from complete security coverage (`coverage_complete={meta['coverage_complete']}`).",
@@ -1772,46 +1950,55 @@ def render_markdown_report(artifacts: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def _ensure_sarif_rule(
+    rules: list[dict[str, Any]],
+    rule_index_by_class: dict[str, int],
+    cls_type: str,
+) -> int:
+    if cls_type in rule_index_by_class:
+        return rule_index_by_class[cls_type]
+    cls_meta = _class_metadata(cls_type)
+    rule_idx = len(rules)
+    rule_index_by_class[cls_type] = rule_idx
+    rule_entry: dict[str, Any] = {
+        "id": cls_type,
+        "name": cls_meta["name"],
+        "shortDescription": {"text": cls_meta["name"]},
+        "fullDescription": {"text": cls_meta["description"]},
+        "defaultConfiguration": {
+            "level": _sarif_level(str(cls_meta.get("default_severity") or "medium")),
+        },
+        "properties": {
+            "tags": [
+                "security",
+                cls_meta["owasp"],
+                cls_meta["cwe"],
+                cls_type,
+            ],
+            "owasp": cls_meta["owasp"],
+            "cwe": cls_meta["cwe"],
+        },
+    }
+    remediation_text = str(cls_meta.get("remediation") or "").strip()
+    if remediation_text:
+        rule_entry["help"] = {"text": remediation_text}
+        rule_entry["properties"]["remediation"] = remediation_text
+    rules.append(rule_entry)
+    return rule_idx
+
+
 def render_sarif_report(artifacts: dict[str, Any]) -> dict[str, Any]:
     """Render a SARIF 2.1.0 report dictionary from loaded run artifacts."""
     secret_values = _collect_secret_values(artifacts)
     meta = _extract_run_metadata(artifacts, secret_values)
     findings = _sorted_findings(artifacts, secret_values, base_url=meta["raw_target"])
+    leads = _sorted_leads(artifacts, secret_values, base_url=meta["raw_target"])
 
     rules: list[dict[str, Any]] = []
     rule_index_by_class: dict[str, int] = {}
 
     for f in findings:
-        cls_type = f["class_type"]
-        if cls_type in rule_index_by_class:
-            continue
-        cls_meta = _class_metadata(cls_type)
-        rule_id = cls_type
-        rule_index_by_class[cls_type] = len(rules)
-        rule_entry: dict[str, Any] = {
-            "id": rule_id,
-            "name": cls_meta["name"],
-            "shortDescription": {"text": cls_meta["name"]},
-            "fullDescription": {"text": cls_meta["description"]},
-            "defaultConfiguration": {
-                "level": _sarif_level(str(cls_meta.get("default_severity") or "medium")),
-            },
-            "properties": {
-                "tags": [
-                    "security",
-                    cls_meta["owasp"],
-                    cls_meta["cwe"],
-                    cls_type,
-                ],
-                "owasp": cls_meta["owasp"],
-                "cwe": cls_meta["cwe"],
-            },
-        }
-        remediation_text = str(cls_meta.get("remediation") or "").strip()
-        if remediation_text:
-            rule_entry["help"] = {"text": remediation_text}
-            rule_entry["properties"]["remediation"] = remediation_text
-        rules.append(rule_entry)
+        _ensure_sarif_rule(rules, rule_index_by_class, f["class_type"])
 
     results: list[dict[str, Any]] = []
     for f in findings:
@@ -1830,6 +2017,7 @@ def render_sarif_report(artifacts: dict[str, Any]) -> dict[str, Any]:
         results.append({
             "ruleId": cls_type,
             "ruleIndex": rule_idx,
+            "kind": "fail",
             "level": _sarif_level(f["severity"]),
             "message": {"text": message_text},
             "locations": [
@@ -1853,6 +2041,7 @@ def render_sarif_report(artifacts: dict[str, Any]) -> dict[str, Any]:
                 "canonicalKey": canonical_key,
             },
             "properties": {
+                "verification_tier": "CONFIRMED",
                 "finding_id": f["finding_id"],
                 "severity": f["severity"],
                 "actor": f["actor"],
@@ -1869,6 +2058,75 @@ def render_sarif_report(artifacts: dict[str, Any]) -> dict[str, Any]:
                 "clean_replay_receipt_id": f["clean_replay_receipt_id"],
                 "verification": f["verification"],
                 "reproduction_curl": f["reproduction_curl"],
+            },
+        })
+
+    for lead in leads:
+        cls_type = lead["class_type"]
+        rule_idx = _ensure_sarif_rule(rules, rule_index_by_class, cls_type)
+        canonical_key = f"lead:{cls_type}:{lead['method']}:{lead['canonical_scope_route']}:{lead['signal_type']}"
+        line_hash = hashlib.sha256(canonical_key.encode("utf-8")).hexdigest()[:16]
+
+        msg_parts = [
+            f"{lead['lead_id']} [NEEDS_VERIFICATION/{lead['signal_type']}] {lead['title']} "
+            f"at {lead['method']} {lead['display_location']} (actor={lead['actor']})"
+        ]
+        if lead["verification_blocker"]:
+            msg_parts.append(f"Blocker: {lead['verification_blocker']}")
+        if lead["suggested_manual_verification"]:
+            msg_parts.append(f"Next: {lead['suggested_manual_verification']}")
+        if lead["evidence"]:
+            msg_parts.append(f"Signal: {lead['evidence'][:400]}")
+        message_text = _sanitize_text(" — ".join(msg_parts), secret_values)
+
+        results.append({
+            "ruleId": cls_type,
+            "ruleIndex": rule_idx,
+            "kind": "review",
+            "level": "note",
+            "message": {"text": message_text},
+            "locations": [
+                {
+                    "physicalLocation": {
+                        "artifactLocation": {
+                            "uri": lead["display_location"],
+                        }
+                    },
+                    "logicalLocations": [
+                        {
+                            "name": lead["display_location"],
+                            "fullyQualifiedName": f"{lead['method']} {lead['display_location']}",
+                            "kind": "endpoint",
+                        }
+                    ],
+                }
+            ],
+            "partialFingerprints": {
+                "primaryLocationLineHash": line_hash,
+                "canonicalKey": canonical_key,
+            },
+            "properties": {
+                "verification_tier": "NEEDS_VERIFICATION",
+                "lead_id": lead["lead_id"],
+                "signal_type": lead["signal_type"],
+                "passed_stages": lead["passed_stages"],
+                "verification_blocker": lead["verification_blocker"],
+                "suggested_manual_verification": lead["suggested_manual_verification"],
+                "severity": lead["severity"],
+                "actor": lead["actor"],
+                "method": lead["method"],
+                "endpoint": lead["display_location"],
+                "url": lead["url"],
+                "owasp": lead["owasp"],
+                "cwe": lead["cwe"],
+                "proof_receipt": lead["primary_proof_receipt"],
+                "proof_receipt_ids": lead["proof_receipt_ids"],
+                "control_receipt_ids": lead["control_receipt_ids"],
+                "clean_replay_receipt_id": lead["clean_replay_receipt_id"],
+                "oob_token": lead["oob_token"],
+                "oob_hit_count": lead["oob_hit_count"],
+                "evidence": lead["evidence"],
+                "reproduction_curl": lead["reproduction_curl"],
             },
         })
 
@@ -1946,6 +2204,7 @@ def generate_run_reports(
         "status": meta["status"],
         "run_dir": str(resolved_run),
         "findings_count": len(artifacts.get("findings") or []),
+        "leads_count": len(artifacts.get("leads") or []),
         "markdown_path": str(md_path) if md_path is not None else None,
         "sarif_path": str(sarif_path) if sarif_path is not None else None,
         "untested_count": len(meta["untested_areas"]),

@@ -1764,6 +1764,174 @@ def _iter_finding_texts(finding: dict[str, Any]) -> list[str]:
     return texts
 
 
+_ANY_HTTP_URL_RE = re.compile(r"https?://[^\s\"'<>\\)`]+", re.IGNORECASE)
+_ALIAS_KV_RE = re.compile(r"\balias=([A-Za-z0-9_.-]+)")
+
+
+def _merge_shared_facts_into_synthesis_context(
+    shared_facts: Any,
+    *,
+    base_url: str,
+    actor_summaries: Sequence[dict[str, Any]],
+    internal_urls: list[str],
+    seen_urls: set[str],
+    extracted_values: list[str],
+    seen_values: set[str],
+    auth_capabilities: list[str],
+    seen_caps: set[str],
+) -> tuple[list[dict[str, Any]], list[str], list[str], dict[str, Any]]:
+    """Merge SharedFactGraph entries into synthesis buckets and return trigger signals."""
+    if shared_facts is None:
+        raw_facts: list[Any] = []
+    elif hasattr(shared_facts, "all_facts") and callable(shared_facts.all_facts):
+        raw_facts = list(shared_facts.all_facts() or ())
+    elif isinstance(shared_facts, (list, tuple)):
+        raw_facts = list(shared_facts)
+    else:
+        raw_facts = []
+
+    known_aliases = {
+        str(row.get("alias") or "").strip()
+        for row in actor_summaries
+        if isinstance(row, dict) and str(row.get("alias") or "").strip()
+    }
+
+    compact_facts: list[dict[str, Any]] = []
+    verified_primitives: list[str] = []
+    seen_primitives: set[str] = set()
+    waf_bypasses: list[str] = []
+    seen_waf: set[str] = set()
+
+    fact_types_seen: set[str] = set()
+    all_fact_shards: set[str] = set()
+    shards_by_type: dict[str, set[str]] = {}
+    has_new_actor_cap = False
+    has_pivot_primitive = False
+    has_non_boot_auth_header = False
+
+    for fact in raw_facts:
+        if not isinstance(fact, dict):
+            continue
+        fid = str(fact.get("fact_id") or "").strip()
+        ftype = str(fact.get("fact_type") or "").strip().lower()
+        ckey = str(fact.get("canonical_key") or "").strip()
+        fsummary = str(fact.get("summary") or "").strip()
+        src_shard = str(fact.get("source_shard") or "").strip()
+        src_rid = str(fact.get("source_receipt_id") or "").strip()
+        if not ftype:
+            continue
+
+        fact_types_seen.add(ftype)
+        if src_shard:
+            all_fact_shards.add(src_shard)
+            shards_by_type.setdefault(ftype, set()).add(src_shard)
+
+        if len(compact_facts) < 40:
+            compact_facts.append({
+                "fact_id": fid,
+                "fact_type": ftype,
+                "canonical_key": ckey[:140],
+                "summary": fsummary[:200],
+                "source_shard": src_shard,
+                "source_receipt_id": src_rid,
+            })
+
+        if ftype == "internal_host":
+            for txt in (ckey, fsummary):
+                _extract_internal_urls_from_text(
+                    txt,
+                    base_url=base_url,
+                    dst=internal_urls,
+                    seen=seen_urls,
+                )
+                for match in _ANY_HTTP_URL_RE.finditer(txt):
+                    cand = match.group(0).rstrip(",;.`'\"")
+                    if not cand or "<redacted" in cand.lower():
+                        continue
+                    if _is_target_own_origin_url(cand, base_url):
+                        continue
+                    if cand not in seen_urls and len(internal_urls) < 20:
+                        seen_urls.add(cand)
+                        internal_urls.append(cand)
+            if ckey and not ckey.lower().startswith("http") and "<redacted" not in ckey.lower():
+                host_val = ckey.split("internal_host:", 1)[-1].strip()
+                if host_val and host_val not in seen_urls and len(internal_urls) < 20:
+                    if not _is_target_own_origin_url(host_val, base_url):
+                        seen_urls.add(host_val)
+                        internal_urls.append(host_val)
+
+        elif ftype == "actor_capability":
+            cap_line = f"actor_capability: {fsummary or ckey}"
+            if cap_line not in seen_caps and len(auth_capabilities) < 20:
+                seen_caps.add(cap_line)
+                auth_capabilities.append(cap_line[:180])
+            alias_match = _ALIAS_KV_RE.search(fsummary)
+            alias_name = (
+                alias_match.group(1).strip()
+                if alias_match
+                else ckey.split("actor:", 1)[-1].strip()
+            )
+            if (src_shard and src_shard != "bootstrap") or (alias_name and alias_name not in known_aliases):
+                has_new_actor_cap = True
+
+        elif ftype == "auth_header":
+            hdr_cap = f"auth_header: {fsummary or ckey}"
+            if hdr_cap not in seen_caps and len(auth_capabilities) < 20:
+                seen_caps.add(hdr_cap)
+                auth_capabilities.append(hdr_cap[:180])
+            _append_extracted_value(
+                f"auth_header={ckey.split('header:', 1)[-1].strip() or fsummary[:80]}",
+                dst=extracted_values,
+                seen=seen_values,
+            )
+            if src_shard and src_shard != "bootstrap":
+                has_non_boot_auth_header = True
+
+        elif ftype == "verified_primitive":
+            prim_val = fsummary or ckey
+            if prim_val and prim_val not in seen_primitives and len(verified_primitives) < 25:
+                seen_primitives.add(prim_val)
+                verified_primitives.append(prim_val[:180])
+            cls_prefix = ckey.split(":", 1)[0].strip().lower()
+            if cls_prefix and cls_prefix != "auth_bypass":
+                has_pivot_primitive = True
+
+        elif ftype == "waf_bypass":
+            waf_val = fsummary or ckey
+            if waf_val and waf_val not in seen_waf and len(waf_bypasses) < 20:
+                seen_waf.add(waf_val)
+                waf_bypasses.append(waf_val[:180])
+            _append_extracted_value(
+                f"waf_bypass={waf_val[:100]}",
+                dst=extracted_values,
+                seen=seen_values,
+            )
+
+        elif ftype == "ssrf_sink":
+            _append_extracted_value(
+                f"ssrf_sink={fsummary or ckey}"[:140],
+                dst=extracted_values,
+                seen=seen_values,
+            )
+
+        elif ftype == "cross_tenant_id":
+            _append_extracted_value(
+                f"cross_tenant_id={fsummary or ckey}"[:140],
+                dst=extracted_values,
+                seen=seen_values,
+            )
+
+    signals = {
+        "fact_types": fact_types_seen,
+        "all_fact_shards": all_fact_shards,
+        "shards_by_type": shards_by_type,
+        "has_new_actor_cap": has_new_actor_cap,
+        "has_pivot_primitive": has_pivot_primitive,
+        "has_non_boot_auth_header": has_non_boot_auth_header,
+    }
+    return compact_facts, verified_primitives, waf_bypasses, signals
+
+
 def collect_cross_shard_synthesis_context(
     *,
     shard_results: Sequence[dict[str, Any]],
@@ -1771,9 +1939,9 @@ def collect_cross_shard_synthesis_context(
     receipts: Any,
     surface_tracker: Any,
     actor_summaries: Sequence[dict[str, Any]] = (),
+    shared_facts: Any = None,
 ) -> dict[str, Any]:
     """Deterministically gather cross-shard chaining artifacts, capabilities, blockers, and untested/blocked writes."""
-    _ = actor_summaries
     base_url = str(getattr(surface_tracker, "base_url", "") or "").strip()
 
     internal_urls: list[str] = []
@@ -2031,17 +2199,61 @@ def collect_cross_shard_synthesis_context(
                 if len(high_risk_unprobed_routes) >= 6:
                     break
 
+    (
+        compact_shared_facts,
+        verified_primitives,
+        waf_bypasses,
+        sf_signals,
+    ) = _merge_shared_facts_into_synthesis_context(
+        shared_facts,
+        base_url=base_url,
+        actor_summaries=actor_summaries,
+        internal_urls=internal_urls,
+        seen_urls=seen_urls,
+        extracted_values=extracted_values,
+        seen_values=seen_values,
+        auth_capabilities=auth_capabilities,
+        seen_caps=seen_caps,
+    )
+
     truncated_shard = any(
         isinstance(s, dict) and str(s.get("status") or "") in {"budget_exhausted", "max_turns_reached"}
         for s in shard_results
     )
     unresolved_restricted_routes = bool(any_401_403_paths - any_2xx_paths)
     has_remaining_work = bool(truncated_shard or unresolved_restricted_routes)
+    sf_types = sf_signals["fact_types"]
+    sf_all_shards = sf_signals["all_fact_shards"]
+    sf_vp_shards = sf_signals["shards_by_type"].get("verified_primitive", set())
+    has_complementary_cross_shard_fact = bool(
+        "internal_host" in sf_types
+        or "ssrf_sink" in sf_types
+        or "waf_bypass" in sf_types
+        or "cross_tenant_id" in sf_types
+        or sf_signals["has_new_actor_cap"]
+        or sf_signals["has_non_boot_auth_header"]
+    )
+    has_shared_fact_combo = bool(
+        ("internal_host" in sf_types and "ssrf_sink" in sf_types)
+        or sf_signals["has_new_actor_cap"]
+        or ("waf_bypass" in sf_types)
+        or (
+            "verified_primitive" in sf_types
+            and (
+                has_complementary_cross_shard_fact
+                or has_remaining_work
+                or (len(sf_vp_shards) >= 2 and sf_signals["has_pivot_primitive"])
+            )
+        )
+        or ("cross_tenant_id" in sf_types and len(sf_all_shards) >= 2)
+        or ("auth_header" in sf_types and (sf_signals["has_non_boot_auth_header"] or has_remaining_work))
+    )
     has_signal = bool(
         internal_urls
         or blockers
         or untested_writes_and_blocked
         or high_risk_unprobed_routes
+        or has_shared_fact_combo
         or ((extracted_values or auth_capabilities) and has_remaining_work)
     )
     return {
@@ -2054,6 +2266,9 @@ def collect_cross_shard_synthesis_context(
         "untested_writes_and_blocked": untested_writes_and_blocked,
         "high_risk_unprobed_routes": high_risk_unprobed_routes,
         "findings": compact_findings[:30],
+        "shared_facts": compact_shared_facts,
+        "verified_primitives": verified_primitives,
+        "waf_bypasses": waf_bypasses,
     }
 
 
@@ -2091,6 +2306,11 @@ def build_cross_shard_synthesis_prompts(
         for item in (ctx.get("high_risk_unprobed_routes") or ())
         if isinstance(item, dict) and str(item.get("route_template") or "").strip()
     ][:6]
+    verified_primitives = [str(v) for v in (ctx.get("verified_primitives") or ()) if str(v).strip()][:20]
+    waf_bypasses = [str(w) for w in (ctx.get("waf_bypasses") or ()) if str(w).strip()][:15]
+    shared_facts_ctx = [
+        item for item in (ctx.get("shared_facts") or ()) if isinstance(item, dict)
+    ][:20]
 
     finding_lines: list[str] = []
     for f in findings:
@@ -2124,7 +2344,7 @@ def build_cross_shard_synthesis_prompts(
         for row in actor_summaries
         if isinstance(row, dict) and row.get("alias")
     ]
-    payload = {
+    payload: dict[str, Any] = {
         "http_budget_remaining": max(0, int(http_budget_remaining)),
         "actors": safe_actors,
         "findings": findings,
@@ -2137,6 +2357,12 @@ def build_cross_shard_synthesis_prompts(
         "untested_writes_and_blocked": untested_writes,
         "high_risk_unprobed_routes": high_risk_unprobed,
     }
+    if verified_primitives:
+        payload["artifacts"]["verified_primitives"] = verified_primitives
+    if waf_bypasses:
+        payload["artifacts"]["waf_bypasses"] = waf_bypasses
+    if shared_facts_ctx:
+        payload["shared_facts"] = shared_facts_ctx
     compact_json = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
     handoff_block = _format_handoff_blocks(
         asset_graph_handoff=asset_graph_handoff,

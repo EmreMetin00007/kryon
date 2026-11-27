@@ -4,6 +4,7 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor
 import copy
 import inspect
+import ipaddress
 import json
 import os
 from pathlib import Path
@@ -11,10 +12,12 @@ import re
 import tempfile
 import threading
 from typing import Any, Callable, Sequence
-from urllib.parse import parse_qsl, urljoin, urlsplit
+from urllib.parse import parse_qsl, unquote, urlencode, urljoin, urlsplit, urlunsplit
 import uuid
 
 from full_agent_budget import compact_json_text
+
+from agentic_fact_graph import VALID_FACT_TYPES, SharedFactGraph, _scrub_secret_text
 
 from agentic_evidence import (
     MAX_CONTROL_EXCERPT_CHARS as MAX_CONTROL_EXCERPT_CHARS,
@@ -154,7 +157,8 @@ from agentic_preview import (
     find_spec_urls as find_spec_urls,
     prune_html_for_preview as prune_html_for_preview,
 )
-from agentic_receipts import DEFAULT_PREVIEW_CHARS, ReceiptStore
+from agentic_receipts import DEFAULT_PREVIEW_CHARS, ReceiptStore, redact_headers, redact_secrets
+from agentic_sandbox import run_python_pure_sandbox
 from agentic_surface import SurfaceFrontierTracker, is_virgin_state_sensitive_path
 from kryon_core.surface.openapi import extract_openapi_header_auth_names
 
@@ -177,6 +181,209 @@ _HTTP_HEADER_NAME_RE = re.compile(r"^[!#$%&'*+\-.^_`|~0-9A-Za-z]{1,128}$")
 _PERSISTENT_VULN_CLASSES = frozenset({"stored_xss", "mass_assignment", "ssti"})
 _OOB_CALLBACK_CLASSES = frozenset({"ssrf", "xxe", "ssti", "command_injection", "insecure_deserialization"})
 _MUTATING_WRITE_METHODS = frozenset({"POST", "PUT", "PATCH"})
+_URL_SCAN_RE = re.compile(r"https?://[^\s\"'<>\\)`]+", re.IGNORECASE)
+_LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1", "0.0.0.0", "localhost.localdomain"})
+_BYPASS_EVASION_HEADER_NAMES = frozenset({
+    "x-forwarded-for",
+    "x-forwarded-host",
+    "x-original-url",
+    "x-rewrite-url",
+    "x-custom-ip-authorization",
+    "x-real-ip",
+    "x-originating-ip",
+    "x-remote-ip",
+    "x-remote-addr",
+    "forwarded",
+    "x-http-method-override",
+})
+_FACT_KEY_PREFIXES: tuple[str, ...] = (
+    "internal_host:",
+    "actor_capability:",
+    "ssrf_sink:",
+    "auth_header:",
+    "verified_primitive:",
+    "cross_tenant_id:",
+    "waf_bypass:",
+    "host:",
+    "internal:",
+    "header:",
+    "actor:",
+    "ssrf:",
+    "tenant:",
+    "cross_tenant:",
+    "waf:",
+    "key:",
+    "url:",
+    "endpoint:",
+    "route:",
+    "param:",
+    "id:",
+)
+
+
+def _is_internal_or_metadata_url(raw_url: str, *, base_url: str) -> str | None:
+    """Return normalized URL if `raw_url` points to a non-target internal/private/metadata host."""
+    cand = str(raw_url or "").strip().rstrip(",;.'\"")
+    if not cand or "<redacted" in cand.lower():
+        return None
+    try:
+        parsed = urlsplit(cand)
+        port = parsed.port
+    except ValueError:
+        return None
+    scheme = (parsed.scheme or "").lower()
+    host = (parsed.hostname or "").strip().lower().rstrip(".")
+    if scheme not in {"http", "https"} or not host or not parsed.netloc:
+        return None
+
+    try:
+        base_parsed = urlsplit(base_url or "")
+        base_port = base_parsed.port
+    except ValueError:
+        base_parsed = urlsplit("")
+        base_port = None
+    base_host = (base_parsed.hostname or "").strip().lower().rstrip(".")
+    if base_parsed.netloc and (scheme, parsed.netloc.lower()) == (
+        base_parsed.scheme.lower(),
+        base_parsed.netloc.lower(),
+    ):
+        return None
+    if (
+        base_port is not None
+        and port is not None
+        and port == base_port
+        and host in _LOOPBACK_HOSTS
+        and base_host in _LOOPBACK_HOSTS
+    ):
+        return None
+
+    is_internal = False
+    try:
+        ip_obj = ipaddress.ip_address(host)
+        is_internal = bool(
+            ip_obj.is_private
+            or ip_obj.is_link_local
+            or ip_obj.is_loopback
+            or ip_obj.is_reserved
+            or ip_obj.is_unspecified
+        )
+    except ValueError:
+        if host == "metadata.google.internal" or host in {"localhost", "localhost.localdomain"}:
+            is_internal = True
+        elif host.endswith((".internal", ".local", ".localhost", ".intranet", ".corp")):
+            is_internal = True
+
+    if not is_internal:
+        return None
+    clean_path = parsed.path or ""
+    return f"{scheme}://{parsed.netloc}{clean_path}"
+
+
+def _extract_internal_host_urls(
+    receipt: dict[str, Any],
+    surface: dict[str, Any],
+    *,
+    base_url: str,
+    limit: int = 10,
+) -> list[str]:
+    """Collect unique internal/private/metadata URLs from extracted surface and receipt text."""
+    candidates: list[str] = []
+    for item in (surface.get("internal_urls") or ()):
+        if isinstance(item, str):
+            candidates.append(item)
+        elif isinstance(item, dict) and item.get("url"):
+            candidates.append(str(item["url"]))
+    for key in ("links", "js_calls", "forms"):
+        for item in (surface.get(key) or ()):
+            if isinstance(item, dict) and item.get("url"):
+                candidates.append(str(item["url"]))
+            elif isinstance(item, str):
+                candidates.append(item)
+    for item in (surface.get("spec_urls") or ()):
+        if isinstance(item, str):
+            candidates.append(item)
+        elif isinstance(item, dict) and item.get("url"):
+            candidates.append(str(item["url"]))
+
+    redir = str(receipt.get("redirect_location") or "")
+    if redir:
+        candidates.extend(_URL_SCAN_RE.findall(redir))
+    resp_hdrs = receipt.get("response_headers") or {}
+    if isinstance(resp_hdrs, dict) and resp_hdrs:
+        candidates.extend(_URL_SCAN_RE.findall(json.dumps(resp_hdrs, ensure_ascii=False)))
+    body = str(receipt.get("body") or "")[:500_000]
+    if body:
+        candidates.extend(_URL_SCAN_RE.findall(body))
+
+    out: list[str] = []
+    seen: set[str] = set()
+    for raw_cand in candidates:
+        norm = _is_internal_or_metadata_url(raw_cand, base_url=base_url)
+        if norm and norm not in seen:
+            seen.add(norm)
+            out.append(norm)
+            if len(out) >= limit:
+                break
+    return out
+
+
+def _is_fact_grounded_in_receipt(
+    raw_key: str,
+    fact_type: str,
+    receipt: dict[str, Any],
+    *,
+    oob_hits: Sequence[dict[str, Any]] = (),
+) -> bool:
+    """Verify key tokens (ignoring punctuation) appear in receipt fields or OOB hits."""
+    key_body = str(raw_key or "").strip()
+    if not key_body:
+        return False
+    low_body = key_body.lower()
+    ft_prefix = f"{fact_type.lower()}:"
+    if low_body.startswith(ft_prefix):
+        key_body = key_body[len(ft_prefix):].strip()
+    else:
+        for prefix in _FACT_KEY_PREFIXES:
+            if low_body.startswith(prefix):
+                key_body = key_body[len(prefix):].strip()
+                break
+
+    raw_tokens = re.findall(r"[a-z0-9]+", key_body.lower())
+    filtered = [tok for tok in raw_tokens if tok not in {"http", "https"}]
+    key_tokens = filtered if filtered else raw_tokens
+    if not key_tokens:
+        return False
+
+    parts: list[str] = [
+        str(receipt.get("method") or ""),
+        str(receipt.get("url") or ""),
+        str(receipt.get("path") or ""),
+        str(receipt.get("query") or ""),
+        str(receipt.get("redirect_location") or ""),
+        unquote(str(receipt.get("url") or "")),
+        unquote(str(receipt.get("query") or "")),
+        str(receipt.get("request_body") or ""),
+        unquote(str(receipt.get("request_body") or ""))[:100_000],
+        str(receipt.get("body") or ""),
+        json.dumps(receipt.get("request_headers") or {}, ensure_ascii=False),
+        json.dumps(receipt.get("response_headers") or {}, ensure_ascii=False),
+    ]
+    saved = receipt.get("saved_session")
+    if isinstance(saved, dict):
+        parts.append(str(saved.get("alias") or ""))
+        parts.append(str(saved.get("role") or ""))
+    if oob_hits:
+        parts.append(json.dumps(list(oob_hits), ensure_ascii=False))
+
+    haystack_lower = "\n".join(parts).lower()
+    haystack_tokens = set(re.findall(r"[a-z0-9]+", haystack_lower))
+    for tok in key_tokens:
+        if len(tok) >= 3:
+            if tok not in haystack_tokens and tok not in haystack_lower:
+                return False
+        elif tok not in haystack_tokens:
+            return False
+    return True
 
 RECORD_FINDING_CLASS_ENUM: list[str] = [
     "auth_bypass",
@@ -210,36 +417,34 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "http_request",
-            "description": "Send scope-locked HTTP or WS (ws://, wss://) request as actor ('anon'). GETs cached unless force=true.",
+            "description": "Scope-locked HTTP/WS request as actor ('anon'). GET cached unless force.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "method": {"type": "string", "description": "HTTP method (defaults GET; POST if body)."},
-                    "url": {"type": "string", "description": "In-scope path/URL (http(s):// or ws(s)://)."},
+                    "method": {"type": "string", "description": "Method (GET; POST if body)."},
+                    "url": {"type": "string", "description": "In-scope http(s)/ws(s) URL."},
                     "actor": {"type": "string"},
                     "headers": {
                         "type": "object",
-                        "additionalProperties": {"type": "string"},
-                        "description": "Request headers; setting Authorization or Cookie isolates auth from actor's default peer auth (use '' to strip).",
+                        "description": "Auth headers override actor auth.",
                     },
-                    "query": {"type": "object", "additionalProperties": {"type": "string"}},
+                    "query": {"type": "object"},
                     "json_body": {},
-                    "base_receipt_id": {"type": "string", "description": "GET receipt_id for base JSON."},
+                    "base_receipt_id": {"type": "string"},
                     "json_merge": {"type": "object"},
-                    "form_body": {"type": "object", "additionalProperties": {"type": "string"}},
+                    "form_body": {"type": "object"},
                     "raw_body": {"type": "string"},
+                    "raw_body_base64": {"type": "string", "description": "Base64 binary body (<=1MB)."},
+                    "grpc_web_mode": {"type": "string", "enum": ["binary", "text"]},
                     "files": {
                         "type": "array",
-                        "description": "Multipart files: [{field,filename,content|content_base64,content_type}].",
+                        "description": "Multipart [{field,filename,content|content_base64,content_type}].",
                         "items": {"type": "object"},
                     },
                     "follow_redirects": {"type": "boolean"},
                     "force": {"type": "boolean"},
-                    "save_session_as": {"type": "string", "description": "Captured session alias."},
-                    "auth_header": {
-                        "type": "string",
-                        "description": "Custom token header name for save_session_as (e.g. X-Access-Token).",
-                    },
+                    "save_session_as": {"type": "string"},
+                    "auth_header": {"type": "string", "description": "Custom token header name."},
                 },
                 "required": ["url"],
             },
@@ -249,7 +454,7 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "read_receipt",
-            "description": "Read stored receipt body at 0 HTTP cost via offset/limit or regex.",
+            "description": "Read receipt body at 0 HTTP cost (offset/limit/regex).",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -266,7 +471,7 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "replay_as",
-            "description": "Replay a receipt_id as another actor or with overrides; returns diff.",
+            "description": "Replay receipt_id with actor/overrides; returns diff.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -274,15 +479,15 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                     "actor": {"type": "string"},
                     "method": {"type": "string"},
                     "url": {"type": "string"},
-                    "query_overrides": {"type": "object", "additionalProperties": {"type": "string"}},
+                    "query_overrides": {"type": "object"},
                     "header_overrides": {
                         "type": "object",
-                        "additionalProperties": {"type": "string"},
-                        "description": "Header overrides; Authorization or Cookie overrides actor's default peer auth (use '' to strip).",
+                        "description": "Auth overrides actor ('' strips).",
                     },
                     "base_receipt_id": {"type": "string"},
                     "json_merge": {"type": "object"},
                     "json_overrides": {"type": "object"},
+                    "raw_body_base64": {"type": "string"},
                     "force": {"type": "boolean"},
                 },
                 "required": ["receipt_id"],
@@ -293,7 +498,7 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "extract_surface",
-            "description": "Extract links, forms, JS/client-logic, OpenAPI/GraphQL/Postman ops, and IDs at 0 HTTP cost.",
+            "description": "Extract links, forms, JS logic, specs, and IDs (0 HTTP cost).",
             "parameters": {
                 "type": "object",
                 "properties": {"receipt_id": {"type": "string"}},
@@ -305,17 +510,18 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "notebook",
-            "description": "Maintain investigation notebook (surface_notes, hypotheses, notes). 0 HTTP cost.",
+            "description": "Update notebook or publish_fact (0 HTTP cost).",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "action": {
                         "type": "string",
-                        "enum": ["read", "update", "add_hypothesis", "update_hypothesis", "add_note"],
+                        "enum": ["read", "update", "add_hypothesis", "update_hypothesis", "add_note", "publish_fact"],
                     },
                     "surface_notes": {"type": "string"},
                     "hypothesis": {"type": "object", "description": "{id,target,vuln_class,status,notes}"},
                     "note": {"type": "string"},
+                    "fact": {"type": "object", "description": "{fact_type,key,summary,source_receipt_id}"},
                 },
                 "required": ["action"],
             },
@@ -325,7 +531,7 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "callback_listener",
-            "description": "OOB callback URLs (create_url/poll); host loopback by default (set --oob-bind-host for Docker).",
+            "description": "OOB callbacks (create_url/poll); loopback default.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -341,23 +547,19 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "concurrent_check",
-            "description": "Send 2-5 synchronized parallel requests to test idempotency and race conditions.",
+            "description": "Send 2-5 parallel requests for race/idempotency.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "url": {"type": "string"},
                     "method": {"type": "string"},
                     "actor": {"type": "string"},
-                    "headers": {
-                        "type": "object",
-                        "additionalProperties": {"type": "string"},
-                        "description": "Request headers; setting Authorization or Cookie isolates auth from actor's default peer auth (use '' to strip).",
-                    },
-                    "query": {"type": "object", "additionalProperties": {"type": "string"}},
+                    "headers": {"type": "object"},
+                    "query": {"type": "object"},
                     "json_body": {},
-                    "form_body": {"type": "object", "additionalProperties": {"type": "string"}},
+                    "form_body": {"type": "object"},
                     "raw_body": {"type": "string"},
-                    "count": {"type": "integer", "description": "2-5 (default 3)."},
+                    "count": {"type": "integer", "description": "2-5."},
                 },
                 "required": ["url", "method", "actor"],
             },
@@ -367,14 +569,14 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "browser_crawl",
-            "description": "Read-only same-origin browser crawl (SPA/XHR), DOM/CSP inspect, or dom_verify.",
+            "description": "Read-only SPA/DOM crawl, inspect, or dom_verify.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "mode": {"type": "string", "enum": ["crawl", "inspect", "dom_verify"]},
                     "url": {"type": "string"},
                     "actor": {"type": "string"},
-                    "max_pages": {"type": "integer", "description": "1-12 (default 6)."},
+                    "max_pages": {"type": "integer", "description": "1-12."},
                     "marker": {"type": "string"},
                     "source": {"type": "string", "enum": ["hash", "query", "postmessage"]},
                     "param_name": {"type": "string"},
@@ -386,30 +588,15 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "analyze_token",
-            "description": "Offline JWT/token/serialization inspector and JWT alg-confusion test builder (0 HTTP cost).",
+            "description": "Offline JWT/token inspector and JWT test builder.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "value": {
-                        "type": "string",
-                        "description": "Token, serialized blob, JSON payload, or 'actor:<alias>'.",
-                    },
-                    "kind": {
-                        "type": "string",
-                        "enum": ["auto", "jwt", "opaque", "serialization", "jwt_test"],
-                    },
-                    "alg": {
-                        "type": "string",
-                        "description": "JWT test alg ('none', 'HS256', 'HS384', 'HS512', 'confusion', 'strip_sig').",
-                    },
-                    "hmac_key": {
-                        "type": "string",
-                        "description": "HMAC key text or 'receipt:<id>' PEM/JWKS for HS256 test signing.",
-                    },
-                    "claim_overrides": {
-                        "type": "object",
-                        "description": "Optional JWT payload claim overrides for jwt_test.",
-                    },
+                    "value": {"type": "string", "description": "Token, blob, JSON, or 'actor:<alias>'."},
+                    "kind": {"type": "string", "enum": ["auto", "jwt", "opaque", "serialization", "jwt_test"]},
+                    "alg": {"type": "string", "description": "none/HS256/384/512/confusion/strip_sig."},
+                    "hmac_key": {"type": "string", "description": "HMAC key or 'receipt:<id>'."},
+                    "claim_overrides": {"type": "object"},
                 },
                 "required": ["value"],
             },
@@ -418,8 +605,26 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
     {
         "type": "function",
         "function": {
+            "name": "run_sandbox_probe",
+            "description": "Air-gapped python_pure compute (HMAC/protobuf/pack); 0 net.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "runtime": {"type": "string", "enum": ["python_pure"]},
+                    "code": {"type": "string", "description": "transform(inputs) or RESULT."},
+                    "inputs": {"type": "object", "description": "{receipt_refs?:[id],params?:obj}"},
+                    "timeout_ms": {"type": "integer"},
+                    "output_contract": {"type": "string", "enum": ["http_transform", "decode_only"]},
+                },
+                "required": ["code"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "record_finding",
-            "description": "Record a verified finding backed by proof_receipt_ids, control_receipt_ids, and evidence_value.",
+            "description": "Record verified finding backed by proof/control receipt IDs and evidence_value.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -427,7 +632,7 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                     "class_type": {
                         "type": "string",
                         "enum": RECORD_FINDING_CLASS_ENUM,
-                        "description": "Canonical finding class (avoid 'other' when a specific class fits).",
+                        "description": "Canonical class (avoid 'other' when specific fits).",
                     },
                     "method": {"type": "string"},
                     "url": {"type": "string"},
@@ -456,7 +661,7 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "finish",
-            "description": "Complete investigation and summarize findings plus untested areas.",
+            "description": "Finish investigation with summary and untested_areas.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -702,6 +907,489 @@ def _extract_graphql_op(
     return ""
 
 
+_LEAD_SIGNAL_RANK: dict[str, int] = {
+    "async_oob_unreplayed": 0,
+    "server_5xx_differential": 1,
+    "timing_anomaly_borderline": 2,
+    "one_shot_state_exhausted": 3,
+    "multistep_precursor_blocked": 4,
+    "multistep_budget_exceeded": 5,
+}
+_LEAD_SENSITIVE_QUERY_KEYS = frozenset({
+    "token",
+    "access_token",
+    "refresh_token",
+    "id_token",
+    "secret",
+    "client_secret",
+    "password",
+    "passwd",
+    "pass",
+    "pwd",
+    "api_key",
+    "apikey",
+    "auth",
+    "session",
+    "session_id",
+    "jwt",
+})
+_OOB_CLASS_HINTS = (
+    ("xxe", "xxe"),
+    ("ssti", "ssti"),
+    ("sqli", "sqli"),
+    ("sql", "sqli"),
+    ("rce", "cmd_injection"),
+    ("cmd", "cmd_injection"),
+    ("ssrf", "ssrf"),
+)
+
+
+_LEAD_INLINE_HEADER_SECRET_RE = re.compile(
+    r"(?im)\b((?:authorization|proxy-authorization|cookie|set-cookie|x-api-key|x-auth-token|x-access-token)\s*:\s*)([^\r\n]+)"
+)
+_LEAD_INLINE_KV_SECRET_RE = re.compile(
+    r"(?i)\b(token|access_token|refresh_token|secret|client_secret|password|passwd|apikey|api_key|session|session_id|jwt)(\s*[:=]\s*['\"]?)([^'\"\s&;,<>]+)"
+)
+
+
+def _redact_lead_url(raw_url: str, extra_secrets: Sequence[str] = ()) -> str:
+    text = str(raw_url or "").strip()
+    if not text:
+        return ""
+    cleaned = redact_secrets(text, extra_secrets)
+    parts = urlsplit(cleaned)
+    if not parts.query:
+        return cleaned
+    redacted_pairs: list[tuple[str, str]] = []
+    changed = False
+    for k, v in parse_qsl(parts.query, keep_blank_values=True):
+        kl = k.strip().lower()
+        if (
+            kl in _LEAD_SENSITIVE_QUERY_KEYS
+            or any(tok in kl for tok in ("token", "secret", "password", "passwd", "apikey", "api_key"))
+        ) and v and "<REDACTED" not in v:
+            redacted_pairs.append((k, "<REDACTED_SECRET>"))
+            changed = True
+        else:
+            redacted_pairs.append((k, v))
+    if not changed:
+        return cleaned
+    return urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(redacted_pairs), parts.fragment))
+
+
+def _redact_lead_text(text: Any, extra_secrets: Sequence[str] = (), *, limit: int = 0) -> str:
+    s = redact_secrets(str(text or ""), extra_secrets).strip()
+    if s:
+        s = _LEAD_INLINE_HEADER_SECRET_RE.sub(
+            lambda m: m.group(0) if "<REDACTED" in m.group(2) else f"{m.group(1)}<REDACTED_SECRET>",
+            s,
+        )
+        s = _LEAD_INLINE_KV_SECRET_RE.sub(
+            lambda m: m.group(0) if "<REDACTED" in m.group(3) else f"{m.group(1)}{m.group(2)}<REDACTED_SECRET>",
+            s,
+        )
+    if limit > 0 and len(s) > limit:
+        s = s[:limit].rstrip()
+    return s
+
+
+def _sanitize_oob_hits_preview(
+    hits: Sequence[dict[str, Any]],
+    extra_secrets: Sequence[str] = (),
+    *,
+    limit: int = 3,
+) -> list[dict[str, Any]]:
+    preview: list[dict[str, Any]] = []
+    for hit in hits[:limit]:
+        if not isinstance(hit, dict):
+            continue
+        raw_hdrs = hit.get("headers") if isinstance(hit.get("headers"), dict) else {}
+        safe_hdrs = {
+            str(k): _redact_lead_text(v, extra_secrets, limit=256)
+            for k, v in redact_headers(raw_hdrs).items()
+        }
+        raw_query = str(hit.get("query") or "")
+        safe_query = _redact_lead_url(f"/?{raw_query}", extra_secrets).split("?", 1)[1] if raw_query else ""
+        entry: dict[str, Any] = {
+            "token": str(hit.get("token") or ""),
+            "method": str(hit.get("method") or "GET").upper(),
+            "path": _redact_lead_text(hit.get("path") or "/", extra_secrets, limit=240),
+            "query": _redact_lead_text(safe_query, extra_secrets, limit=300),
+            "headers": safe_hdrs,
+            "body_preview": _redact_lead_text(hit.get("body_preview") or "", extra_secrets, limit=300),
+            "remote_addr": str(hit.get("remote_addr") or ""),
+            "timestamp": str(hit.get("timestamp") or ""),
+        }
+        preview.append(entry)
+    return preview
+
+
+def _redact_lead_record(raw: dict[str, Any], extra_secrets: Sequence[str] = ()) -> dict[str, Any]:
+    out = dict(raw)
+    out["url"] = _redact_lead_url(str(out.get("url") or out.get("path") or "/"), extra_secrets)
+    out["path"] = _redact_lead_url(str(out.get("path") or out["url"] or "/"), extra_secrets)
+    out["title"] = _redact_lead_text(out.get("title") or "", extra_secrets, limit=240)
+    out["summary"] = _redact_lead_text(out.get("summary") or "", extra_secrets, limit=1200)
+    out["evidence"] = _redact_lead_text(out.get("evidence") or "", extra_secrets, limit=1200)
+    out["evidence_value"] = _redact_lead_text(out.get("evidence_value") or "", extra_secrets, limit=300)
+    out["marker"] = _redact_lead_text(out.get("marker") or out["evidence_value"], extra_secrets, limit=300)
+    out["verification_blocker"] = _redact_lead_text(out.get("verification_blocker") or "", extra_secrets, limit=300)
+    out["suggested_manual_verification"] = _redact_lead_text(
+        out.get("suggested_manual_verification") or "",
+        extra_secrets,
+        limit=600,
+    )
+    if out.get("oracle_reason"):
+        out["oracle_reason"] = _redact_lead_text(out.get("oracle_reason"), extra_secrets, limit=600)
+    if isinstance(out.get("evidence_excerpts"), list):
+        cleaned_excerpts: list[dict[str, Any]] = []
+        for ex in out["evidence_excerpts"][:8]:
+            if not isinstance(ex, dict):
+                continue
+            c_ex = dict(ex)
+            c_ex["url"] = _redact_lead_url(str(c_ex.get("url") or ""), extra_secrets)
+            c_ex["excerpt"] = _redact_lead_text(c_ex.get("excerpt") or "", extra_secrets, limit=MAX_PROOF_EXCERPT_CHARS)
+            cleaned_excerpts.append(c_ex)
+        out["evidence_excerpts"] = cleaned_excerpts
+    if isinstance(out.get("control_excerpts"), list):
+        cleaned_ctrls: list[dict[str, Any]] = []
+        for ex in out["control_excerpts"][:8]:
+            if not isinstance(ex, dict):
+                continue
+            c_ex = dict(ex)
+            c_ex["url"] = _redact_lead_url(str(c_ex.get("url") or ""), extra_secrets)
+            c_ex["excerpt"] = _redact_lead_text(c_ex.get("excerpt") or "", extra_secrets, limit=MAX_CONTROL_EXCERPT_CHARS)
+            cleaned_ctrls.append(c_ex)
+        out["control_excerpts"] = cleaned_ctrls
+    if isinstance(out.get("oob_hits_preview"), list):
+        out["oob_hits_preview"] = _sanitize_oob_hits_preview(out["oob_hits_preview"], extra_secrets)
+    out["verification_tier"] = "NEEDS_VERIFICATION"
+    out["oracle_verdict"] = "NEEDS_VERIFICATION"
+    return out
+
+
+def canonicalize_and_deduplicate_leads(
+    leads: Sequence[dict[str, Any]],
+    *,
+    actor_meta_map: dict[str, dict[str, str]] | None = None,
+    receipt_store: Any | None = None,
+    max_leads: int = 15,
+) -> list[dict[str, Any]]:
+    """Deduplicate, sanitize, rank strongest-first, cap, and assign deterministic L-001..L-NNN IDs."""
+    _ = actor_meta_map, receipt_store
+    if max_leads <= 0 or not leads:
+        return []
+
+    raw_items = [dict(item) for item in leads if isinstance(item, dict)]
+    if not raw_items:
+        return []
+
+    origins = {
+        _extract_finding_origin(str(item.get("url") or item.get("path") or ""))
+        for item in raw_items
+    }
+    origins.discard("")
+    multi_origin = len(origins) > 1
+
+    grouped: dict[tuple[str, str, str, str, str], dict[str, Any]] = {}
+    for item in raw_items:
+        redacted = _redact_lead_record(item)
+        raw_class = str(redacted.get("class_type") or "").strip()
+        method = str(redacted.get("method") or "GET").strip().upper() or "GET"
+        norm_class = normalize_vuln_class(
+            raw_class,
+            method=method,
+            title=str(redacted.get("title") or ""),
+            summary=str(redacted.get("summary") or ""),
+        ) if raw_class else "business_logic"
+        raw_route = str(redacted.get("route_template") or redacted.get("url") or redacted.get("path") or "/")
+        route_tmpl = normalize_route_template(raw_route)
+        signal_type = str(redacted.get("signal_type") or "unverified_signal").strip().lower() or "unverified_signal"
+        origin = _extract_finding_origin(str(redacted.get("url") or redacted.get("path") or ""))
+        dedup_key = (origin if multi_origin else "", norm_class, method, route_tmpl, signal_type)
+
+        redacted["class_type"] = norm_class
+        redacted["method"] = method
+        redacted["route_template"] = route_tmpl
+        redacted["signal_type"] = signal_type
+        if origin and not redacted.get("origin"):
+            redacted["origin"] = origin
+
+        proof_ids = [str(r).strip() for r in (redacted.get("proof_receipt_ids") or []) if str(r).strip()]
+        control_ids = [str(r).strip() for r in (redacted.get("control_receipt_ids") or []) if str(r).strip()]
+        passed_stages = [str(s).strip() for s in (redacted.get("passed_stages") or []) if str(s).strip()]
+        supporting_actors = [str(a).strip() for a in (redacted.get("supporting_actors") or []) if str(a).strip()]
+        actor_val = str(redacted.get("actor") or redacted.get("actor_alias") or "").strip()
+        if actor_val and actor_val not in supporting_actors:
+            supporting_actors.insert(0, actor_val)
+
+        redacted["proof_receipt_ids"] = list(dict.fromkeys(proof_ids))
+        redacted["control_receipt_ids"] = list(dict.fromkeys(control_ids))
+        redacted["passed_stages"] = list(dict.fromkeys(passed_stages))
+        redacted["supporting_actors"] = list(dict.fromkeys(supporting_actors))
+
+        existing = grouped.get(dedup_key)
+        if existing is None:
+            grouped[dedup_key] = redacted
+            continue
+
+        existing["proof_receipt_ids"] = list(dict.fromkeys([
+            *(existing.get("proof_receipt_ids") or []),
+            *redacted["proof_receipt_ids"],
+        ]))
+        existing["control_receipt_ids"] = list(dict.fromkeys([
+            *(existing.get("control_receipt_ids") or []),
+            *redacted["control_receipt_ids"],
+        ]))
+        existing["passed_stages"] = list(dict.fromkeys([
+            *(existing.get("passed_stages") or []),
+            *redacted["passed_stages"],
+        ]))
+        existing["supporting_actors"] = list(dict.fromkeys([
+            *(existing.get("supporting_actors") or []),
+            *redacted["supporting_actors"],
+        ]))
+
+        if len(str(redacted.get("evidence") or "")) > len(str(existing.get("evidence") or "")):
+            existing["evidence"] = redacted["evidence"]
+        if len(redacted.get("evidence_excerpts") or []) > len(existing.get("evidence_excerpts") or []):
+            existing["evidence_excerpts"] = redacted["evidence_excerpts"]
+        if not existing.get("verification_blocker") and redacted.get("verification_blocker"):
+            existing["verification_blocker"] = redacted["verification_blocker"]
+        if not existing.get("suggested_manual_verification") and redacted.get("suggested_manual_verification"):
+            existing["suggested_manual_verification"] = redacted["suggested_manual_verification"]
+        if not existing.get("clean_replay_receipt_id") and redacted.get("clean_replay_receipt_id"):
+            existing["clean_replay_receipt_id"] = redacted["clean_replay_receipt_id"]
+        if int(redacted.get("oob_hit_count") or 0) > int(existing.get("oob_hit_count") or 0):
+            existing["oob_hit_count"] = int(redacted.get("oob_hit_count") or 0)
+        if not existing.get("oob_token") and redacted.get("oob_token"):
+            existing["oob_token"] = redacted["oob_token"]
+        if redacted.get("oob_hits_preview") and len(redacted["oob_hits_preview"]) > len(existing.get("oob_hits_preview") or []):
+            existing["oob_hits_preview"] = redacted["oob_hits_preview"]
+        if _severity_rank(redacted) < _severity_rank(existing):
+            existing["severity"] = redacted["severity"]
+
+    sorted_leads = sorted(
+        grouped.values(),
+        key=lambda item: (
+            _LEAD_SIGNAL_RANK.get(str(item.get("signal_type") or ""), 50),
+            -int(item.get("oob_hit_count") or 0),
+            -len(item.get("passed_stages") or []),
+            _severity_rank(item),
+            str(item.get("class_type") or ""),
+            str(item.get("method") or ""),
+            str(item.get("route_template") or ""),
+        ),
+    )[: int(max_leads)]
+
+    final_leads: list[dict[str, Any]] = []
+    for idx, entry in enumerate(sorted_leads, start=1):
+        out = dict(entry)
+        out["lead_id"] = f"L-{idx:03d}"
+        final_leads.append(out)
+    return final_leads
+
+
+def _receipt_contains_oob_token(receipt: dict[str, Any], token: str) -> bool:
+    if not token:
+        return False
+    return (
+        token in str(receipt.get("url") or "")
+        or token in str(receipt.get("query") or "")
+        or token in str(receipt.get("request_body") or "")
+        or token in json.dumps(receipt.get("request_headers") or {}, ensure_ascii=False)
+    )
+
+
+def _infer_class_from_oob_label(label: str) -> str:
+    low = str(label or "").strip().lower()
+    for hint, cls_name in _OOB_CLASS_HINTS:
+        if hint in low:
+            return cls_name
+    return "ssrf"
+
+
+def reconcile_late_oob_hits(
+    oob_server: Any | None,
+    *,
+    findings: Sequence[dict[str, Any]],
+    leads: Sequence[dict[str, Any]],
+    receipts: Any,
+    base_url: str = "",
+) -> list[dict[str, Any]]:
+    """Convert late-arriving unconfirmed OOB hits into redacted NEEDS_VERIFICATION leads."""
+    if oob_server is None or not hasattr(oob_server, "poll"):
+        return []
+    try:
+        polled = oob_server.poll("")
+    except Exception:
+        return []
+    if not isinstance(polled, dict):
+        return []
+
+    tokens_meta = polled.get("tokens")
+    if not isinstance(tokens_meta, dict) or not tokens_meta:
+        return []
+    all_hits = [h for h in (polled.get("hits") or []) if isinstance(h, dict)]
+
+    receipt_list: list[dict[str, Any]] = []
+    receipt_by_id: dict[str, dict[str, Any]] = {}
+    if hasattr(receipts, "list_ids") and hasattr(receipts, "get"):
+        for rid in receipts.list_ids():
+            try:
+                rec = receipts.get(rid)
+            except (KeyError, ValueError):
+                continue
+            if isinstance(rec, dict):
+                receipt_list.append(rec)
+                if rid:
+                    receipt_by_id[str(rid)] = rec
+    elif isinstance(receipts, dict):
+        for k, rec in receipts.items():
+            if isinstance(rec, dict):
+                receipt_list.append(rec)
+                rid = str(rec.get("receipt_id") or k).strip()
+                if rid:
+                    receipt_by_id[rid] = rec
+    elif isinstance(receipts, (list, tuple)):
+        for rec in receipts:
+            if isinstance(rec, dict):
+                receipt_list.append(rec)
+                rid = str(rec.get("receipt_id") or "").strip()
+                if rid:
+                    receipt_by_id[rid] = rec
+
+    confirmed_rids: set[str] = set()
+    confirmed_blobs: list[str] = []
+    for f in findings:
+        if not isinstance(f, dict):
+            continue
+        for rid in f.get("proof_receipt_ids") or ():
+            s_rid = str(rid).strip()
+            if s_rid:
+                confirmed_rids.add(s_rid)
+                rec = receipt_by_id.get(s_rid)
+                if rec is not None:
+                    confirmed_blobs.append(str(rec.get("url") or ""))
+                    confirmed_blobs.append(str(rec.get("query") or ""))
+                    confirmed_blobs.append(str(rec.get("request_body") or ""))
+        for field_name in ("evidence", "evidence_value", "marker", "url", "oob_token", "title", "summary"):
+            val = str(f.get(field_name) or "")
+            if val:
+                confirmed_blobs.append(val)
+        for ex in f.get("evidence_excerpts") or ():
+            if isinstance(ex, dict):
+                confirmed_blobs.append(str(ex.get("excerpt") or ""))
+                confirmed_blobs.append(str(ex.get("url") or ""))
+    findings_haystack = "\n".join(confirmed_blobs)
+
+    existing_lead_tokens: set[str] = set()
+    existing_lead_blobs: list[str] = []
+    for lead in leads:
+        if not isinstance(lead, dict):
+            continue
+        tok_val = str(lead.get("oob_token") or "").strip()
+        if tok_val:
+            existing_lead_tokens.add(tok_val)
+        for field_name in ("evidence", "evidence_value", "marker", "url"):
+            val = str(lead.get(field_name) or "")
+            if val:
+                existing_lead_blobs.append(val)
+    leads_haystack = "\n".join(existing_lead_blobs)
+
+    new_leads: list[dict[str, Any]] = []
+    for tok in sorted(tokens_meta):
+        info = tokens_meta.get(tok)
+        if not isinstance(info, dict):
+            continue
+        tok_hits = [h for h in all_hits if str(h.get("token") or "") == tok]
+        hit_count = max(int(info.get("hit_count") or 0), len(tok_hits))
+        if hit_count <= 0:
+            continue
+        if tok in findings_haystack or tok in existing_lead_tokens or tok in leads_haystack:
+            continue
+
+        matched_receipts = [r for r in receipt_list if _receipt_contains_oob_token(r, tok)]
+        matched_rids = [str(r.get("receipt_id") or "").strip() for r in matched_receipts if r.get("receipt_id")]
+        if matched_rids and any(rid in confirmed_rids for rid in matched_rids):
+            continue
+
+        primary_rec: dict[str, Any] | None = None
+        if matched_receipts:
+            primary_rec = sorted(
+                matched_receipts,
+                key=lambda r: (
+                    0 if 200 <= int(r.get("status") or 0) < 400 else 1,
+                    int(r.get("receipt_id", "0").lstrip("R-") or 0)
+                    if str(r.get("receipt_id") or "").lstrip("R-").isdigit()
+                    else 0,
+                ),
+            )[0]
+
+        method = str(primary_rec.get("method") or "GET").upper() if primary_rec else "GET"
+        raw_url = (
+            str(primary_rec.get("url") or primary_rec.get("path") or base_url or "/")
+            if primary_rec
+            else (base_url.rstrip("/") + "/" if base_url else "/")
+        )
+        actor = str(primary_rec.get("actor") or "anon").strip() if primary_rec else "anon"
+        label = str(info.get("label") or "").strip()
+        inferred_class = _infer_class_from_oob_label(label)
+        url_path = urlsplit(raw_url).path or "/"
+        route_tmpl = normalize_route_template(raw_url)
+        preview_hits = _sanitize_oob_hits_preview(tok_hits)
+        hit0 = preview_hits[0] if preview_hits else {}
+        oob_summary = (
+            f"---[late_oob_callback:token={tok} hits={hit_count}]---\n"
+            f"{hit0.get('method', 'GET')} {hit0.get('path', '/')} "
+            f"query={hit0.get('query') or ''} remote={hit0.get('remote_addr') or ''}"
+        ).strip()
+        if primary_rec is not None:
+            rec_excerpt = build_receipt_excerpt(primary_rec, tok, max_chars=500)
+            if rec_excerpt:
+                oob_summary = f"{oob_summary}\n{rec_excerpt}"
+
+        lead_entry: dict[str, Any] = {
+            "title": f"Late asynchronous OOB callback hit ({inferred_class})",
+            "class_type": inferred_class,
+            "route_template": route_tmpl,
+            "method": method,
+            "url": raw_url,
+            "path": url_path,
+            "actor": actor,
+            "actor_alias": actor,
+            "severity": "high",
+            "status": "needs_verification",
+            "verification_tier": "NEEDS_VERIFICATION",
+            "oracle_verdict": "NEEDS_VERIFICATION",
+            "signal_type": "async_oob_unreplayed",
+            "passed_stages": ["oob_callback_received"],
+            "verification_blocker": "late_oob_hit_after_shard_close",
+            "suggested_manual_verification": (
+                f"Replay {method} {url_path} with a fresh callback_listener URL and allow extra "
+                f"time for delayed asynchronous OOB callback delivery (observed {hit_count} late hit(s) "
+                f"for token {tok})."
+            ),
+            "oob_token": tok,
+            "oob_hit_count": hit_count,
+            "oob_hits_preview": preview_hits,
+            "evidence_value": tok,
+            "marker": tok,
+            "evidence": oob_summary,
+            "summary": (
+                f"Out-of-band callback listener received {hit_count} late hit(s) for token {tok}"
+                + (f" (label={label})" if label else "")
+                + " after probe submission."
+            ),
+            "proof_receipt_ids": matched_rids,
+            "control_receipt_ids": [],
+            "supporting_actors": [actor] if actor else [],
+        }
+        new_leads.append(_redact_lead_record(lead_entry))
+
+    return new_leads
+
+
 class ToolDispatcher:
     """Executes investigation and QA verification tools against the harness."""
 
@@ -721,6 +1409,7 @@ class ToolDispatcher:
         waf_pivot: WAFPivotTracker | None = None,
         bootstrap_stage1_virgin_guard: bool = False,
         http_reserve_floor: int = 0,
+        shared_facts: SharedFactGraph | None = None,
     ):
         self.http = http_client
         self.receipts = receipt_store
@@ -728,6 +1417,7 @@ class ToolDispatcher:
         self.bsag = bsag
         self.oracle = oracle
         self.telemetry = telemetry
+        self.shared_facts: SharedFactGraph | None = shared_facts
         self._oob_server: LoopbackCallbackServer | None = oob_server
         self._oob_provider = oob_provider
         self._owns_oob_server: bool = False
@@ -741,6 +1431,7 @@ class ToolDispatcher:
         self._step_delta_e: int = 0
         self._step_claim_submitted: bool = False
         self._findings_lock = threading.RLock()
+        self._leads_lock = threading.RLock()
         self._notebook_lock = threading.RLock()
         self.persist_findings: bool = bool(persist_findings)
         self.notebook_path = self.root_dir / "notebook.json"
@@ -749,12 +1440,22 @@ class ToolDispatcher:
             if findings_path is not None
             else (self.root_dir / "findings.json")
         )
+        self.leads_path = (
+            self.findings_path.parent / "leads.json"
+            if findings_path is not None
+            else (self.root_dir / "leads.json")
+        )
         self.notebook_state: dict[str, Any] = self._load_json(
             self.notebook_path,
             default={"surface_notes": "", "hypotheses": [], "notes": []},
         )
         self.findings: list[dict[str, Any]] = (
             self._load_json(self.findings_path, default=[])
+            if self.persist_findings
+            else []
+        )
+        self.leads: list[dict[str, Any]] = (
+            self._load_json(self.leads_path, default=[])
             if self.persist_findings
             else []
         )
@@ -799,14 +1500,28 @@ class ToolDispatcher:
 
     def _ingest_receipt_hooks(self, receipt: dict[str, Any]) -> None:
         self.surface_tracker.ingest_receipt(receipt)
+        source_shard = self.active_worker_id or "bootstrap"
         saved = receipt.get("saved_session")
         if isinstance(saved, dict) and saved.get("alias"):
             alias = str(saved["alias"])
+            role = str(saved.get("role") or "member").lower()
             self.surface_tracker.actors[alias] = {
                 "alias": alias,
-                "role": str(saved.get("role") or "member").lower(),
+                "role": role,
                 "tenant": "",
             }
+            if self.shared_facts is not None:
+                self.shared_facts.publish(
+                    "actor_capability",
+                    f"actor:{alias}",
+                    f"alias={alias} role={role}",
+                    source_shard=source_shard,
+                    source_receipt_id=str(saved.get("source_receipt_id") or receipt.get("receipt_id") or ""),
+                    provenance="host_extracted",
+                    target_families=("*",),
+                    confidence="deterministic",
+                    secret_values=self.http.actors.all_secrets(),
+                )
             if self.bsag is not None:
                 _, ac_v = self.bsag.register_auth_context(
                     alias=alias,
@@ -824,6 +1539,54 @@ class ToolDispatcher:
         status = int(receipt.get("status") or 0)
         actor = str(receipt.get("actor") or "anon")
         method = str(receipt.get("method") or "GET").upper()
+        if self.shared_facts is not None:
+            disc_hdr = str(getattr(self.http.actors, "discovered_auth_header", "") or "").strip()
+            if disc_hdr:
+                self.shared_facts.publish(
+                    "auth_header",
+                    f"header:{disc_hdr}",
+                    f"Custom auth header {disc_hdr} active",
+                    source_shard=source_shard,
+                    source_receipt_id=str(receipt.get("receipt_id") or ""),
+                    provenance="host_extracted",
+                    target_families=("*",),
+                    confidence="deterministic",
+                    secret_values=self.http.actors.all_secrets(),
+                )
+            if (
+                200 <= status < 400
+                and self.waf_pivot is not None
+                and self.waf_pivot.total_blocks > 0
+                and detect_waf_block(receipt) is None
+            ):
+                norm_tmpl = normalize_route_template(str(receipt.get("url") or receipt.get("path") or "/"))
+                waf_summary = self.waf_pivot.summary()
+                blocked_paths = set(waf_summary.get("blocked_paths") or ())
+                req_hdrs = receipt.get("request_headers") or {}
+                evasion_hdrs = (
+                    [
+                        str(k)
+                        for k, v in req_hdrs.items()
+                        if str(k).strip().lower() in _BYPASS_EVASION_HEADER_NAMES and str(v or "").strip()
+                    ]
+                    if isinstance(req_hdrs, dict)
+                    else []
+                )
+                raw_u_low = str(receipt.get("url") or "").lower()
+                encoded_probe = any(tok in raw_u_low for tok in ("%252f", "%2f", "..;"))
+                if norm_tmpl in blocked_paths or evasion_hdrs or encoded_probe:
+                    hdr_note = f" via headers={','.join(evasion_hdrs)}" if evasion_hdrs else ""
+                    self.shared_facts.publish(
+                        "waf_bypass",
+                        f"waf_bypass:{method}:{norm_tmpl}",
+                        f"2xx/3xx {method} {norm_tmpl} bypassed prior WAF block{hdr_note}",
+                        source_shard=source_shard,
+                        source_receipt_id=str(receipt.get("receipt_id") or ""),
+                        provenance="host_extracted",
+                        target_families=("*",),
+                        confidence="deterministic",
+                        secret_values=self.http.actors.all_secrets(),
+                    )
         if (
             status in {401, 403}
             or (300 <= status < 400 and actor == "anon")
@@ -870,6 +1633,156 @@ class ToolDispatcher:
             return
         with self._findings_lock:
             _atomic_write_json(self.findings_path, self.findings)
+
+    def _save_leads(self) -> None:
+        if not self.persist_findings:
+            return
+        with self._leads_lock:
+            _atomic_write_json(self.leads_path, self.leads)
+
+    def _record_needs_verification_lead(
+        self,
+        *,
+        verdict: Any,
+        title: str,
+        canonical_class: str,
+        route_template: str,
+        method: str,
+        raw_url: str,
+        primary: dict[str, Any],
+        valid_proof_records: list[tuple[dict[str, Any], str]],
+        control_receipts: list[dict[str, Any]],
+        evidence_value: str,
+        default_excerpt: str,
+        summary: str,
+        severity: str,
+        best_actor: str,
+        ordered_actors: list[str],
+        proof_ids: list[str],
+        control_ids: list[str],
+        matching_oob_hits: Sequence[dict[str, Any]] = (),
+        oob_matched_tokens: Sequence[str] = (),
+    ) -> tuple[str, int]:
+        valid_receipts_only = [r for r, _ in valid_proof_records]
+        excerpt_by_rid = {r["receipt_id"]: ex for r, ex in valid_proof_records if r.get("receipt_id")}
+        best_evidence = compose_finding_evidence(
+            primary,
+            valid_receipts_only,
+            control_receipts,
+            evidence_value,
+            max_proof_chars=MAX_PROOF_EXCERPT_CHARS,
+            max_control_chars=MAX_CONTROL_EXCERPT_CHARS,
+        ) or excerpt_by_rid.get(primary.get("receipt_id", ""), default_excerpt)
+        resolved_url, clean_path, _ = self.http.resolve_in_scope(primary.get("url") or raw_url)
+        resolved_origin = _extract_finding_origin(resolved_url, self.http.base_url)
+
+        passed_stages: list[str] = []
+        stages_map = getattr(verdict, "stages", None) or {}
+        if str(stages_map.get("stage1_control") or "").startswith("passed"):
+            passed_stages.append("stage1_control")
+        if str(stages_map.get("stage2_diff") or "").startswith("passed"):
+            passed_stages.append("stage2_diff")
+        if verdict.signal_type == "async_oob_unreplayed":
+            passed_stages.append("oob_callback_received")
+        elif verdict.signal_type == "server_5xx_differential":
+            passed_stages.append("primary_5xx_vs_control")
+
+        lead_entry: dict[str, Any] = {
+            "title": title,
+            "class_type": canonical_class,
+            "route_template": route_template,
+            "method": str(primary.get("method") or method).upper(),
+            "url": resolved_url,
+            "path": clean_path,
+            "actor": best_actor,
+            "actor_alias": best_actor,
+            "observed_status": primary.get("status"),
+            "status": "needs_verification",
+            "verification_tier": "NEEDS_VERIFICATION",
+            "oracle_verdict": "NEEDS_VERIFICATION",
+            "signal_type": str(getattr(verdict, "signal_type", "") or ""),
+            "passed_stages": passed_stages,
+            "verification_blocker": str(getattr(verdict, "verification_blocker", "") or ""),
+            "suggested_manual_verification": str(getattr(verdict, "suggested_manual_verification", "") or ""),
+            "oracle_reason": str(getattr(verdict, "reason", "") or ""),
+            "oracle_stages": dict(stages_map),
+            "clean_replay_receipt_id": str(getattr(verdict, "clean_replay_receipt_id", "") or ""),
+            "severity": severity if severity in {"critical", "high", "medium", "low"} else "high",
+            "evidence_value": evidence_value,
+            "marker": evidence_value,
+            "evidence": best_evidence,
+            "summary": summary,
+            "proof_receipt_ids": list(proof_ids),
+            "control_receipt_ids": list(control_ids),
+            "supporting_actors": list(ordered_actors),
+            "evidence_excerpts": [
+                {
+                    "receipt_id": r["receipt_id"],
+                    "actor": r["actor"],
+                    "method": r["method"],
+                    "url": r["url"],
+                    "status": r["status"],
+                    "excerpt": ex[:MAX_PROOF_EXCERPT_CHARS],
+                }
+                for r, ex in valid_proof_records
+            ],
+            "control_excerpts": [
+                {
+                    "receipt_id": c["receipt_id"],
+                    "actor": c["actor"],
+                    "method": c["method"],
+                    "url": c["url"],
+                    "status": c["status"],
+                    "excerpt": build_receipt_excerpt(c, "", max_chars=MAX_CONTROL_EXCERPT_CHARS),
+                }
+                for c in control_receipts
+            ],
+        }
+        if resolved_origin:
+            lead_entry["origin"] = resolved_origin
+        if matching_oob_hits:
+            tok = (
+                oob_matched_tokens[0]
+                if oob_matched_tokens
+                else str(matching_oob_hits[0].get("token") or "")
+            )
+            lead_entry["oob_token"] = tok
+            lead_entry["oob_hit_count"] = len(matching_oob_hits)
+            lead_entry["oob_hits_preview"] = _sanitize_oob_hits_preview(
+                matching_oob_hits,
+                self.http.actors.all_secrets(),
+            )
+
+        redacted_new = _redact_lead_record(lead_entry, self.http.actors.all_secrets())
+        target_sig = (
+            redacted_new.get("class_type", ""),
+            redacted_new.get("method", ""),
+            normalize_route_template(str(redacted_new.get("route_template") or resolved_url)),
+            redacted_new.get("signal_type", ""),
+        )
+        with self._leads_lock:
+            actor_meta = self._actor_meta_map()
+            self.leads = canonicalize_and_deduplicate_leads(
+                [*self.leads, redacted_new],
+                actor_meta_map=actor_meta,
+                receipt_store=self.receipts,
+            )
+            self._save_leads()
+            assigned_id = ""
+            for item in self.leads:
+                item_sig = (
+                    item.get("class_type", ""),
+                    item.get("method", ""),
+                    item.get("route_template", ""),
+                    item.get("signal_type", ""),
+                )
+                if item_sig == target_sig:
+                    assigned_id = str(item.get("lead_id") or "")
+                    break
+            if not assigned_id and self.leads:
+                assigned_id = str(self.leads[-1].get("lead_id") or "L-001")
+            total_leads = len(self.leads)
+        return assigned_id or "L-001", total_leads
 
     def _get_oob_server(self, *, start: bool = False) -> LoopbackCallbackServer | None:
         with self._oob_lock:
@@ -928,6 +1841,7 @@ class ToolDispatcher:
             "extract_surface": self._tool_extract_surface,
             "browser_crawl": self._tool_browser_crawl,
             "analyze_token": self._tool_analyze_token,
+            "run_sandbox_probe": self._tool_run_sandbox_probe,
             "notebook": self._tool_notebook,
             "callback_listener": self._tool_callback_listener,
             "concurrent_check": self._tool_concurrent_check,
@@ -974,6 +1888,8 @@ class ToolDispatcher:
         json_body = _coerce_json_payload(args.get("json_body"))
         form_body = _coerce_mapping_arg(args.get("form_body"))
         raw_body = args.get("raw_body")
+        raw_body_base64 = args.get("raw_body_base64")
+        grpc_web_mode = str(args.get("grpc_web_mode") or "").strip().lower()
         raw_files = args.get("files")
         if isinstance(raw_files, str) and raw_files.lstrip().startswith("["):
             try:
@@ -1006,6 +1922,8 @@ class ToolDispatcher:
             json_body is not None
             or form_body is not None
             or raw_body is not None
+            or raw_body_base64 is not None
+            or bool(grpc_web_mode)
             or files is not None
             or bool(base_receipt_id)
             or (json_merge is not None)
@@ -1069,6 +1987,10 @@ class ToolDispatcher:
             request_kwargs["follow_redirects"] = True
         if auth_header_name:
             request_kwargs["auth_header_name"] = auth_header_name
+        if raw_body_base64 is not None:
+            request_kwargs["raw_body_base64"] = raw_body_base64
+        if grpc_web_mode:
+            request_kwargs["grpc_web_mode"] = grpc_web_mode
         self._enforce_http_reserve_floor(needed=1)
         receipt = self.http.request(**request_kwargs)
         if (
@@ -1145,6 +2067,8 @@ class ToolDispatcher:
         method = str(args.get("method") or baseline["method"]).strip().upper()
         url = str(args.get("url") or baseline["url"])
         base_body_str = str(baseline.get("request_body") or "")
+        base_body_b64 = str(baseline.get("request_body_base64") or "").strip()
+        arg_raw_body_b64 = args.get("raw_body_base64")
         baseline_is_multipart = _is_multipart_receipt(baseline)
 
         query_overrides = _coerce_mapping_arg(args.get("query_overrides"))
@@ -1159,7 +2083,11 @@ class ToolDispatcher:
             patch_obj = json_overrides
 
         base_receipt_id = str(args.get("base_receipt_id") or "").strip()
-        has_body_replacement = bool(base_receipt_id) or (patch_obj is not None)
+        if arg_raw_body_b64 is not None and (base_receipt_id or patch_obj is not None):
+            raise ValueError(
+                "raw_body_base64 cannot be combined with base_receipt_id, json_overrides, or json_merge"
+            )
+        has_body_replacement = bool(base_receipt_id) or (patch_obj is not None) or (arg_raw_body_b64 is not None)
         if baseline_is_multipart and method in _MUTATING_WRITE_METHODS and not has_body_replacement:
             raise ValueError(
                 f"receipt {baseline.get('receipt_id', '')} is a multipart/form-data upload whose stored "
@@ -1194,7 +2122,10 @@ class ToolDispatcher:
 
         json_body = None
         raw_body = None
-        if base_receipt_id:
+        raw_body_base64_arg: Any = None
+        if arg_raw_body_b64 is not None:
+            raw_body_base64_arg = arg_raw_body_b64
+        elif base_receipt_id:
             base_obj = self._load_receipt_json_object(base_receipt_id)
             json_body = _deep_merge_json(base_obj, patch_obj) if patch_obj is not None else base_obj
         elif patch_obj is not None:
@@ -1216,6 +2147,8 @@ class ToolDispatcher:
                 json_body = _deep_merge_json(parsed, patch_obj)
             else:
                 json_body = copy.deepcopy(patch_obj)
+        elif base_body_b64 and not baseline_is_multipart:
+            raw_body_base64_arg = base_body_b64
         elif base_body_str and not baseline_is_multipart:
             try:
                 json_body = json.loads(base_body_str)
@@ -1223,16 +2156,19 @@ class ToolDispatcher:
                 raw_body = base_body_str
 
         self._enforce_http_reserve_floor(needed=1)
-        current = self.http.request(
-            method=method,
-            url=url,
-            actor=target_actor,
-            headers=req_headers or None,
-            query=query_overrides,
-            json_body=json_body,
-            raw_body=raw_body,
-            force=bool(args.get("force", False)),
-        )
+        replay_req_kwargs: dict[str, Any] = {
+            "method": method,
+            "url": url,
+            "actor": target_actor,
+            "headers": req_headers or None,
+            "query": query_overrides,
+            "json_body": json_body,
+            "raw_body": raw_body,
+            "force": bool(args.get("force", False)),
+        }
+        if raw_body_base64_arg is not None:
+            replay_req_kwargs["raw_body_base64"] = raw_body_base64_arg
+        current = self.http.request(**replay_req_kwargs)
         self.surface_tracker.ingest_receipt(baseline)
         self._ingest_receipt_hooks(current)
         replay_preview = _format_receipt_preview(current, preview_chars=1800)
@@ -1441,15 +2377,113 @@ class ToolDispatcher:
         )
         return json.dumps(result, ensure_ascii=False)
 
+    def _hydrate_sandbox_receipt_refs(self, raw_refs: Any) -> list[dict[str, Any]]:
+        if raw_refs is None:
+            return []
+        if not isinstance(raw_refs, list):
+            raise ValueError("inputs.receipt_refs must be a list of receipt IDs")
+        if len(raw_refs) > 10:
+            raise ValueError("inputs.receipt_refs exceeds maximum of 10 receipts")
+
+        all_secrets = self.http.actors.all_secrets()
+        extra_sensitive_hdrs = {
+            str(h).strip().lower() for h in self.http.actors.sensitive_header_names()
+        } | _SKIP_REPLAY_HEADERS
+        hydrated: list[dict[str, Any]] = []
+        for raw_rid in raw_refs:
+            if not isinstance(raw_rid, str) or not raw_rid.strip():
+                raise ValueError("each entry in inputs.receipt_refs must be a non-empty receipt_id string")
+            rec = self.receipts.get(raw_rid.strip())
+            red_resp_hdrs = redact_headers(rec.get("response_headers") or {})
+            safe_resp_hdrs: dict[str, str] = {}
+            for hk, hv in red_resp_hdrs.items():
+                hk_str = str(hk)
+                if hk_str.strip().lower() in extra_sensitive_hdrs and not str(hv).startswith("<REDACTED"):
+                    safe_resp_hdrs[hk_str] = "<REDACTED>"
+                else:
+                    safe_resp_hdrs[hk_str] = redact_secrets(str(hv), all_secrets)
+            hydrated.append({
+                "receipt_id": str(rec.get("receipt_id") or ""),
+                "status": int(rec.get("status") or 0),
+                "method": str(rec.get("method") or ""),
+                "url": redact_secrets(str(rec.get("url") or ""), all_secrets),
+                "content_type": str(rec.get("content_type") or ""),
+                "response_headers": safe_resp_hdrs,
+                "body": redact_secrets(str(rec.get("body") or ""), all_secrets)[:4096],
+            })
+        return hydrated
+
+    def _tool_run_sandbox_probe(self, args: dict[str, Any]) -> str:
+        runtime = str(args.get("runtime") or "python_pure").strip().lower() or "python_pure"
+        if runtime != "python_pure":
+            raise ValueError(f"unsupported sandbox runtime: {runtime!r}; expected 'python_pure'")
+        output_contract = str(args.get("output_contract") or "http_transform").strip().lower() or "http_transform"
+        if output_contract not in {"http_transform", "decode_only"}:
+            raise ValueError(
+                f"unsupported output_contract: {output_contract!r}; expected 'http_transform' or 'decode_only'"
+            )
+        raw_code = args.get("code")
+        if not isinstance(raw_code, str):
+            raise ValueError("code must be a string")
+
+        raw_timeout = args.get("timeout_ms", 1500)
+        if isinstance(raw_timeout, bool):
+            raise ValueError("timeout_ms must be an integer")
+        try:
+            timeout_ms = int(raw_timeout) if raw_timeout is not None else 1500
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"invalid timeout_ms: {raw_timeout!r}") from exc
+
+        raw_inputs_arg = args.get("inputs")
+        if raw_inputs_arg is None:
+            raw_inputs: dict[str, Any] = {}
+        else:
+            coerced = _coerce_mapping_arg(raw_inputs_arg)
+            if coerced is None:
+                raise ValueError("inputs must be an object")
+            raw_inputs = coerced
+
+        hydrated_receipts = self._hydrate_sandbox_receipt_refs(raw_inputs.get("receipt_refs"))
+        sandbox_inputs: dict[str, Any] = {
+            str(k): copy.deepcopy(v)
+            for k, v in raw_inputs.items()
+            if k != "receipt_refs"
+        }
+        if hydrated_receipts:
+            sandbox_inputs["receipts"] = hydrated_receipts
+
+        all_secrets = self.http.actors.all_secrets()
+        res = run_python_pure_sandbox(
+            raw_code,
+            inputs=sandbox_inputs,
+            timeout_ms=timeout_ms,
+            secret_values=all_secrets,
+        )
+        res["output_contract"] = output_contract
+        if self.telemetry is not None:
+            self.telemetry.emit(
+                "sandbox_probe",
+                worker_id=self.active_worker_id,
+                node_id=self.active_node_id,
+                category=self.active_category,
+                runtime=runtime,
+                output_contract=output_contract,
+                ok=bool(res.get("ok")),
+                elapsed_ms=res.get("elapsed_ms"),
+                receipt_ref_count=len(hydrated_receipts),
+            )
+        return wrap_untrusted(res)
+
     def _tool_extract_surface(self, args: dict[str, Any]) -> str:
         receipt = self.receipts.get(str(args.get("receipt_id") or ""))
         body = str(receipt.get("body") or "")
+        discovered_hdr_for_fact = str(getattr(self.http.actors, "discovered_auth_header", "") or "").strip()
         if (
             200 <= int(receipt.get("status") or 0) < 300
             and len(body) <= 2_000_000
             and body.lstrip().startswith("{")
             and ('"securitySchemes"' in body or '"securityDefinitions"' in body)
-            and not self.http.actors.discovered_auth_header
+            and not discovered_hdr_for_fact
         ):
             try:
                 parsed_spec = json.loads(body)
@@ -1459,6 +2493,7 @@ class ToolDispatcher:
                 for hdr_name in extract_openapi_header_auth_names(parsed_spec):
                     if hdr_name.lower() != "authorization":
                         self.http.register_discovered_auth_header(hdr_name)
+                        discovered_hdr_for_fact = hdr_name
                         break
         summary_extra = _supported_kwargs(
             _extract_surface_summary,
@@ -1475,6 +2510,34 @@ class ToolDispatcher:
             dv2, de2 = self.bsag.ingest_surface(surface, actor=str(receipt.get("actor") or ""))
             self._step_delta_v += dv1 + dv2
             self._step_delta_e += de1 + de2
+        if self.shared_facts is not None:
+            source_shard = self.active_worker_id or "bootstrap"
+            src_rid = str(receipt.get("receipt_id") or "")
+            all_secrets = self.http.actors.all_secrets()
+            if discovered_hdr_for_fact:
+                self.shared_facts.publish(
+                    "auth_header",
+                    f"header:{discovered_hdr_for_fact}",
+                    f"Custom auth header {discovered_hdr_for_fact} discovered",
+                    source_shard=source_shard,
+                    source_receipt_id=src_rid,
+                    provenance="host_extracted",
+                    target_families=("*",),
+                    confidence="deterministic",
+                    secret_values=all_secrets,
+                )
+            for internal_url in _extract_internal_host_urls(receipt, surface, base_url=self.http.base_url):
+                self.shared_facts.publish(
+                    "internal_host",
+                    f"internal_host:{internal_url}",
+                    f"Internal/metadata host {internal_url} referenced in {receipt.get('url') or ''}",
+                    source_shard=source_shard,
+                    source_receipt_id=src_rid,
+                    provenance="host_extracted",
+                    target_families=("*", "ssrf", "webhooks", "idor", "api"),
+                    confidence="deterministic",
+                    secret_values=all_secrets,
+                )
         compact_surface = {
             k: v
             for k, v in surface.items()
@@ -1484,6 +2547,90 @@ class ToolDispatcher:
 
     def _tool_notebook(self, args: dict[str, Any]) -> str:
         action = str(args.get("action") or "read").strip().lower()
+        if action == "publish_fact":
+            raw_fact = args.get("fact")
+            if not isinstance(raw_fact, dict):
+                return json.dumps({"rejected": True, "reason": "fact dict is required"})
+            fact_type = str(raw_fact.get("fact_type") or "").strip().lower()
+            if fact_type not in VALID_FACT_TYPES:
+                return json.dumps({"rejected": True, "reason": f"invalid fact_type: {fact_type!r}"})
+            raw_key = str(raw_fact.get("key") or raw_fact.get("canonical_key") or "").strip()
+            raw_summary = str(raw_fact.get("summary") or "").strip()
+            source_rid = str(raw_fact.get("source_receipt_id") or "").strip()
+            if not raw_key or not raw_summary:
+                return json.dumps({"rejected": True, "reason": "fact key and summary are required"})
+            if not source_rid:
+                return json.dumps({"rejected": True, "reason": "source_receipt_id is required"})
+            try:
+                receipt = self.receipts.get(source_rid)
+            except (KeyError, ValueError):
+                return json.dumps({"rejected": True, "reason": f"source_receipt_id {source_rid!r} not found"})
+
+            oob_hits: list[dict[str, Any]] = []
+            oob_srv = self._get_oob_server(start=False)
+            if oob_srv is not None:
+                try:
+                    polled = oob_srv.poll("")
+                    if isinstance(polled, dict):
+                        oob_hits = [h for h in (polled.get("hits") or ()) if isinstance(h, dict)]
+                except Exception:
+                    oob_hits = []
+
+            if not _is_fact_grounded_in_receipt(raw_key, fact_type, receipt, oob_hits=oob_hits):
+                return json.dumps({"rejected": True, "reason": "fact_not_grounded_in_receipt"})
+
+            raw_tf = raw_fact.get("target_families")
+            target_families: tuple[str, ...]
+            if isinstance(raw_tf, (list, tuple)):
+                cleaned_tf = tuple(str(x).strip().lower() for x in raw_tf if str(x).strip())
+                target_families = cleaned_tf or ("*",)
+            elif isinstance(raw_tf, str) and raw_tf.strip():
+                cleaned_tf = tuple(s.strip().lower() for s in raw_tf.split(",") if s.strip())
+                target_families = cleaned_tf or ("*",)
+            else:
+                target_families = ("*",)
+
+            all_secrets = self.http.actors.all_secrets()
+            source_shard = self.active_worker_id or "bootstrap"
+            published_fact: dict[str, Any] | None
+            if self.shared_facts is not None:
+                published_fact = self.shared_facts.publish(
+                    fact_type,
+                    raw_key,
+                    raw_summary,
+                    source_shard=source_shard,
+                    source_receipt_id=source_rid,
+                    provenance="model_receipt_verified",
+                    target_families=target_families,
+                    confidence="model_receipt_verified",
+                    secret_values=all_secrets,
+                )
+                if published_fact is None:
+                    return json.dumps({"rejected": True, "reason": "fact_rejected_by_shared_fact_graph"})
+            else:
+                safe_key = _scrub_secret_text(raw_key, all_secrets)[:220]
+                safe_sum = _scrub_secret_text(raw_summary, all_secrets)[:280]
+                if not safe_key or not safe_sum or "<REDACTED" in safe_key:
+                    return json.dumps({"rejected": True, "reason": "fact_rejected_by_secret_hygiene"})
+                published_fact = {
+                    "fact_id": "sf_000",
+                    "seq": 0,
+                    "fact_type": fact_type,
+                    "canonical_key": safe_key,
+                    "summary": safe_sum,
+                    "source_shard": source_shard,
+                    "source_receipt_id": source_rid,
+                    "provenance": "model_receipt_verified",
+                    "target_families": list(target_families),
+                    "confidence": "model_receipt_verified",
+                }
+
+            note_entry = f"[{published_fact['fact_id']}] {fact_type}: {published_fact['summary']}"[:400]
+            with self._notebook_lock:
+                self.notebook_state["notes"] = [*self.notebook_state.get("notes", []), note_entry][-40:]
+                self._save_notebook()
+            return json.dumps({"published": True, "fact": published_fact}, ensure_ascii=False)
+
         with self._notebook_lock:
             if action == "update" and args.get("surface_notes") is not None:
                 self.notebook_state["surface_notes"] = str(args["surface_notes"])[:6000]
@@ -2242,7 +3389,12 @@ class ToolDispatcher:
                 "rejected": True,
                 "reason": f"proof receipt {primary['receipt_id']} method {primary['method']} does not match {method}",
             })
-        if not (200 <= primary["status"] < 400):
+        allow_5xx_lead_probe = (
+            self.oracle is not None
+            and getattr(self.oracle, "mode", "") == "differential"
+            and 500 <= int(primary["status"]) < 600
+        )
+        if not (200 <= primary["status"] < 400) and not allow_5xx_lead_probe:
             return json.dumps({
                 "rejected": True,
                 "reason": f"primary proof receipt {primary['receipt_id']} has non-success status {primary['status']}",
@@ -2274,7 +3426,7 @@ class ToolDispatcher:
         def _is_compatible_proof_receipt(r: dict[str, Any]) -> bool:
             r_method = str(r.get("method") or "").upper()
             r_status = int(r.get("status") or 0)
-            if not (200 <= r_status < 400):
+            if not (200 <= r_status < 400) and not (allow_5xx_lead_probe and 500 <= r_status < 600):
                 return False
             is_persistent_get = (
                 canonical_class in _PERSISTENT_VULN_CLASSES
@@ -2776,26 +3928,27 @@ class ToolDispatcher:
 
         # Deduplicate & merge by (origin, route_template, graphql_op), cross-class overlap, or alias/family root cause.
         norm_severity = severity if severity in {"critical", "high", "medium", "low"} else "high"
-        with self._findings_lock:
-            merged_resp = self._try_merge_existing_finding_locked(
-                canonical_class=canonical_class,
-                route_template=route_template,
-                raw_url=raw_url,
-                method=method,
-                effective_actor=effective_actor,
-                effective_norm_path=effective_norm_path,
-                evidence_value=evidence_value,
-                proof_ids=proof_ids,
-                control_ids=control_ids,
-                actor_meta=actor_meta,
-                title=title,
-                summary=summary,
-                severity=norm_severity,
-                origin=finding_origin,
-                graphql_op=finding_graphql_op,
-            )
-            if merged_resp is not None:
-                return json.dumps(merged_resp)
+        if not allow_5xx_lead_probe:
+            with self._findings_lock:
+                merged_resp = self._try_merge_existing_finding_locked(
+                    canonical_class=canonical_class,
+                    route_template=route_template,
+                    raw_url=raw_url,
+                    method=method,
+                    effective_actor=effective_actor,
+                    effective_norm_path=effective_norm_path,
+                    evidence_value=evidence_value,
+                    proof_ids=proof_ids,
+                    control_ids=control_ids,
+                    actor_meta=actor_meta,
+                    title=title,
+                    summary=summary,
+                    severity=norm_severity,
+                    origin=finding_origin,
+                    graphql_op=finding_graphql_op,
+                )
+                if merged_resp is not None:
+                    return json.dumps(merged_resp)
 
         best_primary, ordered_actors = select_primary_proof(
             canonical_class,
@@ -2893,6 +4046,40 @@ class ToolDispatcher:
                     clean_replay_receipt_id=verdict.clean_replay_receipt_id,
                 )
             if not verdict.verified:
+                if getattr(verdict, "needs_verification", False):
+                    lead_id, total_leads = self._record_needs_verification_lead(
+                        verdict=verdict,
+                        title=title,
+                        canonical_class=canonical_class,
+                        route_template=route_template,
+                        method=method,
+                        raw_url=raw_url,
+                        primary=best_primary,
+                        valid_proof_records=valid_proof_records,
+                        control_receipts=control_receipts,
+                        evidence_value=evidence_value,
+                        default_excerpt=excerpt,
+                        summary=summary,
+                        severity=norm_severity,
+                        best_actor=best_actor,
+                        ordered_actors=ordered_actors,
+                        proof_ids=proof_ids,
+                        control_ids=control_ids,
+                        matching_oob_hits=matching_oob_hits,
+                        oob_matched_tokens=oob_matched_tokens,
+                    )
+                    return json.dumps({
+                        "rejected": True,
+                        "accepted": False,
+                        "recorded_as_lead": True,
+                        "lead_id": lead_id,
+                        "verification_tier": "NEEDS_VERIFICATION",
+                        "oracle_verdict": verdict.verdict,
+                        "signal_type": verdict.signal_type,
+                        "reason": verdict.reason,
+                        "stages": verdict.stages,
+                        "total_leads": total_leads,
+                    })
                 return json.dumps({
                     "rejected": True,
                     "oracle_verdict": verdict.verdict,
@@ -2964,6 +4151,18 @@ class ToolDispatcher:
                 graphql_op=resolved_graphql_op,
             )
             if merged_resp is not None:
+                if self.shared_facts is not None:
+                    self.shared_facts.publish(
+                        "verified_primitive",
+                        f"{canonical_class}:{best_primary['method']}:{route_template}",
+                        f"{canonical_class} {best_primary['method']} {route_template} actor={best_actor}",
+                        source_shard=self.active_worker_id or "bootstrap",
+                        source_receipt_id=str(best_primary.get("receipt_id") or ""),
+                        provenance="host_extracted",
+                        target_families=("*",),
+                        confidence="deterministic",
+                        secret_values=self.http.actors.all_secrets(),
+                    )
                 return json.dumps(merged_resp)
 
             finding_id = f"F-{len(self.findings) + 1:03d}"
@@ -3019,6 +4218,18 @@ class ToolDispatcher:
             self.findings.append(finding)
             self._save_findings()
             total_findings = len(self.findings)
+        if self.shared_facts is not None:
+            self.shared_facts.publish(
+                "verified_primitive",
+                f"{canonical_class}:{best_primary['method']}:{route_template}",
+                f"{canonical_class} {best_primary['method']} {route_template} actor={best_actor}",
+                source_shard=self.active_worker_id or "bootstrap",
+                source_receipt_id=str(best_primary.get("receipt_id") or ""),
+                provenance="host_extracted",
+                target_families=("*",),
+                confidence="deterministic",
+                secret_values=self.http.actors.all_secrets(),
+            )
         return json.dumps({
             "accepted": True,
             "finding_id": finding_id,

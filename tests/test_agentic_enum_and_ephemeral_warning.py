@@ -112,7 +112,7 @@ def test_record_finding_class_type_closed_enum_and_schema_bounds() -> None:
         "other",
     ]
     assert RECORD_FINDING_CLASS_ENUM == expected_classes
-    assert len(TOOL_SCHEMAS) == 11
+    assert len(TOOL_SCHEMAS) == 12
 
     serialized = json.dumps(TOOL_SCHEMAS, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
     assert len(serialized) <= 16_384

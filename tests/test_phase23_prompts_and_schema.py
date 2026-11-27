@@ -20,7 +20,7 @@ from agentic_tools import RECORD_FINDING_CLASS_ENUM, TOOL_SCHEMAS  # noqa: E402
 
 
 def test_tool_schemas_closed_11_and_weak_credentials_enum() -> None:
-    assert len(TOOL_SCHEMAS) == 11
+    assert len(TOOL_SCHEMAS) == 12
     assert "weak_credentials" in RECORD_FINDING_CLASS_ENUM
 
     rf_tool = next(t["function"] for t in TOOL_SCHEMAS if t["function"]["name"] == "record_finding")

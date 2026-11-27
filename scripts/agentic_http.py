@@ -52,7 +52,11 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 from agentic_receipts import ReceiptStore  # noqa: E402
-from kryon_core.protocol.grpc_web import decode_grpc_web_frames, is_grpc_web_content_type  # noqa: E402
+from kryon_core.protocol.grpc_web import (  # noqa: E402
+    decode_grpc_web_frames,
+    encode_grpc_web_frame,
+    is_grpc_web_content_type,
+)
 from kryon_core.protocol.websocket_probe import probe_websocket  # noqa: E402
 from kryon_core.surface.openapi import extract_openapi_header_auth_names  # noqa: E402
 from target_bootstrap import ScopeGuard, match_logout_route  # noqa: E402
@@ -260,6 +264,8 @@ _SSE_DEFAULT_MAX_DURATION_S = 1.5
 _MULTIPART_MAX_FILES = 8
 _MULTIPART_MAX_FILE_BYTES = 256 * 1024
 _MULTIPART_MAX_TOTAL_BYTES = 512 * 1024
+_RAW_BODY_BASE64_MAX_BYTES = 1024 * 1024
+_VALID_GRPC_WEB_MODES = frozenset({"", "binary", "text"})
 _LOGIN_MISSING_ROUTE_STATUS_CODES = frozenset({404, 405})
 _LOGIN_FALLBACK_MAX_CANDIDATES = 3
 _LOGIN_FALLBACK_SKIP_EXTENSIONS = STATIC_EXTENSIONS | frozenset({
@@ -2674,6 +2680,7 @@ class AgenticHTTPClient:
         headers: dict[str, str],
         body_bytes: bytes | None,
         body_preview: str,
+        request_body_base64: str = "",
         record_receipt: bool = True,
         save_session_as: str = "",
         auth_header_name: str = "",
@@ -2878,6 +2885,9 @@ class AgenticHTTPClient:
                 "_graphql_has_errors": graphql_has_errors,
             }
         extra_sensitive_hdrs = self.actors.sensitive_header_names()
+        extra_record_fields: dict[str, Any] = {}
+        if request_body_base64:
+            extra_record_fields["request_body_base64"] = request_body_base64
         rec = self.receipt_store.record(
             actor=actor,
             method=method,
@@ -2895,6 +2905,7 @@ class AgenticHTTPClient:
             response_text=text,
             error=error,
             secret_values=self.actors.all_secrets(),
+            **extra_record_fields,
         )
         if saved_session_meta is not None:
             self.actors.set_source_receipt_id(saved_session_meta["alias"], rec["receipt_id"])
@@ -2916,6 +2927,7 @@ class AgenticHTTPClient:
         headers: dict[str, str],
         body_bytes: bytes | None,
         body_preview: str,
+        request_body_base64: str = "",
         save_session_as: str = "",
         auth_header_name: str = "",
         out_cookies: dict[str, str] | None = None,
@@ -2934,6 +2946,7 @@ class AgenticHTTPClient:
                 headers=headers,
                 body_bytes=body_bytes,
                 body_preview=body_preview,
+                request_body_base64=request_body_base64,
                 save_session_as=save_session_as,
                 auth_header_name=auth_header_name,
                 out_cookies=out_cookies,
@@ -3610,8 +3623,24 @@ class AgenticHTTPClient:
         json_body: Any,
         form_body: dict[str, Any] | None,
         raw_body: str | None,
+        raw_body_base64: str | None = None,
+        grpc_web_mode: str = "",
     ) -> tuple[bytes | None, str, dict[str, str]]:
         """Encode request body without mutating caller dicts, injecting CSRF form fields when appropriate."""
+        norm_grpc_mode = str(grpc_web_mode or "").strip().lower()
+        if norm_grpc_mode not in _VALID_GRPC_WEB_MODES:
+            raise ValueError(
+                f"invalid grpc_web_mode: {grpc_web_mode!r}; expected '', 'binary', or 'text'"
+            )
+        if raw_body_base64 is not None and (
+            has_files or json_body is not None or form_body is not None or raw_body is not None
+        ):
+            raise ValueError(
+                "raw_body_base64 cannot be combined with json_body, form_body, raw_body, or files"
+            )
+        if has_files and norm_grpc_mode:
+            raise ValueError("grpc_web_mode cannot be combined with files")
+
         eff_headers = dict(extra_headers)
         with session._lock:
             csrf_tok = session.csrf_token
@@ -3653,6 +3682,27 @@ class AgenticHTTPClient:
                 for ek in existing_ct_keys:
                     eff_headers.pop(ek, None)
                 eff_headers["Content-Type"] = multipart_ct
+        elif raw_body_base64 is not None:
+            if not isinstance(raw_body_base64, str):
+                raise ValueError("raw_body_base64 must be a string")
+            compact_b64 = "".join(raw_body_base64.split())
+            max_b64_chars = ((_RAW_BODY_BASE64_MAX_BYTES + 3) * 4 // 3) + 4
+            if len(compact_b64) > max_b64_chars:
+                raise ValueError(
+                    f"raw_body_base64 exceeds maximum payload size of {_RAW_BODY_BASE64_MAX_BYTES} bytes"
+                )
+            try:
+                body_bytes = base64.b64decode(compact_b64, validate=True)
+            except (binascii.Error, ValueError) as exc:
+                raise ValueError(f"invalid raw_body_base64: {exc}") from exc
+            if len(body_bytes) > _RAW_BODY_BASE64_MAX_BYTES:
+                raise ValueError(
+                    f"raw_body_base64 decoded size {len(body_bytes)} exceeds maximum {_RAW_BODY_BASE64_MAX_BYTES} bytes"
+                )
+            sha256_hex = hashlib.sha256(body_bytes).hexdigest()
+            body_preview = f"<binary {len(body_bytes)} bytes sha256={sha256_hex[:16]}>"
+            if not norm_grpc_mode and not any(k.lower() == "content-type" for k in eff_headers):
+                eff_headers["Content-Type"] = "application/octet-stream"
         elif json_body is not None:
             body_preview = json.dumps(json_body, ensure_ascii=False)
             body_bytes = body_preview.encode("utf-8")
@@ -3704,6 +3754,29 @@ class AgenticHTTPClient:
                         else:
                             body_preview = f"{body_preview}&{csrf_pair}"
             body_bytes = body_preview.encode("utf-8")
+
+        if norm_grpc_mode in {"binary", "text"}:
+            payload_bytes = body_bytes if body_bytes is not None else b""
+            if len(payload_bytes) > _RAW_BODY_BASE64_MAX_BYTES:
+                raise ValueError(
+                    f"gRPC-Web payload size {len(payload_bytes)} exceeds maximum {_RAW_BODY_BASE64_MAX_BYTES} bytes"
+                )
+            body_bytes = encode_grpc_web_frame(payload_bytes, text_mode=(norm_grpc_mode == "text"))
+            sha256_hex = hashlib.sha256(body_bytes).hexdigest()
+            body_preview = f"<binary {len(body_bytes)} bytes sha256={sha256_hex[:16]}>"
+            default_grpc_ct = (
+                "application/grpc-web-text+proto"
+                if norm_grpc_mode == "text"
+                else "application/grpc-web+proto"
+            )
+            existing_ct_keys = [k for k in eff_headers if k.lower() == "content-type"]
+            existing_ct_val = eff_headers.get(existing_ct_keys[-1], "") if existing_ct_keys else ""
+            if not is_grpc_web_content_type(existing_ct_val):
+                for ek in existing_ct_keys:
+                    eff_headers.pop(ek, None)
+                eff_headers["Content-Type"] = default_grpc_ct
+            if not any(k.lower() == "x-grpc-web" for k in eff_headers):
+                eff_headers["X-Grpc-Web"] = "1"
 
         return body_bytes, body_preview, eff_headers
 
@@ -3762,6 +3835,8 @@ class AgenticHTTPClient:
         json_body: Any = None,
         form_body: dict[str, Any] | None = None,
         raw_body: str | None = None,
+        raw_body_base64: str | None = None,
+        grpc_web_mode: str = "",
         files: Sequence[dict[str, Any]] | None = None,
         force: bool = False,
         save_session_as: str = "",
@@ -3820,6 +3895,8 @@ class AgenticHTTPClient:
             self.authenticate_actor(actor, force_login=False)
 
         if is_ws:
+            if raw_body_base64 is not None or str(grpc_web_mode or "").strip():
+                raise ValueError("raw_body_base64 and grpc_web_mode are not supported for WebSocket requests")
             ws_messages: list[str] | None = None
             ws_preview = ""
             if json_body is not None:
@@ -3848,6 +3925,7 @@ class AgenticHTTPClient:
                 raise ValueError("files must be a list of file objects")
             has_files = len(files) > 0
 
+        norm_grpc_mode = str(grpc_web_mode or "").strip().lower()
         body_bytes, body_preview, eff_extra_headers = self._prepare_request_body(
             norm_method=norm_method,
             session=session,
@@ -3858,14 +3936,27 @@ class AgenticHTTPClient:
             json_body=json_body,
             form_body=form_body,
             raw_body=raw_body,
+            raw_body_base64=raw_body_base64,
+            grpc_web_mode=norm_grpc_mode,
+        )
+        req_body_b64 = (
+            base64.b64encode(body_bytes).decode("ascii")
+            if (body_bytes is not None and (raw_body_base64 is not None or bool(norm_grpc_mode)))
+            else ""
         )
 
+        cache_body_digest = (
+            hashlib.sha256(body_bytes).hexdigest()
+            if (norm_method in {"GET", "HEAD"} and body_bytes is not None)
+            else ""
+        )
         cache_key = (
             actor,
             norm_method,
             _canonical_url(clean_url),
             tuple(sorted((k.lower(), v) for k, v in eff_extra_headers.items())),
             bool(follow_redirects),
+            cache_body_digest,
         )
         if norm_method in {"GET", "HEAD"} and not force and not save_session_as:
             with self._lock:
@@ -3886,6 +3977,7 @@ class AgenticHTTPClient:
             headers=req_headers,
             body_bytes=body_bytes,
             body_preview=body_preview,
+            request_body_base64=req_body_b64,
             save_session_as=save_session_as,
             auth_header_name=clean_auth_header_name,
             out_cookies=hop_cookies if follow_redirects else None,
@@ -3920,6 +4012,13 @@ class AgenticHTTPClient:
                     json_body=json_body,
                     form_body=form_body,
                     raw_body=raw_body,
+                    raw_body_base64=raw_body_base64,
+                    grpc_web_mode=norm_grpc_mode,
+                )
+                req_body_b64 = (
+                    base64.b64encode(body_bytes).decode("ascii")
+                    if (body_bytes is not None and (raw_body_base64 is not None or bool(norm_grpc_mode)))
+                    else ""
                 )
                 req_headers = session.build_headers(norm_method, eff_extra_headers, target_url=clean_url)
                 hop_cookies.clear()
@@ -3932,6 +4031,7 @@ class AgenticHTTPClient:
                     headers=req_headers,
                     body_bytes=body_bytes,
                     body_preview=body_preview,
+                    request_body_base64=req_body_b64,
                     out_cookies=hop_cookies if follow_redirects else None,
                     skip_rate_limit=bool(concurrent_burst),
                     is_burst=bool(concurrent_burst),
@@ -3957,6 +4057,13 @@ class AgenticHTTPClient:
                 json_body=json_body,
                 form_body=form_body,
                 raw_body=raw_body,
+                raw_body_base64=raw_body_base64,
+                grpc_web_mode=norm_grpc_mode,
+            )
+            req_body_b64 = (
+                base64.b64encode(body_bytes).decode("ascii")
+                if (body_bytes is not None and (raw_body_base64 is not None or bool(norm_grpc_mode)))
+                else ""
             )
             req_headers = session.build_headers(norm_method, eff_extra_headers, target_url=clean_url)
             hop_cookies.clear()
@@ -3969,6 +4076,7 @@ class AgenticHTTPClient:
                 headers=req_headers,
                 body_bytes=body_bytes,
                 body_preview=body_preview,
+                request_body_base64=req_body_b64,
                 out_cookies=hop_cookies if follow_redirects else None,
                 skip_rate_limit=bool(concurrent_burst),
                 is_burst=bool(concurrent_burst),
@@ -3980,6 +4088,7 @@ class AgenticHTTPClient:
             cur_url = clean_url
             cur_body_bytes = body_bytes
             cur_body_preview = body_preview
+            cur_req_body_b64 = req_body_b64
             cur_extra_headers = dict(eff_extra_headers)
             for _ in range(_MAX_REDIRECTS):
                 status_code = int(receipt["status"])
@@ -4028,6 +4137,7 @@ class AgenticHTTPClient:
                     cur_method = "GET"
                     cur_body_bytes = None
                     cur_body_preview = ""
+                    cur_req_body_b64 = ""
                     cur_extra_headers = {
                         k: v for k, v in cur_extra_headers.items()
                         if k.lower() not in {"content-type", "content-length"}
@@ -4036,6 +4146,7 @@ class AgenticHTTPClient:
                     cur_method = "GET"
                     cur_body_bytes = None
                     cur_body_preview = ""
+                    cur_req_body_b64 = ""
                     cur_extra_headers = {
                         k: v for k, v in cur_extra_headers.items()
                         if k.lower() not in {"content-type", "content-length"}
@@ -4088,6 +4199,7 @@ class AgenticHTTPClient:
                     headers=hop_headers,
                     body_bytes=cur_body_bytes,
                     body_preview=cur_body_preview,
+                    request_body_base64=cur_req_body_b64,
                     save_session_as=save_session_as,
                     auth_header_name=clean_auth_header_name,
                     out_cookies=new_hop_cookies,

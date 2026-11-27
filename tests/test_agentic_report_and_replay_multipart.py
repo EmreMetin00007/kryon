@@ -518,5 +518,5 @@ def test_replay_as_multipart_guard_and_safe_overrides(tmp_path: Path) -> None:
 
 def test_tool_schemas_invariants_preserved() -> None:
     serialized = json.dumps(TOOL_SCHEMAS, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-    assert len(TOOL_SCHEMAS) == 11
+    assert len(TOOL_SCHEMAS) == 12
     assert len(serialized) <= 16_384

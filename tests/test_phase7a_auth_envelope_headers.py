@@ -518,8 +518,8 @@ def test_save_session_as_envelopes_priority_and_redaction_live(tmp_path: Path) -
 
 
 def test_tool_dispatcher_http_request_auth_header_openapi_and_replay_hygiene(tmp_path: Path) -> None:
-    # 1. TOOL_SCHEMAS invariants remain intact (11 tools, <= 16384 bytes, <= 140 char descriptions)
-    assert len(TOOL_SCHEMAS) == 11
+    # 1. TOOL_SCHEMAS invariants remain intact (12 tools, <= 16384 bytes, <= 140 char descriptions)
+    assert len(TOOL_SCHEMAS) == 12
     serialized = json.dumps(TOOL_SCHEMAS, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
     assert len(serialized) <= 16_384
     http_tool = next(t["function"] for t in TOOL_SCHEMAS if t["function"]["name"] == "http_request")

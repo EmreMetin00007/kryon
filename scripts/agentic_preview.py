@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from difflib import SequenceMatcher
+import inspect
 import json
 from pathlib import Path
 import re
@@ -45,6 +46,18 @@ _CLIENT_LOGIC_LOADED = False
 _BUILD_CLIENT_LOGIC_MAP: Callable[..., dict[str, Any]] | None = None
 _POSTMAN_VAR_PREFIX_RE = re.compile(r"^\{\{[^}]+\}\}(/.*)$")
 _SIGNING_HEADER_RE = re.compile(r"(?:sign|signature|hmac|digest)", re.I)
+
+
+def _supported_kwargs(fn: Any, candidate_kwargs: dict[str, Any]) -> dict[str, Any]:
+    """Filter optional kwargs against ``fn``'s signature for cross-version safety."""
+    try:
+        sig = inspect.signature(fn)
+    except (TypeError, ValueError):
+        return {}
+    params = sig.parameters
+    if any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()):
+        return dict(candidate_kwargs)
+    return {k: v for k, v in candidate_kwargs.items() if k in params}
 
 
 def _load_build_client_logic_map() -> Callable[..., dict[str, Any]] | None:
@@ -834,7 +847,8 @@ def _extract_js_client_logic(
     if build_fn is None:
         return [], [], {}
     try:
-        cl_map = build_fn(body, parser="static")
+        extra_kwargs = _supported_kwargs(build_fn, {"source_url": url})
+        cl_map = build_fn(body, parser="static", **extra_kwargs)
     except Exception:
         return [], [], {}
     if not isinstance(cl_map, dict):
@@ -961,6 +975,59 @@ def _extract_js_client_logic(
             label = f"{code}: {detail}" if (code and detail) else (code or detail)
             _add_unique(coverage_gaps, label[:160], 20)
 
+    raw_opacity = cl_map.get("opacity_assessment")
+    compact_opacity: dict[str, Any] = {}
+    if isinstance(raw_opacity, dict):
+        op_status = str(raw_opacity.get("status") or "").strip()
+        op_wasm_refs = [
+            str(ref)[:200]
+            for ref in (raw_opacity.get("wasm_refs") or [])
+            if str(ref or "").strip()
+        ][:10]
+        op_signals = [
+            str(sig)[:64]
+            for sig in (raw_opacity.get("signals") or [])
+            if str(sig or "").strip()
+        ][:12]
+        op_regions: list[dict[str, Any]] = []
+        for reg in (raw_opacity.get("opaque_regions") or [])[:5]:
+            if not isinstance(reg, dict):
+                continue
+            c_start = max(0, int(reg.get("char_start") or 0))
+            c_end = max(0, int(reg.get("char_end") or 0))
+            if c_end <= c_start:
+                continue
+            op_regions.append({
+                "region_id": str(reg.get("region_id") or "")[:64],
+                "anchor": str(reg.get("anchor") or "")[:64],
+                "char_start": c_start,
+                "char_end": c_end,
+                "reason": str(reg.get("reason") or "")[:80],
+                "recommended_action": str(
+                    reg.get("recommended_action") or "llm_reverse_engineer_slice"
+                )[:64],
+            })
+        op_gaps: list[dict[str, Any]] = [
+            dict(g)
+            for g in (raw_opacity.get("coverage_gaps") or [])
+            if isinstance(g, dict)
+        ][:5]
+        for gap in op_gaps:
+            code = str(gap.get("code") or gap.get("reason_code") or "").strip()
+            detail = str(gap.get("detail") or gap.get("message") or "").strip()
+            label = f"{code}: {detail}" if (code and detail) else (code or detail)
+            _add_unique(coverage_gaps, label[:160], 20)
+
+        if op_status == "opaque_escalation_candidate" or op_wasm_refs:
+            compact_opacity = {
+                "status": op_status or "opaque_escalation_candidate",
+                "opacity_score": round(float(raw_opacity.get("opacity_score") or 0.0), 2),
+                "signals": op_signals,
+                "wasm_refs": op_wasm_refs,
+                "opaque_regions": op_regions,
+                "coverage_gaps": op_gaps,
+            }
+
     if not any((
         compact_endpoints,
         signing_indicators,
@@ -968,6 +1035,7 @@ def _extract_js_client_logic(
         storage_keys,
         source_maps,
         coverage_gaps,
+        compact_opacity,
     )):
         return merged_calls, merged_links, {}
 
@@ -979,7 +1047,120 @@ def _extract_js_client_logic(
         "source_maps": source_maps,
         "coverage_gaps": coverage_gaps,
     }
+    if compact_opacity:
+        client_logic["opacity_assessment"] = compact_opacity
     return merged_calls, merged_links, client_logic
+
+
+def _enrich_opaque_regions(
+    client_logic: dict[str, Any],
+    receipt_id: str,
+    url: str,
+    *,
+    offset_shift: int = 0,
+    max_end: int | None = None,
+    source_type: str = "",
+) -> None:
+    """Attach receipt_id and url (and optional offset shift / source_type) to opaque_regions."""
+    if not isinstance(client_logic, dict):
+        return
+    opacity = client_logic.get("opacity_assessment")
+    if not isinstance(opacity, dict):
+        return
+    regions = opacity.get("opaque_regions")
+    if not isinstance(regions, list):
+        return
+    for reg in regions:
+        if not isinstance(reg, dict):
+            continue
+        if offset_shift > 0:
+            c_start = max(0, int(reg.get("char_start") or 0) + offset_shift)
+            c_end = max(0, int(reg.get("char_end") or 0) + offset_shift)
+            if max_end is not None:
+                c_start = min(c_start, max_end)
+                c_end = min(c_end, max_end)
+            reg["char_start"] = c_start
+            reg["char_end"] = c_end
+        reg["receipt_id"] = receipt_id
+        reg["url"] = url
+        if source_type:
+            reg["source_type"] = source_type
+
+
+def _merge_client_logic(existing: dict[str, Any], addition: dict[str, Any]) -> dict[str, Any]:
+    """Merge two compact client_logic dicts without duplicating endpoints, gaps, or slices."""
+    if not existing:
+        return dict(addition)
+    merged = dict(existing)
+    seen_ep = {
+        (str(e.get("method") or "GET"), str(e.get("path") or ""))
+        for e in (merged.get("endpoints") or [])
+        if isinstance(e, dict)
+    }
+    eps = list(merged.get("endpoints") or [])
+    for ep in addition.get("endpoints") or []:
+        if isinstance(ep, dict):
+            key = (str(ep.get("method") or "GET"), str(ep.get("path") or ""))
+            if key not in seen_ep and len(eps) < 40:
+                seen_ep.add(key)
+                eps.append(ep)
+    merged["endpoints"] = eps
+
+    for list_key, cap in (
+        ("signing_indicators", 20),
+        ("validation_fields", 30),
+        ("storage_keys", 30),
+        ("source_maps", 20),
+        ("coverage_gaps", 20),
+    ):
+        cur = list(merged.get(list_key) or [])
+        for val in addition.get(list_key) or []:
+            if val not in cur and len(cur) < cap:
+                cur.append(val)
+        merged[list_key] = cur
+
+    add_op = addition.get("opacity_assessment")
+    if isinstance(add_op, dict) and add_op:
+        cur_op = merged.get("opacity_assessment")
+        if not isinstance(cur_op, dict) or not cur_op:
+            merged["opacity_assessment"] = dict(add_op)
+        else:
+            op_merged = dict(cur_op)
+            op_merged["opacity_score"] = max(
+                float(cur_op.get("opacity_score") or 0.0),
+                float(add_op.get("opacity_score") or 0.0),
+            )
+            for k, cap in (("signals", 12), ("wasm_refs", 10)):
+                vals = list(op_merged.get(k) or [])
+                for v in add_op.get(k) or []:
+                    if v not in vals and len(vals) < cap:
+                        vals.append(v)
+                op_merged[k] = vals
+            regs = list(op_merged.get("opaque_regions") or [])
+            seen_reg = {
+                (str(r.get("receipt_id") or ""), int(r.get("char_start") or 0), int(r.get("char_end") or 0))
+                for r in regs
+                if isinstance(r, dict)
+            }
+            for r in add_op.get("opaque_regions") or []:
+                if isinstance(r, dict):
+                    rk = (str(r.get("receipt_id") or ""), int(r.get("char_start") or 0), int(r.get("char_end") or 0))
+                    if rk not in seen_reg and len(regs) < 5:
+                        seen_reg.add(rk)
+                        regs.append(r)
+            op_merged["opaque_regions"] = regs
+            gaps = list(op_merged.get("coverage_gaps") or [])
+            seen_g = {str(g.get("code") or "") for g in gaps if isinstance(g, dict)}
+            for g in add_op.get("coverage_gaps") or []:
+                if isinstance(g, dict):
+                    gc = str(g.get("code") or "")
+                    if (not gc or gc not in seen_g) and len(gaps) < 5:
+                        if gc:
+                            seen_g.add(gc)
+                        gaps.append(g)
+            op_merged["coverage_gaps"] = gaps
+            merged["opacity_assessment"] = op_merged
+    return merged
 
 
 def _extract_surface_summary(
@@ -1104,7 +1285,11 @@ def _extract_surface_summary(
                     forms.append(rec)
             elif not _is_skipped_surface_url(rec.get("url", ""), base_url=base):
                 links.append(rec)
+        inline_search_pos = 0
         for script in extract_inline_scripts(body):
+            script_pos = body.find(script, inline_search_pos)
+            if script_pos >= 0:
+                inline_search_pos = script_pos + len(script)
             script_low = script.lower() if sibling_origins else ""
             base_jcs = [
                 c for c in extract_js_calls(script, effective_doc_url, allow_subdomains=is_multi_origin, limit=40)
@@ -1135,6 +1320,37 @@ def _extract_surface_summary(
                 for cand_u in find_spec_urls(script, sib_orig, allow_subdomains=True):
                     if _explicit_sibling_url_present(script_low, cand_u, sib_netloc) and not _is_skipped_surface_url(cand_u, base_url=base):
                         spec_urls.append(cand_u)
+            if len(script) > 1000:
+                in_calls, in_links, in_cl = _extract_js_client_logic(
+                    script,
+                    url,
+                    base_url=base,
+                    scope_guard=scope_guard,
+                )
+                in_opacity = in_cl.get("opacity_assessment") if isinstance(in_cl, dict) else None
+                if isinstance(in_opacity, dict) and (
+                    in_opacity.get("status") == "opaque_escalation_candidate"
+                    or in_opacity.get("wasm_refs")
+                ):
+                    _enrich_opaque_regions(
+                        in_cl,
+                        str(receipt.get("receipt_id") or ""),
+                        url,
+                        offset_shift=(script_pos if script_pos >= 0 else 0),
+                        max_end=len(body),
+                        source_type="inline_script",
+                    )
+                    seen_js_keys = {
+                        (str(c.get("method") or "GET").upper(), str(c.get("url") or ""))
+                        for c in js_calls
+                    }
+                    for call in in_calls:
+                        ckey = (str(call.get("method") or "GET").upper(), str(call.get("url") or ""))
+                        if ckey not in seen_js_keys:
+                            seen_js_keys.add(ckey)
+                            js_calls.append(call)
+                    links.extend(in_links)
+                    client_logic = _merge_client_logic(client_logic, in_cl)
         # Also capture concrete UUID/resource IDs appearing inside HTML links/attributes.
         seen_html_ids = {(c["field"], c["value"]) for c in candidate_ids}
         for link_item in links:
@@ -1144,7 +1360,7 @@ def _extract_surface_summary(
                         seen_html_ids.add(("path_id", seg))
                         candidate_ids.append({"field": "path_id", "value": seg})
 
-    if "javascript" in ctype or "ecmascript" in ctype or urlsplit(url).path.lower().endswith((".js", ".mjs")):
+    if "javascript" in ctype or "ecmascript" in ctype or urlsplit(url).path.lower().endswith((".js", ".mjs", ".cjs")):
         base_jcs = [
             c for c in extract_js_calls(body, origin_base, allow_subdomains=is_multi_origin, limit=80)
             if not _is_skipped_surface_url(c.get("url", ""), base_url=base)
@@ -1204,12 +1420,14 @@ def _extract_surface_summary(
             for cand_u in find_spec_urls(body, sib_orig, allow_subdomains=True):
                 if _explicit_sibling_url_present(body_low, cand_u, sib_netloc) and not _is_skipped_surface_url(cand_u, base_url=base):
                     spec_urls.append(cand_u)
-        cl_calls, cl_links, client_logic = _extract_js_client_logic(
+        cl_calls, cl_links, js_cl = _extract_js_client_logic(
             body,
             url,
             base_url=base,
             scope_guard=scope_guard,
         )
+        _enrich_opaque_regions(js_cl, str(receipt.get("receipt_id") or ""), url)
+        client_logic = _merge_client_logic(client_logic, js_cl)
         seen_js_call_keys = {
             (str(c.get("method") or "GET").upper(), str(c.get("url") or ""))
             for c in js_calls
@@ -1359,7 +1577,7 @@ def _build_surface_hints(
     )
     ctype = (receipt.get("content_type") or "").lower()
     url_path = urlsplit(str(receipt.get("url") or "")).path.lower()
-    is_js = "javascript" in ctype or "ecmascript" in ctype or url_path.endswith((".js", ".mjs"))
+    is_js = "javascript" in ctype or "ecmascript" in ctype or url_path.endswith((".js", ".mjs", ".cjs"))
 
     def _short_same_origin(raw_u: str) -> tuple[str, str, bool]:
         raw_clean = str(raw_u or "").strip()

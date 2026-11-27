@@ -48,6 +48,7 @@ _BANNER_MARKERS = (
     "\n[LOOP GUARD]",
     "\n[BUDGET-WRAPUP]",
     "\n[URGENT]",
+    "\n[SHARED-FACTS",
 )
 CHARS_PER_TOKEN = 4
 _PROMPT_SOFT_CHAR_LIMIT = 21_000
@@ -217,16 +218,30 @@ def build_system_prompt(
     )
 
 
+def _find_trailing_banner_start(content: str) -> int:
+    """Return index where a trailing host banner starts, ignoring untrusted target body text."""
+    state_idx = content.find("\n[STATE] ")
+    sf_search_start = 0
+    end_idx = content.rfind(_UNTRUSTED_END)
+    if end_idx != -1:
+        sf_search_start = end_idx + len(_UNTRUSTED_END)
+    elif _UNTRUSTED_START in content:
+        sf_search_start = -1
+    sf_idx = content.find("\n[SHARED-FACTS", sf_search_start) if sf_search_start >= 0 else -1
+    candidates = [idx for idx in (state_idx, sf_idx) if idx != -1]
+    return min(candidates) if candidates else -1
+
+
 def _strip_untrusted_markers(content: str) -> str:
     text = content.strip()
     if text.startswith(_UNTRUSTED_START):
         text = text[len(_UNTRUSTED_START):].lstrip()
     if text.endswith(_UNTRUSTED_END):
         text = text[:-len(_UNTRUSTED_END)].rstrip()
-    # Strip trailing [STATE] / [NOTEBOOK] / [URGENT] banner if attached to the tool message.
-    state_idx = text.find("\n[STATE] ")
-    if state_idx != -1:
-        text = text[:state_idx].rstrip()
+    # Strip trailing [STATE] / [NOTEBOOK] / [SHARED-FACTS] / [URGENT] banner if attached to the tool message.
+    banner_idx = _find_trailing_banner_start(text)
+    if banner_idx != -1:
+        text = text[:banner_idx].rstrip()
         if text.endswith(_UNTRUSTED_END):
             text = text[:-len(_UNTRUSTED_END)].rstrip()
     return text
@@ -840,6 +855,13 @@ def _collapse_tool_content(content: str) -> str:
                 return f"[callback {' '.join(cb_parts)}]"
             if "surface_notes" in obj and "hypotheses" in obj:
                 return f"[notebook len={len(content)} (pinned in [NOTEBOOK])]"
+            if obj.get("published") is True and isinstance(obj.get("fact"), dict):
+                fact_obj = obj["fact"]
+                return (
+                    f"[shared_fact id={_one_line(fact_obj.get('fact_id'), 24)} "
+                    f"type={_one_line(fact_obj.get('fact_type'), 32)} "
+                    f"summary={_one_line(fact_obj.get('summary'), 90)}]"
+                )
 
     rid_match = _RECEIPT_ID_RE.search(content)
     rid = rid_match.group(0) if rid_match else ""
@@ -856,10 +878,10 @@ def _collapse_tool_content(content: str) -> str:
 
 
 def _strip_state_banner(content: str) -> str:
-    """Remove trailing [STATE] / [NOTEBOOK] / [SURFACE FRONTIER] banner from non-final messages."""
-    state_idx = content.find("\n[STATE] ")
-    if state_idx != -1:
-        return content[:state_idx].rstrip()
+    """Remove trailing [STATE] / [NOTEBOOK] / [SURFACE FRONTIER] / [SHARED-FACTS] banner from non-final messages."""
+    banner_idx = _find_trailing_banner_start(content)
+    if banner_idx != -1:
+        return content[:banner_idx].rstrip()
     return content
 
 
@@ -867,11 +889,11 @@ def _truncate_recent_tool_content(content: str, max_chars: int, *, preserve_bann
     """Bound a recent tool output to `max_chars` without losing readable JSON/preview structure."""
     banner = ""
     base_text = content
-    state_idx = content.find("\n[STATE] ")
-    if state_idx != -1:
-        base_text = content[:state_idx].rstrip()
+    banner_idx = _find_trailing_banner_start(content)
+    if banner_idx != -1:
+        base_text = content[:banner_idx].rstrip()
         if preserve_banner:
-            banner = content[state_idx:]
+            banner = content[banner_idx:]
 
     if len(base_text) <= max_chars:
         return base_text + banner
@@ -911,10 +933,23 @@ def _build_rolled_history_summary(
     older_groups: list[list[dict[str, Any]]],
     *,
     max_chars: int = 2000,
+    shared_facts_snapshot: str = "",
 ) -> str:
     """Roll older completed turns into a terse, deduplicated 1-line-per-receipt summary block."""
-    if not older_groups or max_chars <= 0:
+    snap = str(shared_facts_snapshot or "").strip()
+    if (not older_groups and not snap) or max_chars <= 0:
         return ""
+    if not older_groups:
+        return "\n" + snap[:max_chars]
+
+    eff_snap = ""
+    hist_max_chars = max_chars
+    if snap:
+        snap_cap = max(0, max_chars - 240) if max_chars > 320 else max(0, max_chars // 2)
+        eff_snap = snap[:snap_cap].rstrip() if len(snap) > snap_cap else snap
+        if eff_snap:
+            hist_max_chars = max(160, max_chars - len(eff_snap) - 1)
+
     lines: list[str] = []
     seen_lines: set[str] = set()
     seen_receipt_kinds: set[tuple[str, str]] = set()
@@ -948,12 +983,14 @@ def _build_rolled_history_summary(
                     seen_lines.add(line)
                     lines.append(line)
     if not lines:
-        return f"\n[COMPACTED HISTORY: {len(older_groups)} earlier turns]"
+        hist_text = f"\n[COMPACTED HISTORY: {len(older_groups)} earlier turns]"
+        return f"{hist_text}\n{eff_snap}" if eff_snap else hist_text
 
     header = f"\n[COMPACTED HISTORY: {len(older_groups)} earlier turns, {len(lines)} distinct receipt/surface entries]\n"
-    avail = max(160, max_chars - len(header))
+    avail = max(160, hist_max_chars - len(header))
     if sum(len(x) + 1 for x in lines) <= avail:
-        return header + "\n".join(lines)
+        hist_text = header + "\n".join(lines)
+        return f"{hist_text}\n{eff_snap}" if eff_snap else hist_text
 
     # Keep the first 3 discovery lines and as many most-recent lines as fit within `avail`.
     head_lines = lines[:3]
@@ -969,7 +1006,8 @@ def _build_rolled_history_summary(
     tail_lines.reverse()
     omitted = max(0, len(lines) - len(head_lines) - len(tail_lines))
     mid = [f"... ({omitted} intermediate receipts omitted; see [SURFACE FRONTIER] & [NOTEBOOK]) ..."] if omitted else []
-    return header + "\n".join([*head_lines, *mid, *tail_lines])
+    hist_text = header + "\n".join([*head_lines, *mid, *tail_lines])
+    return f"{hist_text}\n{eff_snap}" if eff_snap else hist_text
 
 
 def _turn_cutoff_index(messages: list[dict[str, Any]], keep_recent_turns: int) -> int:
@@ -1002,6 +1040,7 @@ def compact_messages_for_context(
     max_recent_tool_chars: int | None = None,
     max_history_summary_chars: int = 2000,
     roll_older_turns: bool = True,
+    shared_facts_snapshot: str = "",
 ) -> list[dict[str, Any]]:
     """Return a context-hygienic copy of messages keeping only recent turns verbatim (~8-16 KB total)."""
     if len(messages) <= 2:
@@ -1050,7 +1089,11 @@ def compact_messages_for_context(
     if roll_older_turns and len(turn_groups) > eff_keep:
         older_groups = turn_groups[:-eff_keep]
         recent_groups = turn_groups[-eff_keep:]
-        rolled_text = _build_rolled_history_summary(older_groups, max_chars=eff_hist_chars)
+        rolled_text = _build_rolled_history_summary(
+            older_groups,
+            max_chars=eff_hist_chars,
+            shared_facts_snapshot=shared_facts_snapshot,
+        )
         init_user_msg["content"] = str(init_user_msg.get("content") or "") + rolled_text
         compacted: list[dict[str, Any]] = [sys_msg, init_user_msg]
     else:

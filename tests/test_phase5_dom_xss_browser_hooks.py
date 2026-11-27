@@ -205,7 +205,7 @@ def _unwrap_untrusted(raw: str) -> dict[str, Any]:
 
 
 def test_browser_crawl_schema_exposes_dom_verify_and_preserves_11_tools() -> None:
-    assert len(TOOL_SCHEMAS) == 11
+    assert len(TOOL_SCHEMAS) == 12
     browser_tool = next(
         t["function"] for t in TOOL_SCHEMAS if t["function"]["name"] == "browser_crawl"
     )

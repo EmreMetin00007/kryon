@@ -66,7 +66,7 @@ def test_tool_schemas_include_phase_b_tools_and_stay_concise() -> None:
     names = [t["function"]["name"] for t in TOOL_SCHEMAS]
     assert "browser_crawl" in names
     assert "analyze_token" in names
-    assert len(names) == 11
+    assert len(names) == 12
     for tool in TOOL_SCHEMAS:
         assert len(tool["function"]["description"]) <= 140
 
