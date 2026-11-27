@@ -6,11 +6,16 @@ import json
 from pathlib import Path
 import re
 import sys
-from typing import Any, Callable
+from typing import Any, Callable, Sequence
 from urllib.parse import urljoin, urlsplit
 
 from agentic_http import is_static_asset_url
-from agentic_surface import is_non_endpoint_source_path
+from agentic_surface import (
+    _collect_authorized_sibling_origins,
+    _explicit_sibling_url_present,
+    is_non_endpoint_source_path,
+)
+from target_bootstrap import ScopeGuard
 
 _STANDALONE_SCRIPT_EXTS = (".js", ".mjs", ".cjs")
 _STANDALONE_API_PREFIX_RE = re.compile(r"(?:^|/)(?:api(?:/v\d+)?|graphql|rest|rpc)(?:/|$)", re.I)
@@ -369,16 +374,153 @@ def _compute_structural_diff(baseline: dict[str, Any], current: dict[str, Any]) 
     return diff
 
 
-def _extract_openapi_operations(spec: dict[str, Any], base_url: str) -> list[dict[str, Any]]:
+def _build_preview_scope_guard(
+    base_url: str,
+    in_scope_assets: Sequence[str] = (),
+    out_of_scope_assets: Sequence[str] = (),
+) -> ScopeGuard | None:
+    """Build a ScopeGuard when multi-origin assets are configured for preview extraction."""
+    if not str(base_url or "").strip():
+        return None
+    in_assets = tuple(str(x).strip() for x in (in_scope_assets or ()) if str(x or "").strip())
+    out_assets = tuple(str(x).strip() for x in (out_of_scope_assets or ()) if str(x or "").strip())
+    if not in_assets and not out_assets:
+        return None
+    try:
+        return ScopeGuard(base_url, in_scope_assets=in_assets, out_of_scope_assets=out_assets)
+    except ValueError:
+        return None
+
+
+def _is_origin_match_or_in_scope(
+    raw_url: str,
+    *,
+    base_url: str,
+    scope_guard: ScopeGuard | None = None,
+) -> tuple[bool, bool]:
+    """Return ``(is_in_scope, is_primary_origin)`` for ``raw_url`` relative to ``base_url`` and ``scope_guard``."""
+    raw = str(raw_url or "").strip()
+    if not raw:
+        return False, False
+    parsed_u = urlsplit(raw)
+    parsed_base = urlsplit(str(base_url or "").strip())
+    if not parsed_u.netloc:
+        if scope_guard is not None:
+            try:
+                scope_guard.check_url(raw)
+            except ValueError:
+                return False, False
+        return True, True
+    if parsed_u.scheme.lower() not in {"http", "https"}:
+        return False, False
+    u_port = parsed_u.port or (443 if parsed_u.scheme.lower() == "https" else 80)
+    b_port = parsed_base.port or (443 if parsed_base.scheme.lower() == "https" else 80)
+    is_primary = (
+        parsed_u.scheme.lower() == parsed_base.scheme.lower()
+        and (parsed_u.hostname or "").lower() == (parsed_base.hostname or "").lower()
+        and u_port == b_port
+    )
+    if is_primary:
+        if scope_guard is not None:
+            try:
+                scope_guard.check_url(raw)
+            except ValueError:
+                return False, True
+        return True, True
+    if scope_guard is not None:
+        try:
+            scope_guard.check_url(raw)
+            return True, False
+        except ValueError:
+            return False, False
+    return False, False
+
+
+def _resolve_openapi_effective_base(
+    spec: dict[str, Any],
+    base_url: str,
+    *,
+    scope_guard: ScopeGuard | None = None,
+) -> str:
+    """Resolve OpenAPI 3 ``servers[0].url`` or Swagger 2 ``host`` + ``basePath`` while enforcing scope."""
+    clean_base = str(base_url or "").strip().rstrip("/")
+    servers = spec.get("servers")
+    if isinstance(servers, list):
+        for srv in servers:
+            if not isinstance(srv, dict):
+                continue
+            srv_url = str(srv.get("url") or "").strip()
+            if not srv_url:
+                continue
+            if srv_url.lower().startswith(("http://", "https://")):
+                parsed_srv = urlsplit(srv_url)
+                if "{" in parsed_srv.netloc or not parsed_srv.netloc:
+                    continue
+                in_scope, _ = _is_origin_match_or_in_scope(
+                    srv_url,
+                    base_url=base_url,
+                    scope_guard=scope_guard,
+                )
+                if in_scope:
+                    return srv_url.rstrip("/")
+                srv_path = (parsed_srv.path or "").strip()
+                if srv_path and srv_path != "/" and "{" not in srv_path:
+                    return clean_base + "/" + srv_path.strip("/")
+                break
+            if srv_url.startswith("/") and "{" not in srv_url:
+                srv_path = srv_url.strip("/")
+                return f"{clean_base}/{srv_path}" if srv_path else clean_base
+
+    raw_host = str(spec.get("host") or "").strip()
+    raw_bp = str(spec.get("basePath") or "").strip()
+    bp_clean = f"/{raw_bp.strip('/')}" if raw_bp.strip("/") and "{" not in raw_bp else ""
+    if raw_host and "{" not in raw_host:
+        raw_schemes = spec.get("schemes")
+        schemes = (
+            [str(s).strip().lower() for s in raw_schemes if str(s).strip().lower() in {"http", "https"}]
+            if isinstance(raw_schemes, list)
+            else []
+        )
+        base_scheme = (urlsplit(base_url).scheme or "https").lower()
+        chosen_scheme = "https" if "https" in schemes else (schemes[0] if schemes else base_scheme)
+        cand = f"{chosen_scheme}://{raw_host}{bp_clean}"
+        in_scope, _ = _is_origin_match_or_in_scope(cand, base_url=base_url, scope_guard=scope_guard)
+        if in_scope:
+            return cand.rstrip("/")
+    if bp_clean:
+        return f"{clean_base}{bp_clean}"
+    return clean_base
+
+
+def _extract_openapi_operations(
+    spec: dict[str, Any],
+    base_url: str,
+    *,
+    scope_guard: ScopeGuard | None = None,
+) -> list[dict[str, Any]]:
     """Extract normalized endpoints, methods, params, and body fields from OpenAPI 2/3 JSON."""
     resolver = LocalSchema(spec)
     paths = spec.get("paths")
     if not isinstance(paths, dict):
         return []
+    eff_base = _resolve_openapi_effective_base(spec, base_url, scope_guard=scope_guard)
+    parsed_eff = urlsplit(eff_base)
+    eff_origin = f"{parsed_eff.scheme}://{parsed_eff.netloc}" if parsed_eff.netloc else eff_base
+    eff_prefix = (parsed_eff.path or "").rstrip("/")
     operations: list[dict[str, Any]] = []
     for raw_path, path_item in paths.items():
         if not isinstance(raw_path, str) or not isinstance(path_item, dict):
             continue
+        norm_raw = raw_path if raw_path.startswith("/") else "/" + raw_path
+        if eff_prefix and (
+            norm_raw.lower() == eff_prefix.lower()
+            or norm_raw.lower().startswith(eff_prefix.lower() + "/")
+        ):
+            op_url = eff_origin.rstrip("/") + norm_raw
+            op_path = norm_raw
+        else:
+            op_url = eff_base.rstrip("/") + norm_raw
+            op_path = (eff_prefix + norm_raw) if eff_prefix else norm_raw
         raw_path_params = path_item.get("parameters")
         path_params = raw_path_params if isinstance(raw_path_params, list) else []
         for method in ("get", "post", "put", "patch", "delete", "head", "options"):
@@ -386,14 +528,20 @@ def _extract_openapi_operations(spec: dict[str, Any], base_url: str) -> list[dic
             if not isinstance(op, dict):
                 continue
             params: list[dict[str, str]] = []
+            body_fields: list[str] = []
             raw_op_params = op.get("parameters")
             op_params = raw_op_params if isinstance(raw_op_params, list) else []
             for p in [*path_params, *op_params]:
                 resolved_p = resolver.resolve(p) if isinstance(p, dict) else {}
                 pname = resolved_p.get("name")
+                pin = str(resolved_p.get("in") or "query")
                 if pname:
-                    params.append({"name": str(pname), "in": str(resolved_p.get("in") or "query")})
-            body_fields: list[str] = []
+                    params.append({"name": str(pname), "in": pin})
+                if pin.lower() == "body" and isinstance(resolved_p.get("schema"), dict):
+                    body_schema = resolver.schema(resolved_p["schema"])
+                    props = body_schema.get("properties")
+                    if isinstance(props, dict):
+                        body_fields.extend(str(k) for k in props.keys())
             req_body = resolver.resolve(op.get("requestBody")) if isinstance(op.get("requestBody"), dict) else {}
             raw_content = req_body.get("content")
             content = raw_content if isinstance(raw_content, dict) else {}
@@ -405,8 +553,8 @@ def _extract_openapi_operations(spec: dict[str, Any], base_url: str) -> list[dic
                         body_fields.extend(str(k) for k in props.keys())
             operations.append({
                 "method": method.upper(),
-                "path": raw_path,
-                "url": base_url.rstrip("/") + (raw_path if raw_path.startswith("/") else "/" + raw_path),
+                "path": op_path,
+                "url": op_url,
                 "params": params[:25],
                 "body_fields": list(dict.fromkeys(body_fields))[:25],
                 "summary": str(op.get("summary") or "")[:120],
@@ -605,12 +753,13 @@ def _postman_body_keys(req_body: Any) -> list[str]:
 def _extract_postman_operations(
     parsed: dict[str, Any],
     base_url: str,
+    *,
+    scope_guard: ScopeGuard | None = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    """Recursively extract up to 60 operations and same-origin links from Postman v2.x JSON."""
+    """Recursively extract up to 60 operations and in-scope links from Postman v2.x JSON."""
     if not isinstance(parsed.get("info"), dict) or not isinstance(parsed.get("item"), list):
         return [], []
 
-    base_netloc = urlsplit(base_url).netloc
     ops: list[dict[str, Any]] = []
     same_origin_links: list[dict[str, Any]] = []
 
@@ -649,10 +798,14 @@ def _extract_postman_operations(
                 elif raw_url.startswith("/"):
                     resolved = urljoin(base_url.rstrip("/") + "/", raw_url)
                 else:
-                    parsed_u = urlsplit(raw_url)
-                    if parsed_u.scheme in {"http", "https"} and parsed_u.netloc and parsed_u.netloc == base_netloc:
+                    in_scope, _ = _is_origin_match_or_in_scope(
+                        raw_url,
+                        base_url=base_url,
+                        scope_guard=scope_guard,
+                    )
+                    if in_scope:
                         resolved = raw_url
-                if resolved and not _is_skipped_surface_url(resolved):
+                if resolved and not _is_skipped_surface_url(resolved, base_url=base_url):
                     same_origin_links.append({
                         "method": method,
                         "url": resolved,
@@ -670,6 +823,9 @@ def _extract_postman_operations(
 def _extract_js_client_logic(
     body: str,
     url: str,
+    *,
+    base_url: str = "",
+    scope_guard: ScopeGuard | None = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, Any]]:
     """Run passive kryon_core.js Client Logic Map on JS source without exposing secret values."""
     if not body or not body.strip():
@@ -683,6 +839,12 @@ def _extract_js_client_logic(
         return [], [], {}
     if not isinstance(cl_map, dict):
         return [], [], {}
+
+    resolve_base = url
+    if base_url:
+        doc_in_scope, _ = _is_origin_match_or_in_scope(url, base_url=base_url, scope_guard=scope_guard)
+        if not doc_in_scope:
+            resolve_base = base_url
 
     raw_endpoints: list[dict[str, Any]] = []
     for ep in cl_map.get("endpoints") or []:
@@ -714,10 +876,10 @@ def _extract_js_client_logic(
     seen_ep_keys: set[tuple[str, str]] = set()
     for ep in raw_endpoints:
         method = str(ep.get("method") or "GET").strip().upper() or "GET"
-        path = normalize_bare_hostport_url(str(ep.get("path") or "").strip()[:240], base=url)
+        path = normalize_bare_hostport_url(str(ep.get("path") or "").strip()[:240], base=resolve_base)
         if (
             is_third_party_sdk_static_route(path, sdk_context=sdk_ctx)
-            or is_port_in_path_artifact(path, origin_url=url)
+            or is_port_in_path_artifact(path, origin_url=resolve_base)
             or is_os_filesystem_path(path)
         ):
             continue
@@ -733,7 +895,7 @@ def _extract_js_client_logic(
             if _SIGNING_HEADER_RE.search(h):
                 _add_unique(signing_indicators, h, 20)
 
-        if path and not _is_skipped_surface_url(path, base_url=url) and (method, path) not in seen_ep_keys and len(compact_endpoints) < 40:
+        if path and not _is_skipped_surface_url(path, base_url=resolve_base) and (method, path) not in seen_ep_keys and len(compact_endpoints) < 40:
             seen_ep_keys.add((method, path))
             compact_endpoints.append({
                 "method": method,
@@ -745,10 +907,10 @@ def _extract_js_client_logic(
                 "runtime_required": runtime_required,
             })
 
-        if path.startswith(("/", "http://", "https://")) and not _is_skipped_surface_url(path, base_url=url):
-            resolved = urljoin(url, path)
+        if path.startswith(("/", "http://", "https://")) and not _is_skipped_surface_url(path, base_url=resolve_base):
+            resolved = urljoin(resolve_base, path)
             if (
-                not _is_skipped_surface_url(resolved, base_url=url)
+                not _is_skipped_surface_url(resolved, base_url=resolve_base)
                 and not is_third_party_sdk_static_route(resolved, sdk_context=sdk_ctx)
                 and not is_os_filesystem_path(resolved)
             ):
@@ -820,18 +982,44 @@ def _extract_js_client_logic(
     return merged_calls, merged_links, client_logic
 
 
-def _extract_surface_summary(receipt: dict[str, Any], base_url: str) -> dict[str, Any]:
+def _extract_surface_summary(
+    receipt: dict[str, Any],
+    base_url: str,
+    *,
+    in_scope_assets: Sequence[str] = (),
+    out_of_scope_assets: Sequence[str] = (),
+) -> dict[str, Any]:
     """Extract normalized attack-surface artifacts from a stored receipt at 0 HTTP cost."""
     body = receipt.get("body") or ""
     url = receipt["url"]
     ctype = (receipt.get("content_type") or "").lower()
     base = base_url
-    parsed_doc_url = urlsplit(str(url or ""))
-    origin_base = (
-        f"{parsed_doc_url.scheme}://{parsed_doc_url.netloc}/"
-        if parsed_doc_url.scheme in {"http", "https"} and parsed_doc_url.netloc
-        else base
+    scope_guard = _build_preview_scope_guard(
+        base,
+        in_scope_assets=in_scope_assets,
+        out_of_scope_assets=out_of_scope_assets,
     )
+    is_multi_origin = bool(scope_guard is not None and scope_guard.is_multi_origin)
+    parsed_doc_url = urlsplit(str(url or ""))
+    doc_in_scope, _ = _is_origin_match_or_in_scope(url, base_url=base, scope_guard=scope_guard)
+    if doc_in_scope and parsed_doc_url.scheme in {"http", "https"} and parsed_doc_url.netloc:
+        origin_base = f"{parsed_doc_url.scheme.lower()}://{parsed_doc_url.netloc.lower()}/"
+        effective_doc_url = url
+    else:
+        origin_base = base
+        doc_path = parsed_doc_url.path or "/"
+        effective_doc_url = urljoin(base, doc_path) if parsed_doc_url.netloc else url
+
+    sibling_origins = (
+        _collect_authorized_sibling_origins(
+            body,
+            primary_url=effective_doc_url,
+            scope_guard=scope_guard,
+        )
+        if is_multi_origin
+        else []
+    )
+    body_low = body.lower() if sibling_origins else ""
 
     links: list[dict[str, Any]] = []
     forms: list[dict[str, Any]] = []
@@ -856,9 +1044,17 @@ def _extract_surface_summary(receipt: dict[str, Any], base_url: str) -> dict[str
     elif redir_loc:
         hdr_input = {"Location": redir_loc}
     if hdr_input:
-        for rec in extract_http_headers(hdr_input, url):
+        for rec in extract_http_headers(hdr_input, effective_doc_url, allow_subdomains=is_multi_origin):
             if not _is_skipped_surface_url(rec.get("url", ""), base_url=base):
                 links.append(rec)
+        if is_multi_origin and scope_guard is not None:
+            hdr_text = json.dumps(hdr_input, ensure_ascii=False) if isinstance(hdr_input, dict) else str(hdr_input)
+            for sib_orig in _collect_authorized_sibling_origins(hdr_text, primary_url=effective_doc_url, scope_guard=scope_guard):
+                sib_netloc = urlsplit(sib_orig).netloc.lower()
+                for rec in extract_http_headers(hdr_input, sib_orig, allow_subdomains=True):
+                    rec_u = str(rec.get("url") or "")
+                    if _explicit_sibling_url_present(hdr_text.lower(), rec_u, sib_netloc) and not _is_skipped_surface_url(rec_u, base_url=base):
+                        links.append(rec)
 
     stripped = body.lstrip()
     if "json" in ctype or stripped.startswith(("{", "[")):
@@ -869,20 +1065,39 @@ def _extract_surface_summary(receipt: dict[str, Any], base_url: str) -> dict[str
         if isinstance(parsed, (dict, list)):
             if isinstance(parsed, dict):
                 if "paths" in parsed and ("openapi" in parsed or "swagger" in parsed):
-                    openapi_ops = _extract_openapi_operations(parsed, base)
+                    openapi_base = origin_base if doc_in_scope else base
+                    openapi_ops = _extract_openapi_operations(parsed, openapi_base, scope_guard=scope_guard)
                 graphql_ops = _extract_graphql_operations(parsed)
-                postman_ops, postman_links = _extract_postman_operations(parsed, base)
+                postman_ops, postman_links = _extract_postman_operations(parsed, base, scope_guard=scope_guard)
                 if postman_links:
                     links.extend(postman_links)
-            hypermedia, _ = extract_json_hypermedia(parsed, url, origin_url=base)
+            hm_origin = origin_base if is_multi_origin else base
+            hypermedia, _ = extract_json_hypermedia(parsed, effective_doc_url, origin_url=hm_origin)
+            for sib_orig in sibling_origins:
+                sib_hm, _ = extract_json_hypermedia(parsed, effective_doc_url, origin_url=sib_orig)
+                hypermedia.extend(sib_hm)
             for item in hypermedia:
                 if not _is_skipped_surface_url(item.get("url", ""), base_url=base):
                     links.append(item)
             candidate_ids = _extract_candidate_ids(parsed)
-            spec_urls = [u for u in find_spec_urls(body, url) if not _is_skipped_surface_url(u, base_url=base)]
+            spec_urls = [
+                u for u in find_spec_urls(body, effective_doc_url, allow_subdomains=is_multi_origin)
+                if not _is_skipped_surface_url(u, base_url=base)
+            ]
+            for sib_orig in sibling_origins:
+                sib_netloc = urlsplit(sib_orig).netloc.lower()
+                for cand_u in find_spec_urls(body, sib_orig, allow_subdomains=True):
+                    if _explicit_sibling_url_present(body_low, cand_u, sib_netloc) and not _is_skipped_surface_url(cand_u, base_url=base):
+                        spec_urls.append(cand_u)
 
     if "html" in ctype or "<html" in body[:512].lower() or "<form" in body.lower() or "href=" in body.lower():
-        for rec in extract_html(body, url):
+        html_recs = list(extract_html(body, effective_doc_url, allow_subdomains=is_multi_origin))
+        for sib_orig in sibling_origins:
+            sib_netloc = urlsplit(sib_orig).netloc.lower()
+            for rec in extract_html(body, sib_orig, allow_subdomains=True):
+                if _explicit_sibling_url_present(body_low, str(rec.get("url") or ""), sib_netloc):
+                    html_recs.append(rec)
+        for rec in html_recs:
             if rec.get("sources") == ["form"]:
                 form_url = rec.get("url", "")
                 if not is_non_endpoint_source_path(form_url) and not is_port_in_path_artifact(form_url, origin_url=base):
@@ -890,15 +1105,36 @@ def _extract_surface_summary(receipt: dict[str, Any], base_url: str) -> dict[str
             elif not _is_skipped_surface_url(rec.get("url", ""), base_url=base):
                 links.append(rec)
         for script in extract_inline_scripts(body):
-            js_calls.extend(
-                c for c in extract_js_calls(script, url, limit=40)
+            script_low = script.lower() if sibling_origins else ""
+            base_jcs = [
+                c for c in extract_js_calls(script, effective_doc_url, allow_subdomains=is_multi_origin, limit=40)
                 if not _is_skipped_surface_url(c.get("url", ""), base_url=base)
-            )
+            ]
+            base_jc_sigs = {(str(c.get("method") or "GET").upper(), urlsplit(str(c.get("url") or "")).path) for c in base_jcs}
+            js_calls.extend(base_jcs)
+            for sib_orig in sibling_origins:
+                sib_netloc = urlsplit(sib_orig).netloc.lower()
+                for c in extract_js_calls(script, sib_orig, allow_subdomains=True, limit=40):
+                    cu = str(c.get("url") or "")
+                    cp = urlsplit(cu)
+                    if cp.netloc.lower() != sib_netloc or _is_skipped_surface_url(cu, base_url=base):
+                        continue
+                    sig = (str(c.get("method") or "GET").upper(), cp.path)
+                    if sig not in base_jc_sigs or _explicit_sibling_url_present(script_low, cu, sib_netloc):
+                        js_calls.append(c)
             spa_routes.extend(
-                r for r in extract_spa_routes(script, origin_base, limit=40)
+                r for r in extract_spa_routes(script, origin_base, allow_subdomains=is_multi_origin, limit=40)
                 if not _is_skipped_surface_url(r.get("url", ""), base_url=base)
             )
-            spec_urls.extend(u for u in find_spec_urls(script, url) if not _is_skipped_surface_url(u, base_url=base))
+            spec_urls.extend(
+                u for u in find_spec_urls(script, effective_doc_url, allow_subdomains=is_multi_origin)
+                if not _is_skipped_surface_url(u, base_url=base)
+            )
+            for sib_orig in sibling_origins:
+                sib_netloc = urlsplit(sib_orig).netloc.lower()
+                for cand_u in find_spec_urls(script, sib_orig, allow_subdomains=True):
+                    if _explicit_sibling_url_present(script_low, cand_u, sib_netloc) and not _is_skipped_surface_url(cand_u, base_url=base):
+                        spec_urls.append(cand_u)
         # Also capture concrete UUID/resource IDs appearing inside HTML links/attributes.
         seen_html_ids = {(c["field"], c["value"]) for c in candidate_ids}
         for link_item in links:
@@ -909,13 +1145,37 @@ def _extract_surface_summary(receipt: dict[str, Any], base_url: str) -> dict[str
                         candidate_ids.append({"field": "path_id", "value": seg})
 
     if "javascript" in ctype or "ecmascript" in ctype or urlsplit(url).path.lower().endswith((".js", ".mjs")):
-        js_calls.extend(
-            c for c in extract_js_calls(body, origin_base, limit=80)
+        base_jcs = [
+            c for c in extract_js_calls(body, origin_base, allow_subdomains=is_multi_origin, limit=80)
             if not _is_skipped_surface_url(c.get("url", ""), base_url=base)
-        )
+        ]
+        base_jc_sigs = {(str(c.get("method") or "GET").upper(), urlsplit(str(c.get("url") or "")).path) for c in base_jcs}
+        js_calls.extend(base_jcs)
+        for sib_orig in sibling_origins:
+            sib_netloc = urlsplit(sib_orig).netloc.lower()
+            for c in extract_js_calls(body, sib_orig, allow_subdomains=True, limit=80):
+                cu = str(c.get("url") or "")
+                cp = urlsplit(cu)
+                if cp.netloc.lower() != sib_netloc or _is_skipped_surface_url(cu, base_url=base):
+                    continue
+                sig = (str(c.get("method") or "GET").upper(), cp.path)
+                if sig not in base_jc_sigs or _explicit_sibling_url_present(body_low, cu, sib_netloc):
+                    js_calls.append(c)
         kept_js_links = 0
         kept_script_links = 0
-        for rec in extract_js(body, origin_base, limit=480):
+        base_js_recs = extract_js(body, origin_base, allow_subdomains=is_multi_origin, limit=480)
+        base_js_paths = {urlsplit(str(r.get("url") or "")).path for r in base_js_recs}
+        all_js_recs = list(base_js_recs)
+        for sib_orig in sibling_origins:
+            sib_netloc = urlsplit(sib_orig).netloc.lower()
+            for rec in extract_js(body, sib_orig, allow_subdomains=True, limit=480):
+                rec_u = str(rec.get("url") or "")
+                rec_p = urlsplit(rec_u)
+                if rec_p.netloc.lower() != sib_netloc:
+                    continue
+                if rec_p.path not in base_js_paths or _explicit_sibling_url_present(body_low, rec_u, sib_netloc):
+                    all_js_recs.append(rec)
+        for rec in all_js_recs:
             rec_url = rec.get("url", "")
             if _is_skipped_surface_url(rec_url, base_url=base):
                 continue
@@ -929,14 +1189,27 @@ def _extract_surface_summary(receipt: dict[str, Any], base_url: str) -> dict[str
             if kept_js_links >= 60:
                 break
         kept_spa_routes = 0
-        for rec in extract_spa_routes(body, origin_base, limit=240):
+        for rec in extract_spa_routes(body, origin_base, allow_subdomains=is_multi_origin, limit=240):
             if not _is_skipped_surface_url(rec.get("url", ""), base_url=base):
                 spa_routes.append(rec)
                 kept_spa_routes += 1
                 if kept_spa_routes >= 60:
                     break
-        spec_urls.extend(u for u in find_spec_urls(body, url) if not _is_skipped_surface_url(u, base_url=base))
-        cl_calls, cl_links, client_logic = _extract_js_client_logic(body, url)
+        spec_urls.extend(
+            u for u in find_spec_urls(body, effective_doc_url, allow_subdomains=is_multi_origin)
+            if not _is_skipped_surface_url(u, base_url=base)
+        )
+        for sib_orig in sibling_origins:
+            sib_netloc = urlsplit(sib_orig).netloc.lower()
+            for cand_u in find_spec_urls(body, sib_orig, allow_subdomains=True):
+                if _explicit_sibling_url_present(body_low, cand_u, sib_netloc) and not _is_skipped_surface_url(cand_u, base_url=base):
+                    spec_urls.append(cand_u)
+        cl_calls, cl_links, client_logic = _extract_js_client_logic(
+            body,
+            url,
+            base_url=base,
+            scope_guard=scope_guard,
+        )
         seen_js_call_keys = {
             (str(c.get("method") or "GET").upper(), str(c.get("url") or ""))
             for c in js_calls
@@ -949,14 +1222,23 @@ def _extract_surface_summary(receipt: dict[str, Any], base_url: str) -> dict[str
         links.extend(cl_links)
 
     if "css" in ctype or urlsplit(url).path.lower().endswith(".css"):
-        for rec in extract_css(body, url, limit=120):
+        for rec in extract_css(body, effective_doc_url, allow_subdomains=is_multi_origin, limit=120):
             if not _is_skipped_surface_url(rec.get("url", ""), base_url=base):
                 links.append(rec)
 
     if urlsplit(url).path.lower().endswith("/robots.txt"):
-        links.extend(r for r in extract_robots(body, url) if not _is_skipped_surface_url(r.get("url", ""), base_url=base))
+        links.extend(r for r in extract_robots(body, effective_doc_url) if not _is_skipped_surface_url(r.get("url", ""), base_url=base))
     if "xml" in ctype or "<urlset" in body[:512].lower() or "<sitemapindex" in body[:512].lower():
-        links.extend(r for r in extract_sitemap(body, url) if not _is_skipped_surface_url(r.get("url", ""), base_url=base))
+        links.extend(
+            r for r in extract_sitemap(body, effective_doc_url, allow_subdomains=is_multi_origin)
+            if not _is_skipped_surface_url(r.get("url", ""), base_url=base)
+        )
+        for sib_orig in sibling_origins:
+            sib_netloc = urlsplit(sib_orig).netloc.lower()
+            for rec in extract_sitemap(body, sib_orig, allow_subdomains=True):
+                rec_u = str(rec.get("url") or "")
+                if _explicit_sibling_url_present(body_low, rec_u, sib_netloc) and not _is_skipped_surface_url(rec_u, base_url=base):
+                    links.append(rec)
 
     # Deduplicate and compact links/forms so high-signal routes, forms, and IDs appear first without verbose boilerplate.
     base_netloc = urlsplit(base).netloc
@@ -969,13 +1251,39 @@ def _extract_surface_summary(receipt: dict[str, Any], base_url: str) -> dict[str
         else:
             short_u = raw_u
         p_list: list[str] = []
+        param_in: dict[str, str] = {}
         for p in (item.get("params") or []):
-            pname = str(p.get("name") if isinstance(p, dict) else p or "").strip()
+            if isinstance(p, dict):
+                pname = str(p.get("name") or "").strip()
+                pin = str(p.get("in") or "").strip().lower()
+            else:
+                pname = str(p or "").strip()
+                pin = ""
             if pname and pname not in p_list:
                 p_list.append(pname)
+            if pname and pin and len(param_in) < 15:
+                param_in[pname] = pin
         compact: dict[str, Any] = {"method": str(item.get("method") or "GET").upper(), "url": short_u}
         if p_list:
             compact["params"] = p_list[:15]
+        if param_in:
+            compact["param_in"] = param_in
+        ctype_val = str(item.get("content_type") or "").strip()
+        if ctype_val:
+            compact["content_type"] = ctype_val[:80]
+        raw_op = item.get("graphql_op") or item.get("operation")
+        if isinstance(raw_op, dict) and raw_op:
+            op_compact: dict[str, Any] = {}
+            for k in ("kind", "name", "selection"):
+                val = raw_op.get(k)
+                if isinstance(val, str) and val.strip():
+                    op_compact[k] = val.strip()[:80]
+            if isinstance(raw_op.get("fields"), list) and raw_op["fields"]:
+                op_compact["fields"] = [str(f)[:64] for f in raw_op["fields"][:8] if str(f).strip()]
+            if op_compact:
+                compact["graphql_op" if "graphql_op" in item else "operation"] = op_compact
+        elif isinstance(raw_op, str) and raw_op.strip():
+            compact["graphql_op"] = raw_op.strip()[:80]
         return compact
 
     dedup_links: list[dict[str, Any]] = []
@@ -984,6 +1292,10 @@ def _extract_surface_summary(receipt: dict[str, Any], base_url: str) -> dict[str
         raw_item_url = str(item.get("url") or "")
         if _is_skipped_surface_url(raw_item_url, base_url=base):
             continue
+        if scope_guard is not None:
+            item_in_scope, _ = _is_origin_match_or_in_scope(raw_item_url, base_url=base, scope_guard=scope_guard)
+            if not item_in_scope:
+                continue
         comp = _compact_surface_item(item)
         if _is_skipped_surface_url(comp["url"], base_url=base):
             continue
@@ -1030,20 +1342,45 @@ def _build_surface_hints(
     base_url: str,
     *,
     max_chars: int = 900,
+    in_scope_assets: Sequence[str] = (),
+    out_of_scope_assets: Sequence[str] = (),
 ) -> dict[str, Any]:
     """Build a compact, strictly bounded surface_hints dict for inline http_request previews."""
-    summary = _extract_surface_summary(receipt, base_url)
-    base_netloc = urlsplit(base_url).netloc
+    summary = _extract_surface_summary(
+        receipt,
+        base_url,
+        in_scope_assets=in_scope_assets,
+        out_of_scope_assets=out_of_scope_assets,
+    )
+    scope_guard = _build_preview_scope_guard(
+        base_url,
+        in_scope_assets=in_scope_assets,
+        out_of_scope_assets=out_of_scope_assets,
+    )
     ctype = (receipt.get("content_type") or "").lower()
     url_path = urlsplit(str(receipt.get("url") or "")).path.lower()
     is_js = "javascript" in ctype or "ecmascript" in ctype or url_path.endswith((".js", ".mjs"))
 
     def _short_same_origin(raw_u: str) -> tuple[str, str, bool]:
-        parsed_u = urlsplit(str(raw_u or "").strip())
-        same_origin = not parsed_u.netloc or parsed_u.netloc == base_netloc
+        raw_clean = str(raw_u or "").strip()
+        if not raw_clean:
+            return "/", "/", True
+        parsed_u = urlsplit(raw_clean)
+        in_scope, is_primary = _is_origin_match_or_in_scope(
+            raw_clean,
+            base_url=base_url,
+            scope_guard=scope_guard,
+        )
+        if not in_scope:
+            path = parsed_u.path or "/"
+            short = path + (f"?{parsed_u.query}" if parsed_u.query else "")
+            return path[:120], short[:120], False
         path = parsed_u.path or "/"
         short = path + (f"?{parsed_u.query}" if parsed_u.query else "")
-        return path[:120], short[:120], same_origin
+        if not is_primary and parsed_u.netloc:
+            origin_pfx = f"{parsed_u.scheme.lower()}://{parsed_u.netloc.lower()}"
+            return f"{origin_pfx}{path}"[:120], f"{origin_pfx}{short}"[:120], True
+        return path[:120], short[:120], True
 
     forms: list[dict[str, Any]] = []
     for f in (summary.get("forms") or [])[:4]:
@@ -1056,7 +1393,11 @@ def _build_surface_hints(
     openapi_ops: list[str] = []
     seen_ops: set[str] = set()
     for op in summary.get("openapi_operations") or []:
-        op_str = f"{str(op.get('method') or '').upper()} {str(op.get('path') or '')}".strip()[:120]
+        op_target = str(op.get("url") or op.get("path") or "")
+        op_path_val, _, op_ok = _short_same_origin(op_target)
+        if not op_ok:
+            op_path_val = str(op.get("path") or "")
+        op_str = f"{str(op.get('method') or '').upper()} {op_path_val}".strip()[:120]
         if op_str and op_str not in seen_ops:
             seen_ops.add(op_str)
             openapi_ops.append(op_str)
@@ -1071,11 +1412,12 @@ def _build_surface_hints(
             return
         if _is_skipped_surface_url(raw_u, base_url=base_url) or is_hashed_asset_chunk_path(raw_u):
             return
-        path, _, same_origin = _short_same_origin(raw_u)
+        path, _, in_scope = _short_same_origin(raw_u)
+        path_only = urlsplit(path).path or "/"
         if (
-            not same_origin
+            not in_scope
             or not path
-            or path == "/"
+            or path_only == "/"
             or _is_skipped_surface_url(path, base_url=base_url)
             or is_hashed_asset_chunk_path(path)
             or _is_standalone_script_url(path)
@@ -1086,7 +1428,7 @@ def _build_surface_hints(
             api_endpoints.append(path)
 
     for op in summary.get("openapi_operations") or []:
-        _add_api(str(op.get("path") or ""))
+        _add_api(str(op.get("url") or op.get("path") or ""))
     for call in summary.get("js_calls") or []:
         _add_api(str(call.get("url") or ""))
     for spec_u in summary.get("spec_urls") or []:
@@ -1094,9 +1436,10 @@ def _build_surface_hints(
     for item in summary.get("links") or []:
         u = str(item.get("url") or "")
         path, _, _ = _short_same_origin(u)
+        path_only = urlsplit(path).path or "/"
         if is_js and _is_standalone_script_url(path):
             continue
-        if is_js or "/api/" in path or path.startswith("/api") or "/graphql" in path:
+        if is_js or "/api/" in path_only or path_only.startswith("/api") or "/graphql" in path_only:
             _add_api(u)
 
     ids: list[str] = []
@@ -1115,16 +1458,17 @@ def _build_surface_hints(
         if len(links) >= 6:
             break
         raw_u = str(item.get("url") or "")
-        path, short, same_origin = _short_same_origin(raw_u)
+        path, short, in_scope = _short_same_origin(raw_u)
+        path_only = urlsplit(path).path or "/"
         if (
-            not same_origin
+            not in_scope
             or _is_skipped_surface_url(raw_u, base_url=base_url)
             or _is_skipped_surface_url(path, base_url=base_url)
             or is_hashed_asset_chunk_path(path)
             or (is_js and _is_standalone_script_url(path))
         ):
             continue
-        if path == "/" and "?" not in short:
+        if path_only == "/" and "?" not in short:
             continue
         if path in api_path_set or short in api_path_set:
             continue

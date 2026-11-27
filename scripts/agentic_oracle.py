@@ -1,6 +1,7 @@
 """Layer 4: Protocol-level, vuln-class-agnostic 3-stage Clean-Replay Differential Oracle."""
 from __future__ import annotations
 
+from collections import Counter
 from dataclasses import dataclass, field
 from datetime import datetime
 import html
@@ -10,7 +11,7 @@ import re
 import statistics
 import time
 from typing import Any, Callable, Sequence
-from urllib.parse import parse_qsl, quote, unquote, urlencode, urlsplit, urlunsplit
+from urllib.parse import parse_qsl, quote, unquote, urlencode, urljoin, urlsplit, urlunsplit
 import uuid
 
 import requests
@@ -210,6 +211,8 @@ _API_VERSION_SEG_RE = re.compile(r"^v\d+$", re.I)
 _CREATE_CONFLICT_INDICATOR_RE = re.compile(
     r"(?<![a-z0-9])(?:already[\s_-]+exists?|already[\s_-]+taken|"
     r"already[\s_-]+registered|already[\s_-]+in[\s_-]+use|"
+    r"already[\s_-]+redeemed|already[\s_-]+used|already[\s_-]+applied|"
+    r"already[\s_-]+processed|limit[\s_-]+reached|"
     r"duplicate|conflict)(?![a-z0-9])",
     re.IGNORECASE,
 )
@@ -248,38 +251,120 @@ _TRIVIAL_CORRELATION_TOKENS = frozenset({
     "en",
     "us",
 })
+_OWNER_TENANT_ENVELOPE_KEYS = frozenset({
+    "data",
+    "result",
+    "user",
+    "account",
+    "order",
+    "item",
+    "record",
+    "profile",
+    "payload",
+})
+
+
+def _extract_origin(url_or_path: str) -> str:
+    """Return normalized `scheme://netloc` origin for an explicit HTTP(S)/WS(S) URL, else ''."""
+    raw = str(url_or_path or "").strip()
+    if not raw:
+        return ""
+    parsed = urlsplit(raw)
+    scheme = parsed.scheme.lower()
+    if scheme not in {"http", "https", "ws", "wss"} or not parsed.netloc:
+        return ""
+    host = (parsed.hostname or "").strip().lower().rstrip(".")
+    if not host:
+        return ""
+    try:
+        port = parsed.port
+    except ValueError:
+        return ""
+    default_port = 80 if scheme in {"http", "ws"} else 443
+    host_part = f"[{host}]" if ":" in host else host
+    netloc = f"{host_part}:{port}" if (port is not None and port != default_port) else host_part
+    return f"{scheme}://{netloc}"
+
+
+def _is_graphql_error_envelope(receipt: dict[str, Any]) -> bool:
+    """Return True if receipt JSON body is a GraphQL error-only envelope (`errors` with empty/null `data`)."""
+    body = str(receipt.get("body") or "").strip()
+    if not body.startswith("{"):
+        return False
+    parsed = _try_parse_json_body(body)
+    if not isinstance(parsed, dict):
+        return False
+    errors = parsed.get("errors")
+    if not isinstance(errors, list) or len(errors) == 0:
+        return False
+    if "data" not in parsed or parsed["data"] is None:
+        return True
+    data = parsed["data"]
+    if isinstance(data, dict):
+        return all(v is None for v in data.values())
+    return False
+
+
+def _is_denied_control_receipt(receipt: dict[str, Any]) -> bool:
+    """Return True for HTTP 401/403/404 denials or HTTP-2xx GraphQL error-only responses."""
+    status = int(receipt.get("status") or 0)
+    if status in {401, 403, 404}:
+        return True
+    if 200 <= status < 300 and _is_graphql_error_envelope(receipt):
+        return True
+    return False
 
 
 def _extract_owner_and_tenant_from_receipt(
     receipt: dict[str, Any],
     actor_meta_map: dict[str, dict[str, str]],
 ) -> tuple[str, str]:
-    """Extract explicit owner alias and tenant string from a JSON response receipt."""
+    """Extract explicit owner alias and tenant string from top-level or nested JSON envelope receipts."""
     body = str(receipt.get("body") or "").strip()
-    if not body.startswith("{"):
+    if not body.startswith(("{", "[")):
         return "", ""
     try:
         parsed = json.loads(body)
     except ValueError:
         return "", ""
-    if not isinstance(parsed, dict):
+    if not isinstance(parsed, (dict, list)):
         return "", ""
 
     owner_actor = ""
-    for key in _BOLA_OWNER_KEYS:
-        val = parsed.get(key)
-        if isinstance(val, str):
-            clean = val.strip()
-            if clean and clean != "anon" and (clean in actor_meta_map or not actor_meta_map):
-                owner_actor = clean
-                break
-
     record_tenant = ""
-    for key in _BOLA_TENANT_KEYS:
-        val = parsed.get(key)
-        if isinstance(val, str) and val.strip():
-            record_tenant = val.strip().lower()
-            break
+    queue: list[tuple[Any, int]] = [(parsed, 0)]
+    q_idx = 0
+    visited = 0
+    while q_idx < len(queue) and visited < 120:
+        node, depth = queue[q_idx]
+        q_idx += 1
+        visited += 1
+        if isinstance(node, dict):
+            if not owner_actor:
+                for key in _BOLA_OWNER_KEYS:
+                    val = node.get(key)
+                    if isinstance(val, str):
+                        clean = val.strip()
+                        if clean and clean != "anon" and (clean in actor_meta_map or not actor_meta_map):
+                            owner_actor = clean
+                            break
+            if not record_tenant:
+                for key in _BOLA_TENANT_KEYS:
+                    val = node.get(key)
+                    if isinstance(val, str) and val.strip():
+                        record_tenant = val.strip().lower()
+                        break
+            if owner_actor and record_tenant:
+                break
+            if depth < 3:
+                for k, v in node.items():
+                    if str(k).lower() in _OWNER_TENANT_ENVELOPE_KEYS and isinstance(v, (dict, list)):
+                        queue.append((v, depth + 1))
+        elif isinstance(node, list) and 1 <= len(node) <= 5 and depth < 3:
+            for item in node:
+                if isinstance(item, (dict, list)):
+                    queue.append((item, depth + 1))
+
     if not record_tenant and owner_actor and owner_actor in actor_meta_map:
         record_tenant = str(actor_meta_map[owner_actor].get("tenant") or "").strip().lower()
     return owner_actor, record_tenant
@@ -404,13 +489,19 @@ def check_bola_false_positive(
         proof_actors = {str(r.get("actor") or "").strip() for r in proof_receipts}
         for ctrl in control_receipts:
             c_actor = str(ctrl.get("actor") or "").strip()
-            if c_actor and c_actor != "anon" and c_actor not in proof_actors and 200 <= int(ctrl.get("status") or 0) < 300:
+            if (
+                c_actor
+                and c_actor != "anon"
+                and c_actor not in proof_actors
+                and 200 <= int(ctrl.get("status") or 0) < 300
+                and not _is_graphql_error_envelope(ctrl)
+            ):
                 eff_owner = c_actor
                 break
     owner_tenant = record_tenant or str((meta_map.get(eff_owner) or {}).get("tenant") or "").strip().lower()
 
     if p_tenant and owner_tenant and p_tenant == owner_tenant:
-        denied_controls = [c for c in control_receipts if int(c.get("status") or 0) in {401, 403, 404}]
+        denied_controls = [c for c in control_receipts if _is_denied_control_receipt(c)]
         if denied_controls:
             has_same_tenant_denied = False
             has_cross_tenant_denied = False
@@ -461,8 +552,10 @@ def _receipt_contains_evidence(
         return True
     body = str(receipt.get("body") or "")
     loc = str(receipt.get("redirect_location") or "")
-    hdrs = json.dumps(receipt.get("response_headers") or {}, ensure_ascii=False)
-    if ev in f"{body}\n{loc}\n{hdrs}".lower():
+    resp_headers = receipt.get("response_headers") or {}
+    hdrs = json.dumps(resp_headers, ensure_ascii=False)
+    hdr_lines = "\n".join(f"{k}: {v}" for k, v in resp_headers.items()) if isinstance(resp_headers, dict) else ""
+    if ev in f"{body}\n{loc}\n{hdrs}\n{hdr_lines}".lower():
         return True
     if canonical_class in _HTML_UNESCAPE_EVIDENCE_CLASSES and is_html_receipt(receipt) and body:
         unescaped = html.unescape(body).lower()
@@ -535,9 +628,143 @@ def _request_header_ci(receipt: dict[str, Any], header_name: str) -> str:
 
 def _cors_header_signature(receipt: dict[str, Any]) -> tuple[str, str]:
     """Return `(Access-Control-Allow-Origin, Access-Control-Allow-Credentials)` for CORS diffing."""
-    acao = _response_header_ci(receipt, "access-control-allow-origin")
+    acao = _response_header_ci(receipt, "access-control-allow-origin").lower()
     acac = _response_header_ci(receipt, "access-control-allow-credentials").lower()
     return acao, acac
+
+
+_VOLATILE_RESPONSE_HEADERS = frozenset({
+    "date",
+    "etag",
+    "last-modified",
+    "age",
+    "connection",
+    "keep-alive",
+    "content-length",
+    "transfer-encoding",
+    "x-request-id",
+    "x-correlation-id",
+    "x-trace-id",
+    "x-amzn-requestid",
+    "x-amz-request-id",
+    "x-amz-id-2",
+    "cf-ray",
+    "x-runtime",
+    "x-response-time",
+    "server-timing",
+    "x-envoy-upstream-service-time",
+})
+_COOKIE_ATTR_LOWER = frozenset({
+    "path",
+    "domain",
+    "expires",
+    "max-age",
+    "secure",
+    "httponly",
+    "samesite",
+    "partitioned",
+})
+
+
+def _normalize_set_cookie_signature(raw_val: str, *, preserve_values: Sequence[str] = ()) -> str:
+    """Normalize Set-Cookie header so rotating token values match while cookie names/flags stay distinct."""
+    preserved_low = [str(p).strip().lower() for p in preserve_values if isinstance(p, str) and len(p) >= 3]
+    parts_out: list[str] = []
+    for cookie_item in str(raw_val or "").split(","):
+        seg = cookie_item.strip()
+        if not seg:
+            continue
+        attrs = [a.strip() for a in seg.split(";") if a.strip()]
+        if not attrs:
+            continue
+        norm_attrs: list[str] = []
+        for idx, attr in enumerate(attrs):
+            if "=" in attr:
+                ak, av = attr.split("=", 1)
+                akl = ak.strip().lower()
+                av_clean = av.strip()
+                if idx == 0 or akl not in _COOKIE_ATTR_LOWER:
+                    if any(pv in av_clean.lower() for pv in preserved_low):
+                        norm_attrs.append(f"{akl}={av_clean}")
+                    else:
+                        norm_attrs.append(f"{akl}=<COOKIE_VAL>")
+                elif akl in {"expires", "max-age"}:
+                    norm_attrs.append(f"{akl}=<TTL>")
+                else:
+                    norm_attrs.append(f"{akl}={av_clean.lower()}")
+            else:
+                norm_attrs.append(attr.lower())
+        parts_out.append(";".join(norm_attrs))
+    return "|".join(sorted(parts_out))
+
+
+def _response_headers_signature(
+    receipt: dict[str, Any],
+    *,
+    preserve_values: Sequence[str] = (),
+) -> tuple[tuple[str, str], ...]:
+    """Return canonicalized non-volatile response header signature for Stage 1/2 diffing."""
+    headers = receipt.get("response_headers") or {}
+    if not isinstance(headers, dict):
+        return ()
+    sig: list[tuple[str, str]] = []
+    for k, v in headers.items():
+        lk = str(k or "").strip().lower()
+        if not lk or lk in _VOLATILE_RESPONSE_HEADERS:
+            continue
+        val_str = str(v or "").strip()
+        if lk == "set-cookie":
+            norm_val = _normalize_set_cookie_signature(val_str, preserve_values=preserve_values)
+        else:
+            norm_val = mask_dynamic_fields(val_str, preserve_values=preserve_values).lower()
+        sig.append((lk, norm_val))
+    sig.sort()
+    return tuple(sig)
+
+
+def _is_sensitive_authenticated_receipt(
+    receipt: dict[str, Any],
+    eff_controls: Sequence[dict[str, Any]] = (),
+) -> bool:
+    """Return True if a CORS proof carries authenticated/sensitive data rather than anonymous public output."""
+    actor = str(receipt.get("actor") or "").strip()
+    status = int(receipt.get("status") or 0)
+    if not (200 <= status < 300):
+        return False
+    req_headers = receipt.get("request_headers") or {}
+    has_auth_hdr = isinstance(req_headers, dict) and any(
+        str(k).strip().lower() in {"authorization", "cookie", "x-api-key", "x-auth-token"} and str(v or "").strip()
+        for k, v in req_headers.items()
+    )
+    if (actor and actor != "anon") or has_auth_hdr:
+        body = str(receipt.get("body") or "").strip()
+        if len(body) > 2:
+            return True
+    for ctrl in eff_controls:
+        c_actor = str(ctrl.get("actor") or "").strip()
+        if c_actor == "anon" and _is_denied_control_receipt(ctrl):
+            return True
+    return False
+
+
+def _is_exempt_static_cors_control(
+    diff_target: dict[str, Any],
+    ctrl: dict[str, Any],
+    eff_controls: Sequence[dict[str, Any]],
+) -> bool:
+    """Allow static `ACAO: *` (with ACAC:true or sensitive auth data) and `Origin: null` -> `ACAO: null` when control uses a different Origin."""
+    p_acao, p_acac = _cors_header_signature(diff_target)
+    p_origin = _request_header_ci(diff_target, "origin").lower()
+    c_origin = _request_header_ci(ctrl, "origin").lower()
+    if c_origin == p_origin:
+        return False
+    is_static_wildcard = p_acao == "*" and (
+        p_acac == "true" or _is_sensitive_authenticated_receipt(diff_target, eff_controls)
+    )
+    is_null_origin = p_origin == "null" and p_acao == "null" and (
+        p_acac == "true" or _is_sensitive_authenticated_receipt(diff_target, eff_controls)
+    )
+    return is_static_wildcard or is_null_origin
 
 
 _OVERRIDDEN_AUTH_HEADERS = frozenset({
@@ -570,6 +797,30 @@ _CREDENTIAL_BODY_KEY_EXACT = frozenset({
     "authcode",
     "clientsecret",
     "appsecret",
+    "csrf_token",
+    "csrf",
+    "xsrf_token",
+    "xsrf",
+    "csrftoken",
+    "csrfmiddlewaretoken",
+    "_csrf",
+    "_token",
+    "authenticity_token",
+    "access_token",
+    "accesstoken",
+    "refresh_token",
+    "refreshtoken",
+    "id_token",
+    "idtoken",
+    "auth_token",
+    "authtoken",
+    "session_token",
+    "sessiontoken",
+    "api_key",
+    "apikey",
+    "token",
+    "jwt",
+    "bearer",
 })
 _CREDENTIAL_BODY_KEY_TOKENS = frozenset({
     "password",
@@ -587,6 +838,13 @@ _CREDENTIAL_BODY_KEY_TOKENS = frozenset({
     "otp",
     "totp",
     "mfa",
+    "csrf",
+    "xsrf",
+    "csrftoken",
+    "authenticity",
+    "token",
+    "apikey",
+    "jwt",
 })
 _CREDENTIAL_CODE_PREFIX_TOKENS = frozenset({
     "verify",
@@ -618,14 +876,27 @@ _AUTH_ENDPOINT_PATH_RE = re.compile(
 _AUTH_REJECTION_BODY_RE = re.compile(
     r"(?<![a-z0-9])(?:"
     r"(?:illegal|invalid|wrong|bad|incorrect|missing|expired|failed|mismatch(?:ed)?)[_\s-]*"
-    r"(?:password|passwd|pwd|passcode|passphrase|credentials?|secret|pin|otp|totp|token|login|auth(?:entication)?|grant|client|code)"
-    r"|(?:password|passwd|pwd|passcode|passphrase|credentials?|login|signin|sign[-_]?in|auth(?:entication|orization)?|unauthenticated|unauthorized|otp|totp|mfa|pin)[_\s-]*"
+    r"(?:password|passwd|pwd|passcode|passphrase|credentials?|secret|pin|otp|totp|token|login|auth(?:entication)?|grant|client|code|csrf|xsrf|authenticity(?:[_\s-]*token)?|api[_\s-]*key)"
+    r"|(?:password|passwd|pwd|passcode|passphrase|credentials?|login|signin|sign[-_]?in|auth(?:entication|orization)?|unauthenticated|unauthorized|otp|totp|mfa|pin|csrf|xsrf|authenticity(?:[_\s-]*token)?|api[_\s-]*key|access[_\s-]*token)[_\s-]*"
     r"(?:error|fail(?:ed|ure)?|invalid|illegal|incorrect|wrong|denied|reject(?:ed)?|mismatch(?:ed)?|required|expired|validation|check)"
     r"|illegal_password|bad_credentials|invalid_grant|access_denied|unauthorized|unauthenticated|authentication|credential"
-    r"|password|passwd|passcode"
+    r"|password|passwd|passcode|csrf|xsrf"
     r")(?![a-z0-9])",
     re.IGNORECASE,
 )
+_CSRF_BODY_FIELD_KEYS = frozenset({
+    "csrf",
+    "csrf_token",
+    "xsrf_token",
+    "xsrf",
+    "csrftoken",
+    "csrfmiddlewaretoken",
+    "authenticity_token",
+    "_csrf",
+    "_token",
+    "__token__",
+    "__requestverificationtoken",
+})
 
 
 def _has_redacted_credential_placeholder(value: str) -> bool:
@@ -634,7 +905,7 @@ def _has_redacted_credential_placeholder(value: str) -> bool:
 
 
 def _is_credential_body_key(raw_key: str) -> bool:
-    """Return True if a JSON or form field key denotes a password/secret/credential input."""
+    """Return True if a JSON or form field key denotes a password/secret/credential/CSRF/API-token input."""
     clean = str(raw_key or "").strip()
     if not clean:
         return False
@@ -646,6 +917,8 @@ def _is_credential_body_key(raw_key: str) -> bool:
     if not tokens:
         return False
     if any(tok in _CREDENTIAL_BODY_KEY_TOKENS for tok in tokens):
+        return True
+    if "api" in tokens and "key" in tokens:
         return True
     if "code" in tokens and any(tok in _CREDENTIAL_CODE_PREFIX_TOKENS for tok in tokens):
         return True
@@ -669,10 +942,13 @@ def _contains_redacted_placeholder_in_obj(obj: Any, *, max_nodes: int = 100) -> 
 
 
 def _has_redacted_credential_body(receipt: dict[str, Any]) -> bool:
-    """Return True if `receipt`'s saved request_body has a redacted placeholder on a credential key."""
+    """Return True if `receipt`'s saved request_body has a redacted placeholder on a credential/token/CSRF key or ReceiptStore secret digest."""
     raw_body = str(receipt.get("request_body") or "").strip()
     if not raw_body or "REDACTED" not in raw_body:
         return False
+    # ReceiptStore always tags scrubbed registered secrets (password/token/CSRF) with `<REDACTED_SECRET:sha256_8=...>`.
+    if "<REDACTED_SECRET:" in raw_body:
+        return True
 
     parsed_json = _try_parse_json_body(raw_body)
     if parsed_json is not None:
@@ -708,6 +984,58 @@ def _has_redacted_credential_body(receipt: dict[str, Any]) -> bool:
             if _is_credential_body_key(match.group(1)):
                 return True
     return False
+
+
+def _restore_session_csrf_in_body(raw_body: str, session_obj: Any) -> str:
+    """Replace redacted CSRF field values in a replay request body with the actor's live CSRF token if available."""
+    if not raw_body or "<REDACTED" not in raw_body or session_obj is None:
+        return raw_body
+    csrf_tok = str(getattr(session_obj, "csrf_token", "") or "")
+    if not csrf_tok:
+        return raw_body
+    csrf_keys = set(_CSRF_BODY_FIELD_KEYS)
+    session_field = str(getattr(session_obj, "csrf_field_name", "") or "").strip().lower()
+    if session_field:
+        csrf_keys.add(session_field)
+
+    stripped = raw_body.strip()
+    parsed_json = _try_parse_json_body(stripped)
+    if parsed_json is not None:
+        changed = False
+
+        def _replace_json(obj: Any) -> Any:
+            nonlocal changed
+            if isinstance(obj, dict):
+                out: dict[str, Any] = {}
+                for k, v in obj.items():
+                    if str(k).strip().lower() in csrf_keys and isinstance(v, str) and _has_redacted_credential_placeholder(v):
+                        out[k] = csrf_tok
+                        changed = True
+                    else:
+                        out[k] = _replace_json(v)
+                return out
+            if isinstance(obj, list):
+                return [_replace_json(item) for item in obj]
+            return obj
+
+        updated = _replace_json(parsed_json)
+        if changed:
+            return json.dumps(updated, ensure_ascii=False, separators=(",", ":"))
+        return raw_body
+
+    if "=" in raw_body and not stripped.startswith("<") and "\n" not in raw_body[:256]:
+        pairs = parse_qsl(raw_body, keep_blank_values=True)
+        changed = False
+        new_pairs: list[tuple[str, str]] = []
+        for k, v in pairs:
+            if k.strip().lower() in csrf_keys and _has_redacted_credential_placeholder(v):
+                new_pairs.append((k, csrf_tok))
+                changed = True
+            else:
+                new_pairs.append((k, v))
+        if changed:
+            return urlencode(new_pairs, doseq=True)
+    return raw_body
 
 
 def _can_accept_redacted_credential_body_replay(
@@ -833,7 +1161,15 @@ def _can_accept_redacted_auth_override(
                 or urlsplit(str(c.get("redirect_location") or "")).netloc != urlsplit(p_loc).netloc
                 or (
                     canonical_class == "cors_misconfiguration"
-                    and _cors_header_signature(c) != p_cors_sig
+                    and (
+                        _cors_header_signature(c) != p_cors_sig
+                        or _is_exempt_static_cors_control(replay_target, c, eff_controls)
+                    )
+                )
+                or (
+                    canonical_class != "weak_credentials"
+                    and _response_headers_signature(c, preserve_values=(evidence_value,))
+                    != _response_headers_signature(replay_target, preserve_values=(evidence_value,))
                 )
             )
             for c in baseline_controls
@@ -919,17 +1255,26 @@ def is_persistent_read_path_related(
     write_receipt_or_url: dict[str, Any] | str,
     read_url_or_path: str,
 ) -> bool:
-    """Return True if a read GET path is the same, parent/ancestor, child, sibling, or redirect target of a write."""
+    """Return True if a read GET path is on the same origin (when explicit) and same, parent, child, sibling, or redirect target of a write."""
+    r_url = str(read_url_or_path or "")
+    r_origin = _extract_origin(r_url)
     if isinstance(write_receipt_or_url, dict):
         w_url = str(write_receipt_or_url.get("url") or write_receipt_or_url.get("path") or "")
+        w_origin = _extract_origin(w_url)
         redir = str(write_receipt_or_url.get("redirect_location") or "").strip()
-        if redir and _norm_url_path(redir) == _norm_url_path(read_url_or_path):
-            return True
+        if redir and _norm_url_path(redir) == _norm_url_path(r_url):
+            redir_origin = _extract_origin(redir) or w_origin
+            if not (redir_origin and r_origin and redir_origin != r_origin):
+                return True
     else:
         w_url = str(write_receipt_or_url or "")
+        w_origin = _extract_origin(w_url)
+
+    if w_origin and r_origin and w_origin != r_origin:
+        return False
 
     w_path = _norm_url_path(w_url)
-    r_path = _norm_url_path(read_url_or_path)
+    r_path = _norm_url_path(r_url)
     if w_path == r_path:
         return True
 
@@ -2157,11 +2502,11 @@ def _is_unrelated_route_not_found(receipt: dict[str, Any], method: str = "") -> 
 
 
 def _is_one_shot_create_conflict(replay_rec: dict[str, Any]) -> bool:
-    """Return True if a POST clean replay returned 409 Conflict or 400 with an explicit duplicate/conflict indicator."""
+    """Return True if a POST clean replay returned 409 Conflict or 400/422 with an explicit duplicate/conflict indicator."""
     r_status = int(replay_rec.get("status") or 0)
     if r_status == 409:
         return True
-    if r_status == 400:
+    if r_status in {400, 422}:
         return bool(_CREATE_CONFLICT_INDICATOR_RE.search(str(replay_rec.get("body") or "")))
     return False
 
@@ -2335,6 +2680,99 @@ def _detect_ephemeral_evidence_mismatch(
     t_masked = _mask_for_ephemeral_replay_comparison(t_body, parsed_json=t_json)
     r_masked = _mask_for_ephemeral_replay_comparison(r_body, parsed_json=r_json)
     return bool(t_masked) and t_masked == r_masked
+
+
+def _control_probe_url_for_proof(receipt: dict[str, Any], suffix: str) -> str:
+    """Resolve a Stage 1 control/decoy path against `receipt['url']`'s origin when absolute."""
+    proof_url = str(receipt.get("url") or receipt.get("path") or "").strip()
+    if _extract_origin(proof_url):
+        return urljoin(proof_url, f"/{suffix.lstrip('/')}")
+    return f"/{suffix.lstrip('/')}"
+
+
+def _has_race_concurrency_evidence(
+    proof_receipts: Sequence[dict[str, Any]],
+    control_receipts: Sequence[dict[str, Any]],
+    *,
+    preserve_values: Sequence[str] = (),
+) -> tuple[bool, str]:
+    """Verify that `race_condition` proofs reflect genuine concurrency rather than sequential reads."""
+    success_proofs: list[dict[str, Any]] = []
+    seen_rids: set[str] = set()
+    for rec in proof_receipts:
+        rid = str(rec.get("receipt_id") or "").strip()
+        if not rid or rid in seen_rids:
+            continue
+        status = int(rec.get("status") or 0)
+        if 200 <= status < 400:
+            seen_rids.add(rid)
+            success_proofs.append(rec)
+
+    if len(success_proofs) < 2:
+        return False, "race_condition requires at least 2 distinct 2xx/3xx concurrent proof receipts."
+
+    burst_counts = Counter(
+        str(r.get("concurrent_burst_id") or "").strip()
+        for r in success_proofs
+        if str(r.get("concurrent_burst_id") or "").strip()
+    )
+    has_shared_burst_id = any(cnt >= 2 for cnt in burst_counts.values())
+
+    def _within_window(recs: Sequence[dict[str, Any]], max_delta_s: float = 2.0) -> bool:
+        by_ep: dict[tuple[str, str], list[tuple[str, datetime]]] = {}
+        for r in recs:
+            u = str(r.get("url") or r.get("path") or "")
+            ep_key = (_norm_url_path(u), str(r.get("method") or "").upper())
+            dt = _parse_receipt_timestamp(str(r.get("timestamp") or ""))
+            if dt is not None:
+                by_ep.setdefault(ep_key, []).append((_extract_origin(u), dt))
+        for items in by_ep.values():
+            if len(items) < 2:
+                continue
+            for i in range(len(items)):
+                orig_i, dt_i = items[i]
+                for j in range(i + 1, len(items)):
+                    orig_j, dt_j = items[j]
+                    if orig_i and orig_j and orig_i != orig_j:
+                        continue
+                    if (dt_i.tzinfo is None) != (dt_j.tzinfo is None):
+                        continue
+                    if abs((dt_j - dt_i).total_seconds()) <= max_delta_s:
+                        return True
+        return False
+
+    mutating_success = [
+        r for r in success_proofs if str(r.get("method") or "").upper() in _MUTATING_METHODS
+    ]
+    if len(mutating_success) >= 2:
+        if has_shared_burst_id or _within_window(mutating_success, 2.0):
+            return True, ""
+        return (
+            False,
+            "race_condition requires shared concurrent_burst_id or >= 2 same-endpoint mutating proofs within 2.0s.",
+        )
+
+    # Purely read-only GET/HEAD proofs must NOT pass unless backed by BOTH concurrency and state-change evidence.
+    has_tight_pair = has_shared_burst_id or _within_window(success_proofs, 2.0)
+    has_mutating_proof = any(
+        str(r.get("method") or "").upper() in _MUTATING_METHODS for r in proof_receipts
+    )
+    distinct_ro_states = {
+        (
+            int(r.get("status") or 0),
+            mask_dynamic_fields(str(r.get("body") or ""), preserve_values=preserve_values),
+        )
+        for r in success_proofs
+    }
+    has_mutating_ctrl = any(
+        str(c.get("method") or "").upper() in _MUTATING_METHODS for c in control_receipts
+    )
+    if has_tight_pair and (has_mutating_proof or len(distinct_ro_states) >= 2 or has_mutating_ctrl):
+        return True, ""
+    return (
+        False,
+        "race_condition rejected: purely read-only GET/HEAD receipts require concurrency and state-change evidence.",
+    )
 
 
 @dataclass
@@ -2847,7 +3285,10 @@ class DifferentialOracle:
                     probe = self._run_clean_session_request(
                         actor="anon",
                         method="GET",
-                        url=f"/{uuid.uuid4().hex[:12]}-control-check",
+                        url=_control_probe_url_for_proof(
+                            primary_proof,
+                            f"{uuid.uuid4().hex[:12]}-control-check",
+                        ),
                     )
                     ctrl_probe_rid = probe["receipt_id"]
                     eff_controls.append(probe)
@@ -2870,7 +3311,10 @@ class DifferentialOracle:
                 catchall_probe = self._run_clean_session_request(
                     actor="anon",
                     method="GET",
-                    url=f"/{uuid.uuid4().hex[:12]}-control-check",
+                    url=_control_probe_url_for_proof(
+                        primary_proof,
+                        f"{uuid.uuid4().hex[:12]}-control-check",
+                    ),
                 )
                 ctrl_probe_rid = catchall_probe["receipt_id"]
                 c_masked = mask_dynamic_fields(str(catchall_probe.get("body") or ""), preserve_values=(ev,))
@@ -2919,6 +3363,11 @@ class DifferentialOracle:
             same_actor_ctrls = [c for c in diff_controls if str(c.get("actor") or "") == p_actor]
             p_elapsed = _receipt_elapsed_ms(diff_target)
             p_diff_rid = str(diff_target.get("receipt_id") or "").strip()
+            p_hdr_sig = (
+                _response_headers_signature(diff_target, preserve_values=(ev,))
+                if canonical_class != "weak_credentials"
+                else ()
+            )
             for ctrl in same_actor_ctrls:
                 if canonical_class == "weak_credentials":
                     is_equivalent = _weak_credentials_controls_equivalent(diff_target, ctrl, ev=ev)
@@ -2931,12 +3380,20 @@ class DifferentialOracle:
                         if canonical_class != "cors_misconfiguration"
                         else _cors_header_signature(ctrl) == p_cors_sig
                     )
+                    hdrs_same = _response_headers_signature(ctrl, preserve_values=(ev,)) == p_hdr_sig
                     is_equivalent = (
                         c_status == p_status
                         and c_masked == p_masked
                         and urlsplit(c_loc).netloc == urlsplit(p_loc).netloc
                         and cors_same
+                        and hdrs_same
                     )
+                    if (
+                        is_equivalent
+                        and canonical_class == "cors_misconfiguration"
+                        and _is_exempt_static_cors_control(diff_target, ctrl, eff_controls)
+                    ):
+                        is_equivalent = False
                 if is_equivalent:
                     c_rid = str(ctrl.get("receipt_id") or "").strip()
                     if (
@@ -2966,20 +3423,25 @@ class DifferentialOracle:
                         control_probe_receipt_id=ctrl_probe_rid,
                     )
         elif canonical_class in _CONCURRENCY_CLASSES:
-            success_rids = {
-                str(r.get("receipt_id") or "")
-                for r in proof_receipts
-                if r.get("receipt_id") and 200 <= int(r.get("status") or 0) < 400
-            }
-            if canonical_class == "race_condition" and len(success_rids) < 2:
-                stages["stage1_control"] = "failed_missing_concurrent_proofs"
-                return OracleVerdict(
-                    verified=False,
-                    verdict="REFUTED",
-                    reason="race_condition requires at least 2 distinct 2xx/3xx concurrent proof receipts.",
-                    mode=self.mode,
-                    stages=stages,
+            if canonical_class == "race_condition":
+                race_ok, race_reason = _has_race_concurrency_evidence(
+                    proof_receipts,
+                    eff_controls,
+                    preserve_values=(ev,),
                 )
+                if not race_ok:
+                    stages["stage1_control"] = (
+                        "failed_missing_concurrent_proofs"
+                        if "at least 2 distinct" in race_reason
+                        else "failed_missing_concurrency_evidence"
+                    )
+                    return OracleVerdict(
+                        verified=False,
+                        verdict="REFUTED",
+                        reason=race_reason,
+                        mode=self.mode,
+                        stages=stages,
+                    )
             if not eff_controls:
                 stages["stage1_control"] = "failed_missing_control"
                 return OracleVerdict(
@@ -3007,6 +3469,16 @@ class DifferentialOracle:
                     stages=stages,
                 )
         elif canonical_class in _ACCESS_CLASSES:
+            if _is_graphql_error_envelope(primary_proof):
+                stages["stage1_control"] = "failed_graphql_error_proof"
+                return OracleVerdict(
+                    verified=False,
+                    verdict="REFUTED",
+                    reason=f"{canonical_class} primary proof returned a GraphQL error-only envelope.",
+                    mode=self.mode,
+                    stages=stages,
+                    control_probe_receipt_id=ctrl_probe_rid,
+                )
             # Check if a negative control (e.g. different path returning 403/404, or anon returning 401/403)
             # accidentally returned the exact same masked body + evidence_value for an unrelated/denied check.
             for ctrl in eff_controls:
@@ -3040,6 +3512,11 @@ class DifferentialOracle:
             input_diff_eligible or canonical_class not in (_CONCURRENCY_CLASSES | _ACCESS_CLASSES)
         ) and not is_oob_verified:
             has_masked_diff = False
+            p_hdr_sig_s2 = (
+                _response_headers_signature(diff_target, preserve_values=(ev,))
+                if canonical_class != "weak_credentials"
+                else ()
+            )
             for ctrl in diff_controls:
                 if canonical_class == "weak_credentials":
                     ctrl_differs = not _weak_credentials_controls_equivalent(diff_target, ctrl, ev=ev)
@@ -3049,13 +3526,18 @@ class DifferentialOracle:
                     c_loc = str(ctrl.get("redirect_location") or "")
                     cors_diff = (
                         canonical_class == "cors_misconfiguration"
-                        and _cors_header_signature(ctrl) != p_cors_sig
+                        and (
+                            _cors_header_signature(ctrl) != p_cors_sig
+                            or _is_exempt_static_cors_control(diff_target, ctrl, eff_controls)
+                        )
                     )
+                    hdrs_diff = _response_headers_signature(ctrl, preserve_values=(ev,)) != p_hdr_sig_s2
                     ctrl_differs = (
                         c_status != p_status
                         or c_masked != p_masked
                         or urlsplit(c_loc).netloc != urlsplit(p_loc).netloc
                         or cors_diff
+                        or hdrs_diff
                     )
                 if ctrl_differs:
                     has_masked_diff = True
@@ -3246,13 +3728,21 @@ class DifferentialOracle:
         multistep_substitutions: dict[str, str] = {}
         attempted_precursor_chain = False
 
+        replay_raw_body = str(replay_target.get("request_body") or "")
+        if canonical_class != "csrf" and "<REDACTED" in replay_raw_body:
+            try:
+                csrf_session_obj = self.http.actors.get(str(replay_target.get("actor") or "anon"))
+            except ValueError:
+                csrf_session_obj = None
+            replay_raw_body = _restore_session_csrf_in_body(replay_raw_body, csrf_session_obj)
+
         try:
             replay_rec = self._run_clean_session_request(
                 actor=str(replay_target.get("actor") or "anon"),
                 method=str(replay_target.get("method") or "GET"),
                 url=str(replay_target.get("url") or "/"),
                 headers=replay_target.get("request_headers") or {},
-                raw_body=str(replay_target.get("request_body") or ""),
+                raw_body=replay_raw_body,
             )
         except BudgetExhaustedError:
             stages["stage3_clean_replay"] = "skipped_budget"
@@ -3480,7 +3970,7 @@ class DifferentialOracle:
             same_path_denied_controls = [
                 c
                 for c in eff_controls
-                if int(c.get("status") or 0) in {401, 403, 404}
+                if _is_denied_control_receipt(c)
                 and _norm_url_path(str(c.get("url") or c.get("path") or "")) == p_norm_path
             ]
             has_same_path_denied_control = bool(same_path_denied_controls)
@@ -3783,9 +4273,9 @@ class DifferentialOracle:
                             multistep_substitutions = dict(id_map)
 
         # Case B — Single-use POST create conflict verification:
-        # When re-executing a 200/201 POST returns 409 Conflict (or 400 Bad Request
-        # with an explicit duplicate/conflict indicator) because the resource already
-        # exists from the original request, verify after Stages 1-2 passed.
+        # When re-executing a 200/201 POST returns 409 Conflict (or 400/422
+        # with an explicit duplicate/conflict/already-redeemed indicator) because the resource
+        # or one-shot action was already consumed by the original request, verify after Stages 1-2 passed.
         if (
             not attempted_precursor_chain
             and not has_redacted_auth_override
@@ -3823,10 +4313,12 @@ class DifferentialOracle:
             and not has_redacted_auth_override
             and replay_target is primary_proof
             and str(primary_proof.get("method") or "").upper() in _WRITE_METHODS
-            and r_status in {403, 404, 409}
+            and (r_status in {403, 404, 409} or _is_graphql_error_envelope(replay_rec))
             and self._has_budget(1)
         ):
-            p_path = urlsplit(str(primary_proof.get("url") or primary_proof.get("path") or "")).path.rstrip("/")
+            p_url_str = str(primary_proof.get("url") or primary_proof.get("path") or "")
+            p_origin = _extract_origin(p_url_str)
+            p_path = urlsplit(p_url_str).path.rstrip("/")
             actor_rows = list(self.http.actors.summaries())
             actor_by_alias = {str(a.get("alias") or ""): a for a in actor_rows}
             p_tenant = str((actor_by_alias.get(p_actor) or {}).get("tenant") or "").strip().lower()
@@ -3834,15 +4326,17 @@ class DifferentialOracle:
             fallback_actors: list[str] = []
             for ctrl in eff_controls:
                 c_actor = str(ctrl.get("actor") or "")
-                c_status = int(ctrl.get("status") or 0)
-                c_path = urlsplit(str(ctrl.get("url") or ctrl.get("path") or "")).path.rstrip("/")
+                c_url_str = str(ctrl.get("url") or ctrl.get("path") or "")
+                c_origin = _extract_origin(c_url_str)
+                c_path = urlsplit(c_url_str).path.rstrip("/")
                 if (
                     c_actor
                     and c_actor != p_actor
                     and c_actor in actor_by_alias
                     and c_actor not in fallback_actors
-                    and c_status in {401, 403, 404}
+                    and _is_denied_control_receipt(ctrl)
                     and c_path == p_path
+                    and not (p_origin and c_origin and p_origin != c_origin)
                 ):
                     fallback_actors.append(c_actor)
 
@@ -3875,8 +4369,10 @@ class DifferentialOracle:
                 except BudgetExhaustedError:
                     break
                 fb_status = int(fb_rec.get("status") or 0)
-                if 200 <= fb_status < 300 and _receipt_contains_evidence(
-                    fb_rec, ev, canonical_class=canonical_class
+                if (
+                    200 <= fb_status < 300
+                    and not _is_graphql_error_envelope(fb_rec)
+                    and _receipt_contains_evidence(fb_rec, ev, canonical_class=canonical_class)
                 ):
                     replay_rec = fb_rec
                     r_status = fb_status
@@ -3890,6 +4386,18 @@ class DifferentialOracle:
                 verified=False,
                 verdict="REFUTED",
                 reason=f"Clean-session replay returned status {r_status} (expected {t_status // 100}xx).",
+                mode=self.mode,
+                stages=stages,
+                clean_replay_receipt_id=replay_rec["receipt_id"],
+                control_probe_receipt_id=ctrl_probe_rid,
+            )
+
+        if not _is_graphql_error_envelope(replay_target) and _is_graphql_error_envelope(replay_rec):
+            stages["stage3_clean_replay"] = "failed_graphql_error_envelope"
+            return OracleVerdict(
+                verified=False,
+                verdict="REFUTED",
+                reason="Clean-session replay returned a GraphQL error-only envelope.",
                 mode=self.mode,
                 stages=stages,
                 clean_replay_receipt_id=replay_rec["receipt_id"],

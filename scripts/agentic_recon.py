@@ -89,6 +89,8 @@ _EDGE_RELATIONS = frozenset({
 
 _REDIRECT_STATUS_CODES = frozenset({301, 302, 303, 307, 308})
 _VALID_SCHEMES = frozenset({"http", "https"})
+_API_SPEC_PROBE_ROLES = frozenset({"api", "graphql", "unknown", "admin"})
+_API_SPEC_PROBE_PATHS: tuple[str, ...] = ("/openapi.json", "/swagger.json", "/graphql")
 
 _API_HOST_LABELS = frozenset({
     "api",
@@ -1559,6 +1561,91 @@ def _read_bounded_response(resp: Any, max_bytes: int) -> tuple[int, dict[str, st
     return status, resp_headers, raw_bytes.decode("utf-8", errors="replace")
 
 
+def _is_valid_openapi_spec_json(body_text: str, content_type: str = "") -> bool:
+    """Return True if an HTTP 200 body is a valid OpenAPI/Swagger JSON specification."""
+    ctype = (content_type or "").split(";", 1)[0].strip().lower()
+    stripped = (body_text or "").lstrip()
+    if not stripped or "html" in ctype or stripped[:32].lower().startswith(("<!doctype", "<html")):
+        return False
+    if not stripped.startswith("{"):
+        return False
+    try:
+        parsed = json.loads(stripped[:MAX_PROBE_BODY_BYTES])
+    except ValueError:
+        return False
+    if not isinstance(parsed, dict):
+        return False
+    return ("openapi" in parsed or "swagger" in parsed) and ("paths" in parsed or "info" in parsed)
+
+
+_GRAPHQL_TOP_LEVEL_KEYS = frozenset({"data", "errors", "extensions"})
+_GRAPHQL_ERROR_KEYWORDS = (
+    "query",
+    "graphql",
+    "operation",
+    "syntax",
+    "introspection",
+    "must provide",
+    "missing query",
+)
+
+
+def _classify_graphql_probe_response(
+    body_text: str,
+    content_type: str = "",
+    *,
+    status: int = 200,
+) -> tuple[bool, bool]:
+    """Return ``(is_graphql_endpoint, is_graphql_json)`` for a /graphql probe response."""
+    if int(status) not in {200, 400, 405}:
+        return False, False
+    ctype = (content_type or "").split(";", 1)[0].strip().lower()
+    stripped = (body_text or "").lstrip()
+    if not stripped:
+        return False, False
+    if "json" in ctype or stripped.startswith("{"):
+        try:
+            parsed = json.loads(stripped[:MAX_PROBE_BODY_BYTES])
+        except ValueError:
+            parsed = None
+        if parsed is not None:
+            if not isinstance(parsed, dict) or not parsed:
+                return False, False
+            if not set(parsed.keys()).issubset(_GRAPHQL_TOP_LEVEL_KEYS):
+                return False, False
+            data = parsed.get("data")
+            if isinstance(data, dict):
+                if isinstance(data.get("__schema"), dict):
+                    return True, True
+                typename = data.get("__typename")
+                if isinstance(typename, str) and typename.strip():
+                    return True, True
+            errs = parsed.get("errors")
+            if isinstance(errs, list) and errs:
+                for err in errs:
+                    if not isinstance(err, dict):
+                        continue
+                    msg_low = str(err.get("message") or "").lower()
+                    locs = err.get("locations")
+                    ext = err.get("extensions")
+                    has_locs = isinstance(locs, list) and len(locs) > 0
+                    has_ext = isinstance(ext, dict) and len(ext) > 0
+                    ext_text = json.dumps(ext, sort_keys=True).lower() if has_ext else ""
+                    if (
+                        has_locs
+                        or has_ext
+                        or any(kw in msg_low for kw in _GRAPHQL_ERROR_KEYWORDS)
+                        or any(kw in ext_text for kw in _GRAPHQL_ERROR_KEYWORDS)
+                    ):
+                        return True, True
+            return False, False
+    if int(status) == 200:
+        low = stripped[:65536].lower()
+        if any(tok in low for tok in ("graphiql", "graphql playground", "apollo-sandbox", "graphql-playground")):
+            return True, False
+    return False, False
+
+
 def _extract_robots_paths(robots_text: str) -> list[str]:
     paths: list[str] = []
     for raw_line in (robots_text or "").splitlines():
@@ -1919,6 +2006,58 @@ def run_recon(
                     robots_paths = _extract_robots_paths(r_body)
                     if robots_paths:
                         node.sample_paths = _normalize_sample_paths([*node.sample_paths, *robots_paths])
+
+        # Pass 3: high-signal passive API spec & GraphQL probing on alive API-like in-scope hosts.
+        for node in graph.ranked_targets(include_unreachable=False):
+            if budget_exhausted or budget.used >= budget.limit:
+                break
+            if node.alive is not True or not node.in_scope:
+                continue
+            if node.role not in _API_SPEC_PROBE_ROLES:
+                continue
+            existing_sample_paths = {p.lower() for p in node.sample_paths}
+            openapi_found = "openapi" in {t.lower() for t in node.tech_signals}
+            for spec_path in _API_SPEC_PROBE_PATHS:
+                if budget_exhausted or budget.used >= budget.limit:
+                    break
+                if spec_path.lower() in existing_sample_paths:
+                    continue
+                if spec_path == "/swagger.json" and openapi_found:
+                    continue
+                spec_url = f"{node.origin}{spec_path}"
+                try:
+                    guard.check_url(spec_url)
+                except ValueError:
+                    continue
+                p_status, p_headers, p_body, attempted = _send_readonly_get(spec_url)
+                if not attempted:
+                    break
+                if not p_body:
+                    continue
+                p_ctype = next((v for k, v in p_headers.items() if k.lower() == "content-type"), "").lower()
+                if spec_path in {"/openapi.json", "/swagger.json"}:
+                    if p_status == 200 and _is_valid_openapi_spec_json(p_body, p_ctype):
+                        node.sample_paths = _normalize_sample_paths([*node.sample_paths, spec_path])
+                        existing_sample_paths.add(spec_path.lower())
+                        node.tech_signals = sorted({*node.tech_signals, "openapi", "json"})
+                        if spec_path == "/openapi.json":
+                            openapi_found = True
+                        if node.role not in {"graphql", "admin"}:
+                            node.role = "api"
+                elif spec_path == "/graphql":
+                    if p_status in {200, 400, 405}:
+                        is_gql_ep, is_gql_json = _classify_graphql_probe_response(
+                            p_body,
+                            p_ctype,
+                            status=p_status,
+                        )
+                        if is_gql_ep:
+                            node.sample_paths = _normalize_sample_paths([*node.sample_paths, spec_path])
+                            existing_sample_paths.add(spec_path.lower())
+                            gql_signals = ("graphql", "json") if is_gql_json else ("graphql",)
+                            node.tech_signals = sorted({*node.tech_signals, *gql_signals})
+                            if is_gql_json and node.role != "admin":
+                                node.role = "graphql"
     finally:
         close_sess = getattr(session, "close", None)
         if callable(close_sess):

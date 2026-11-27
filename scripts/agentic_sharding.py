@@ -308,7 +308,80 @@ def _is_virgin_state_action_path(path_or_url: str) -> bool:
 
 
 def _is_api_route(path: str) -> bool:
-    return bool(_API_ROUTE_RE.search(str(path or "")))
+    path_only = urlsplit(str(path or "").strip()).path or "/"
+    return bool(_API_ROUTE_RE.search(path_only))
+
+
+def _scoped_route_template(raw_path: str, base_url: str = "") -> str:
+    """Normalize ``raw_path`` into a route template preserving non-primary http(s) origins and GraphQL #op fragments."""
+    raw = str(raw_path or "").strip()
+    if not raw:
+        return "/"
+    gql_frag = ""
+    if "#" in raw:
+        base_part, frag_part = raw.split("#", 1)
+        clean_frag = frag_part.strip()
+        path_low = (urlsplit(base_part).path or "/").lower().rstrip("/")
+        if clean_frag and not clean_frag.startswith("/") and path_low.endswith(("/graphql", "/gql")):
+            gql_frag = f"#{clean_frag}"
+            raw = base_part
+    if raw.lower().startswith(("http://", "https://")):
+        parsed = urlsplit(raw)
+        if parsed.netloc:
+            if base_url:
+                parsed_base = urlsplit(base_url.strip())
+                if parsed_base.netloc and (parsed.scheme.lower(), parsed.netloc.lower()) == (
+                    parsed_base.scheme.lower(),
+                    parsed_base.netloc.lower(),
+                ):
+                    return route_template_of(parsed.path or "/") + gql_frag
+            return f"{parsed.scheme.lower()}://{parsed.netloc.lower()}{route_template_of(parsed.path or '/')}{gql_frag}"
+    return route_template_of(raw) + gql_frag
+
+
+def _scoped_concrete_path(raw_url: str, base_url: str = "") -> str:
+    """Return relative ``/path`` for primary origin, or ``scheme://netloc/path`` for sibling origins."""
+    raw = str(raw_url or "").strip()
+    if not raw:
+        return "/"
+    parsed = urlsplit(raw)
+    path = parsed.path or "/"
+    if raw.lower().startswith(("http://", "https://")) and parsed.netloc:
+        if base_url:
+            parsed_base = urlsplit(base_url.strip())
+            if parsed_base.netloc and (parsed.scheme.lower(), parsed.netloc.lower()) == (
+                parsed_base.scheme.lower(),
+                parsed_base.netloc.lower(),
+            ):
+                return path
+        return f"{parsed.scheme.lower()}://{parsed.netloc.lower()}{path}"
+    return path
+
+
+def _format_handoff_blocks(
+    *,
+    asset_graph_handoff: str = "",
+    prescan_handoff: str = "",
+    har_flows_handoff: str = "",
+    waf_pivot_guidance: str = "",
+) -> str:
+    """Format non-empty Stage 0/WAF handoff advisories cleanly for Stage 2/3 user prompts."""
+    blocks: list[str] = []
+    for label, raw, cap in (
+        ("[STAGE 0 ASSET GRAPH]", asset_graph_handoff, 1200),
+        ("[STAGE 0 PRESCAN LEADS]", prescan_handoff, 1800),
+        ("[HAR MULTI-STEP WORKFLOWS]", har_flows_handoff, 1800),
+        ("[ACTIVE WAF PIVOT GUIDANCE]", waf_pivot_guidance, 900),
+    ):
+        text = str(raw or "").strip()
+        if not text:
+            continue
+        clipped = text[:cap] + ("..." if len(text) > cap else "")
+        if clipped.startswith("["):
+            blocks.append(clipped)
+        else:
+            blocks.append(f"{label}\n{clipped}")
+    return ("\n\n" + "\n\n".join(blocks)) if blocks else ""
 
 
 @dataclass
@@ -407,6 +480,7 @@ def _rank_routes_by_input_risk(
     surface_tracker: Any | None = None,
 ) -> list[dict[str, Any]]:
     """Score and deterministically sort routes by descending input attack-surface risk."""
+    tracker_base = str(getattr(surface_tracker, "base_url", "") or "").strip()
     route_set: set[str] = set()
     inferred_methods: dict[str, set[str]] = {}
     body_template_routes: set[str] = set()
@@ -420,7 +494,7 @@ def _rank_routes_by_input_risk(
         raw = str(raw_path or "").strip()
         if not raw or is_non_endpoint_source_path(raw):
             return None
-        tmpl = route_template_of(raw)
+        tmpl = _scoped_route_template(raw, base_url=tracker_base)
         if is_non_endpoint_source_path(tmpl):
             return None
         route_set.add(tmpl)
@@ -720,6 +794,7 @@ def _rank_and_select_write_ops(
     cluster_body_templates: Mapping[str, Any],
     form_templates: set[str],
     limit: int = 25,
+    base_url: str = "",
 ) -> list[str]:
     """Score write operations individually and select a family-diverse high-risk slice."""
     write_entries: list[dict[str, Any]] = []
@@ -732,7 +807,7 @@ def _rank_and_select_write_ops(
             op_method, op_path = parts[0].strip().upper(), parts[1].strip()
         else:
             op_method, op_path = "POST", op_str
-        op_tmpl = route_template_of(op_path)
+        op_tmpl = _scoped_route_template(op_path, base_url=base_url)
         op_params = _order_params_by_risk(list(cluster_params.get(op_tmpl) or ()))
         op_hints = [str(h).strip() for h in (cluster_schema_hints.get(op_tmpl) or ()) if str(h).strip()]
         is_form = op_tmpl in form_templates
@@ -780,6 +855,7 @@ def cluster_discovered_surface(
     """Cluster discovered attack-surface items into balanced `SubsystemCluster`s."""
     eff_max = max(1, int(max_shards))
     eff_min_routes = max(1, int(min_routes_for_sharding))
+    tracker_base = str(getattr(surface_tracker, "base_url", "") or "").strip()
 
     family_routes: dict[str, set[str]] = {}
     family_methods: dict[str, dict[str, set[str]]] = {}
@@ -798,7 +874,7 @@ def cluster_discovered_surface(
         raw = str(raw_path or "")
         if is_non_endpoint_source_path(raw):
             return None
-        tmpl = route_template_of(raw)
+        tmpl = _scoped_route_template(raw, base_url=tracker_base)
         if is_non_endpoint_source_path(tmpl):
             return None
         fam = extract_resource_family(tmpl)
@@ -829,7 +905,7 @@ def cluster_discovered_surface(
         raw_obj = str(concrete_path or "")
         if is_non_endpoint_source_path(raw_obj):
             continue
-        clean_obj = urlsplit(raw_obj.strip()).path or "/"
+        clean_obj = _scoped_concrete_path(raw_obj, base_url=tracker_base)
         tmpl = _add_route(clean_obj)
         if tmpl is None:
             continue
@@ -957,9 +1033,10 @@ def cluster_discovered_surface(
             schema_hints=all_schema_hints,
             methods_by_route=all_methods,
             form_templates=form_templates,
+            surface_tracker=surface_tracker,
         )
         all_bt_routes = {
-            route_template_of(op_key.split(" ", 1)[1])
+            _scoped_route_template(op_key.split(" ", 1)[1], base_url=tracker_base)
             for op_key in all_body_templates
             if " " in op_key
         }
@@ -1067,9 +1144,10 @@ def cluster_discovered_surface(
             schema_hints=c_schema_hints,
             methods_by_route=c_methods,
             form_templates=form_templates,
+            surface_tracker=surface_tracker,
         )
         c_bt_routes = {
-            route_template_of(op_key.split(" ", 1)[1])
+            _scoped_route_template(op_key.split(" ", 1)[1], base_url=tracker_base)
             for op_key in c_body_templates
             if " " in op_key
         }
@@ -1108,8 +1186,13 @@ def build_shard_prompts(
     receipts: Any | None = None,
     state_banner: str = "",
     surface_tracker: Any | None = None,
+    prescan_handoff: str = "",
+    har_flows_handoff: str = "",
+    asset_graph_handoff: str = "",
+    waf_pivot_guidance: str = "",
 ) -> tuple[str, str]:
     """Construct focused system and initial user prompts for one subsystem shard."""
+    tracker_base = str(getattr(surface_tracker, "base_url", "") or "").strip()
     findings_lines: list[str] = []
     for f in list(bootstrap_findings)[:30]:
         if not isinstance(f, dict):
@@ -1133,7 +1216,7 @@ def build_shard_prompts(
         if str(t).strip()
     }
     bt_routes = {
-        route_template_of(op_key.split(" ", 1)[1])
+        _scoped_route_template(op_key.split(" ", 1)[1], base_url=tracker_base)
         for op_key in (getattr(cluster, "body_templates", {}) or {})
         if isinstance(op_key, str) and " " in op_key
     }
@@ -1182,23 +1265,24 @@ def build_shard_prompts(
             cluster_body_templates=cluster.body_templates,
             form_templates=form_templates,
             limit=25,
+            base_url=tracker_base,
         )
     else:
         selected_write_ops = list(cluster.write_ops[:25])
 
     ordered_param_items = sorted(
         cluster.params.items(),
-        key=lambda kv: (-risk_score_by_route.get(route_template_of(kv[0]), 0), kv[0]),
+        key=lambda kv: (-risk_score_by_route.get(_scoped_route_template(kv[0], base_url=tracker_base), 0), kv[0]),
     )
     if ordered_param_items and (is_large_shard or len(ordered_param_items) > 20):
         param_entries = [
             {
-                "route_template": route_template_of(tmpl),
+                "route_template": _scoped_route_template(tmpl, base_url=tracker_base),
                 "raw_tmpl": tmpl,
                 "pnames": pnames,
-                "methods": methods_by_tmpl.get(route_template_of(tmpl), []),
+                "methods": methods_by_tmpl.get(_scoped_route_template(tmpl, base_url=tracker_base), []),
                 "params": list(pnames),
-                "risk_score": risk_score_by_route.get(route_template_of(tmpl), 0),
+                "risk_score": risk_score_by_route.get(_scoped_route_template(tmpl, base_url=tracker_base), 0),
             }
             for tmpl, pnames in ordered_param_items
         ]
@@ -1342,10 +1426,11 @@ def build_shard_prompts(
             path_or_url = str(rec.get("path") or rec.get("url") or "/")
             if is_non_endpoint_source_path(path_or_url):
                 continue
+            rec_url_or_path = str(rec.get("url") or path_or_url)
             if cluster_fams:
-                rec_fam = extract_resource_family(path_or_url)
-                rec_sub = _extract_subfamily_after(path_or_url, rec_fam)
-                rec_tmpl = route_template_of(path_or_url)
+                rec_fam = extract_resource_family(rec_url_or_path)
+                rec_sub = _extract_subfamily_after(rec_url_or_path, rec_fam)
+                rec_tmpl = _scoped_route_template(rec_url_or_path, base_url=tracker_base)
                 if (
                     rec_fam not in cluster_fams
                     and rec_tmpl not in cluster_routes
@@ -1354,10 +1439,12 @@ def build_shard_prompts(
                     continue
             actor = str(rec.get("actor") or "anon")
             method = str(rec.get("method") or "GET")
-            parsed = urlsplit(str(rec.get("url") or path_or_url))
-            short_path = (parsed.path or "/") + (f"?{parsed.query}" if parsed.query else "")
-            if len(short_path) > 72:
-                short_path = short_path[:69] + "..."
+            parsed = urlsplit(rec_url_or_path)
+            scoped_base = _scoped_concrete_path(rec_url_or_path, base_url=tracker_base)
+            short_path = scoped_base + (f"?{parsed.query}" if parsed.query else "")
+            max_len = 96 if scoped_base.startswith(("http://", "https://")) else 72
+            if len(short_path) > max_len:
+                short_path = short_path[: max_len - 3] + "..."
             status = int(rec.get("status") or 0)
             sig = (actor, method, short_path, status)
             if sig in seen_sig:
@@ -1373,6 +1460,12 @@ def build_shard_prompts(
         if receipt_lines
         else "\n[RELEVANT BOOTSTRAP RECEIPTS] none recorded yet for these families"
     )
+    handoff_block = _format_handoff_blocks(
+        asset_graph_handoff=asset_graph_handoff,
+        prescan_handoff=prescan_handoff,
+        har_flows_handoff=har_flows_handoff,
+        waf_pivot_guidance=waf_pivot_guidance,
+    )
     user_prompt = (
         f"Execute deep security verification for subsystem shard `{cluster.shard_id}` "
         f"(families: {', '.join(cluster.families) or cluster.name}). "
@@ -1380,6 +1473,7 @@ def build_shard_prompts(
         "probe all assigned parameters and write operations, record verified findings immediately, and call `finish` when done."
         f"{must_test_block}"
         f"{receipt_block}"
+        f"{handoff_block}"
         f"{state_banner}"
     )
     return sys_prompt, user_prompt
@@ -1820,7 +1914,7 @@ def collect_cross_shard_synthesis_context(
             if len(parts) != 2:
                 continue
             w_method, w_path = parts[0].upper(), parts[1].strip()
-            w_key = (w_method, route_template_of(w_path))
+            w_key = (w_method, _scoped_route_template(w_path, base_url=base_url))
             if w_key not in seen_write_keys:
                 seen_write_keys.add(w_key)
                 untested_writes_and_blocked.append(f"{w_method} {w_path}")
@@ -1845,12 +1939,13 @@ def collect_cross_shard_synthesis_context(
             status = int(rec.get("status") or 0)
             method = str(rec.get("method") or "GET").strip().upper()
             raw_path = str(rec.get("path") or rec.get("url") or "/")
+            rec_url_or_path = str(rec.get("url") or raw_path)
 
             if 200 <= status < 300:
                 recent_2xx_receipts.append(rec)
 
             if not is_non_endpoint_source_path(raw_path) and not _is_auth_utility_endpoint(raw_path):
-                tmpl = route_template_of(raw_path)
+                tmpl = _scoped_route_template(rec_url_or_path, base_url=base_url)
                 if 200 <= status < 300:
                     any_2xx_paths.add(tmpl)
                 elif status in {401, 403}:
@@ -1861,12 +1956,12 @@ def collect_cross_shard_synthesis_context(
                 and not is_non_endpoint_source_path(raw_path)
                 and not _is_auth_utility_endpoint(raw_path)
             ):
-                tmpl = route_template_of(raw_path)
+                tmpl = _scoped_route_template(rec_url_or_path, base_url=base_url)
                 w_key = (method, tmpl)
                 if 200 <= status < 300:
                     write_2xx_tmpls.add(w_key)
                 elif status in {401, 403} and w_key not in write_401_403:
-                    concrete_path = urlsplit(str(rec.get("url") or raw_path)).path or "/"
+                    concrete_path = _scoped_concrete_path(rec_url_or_path, base_url=base_url)
                     write_401_403[w_key] = (concrete_path, status)
 
     for w_key, (sample_path, status) in write_401_403.items():
@@ -1976,6 +2071,10 @@ def build_cross_shard_synthesis_prompts(
     actor_summaries: Sequence[dict[str, Any]],
     http_budget_remaining: int,
     state_banner: str = "",
+    prescan_handoff: str = "",
+    har_flows_handoff: str = "",
+    asset_graph_handoff: str = "",
+    waf_pivot_guidance: str = "",
 ) -> tuple[str, str]:
     """Construct Stage 3 system and initial user prompts with shard fences removed and chain artifacts embedded."""
     clean_base = _strip_shard_scope_fences(base_system_prompt)
@@ -2039,6 +2138,12 @@ def build_cross_shard_synthesis_prompts(
         "high_risk_unprobed_routes": high_risk_unprobed,
     }
     compact_json = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+    handoff_block = _format_handoff_blocks(
+        asset_graph_handoff=asset_graph_handoff,
+        prescan_handoff=prescan_handoff,
+        har_flows_handoff=har_flows_handoff,
+        waf_pivot_guidance=waf_pivot_guidance,
+    )
 
     user_prompt = (
         "Execute UNIFIED CROSS-SHARD CHAIN SYNTHESIS (Stage 3) across all subsystems.\n"
@@ -2048,6 +2153,7 @@ def build_cross_shard_synthesis_prompts(
         "across subsystems to resolve cross-shard blockers and unlock `401`/`403` or untested `POST`/write workflows "
         "(using `concurrent_check` first where virgin actors remain on single-use actions). "
         "Call `record_finding` immediately for each newly verified vulnerability and call `finish` when done."
+        f"{handoff_block}"
         f"{state_banner}"
     )
     return sys_prompt, user_prompt

@@ -39,6 +39,10 @@ except Exception:  # pragma: no cover - optional fallback when rich is unavailab
 TERMINAL_STATUSES: frozenset[str] = frozenset({
     "completed",
     "done",
+    "finished",
+    "max_turns_reached",
+    "budget_exhausted",
+    "http_budget_exhausted",
     "failed",
     "interrupted",
     "service_degraded",
@@ -153,7 +157,9 @@ def _short_ts(raw_ts: Any) -> str:
 
 def _severity_rank(finding: dict[str, Any]) -> tuple[int, str]:
     sev = str(finding.get("severity") or "info").strip().lower()
-    return _SEVERITY_ORDER.get(sev, 5), str(finding.get("vuln_class") or finding.get("category") or "")
+    return _SEVERITY_ORDER.get(sev, 5), str(
+        finding.get("class_type") or finding.get("vuln_class") or finding.get("category") or ""
+    )
 
 
 def _format_event_detail(ev: dict[str, Any]) -> str:
@@ -285,9 +291,24 @@ def load_run_snapshot(
             snap.seconds_limit = float(limits.get("seconds") or 0.0)
         budget = meta.get("budget")
         if isinstance(budget, dict):
-            snap.http_used = int(budget.get("http_used") or budget.get("http") or 0)
-            snap.tokens_used = int(budget.get("tokens_used") or budget.get("tokens") or 0)
-            snap.seconds_used = float(budget.get("elapsed_seconds") or budget.get("seconds_used") or 0.0)
+            b_limits = _as_dict(budget.get("limits"))
+            b_used = _as_dict(budget.get("used"))
+            if b_limits.get("http") is not None:
+                snap.http_limit = max(snap.http_limit, int(b_limits.get("http") or 0))
+            if b_limits.get("tokens") is not None:
+                snap.tokens_limit = max(snap.tokens_limit, int(b_limits.get("tokens") or 0))
+            http_val = b_used.get("http") if b_used.get("http") is not None else (budget.get("http_used") or budget.get("http") or 0)
+            tok_val = b_used.get("tokens") if b_used.get("tokens") is not None else (budget.get("tokens_used") or budget.get("tokens") or 0)
+            snap.http_used = max(snap.http_used, int(http_val or 0))
+            snap.tokens_used = max(snap.tokens_used, int(tok_val or 0))
+            if budget.get("elapsed_seconds") is not None or budget.get("seconds_used") is not None:
+                snap.seconds_used = max(
+                    snap.seconds_used,
+                    float(budget.get("elapsed_seconds") or budget.get("seconds_used") or 0.0),
+                )
+            elif budget.get("remaining_seconds") is not None and snap.seconds_limit > 0:
+                rem_sec = float(budget.get("remaining_seconds") or 0.0)
+                snap.seconds_used = max(snap.seconds_used, max(0.0, snap.seconds_limit - rem_sec))
         snap.llm_calls = int(meta.get("llm_calls") or 0)
         if meta.get("target_requests") is not None:
             snap.http_used = max(snap.http_used, int(meta.get("target_requests") or 0))
@@ -318,11 +339,16 @@ def load_run_snapshot(
         if isinstance(sharding_summary, dict) and isinstance(sharding_summary.get("shards"), list):
             for idx, item in enumerate(sharding_summary["shards"]):
                 if isinstance(item, dict):
+                    raw_shard_findings = (
+                        item.get("findings")
+                        if item.get("findings") is not None
+                        else item.get("findings_count")
+                    )
                     snap.shards.append({
                         "name": str(item.get("shard_id") or item.get("name") or f"shard-{idx + 1}"),
                         "status": str(item.get("status") or "unknown"),
                         "turns": int(item.get("turns") or 0),
-                        "findings": int(item.get("findings_count") or 0),
+                        "findings": int(raw_shard_findings or 0),
                     })
         snap.report_md = str(meta.get("report_md") or "")
         snap.report_sarif = str(meta.get("report_sarif") or "")
@@ -332,12 +358,24 @@ def load_run_snapshot(
     # Optional live numeric budget snapshot written by runner
     budget_file = _read_json_safe(root / "private" / "budget.json")
     if isinstance(budget_file, dict):
-        snap.http_used = max(snap.http_used, int(budget_file.get("http_used") or budget_file.get("http") or 0))
-        snap.tokens_used = max(snap.tokens_used, int(budget_file.get("tokens_used") or budget_file.get("tokens") or 0))
-        snap.seconds_used = max(
-            snap.seconds_used,
-            float(budget_file.get("elapsed_seconds") or budget_file.get("seconds_used") or 0.0),
-        )
+        bf_limits = _as_dict(budget_file.get("limits"))
+        bf_used = _as_dict(budget_file.get("used"))
+        if bf_limits.get("http") is not None:
+            snap.http_limit = max(snap.http_limit, int(bf_limits.get("http") or 0))
+        if bf_limits.get("tokens") is not None:
+            snap.tokens_limit = max(snap.tokens_limit, int(bf_limits.get("tokens") or 0))
+        bf_http = bf_used.get("http") if bf_used.get("http") is not None else (budget_file.get("http_used") or budget_file.get("http") or 0)
+        bf_tok = bf_used.get("tokens") if bf_used.get("tokens") is not None else (budget_file.get("tokens_used") or budget_file.get("tokens") or 0)
+        snap.http_used = max(snap.http_used, int(bf_http or 0))
+        snap.tokens_used = max(snap.tokens_used, int(bf_tok or 0))
+        if budget_file.get("elapsed_seconds") is not None or budget_file.get("seconds_used") is not None:
+            snap.seconds_used = max(
+                snap.seconds_used,
+                float(budget_file.get("elapsed_seconds") or budget_file.get("seconds_used") or 0.0),
+            )
+        elif budget_file.get("remaining_seconds") is not None and snap.seconds_limit > 0:
+            rem_sec = float(budget_file.get("remaining_seconds") or 0.0)
+            snap.seconds_used = max(snap.seconds_used, max(0.0, snap.seconds_limit - rem_sec))
 
     # Receipts (tail-only read for O(max_receipts) performance during large runs)
     receipts_dir = root / "receipts"
@@ -379,7 +417,13 @@ def load_run_snapshot(
             proof_ref = str(item.get("receipt_id") or (proof_ids[0] if isinstance(proof_ids, list) and proof_ids else ""))
             snap.findings.append({
                 "severity": str(item.get("severity") or "info").upper(),
-                "vuln_class": str(item.get("vuln_class") or item.get("category") or item.get("type") or "finding"),
+                "vuln_class": str(
+                    item.get("class_type")
+                    or item.get("vuln_class")
+                    or item.get("category")
+                    or item.get("type")
+                    or "finding"
+                ),
                 "method": str(item.get("method") or "").upper(),
                 "path": str(item.get("path") or item.get("endpoint") or ""),
                 "actor": str(item.get("actor") or ""),
@@ -403,13 +447,26 @@ def load_run_snapshot(
                     row["status"] = str(ev.get("status"))
             snap.shards = list(seen_shards.values())
 
+        token_usage_events = 0
+        llm_turn_events = 0
+        max_reported_llm_calls = 0
         for ev in events:
             ev_name = str(ev.get("event") or "").lower()
             if "waf" in ev_name or ev.get("waf_block"):
                 snap.waf_blocks += 1
+            if ev_name == "token_usage":
+                token_usage_events += 1
+            elif ev_name == "llm_turn":
+                llm_turn_events += 1
+            raw_calls = ev.get("llm_calls")
+            if isinstance(raw_calls, int) and not isinstance(raw_calls, bool) and raw_calls > max_reported_llm_calls:
+                max_reported_llm_calls = raw_calls
             toks = ev.get("total_tokens") or ev.get("tokens_used")
             if isinstance(toks, int) and toks > snap.tokens_used:
                 snap.tokens_used = toks
+
+        if not snap.llm_calls:
+            snap.llm_calls = max(max_reported_llm_calls, token_usage_events, llm_turn_events)
 
         for ev in events[-max(1, int(max_events)):]:
             snap.recent_events.append({
@@ -582,11 +639,11 @@ def render_plain_dashboard(snap: RunSnapshot) -> str:
 
 def _status_style(status: str) -> str:
     low = status.lower()
-    if low in {"completed", "done", "planned"}:
+    if low in {"completed", "done", "finished", "planned"}:
         return "bold green"
     if low in {"running", "starting"}:
         return "bold cyan"
-    if low in {"service_degraded", "interrupted"}:
+    if low in {"service_degraded", "interrupted", "max_turns_reached", "budget_exhausted", "http_budget_exhausted"}:
         return "bold yellow"
     if low in {"failed"}:
         return "bold red"

@@ -81,6 +81,53 @@ _REFRESH_TOKEN_KEY_RANK: dict[str, int] = {
 }
 
 
+def _extract_access_token_from_json(raw_value: Any) -> tuple[int, int, str] | None:
+    """Safely extract (depth, key_rank, access_token) from a nested JSON object without echoing secrets."""
+    if not isinstance(raw_value, str):
+        return None
+    stripped = raw_value.strip()
+    if not stripped:
+        return None
+    if stripped.startswith('"') and stripped.endswith('"'):
+        try:
+            unwrapped = json.loads(stripped)
+        except ValueError:
+            unwrapped = None
+        if isinstance(unwrapped, str):
+            stripped = unwrapped.strip()
+    if not stripped.startswith("{"):
+        return None
+    try:
+        parsed = json.loads(stripped)
+    except ValueError:
+        return None
+    if not isinstance(parsed, dict):
+        return None
+
+    best: tuple[int, int, str] | None = None
+    queue: deque[tuple[dict[str, Any], int]] = deque([(parsed, 0)])
+    visited = 0
+    while queue and visited < 32:
+        obj, depth = queue.popleft()
+        visited += 1
+        for k, v in obj.items():
+            if not isinstance(k, str):
+                continue
+            k_low = k.strip().lower()
+            rank = _TOKEN_KEY_RANK.get(k_low)
+            if rank is None:
+                rank = _TOKEN_KEY_RANK.get(k_low.replace("-", "_"))
+            if rank is not None and isinstance(v, str):
+                cand = _normalize_bearer_value(v)
+                if cand and not cand.startswith(("{", "[", "<REDACTED")):
+                    cand_score = (depth, rank, cand)
+                    if best is None or (cand_score[0], cand_score[1]) < (best[0], best[1]):
+                        best = cand_score
+            elif isinstance(v, dict) and depth < 4:
+                queue.append((v, depth + 1))
+    return best
+
+
 def _extract_refresh_token_from_json(raw_value: Any) -> tuple[int, int, str] | None:
     """Safely extract (depth, key_rank, refresh_token) from a JSON-encoded object without echoing secrets."""
     if not isinstance(raw_value, str):
@@ -153,6 +200,24 @@ def _is_trustworthy_origin(scheme: str, host: str) -> bool:
     return host in _LOOPBACK_HOSTS or host.endswith(".localhost")
 
 
+def _canonical_host(host: str) -> str:
+    clean = host.strip().lower().rstrip(".")
+    if ":" in clean and "%" not in clean:
+        try:
+            return ipaddress.ip_address(clean).compressed
+        except ValueError:
+            return clean
+    return clean
+
+
+def _format_origin_key(scheme: str, host: str, port: int) -> str:
+    canon = _canonical_host(host)
+    host_netloc = f"[{canon}]" if ":" in canon else canon
+    if port == _default_port(scheme):
+        return f"{scheme}://{host_netloc}"
+    return f"{scheme}://{host_netloc}:{port}"
+
+
 def _parse_origin_tuple(raw_url: str, *, label: str = "base_url") -> tuple[str, str, int]:
     """Parse an http(s) URL into (scheme, normalized_host, effective_port)."""
     text = str(raw_url or "").strip()
@@ -168,7 +233,7 @@ def _parse_origin_tuple(raw_url: str, *, label: str = "base_url") -> tuple[str, 
         raise ValueError(f"{label} must use http:// or https:// scheme")
     if parsed.username is not None or parsed.password is not None or "@" in parsed.netloc:
         raise ValueError(f"{label} must not embed credentials")
-    host = (parsed.hostname or "").strip().lower().rstrip(".")
+    host = _canonical_host(parsed.hostname or "")
     if not host:
         raise ValueError(f"{label} must include a hostname")
     if explicit_port is not None and explicit_port <= 0:
@@ -287,14 +352,18 @@ def _cookie_matches_host(raw_domain: Any, target_host: str) -> tuple[bool, bool,
     raw = raw_domain.strip().lower()
     if not raw or any(ch.isspace() or ord(ch) < 32 for ch in raw):
         return False, False, ""
-    cookie_domain = raw.lstrip(".").rstrip(".")
+    has_leading_dot = raw.startswith(".")
+    norm_target = _canonical_host(target_host)
+    cookie_domain = _canonical_host(raw.lstrip("."))
     if not cookie_domain:
         return False, False, ""
-    if cookie_domain == target_host:
-        return True, True, cookie_domain
-    if _is_ip_address(target_host) or _is_ip_address(cookie_domain):
+    if cookie_domain == norm_target:
+        return True, not has_leading_dot, cookie_domain
+    if not has_leading_dot:
         return False, False, ""
-    if "." in cookie_domain and target_host.endswith("." + cookie_domain):
+    if _is_ip_address(norm_target) or _is_ip_address(cookie_domain):
+        return False, False, ""
+    if "." in cookie_domain and norm_target.endswith("." + cookie_domain):
         return True, False, cookie_domain
     return False, False, ""
 
@@ -322,7 +391,8 @@ def _match_cookie_scope(
     raw = raw_domain.strip().lower()
     if not raw or any(ch.isspace() or ord(ch) < 32 for ch in raw):
         return False, False, False, "", False
-    cookie_domain = raw.lstrip(".").rstrip(".")
+    has_leading_dot = raw.startswith(".")
+    cookie_domain = _canonical_host(raw.lstrip("."))
     if not cookie_domain:
         return False, False, False, "", False
 
@@ -343,21 +413,32 @@ def _match_cookie_scope(
         cand: tuple[bool, bool, bool, str, bool] | None = None
         if not rule.host_pattern.startswith("*."):
             rule_host = rule.host_pattern
-            if guard.check_origin(rule_scheme, rule_host, rule_port):
-                matched, is_exact_host, norm_domain = _cookie_matches_host(raw, rule_host)
-                if matched:
+            if "*" not in rule_host and "?" not in rule_host:
+                if guard.check_origin(rule_scheme, rule_host, rule_port):
+                    matched, is_exact_host, norm_domain = _cookie_matches_host(raw, rule_host)
+                    if matched:
+                        cand = (
+                            True,
+                            False,
+                            is_exact_host,
+                            norm_domain,
+                            _is_trustworthy_origin(rule_scheme, rule_host),
+                        )
+            elif not _is_ip_address(cookie_domain):
+                # Non-leading wildcard pattern (e.g. admin-*.target.com): exact/host match only if in scope.
+                if guard.check_origin(rule_scheme, cookie_domain, rule_port):
                     cand = (
                         True,
                         False,
-                        is_exact_host,
-                        norm_domain,
-                        _is_trustworthy_origin(rule_scheme, rule_host),
+                        not has_leading_dot,
+                        cookie_domain,
+                        _is_trustworthy_origin(rule_scheme, cookie_domain),
                     )
         else:
             wildcard_base = rule.host_pattern[2:]
             if cookie_domain.endswith("." + wildcard_base) and not _is_ip_address(cookie_domain):
                 if guard.check_origin(rule_scheme, cookie_domain, rule_port):
-                    is_exact = not raw.startswith(".")
+                    is_exact = not has_leading_dot
                     cand = (
                         True,
                         False,
@@ -369,15 +450,17 @@ def _match_cookie_scope(
                 cookie_domain == wildcard_base
                 and "." in cookie_domain
                 and not _is_ip_address(cookie_domain)
+                and (has_leading_dot or guard.check_origin(rule_scheme, cookie_domain, rule_port))
                 and not any(
                     out_rule.host_pattern in {cookie_domain, f"*.{cookie_domain}"}
+                    or out_rule.matches_origin(rule_scheme, cookie_domain, rule_port)
                     for out_rule in guard._out_of_scope_origin_rules
                 )
             ):
                 cand = (
                     True,
                     False,
-                    False,
+                    not has_leading_dot,
                     cookie_domain,
                     _is_trustworthy_origin(rule_scheme, cookie_domain),
                 )
@@ -425,7 +508,7 @@ def _normalize_bearer_value(raw_value: Any) -> str:
     if not cleaned or cleaned.lower() == "bearer":
         return ""
     stripped = _BEARER_PREFIX_RE.sub("", cleaned).strip()
-    if not stripped or _has_control_chars(stripped):
+    if not stripped or _has_control_chars(stripped) or stripped.startswith(("{", "[")):
         return ""
     return stripped
 
@@ -518,7 +601,7 @@ def load_storage_state_actor(
         raise ValueError("storage state source must be a file path or dict")
 
     # 1. Strictly scope cookies to authorized origin(s), secure policy, and expiry.
-    cookie_candidates: list[tuple[tuple[int, int, int, int], str, str]] = []
+    cookie_candidates: list[tuple[tuple[int, int, int, int], str, str, str, str, bool, bool]] = []
     for entry in state.get("cookies") or []:
         if not isinstance(entry, dict):
             continue
@@ -531,8 +614,9 @@ def load_storage_state_actor(
             continue
         if not raw_value or _has_control_chars(raw_value):
             continue
+        raw_dom_input = entry.get("domain")
         matched, is_base_match, is_exact_host, norm_domain, trustworthy_match = _match_cookie_scope(
-            entry.get("domain"),
+            raw_dom_input,
             target_scheme=target_scheme,
             target_host=target_host,
             target_port=target_port,
@@ -547,6 +631,9 @@ def load_storage_state_actor(
             continue
         raw_path = entry.get("path")
         cookie_path = raw_path.strip() if isinstance(raw_path, str) and raw_path.strip() else "/"
+        raw_dom_str = str(raw_dom_input or "").strip().lower()
+        is_host_only_cookie = not raw_dom_str.startswith(".")
+        rec_domain = norm_domain if is_host_only_cookie else f".{norm_domain}"
         # Broader domain / narrower path sorted first so base origin & exact host & root path win on duplicates.
         priority_key = (
             1 if is_base_match else 0,
@@ -554,25 +641,39 @@ def load_storage_state_actor(
             len(norm_domain),
             -len(cookie_path),
         )
-        cookie_candidates.append((priority_key, name, raw_value))
+        cookie_candidates.append(
+            (priority_key, name, raw_value, rec_domain, cookie_path, is_secure, is_host_only_cookie)
+        )
 
     cookie_candidates.sort(key=lambda item: item[0])
     cookies_dict: dict[str, str] = {}
-    for _, name, value in cookie_candidates:
+    cookie_records_map: dict[tuple[str, str, str], dict[str, Any]] = {}
+    for _, name, value, rec_domain, cookie_path, is_secure, is_host_only_cookie in cookie_candidates:
         cookies_dict[name] = value
+        cookie_records_map[(name, rec_domain, cookie_path)] = {
+            "name": name,
+            "value": value,
+            "domain": rec_domain,
+            "path": cookie_path,
+            "secure": is_secure,
+            "host_only": is_host_only_cookie,
+        }
+    cookie_records: list[dict[str, Any]] = list(cookie_records_map.values())
 
     # 2. Extract bearer, refresh & CSRF tokens and preserve authorized-origin localStorage entries.
-    best_token_rank: int | None = None
+    best_token_rank: tuple[int, int, int, int] | None = None
     access_token_str = ""
     best_refresh_rank: tuple[int, int, int, int] | None = None
     refresh_token_str = ""
-    best_csrf_rank: int | None = None
+    best_csrf_rank: tuple[int, int] | None = None
     csrf_token_str = ""
     local_storage_dict: dict[str, str] = {}
     local_storage_bytes = 0
+    local_storage_by_origin: dict[str, dict[str, str]] = {}
+    origin_ls_bytes: dict[str, int] = {}
 
     target_origin = (target_scheme, target_host, target_port)
-    scoped_origin_entries: list[tuple[bool, list[Any]]] = []
+    scoped_origin_entries: list[tuple[bool, str, list[Any]]] = []
     for origin_entry in state.get("origins") or []:
         if not isinstance(origin_entry, dict):
             continue
@@ -593,12 +694,15 @@ def load_storage_state_actor(
         local_storage = origin_entry.get("localStorage")
         if not isinstance(local_storage, list):
             continue
-        scoped_origin_entries.append((is_base_origin, local_storage))
+        canon_origin = _format_origin_key(*origin_tuple)
+        scoped_origin_entries.append((is_base_origin, canon_origin, local_storage))
 
     # Process base_origin entries first so base_origin wins on equal-rank tokens & key collisions.
     scoped_origin_entries.sort(key=lambda item: 0 if item[0] else 1)
-    for is_base_origin, local_storage in scoped_origin_entries:
+    for is_base_origin, canon_origin, local_storage in scoped_origin_entries:
         origin_tier = 0 if is_base_origin else 1
+        origin_bucket = local_storage_by_origin.setdefault(canon_origin, {})
+        origin_used_bytes = origin_ls_bytes.get(canon_origin, 0)
         for item in local_storage:
             if not isinstance(item, dict):
                 continue
@@ -609,6 +713,19 @@ def load_storage_state_actor(
             raw_val = item.get("value")
             if ls_key and not _has_control_chars(raw_key) and isinstance(raw_val, str):
                 entry_bytes = len(ls_key.encode("utf-8")) + len(raw_val.encode("utf-8"))
+                if ls_key in origin_bucket:
+                    prev_ob = len(ls_key.encode("utf-8")) + len(origin_bucket[ls_key].encode("utf-8"))
+                    new_ob_total = origin_used_bytes - prev_ob + entry_bytes
+                    if new_ob_total <= MAX_LOCAL_STORAGE_BYTES:
+                        origin_bucket[ls_key] = raw_val
+                        origin_used_bytes = new_ob_total
+                elif (
+                    len(origin_bucket) < MAX_LOCAL_STORAGE_KEYS
+                    and origin_used_bytes + entry_bytes <= MAX_LOCAL_STORAGE_BYTES
+                ):
+                    origin_bucket[ls_key] = raw_val
+                    origin_used_bytes += entry_bytes
+
                 if ls_key in local_storage_dict:
                     if is_base_origin:
                         prev_bytes = len(ls_key.encode("utf-8")) + len(local_storage_dict[ls_key].encode("utf-8"))
@@ -631,10 +748,28 @@ def load_storage_state_actor(
             if token_rank is None:
                 token_rank = _TOKEN_KEY_RANK.get(key_lower.replace("-", "_"))
             if token_rank is not None:
-                candidate = _normalize_bearer_value(raw_val)
-                if candidate and (best_token_rank is None or token_rank < best_token_rank):
-                    best_token_rank = token_rank
-                    access_token_str = candidate
+                cleaned_tok_raw = _clean_secret_value(raw_val)
+                if cleaned_tok_raw.startswith("{"):
+                    nested_tok = _extract_access_token_from_json(cleaned_tok_raw)
+                    if nested_tok is not None:
+                        tok_score = (origin_tier, 0, nested_tok[0], nested_tok[1])
+                        if best_token_rank is None or tok_score < best_token_rank:
+                            best_token_rank = tok_score
+                            access_token_str = nested_tok[2]
+                else:
+                    candidate = _normalize_bearer_value(raw_val)
+                    if candidate and not candidate.startswith("<REDACTED"):
+                        tok_score = (origin_tier, 0, 0, token_rank)
+                        if best_token_rank is None or tok_score < best_token_rank:
+                            best_token_rank = tok_score
+                            access_token_str = candidate
+            else:
+                nested_tok = _extract_access_token_from_json(raw_val)
+                if nested_tok is not None:
+                    tok_score = (origin_tier, 1, nested_tok[0], nested_tok[1])
+                    if best_token_rank is None or tok_score < best_token_rank:
+                        best_token_rank = tok_score
+                        access_token_str = nested_tok[2]
 
             refresh_rank = _REFRESH_TOKEN_KEY_RANK.get(key_lower)
             if refresh_rank is None:
@@ -665,9 +800,14 @@ def load_storage_state_actor(
             csrf_rank = _LOCALSTORAGE_CSRF_RANK.get(key_lower)
             if csrf_rank is not None:
                 csrf_candidate = _clean_secret_value(raw_val)
-                if csrf_candidate and (best_csrf_rank is None or csrf_rank < best_csrf_rank):
-                    best_csrf_rank = csrf_rank
-                    csrf_token_str = csrf_candidate
+                if csrf_candidate and not csrf_candidate.startswith("<REDACTED"):
+                    csrf_score = (origin_tier, csrf_rank)
+                    if best_csrf_rank is None or csrf_score < best_csrf_rank:
+                        best_csrf_rank = csrf_score
+                        csrf_token_str = csrf_candidate
+        origin_ls_bytes[canon_origin] = origin_used_bytes
+        if not origin_bucket:
+            local_storage_by_origin.pop(canon_origin, None)
 
     # 3. Fallback CSRF extraction from scoped cookies.
     if not csrf_token_str and cookies_dict:
@@ -690,8 +830,10 @@ def load_storage_state_actor(
         "role": clean_role,
         "tenant": clean_tenant,
         "cookies": cookies_dict,
+        "cookie_records": cookie_records,
         "headers": extra_headers,
         "local_storage": local_storage_dict,
+        "local_storage_by_origin": local_storage_by_origin,
         "auth_header": auth_header_str,
         "access_token": access_token_str,
         "csrf_token": csrf_token_str,

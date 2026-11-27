@@ -16,6 +16,7 @@ for _p in (str(_REPO_ROOT), str(SCRIPTS)):
 COMMANDS: dict[str, tuple[str, list[str]]] = {
     "start": ("agentic_wizard", []),
     "recon": ("agentic_recon", []),
+    "map": ("agentic_surface_map", []),
     "agentic": ("agentic_runner", []),
     "run": ("agentic_runner", []),
     "watch": ("agentic_tui", []),
@@ -78,6 +79,7 @@ def _cmd_status(remainder: list[str]) -> int:
         "prescan": doc.get("prescan"),
         "har_flows": doc.get("har_flows"),
         "asset_graph": doc.get("asset_graph"),
+        "surface_map": doc.get("surface_map"),
         "waf_pivot": doc.get("waf_pivot"),
         "report_md": doc.get("report_md"),
         "report_sarif": doc.get("report_sarif"),
@@ -92,6 +94,7 @@ def main(argv: list[str] | None = None) -> int:
         description=__doc__,
         epilog=(
             "Available commands: start (interactive zero-flag launcher), recon (scope-locked asset discovery & graph builder), "
+            "map (canonical multi-origin site map builder), "
             "plan (zero-traffic dry-run planner), run / agentic (autonomous assessment runner with --preset/--config/--prescan/--tui), "
             "watch (read-only live TUI monitor), presets (list built-in presets), status (compact JSON run summary), "
             "report (evidence-backed report renderer), save-auth (browser session capture), "

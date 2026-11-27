@@ -161,6 +161,7 @@ _BOOL_FIELDS: frozenset[str] = frozenset({
     "auto_crawl",
     "auto_crawl_forms",
     "prescan",
+    "apply_har_headers",
 })
 _STR_LIST_FIELDS: frozenset[str] = frozenset({
     "allowed_methods",

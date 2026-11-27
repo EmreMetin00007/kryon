@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import argparse
+import importlib
+import inspect
 import json
 import math
 import os
@@ -115,6 +117,7 @@ def _runner_defaults() -> dict[str, Any]:
         "auto_crawl_max_actions": 24,
         "prescan": False,
         "prescan_max_requests": 24,
+        "apply_har_headers": False,
         "oob_bind_host": "",
         "oob_advertise_host": "",
     }
@@ -244,6 +247,108 @@ def _merge_header_maps(*maps: dict[str, str] | None) -> dict[str, str]:
                 merged.pop(existing, None)
             merged[hk] = hv
     return normalize_global_headers(merged)
+
+
+_HAR_GLOBAL_SKIP_HEADERS: frozenset[str] = frozenset({"content-type", "accept"})
+_RUNNER_SECRET_HEADER_PREFIXES: tuple[str, ...] = ("sec-", "x-b3-", "x-amz-", ":")
+_RUNNER_SECRET_HEADER_TOKENS: frozenset[str] = frozenset({
+    "auth",
+    "authorization",
+    "token",
+    "secret",
+    "password",
+    "passwd",
+    "cookie",
+    "jwt",
+    "bearer",
+    "apikey",
+    "credential",
+    "credentials",
+    "private",
+    "key",
+    "signature",
+    "sig",
+    "hmac",
+    "session",
+    "sessionid",
+    "sid",
+    "csrf",
+    "xsrf",
+    "otp",
+    "pin",
+})
+_RUNNER_SECRET_HEADER_SUBSTRINGS: tuple[str, ...] = (
+    "auth",
+    "jwt",
+    "bearer",
+    "signature",
+    "credential",
+    "hmac",
+    "session",
+    "csrf",
+    "xsrf",
+    "private_key",
+    "secret",
+    "token",
+    "password",
+    "passwd",
+    "cookie",
+    "apikey",
+    "api_key",
+)
+
+
+def _is_blocked_har_header(name: str, value: str) -> bool:
+    """Defense-in-depth secret header name/value blocklist for HAR/seed app headers."""
+    if agentic_har_flow._is_secret_header_name(name) or agentic_har_flow._is_secret_header_value(value):
+        return True
+    low_name = name.strip().lower()
+    if not low_name or any(low_name.startswith(prefix) for prefix in _RUNNER_SECRET_HEADER_PREFIXES):
+        return True
+    snake, tokens = agentic_har_flow._to_snake_tokens(low_name)
+    if snake in _RUNNER_SECRET_HEADER_TOKENS or any(tok in _RUNNER_SECRET_HEADER_TOKENS for tok in tokens):
+        return True
+    if any(sub in snake for sub in _RUNNER_SECRET_HEADER_SUBSTRINGS):
+        return True
+    stripped_val = value.strip()
+    if not stripped_val or agentic_har_flow._has_secret_value_pattern(stripped_val):
+        return True
+    return False
+
+
+def _supported_kwargs(fn: Any, candidate_kwargs: dict[str, Any]) -> dict[str, Any]:
+    """Filter optional kwargs against `fn`'s signature for safe cross-module compatibility."""
+    try:
+        sig = inspect.signature(fn)
+    except (TypeError, ValueError):
+        return {}
+    params = sig.parameters
+    if any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()):
+        return dict(candidate_kwargs)
+    return {k: v for k, v in candidate_kwargs.items() if k in params}
+
+
+def _filter_safe_har_app_headers(*raw_maps: Any) -> dict[str, str]:
+    """Extract strictly non-secret, non-auth/cookie/CSRF application headers from HAR/seed sources."""
+    merged: dict[str, str] = {}
+    for raw in raw_maps:
+        if not isinstance(raw, dict) or not raw:
+            continue
+        sanitized = agentic_har_flow._sanitize_app_headers(raw)
+        for hk, hv in sanitized.items():
+            if hk.strip().lower() in _HAR_GLOBAL_SKIP_HEADERS:
+                continue
+            if _is_blocked_har_header(hk, hv):
+                continue
+            try:
+                validated = normalize_global_headers({hk: hv})
+            except ValueError:
+                continue
+            for vk, vv in validated.items():
+                for existing in [ek for ek in merged if ek.lower() == vk.lower()]:
+                    merged.pop(existing, None)
+                merged[vk] = vv
+    return merged
 
 
 def _extract_bundle_custom_headers(bundle: dict[str, Any], scope_rules: dict[str, Any]) -> dict[str, str]:
@@ -424,10 +529,12 @@ def run_agentic_target(
     auto_crawl_max_actions: int = 24,
     prescan: bool = False,
     prescan_max_requests: int = 24,
+    apply_har_headers: bool = False,
     oob_bind_host: str = "",
     oob_advertise_host: str = "",
     preset: str = "",
     config_file: Path | None = None,
+    cancel_event: threading.Event | None = None,
     _options_resolved: bool = False,
 ) -> tuple[Path, dict[str, Any]]:
     """Run (or plan when execute=False) AgenticInvestigator against an authorized target."""
@@ -492,6 +599,7 @@ def run_agentic_target(
             "auto_crawl_max_actions": auto_crawl_max_actions,
             "prescan": prescan,
             "prescan_max_requests": prescan_max_requests,
+            "apply_har_headers": apply_har_headers,
             "oob_bind_host": oob_bind_host,
             "oob_advertise_host": oob_advertise_host,
         }
@@ -509,6 +617,7 @@ def run_agentic_target(
             **merged,
             preset=resolved_preset,
             config_file=config_file,
+            cancel_event=cancel_event,
             _options_resolved=True,
         )
     if output_dir is None:
@@ -556,7 +665,6 @@ def run_agentic_target(
     scope_rules: dict[str, Any] = raw_scope if isinstance(raw_scope, dict) else {}
     scope_file_headers = _parse_custom_headers(scope_meta.get("custom_headers"))
     bundle_headers = _extract_bundle_custom_headers(bundle, scope_rules)
-    global_headers = _merge_header_maps(scope_file_headers, bundle_headers, cli_global_headers)
     eff_methods = _parse_allowed_methods(allowed_methods, scope_rules)
     bundle_max_req = scope_rules.get("max_requests")
     eff_http_budget = int(
@@ -573,6 +681,7 @@ def run_agentic_target(
     har_flows_doc: dict[str, Any] | None = None
     har_flows_handoff: str = ""
     asset_graph_doc: dict[str, Any] | None = None
+    asset_graph_raw: dict[str, Any] | None = None
     asset_graph_handoff: str = ""
     if asset_graph_file is not None:
         asset_graph_doc = agentic_recon.load_asset_graph_for_run(
@@ -582,6 +691,11 @@ def run_agentic_target(
             in_scope_assets=eff_in_scope_assets,
             out_of_scope_assets=eff_out_of_scope_assets,
         )
+        try:
+            loaded_ag = json.loads(agentic_recon._read_regular_file(asset_graph_file))
+            asset_graph_raw = loaded_ag if isinstance(loaded_ag, dict) else asset_graph_doc
+        except (OSError, ValueError):
+            asset_graph_raw = asset_graph_doc
         for hint in asset_graph_doc.get("discovery_hints") or []:
             if hint not in eff_discovery_hints:
                 eff_discovery_hints.append(hint)
@@ -604,6 +718,22 @@ def run_agentic_target(
             in_scope_assets=eff_in_scope_assets,
             out_of_scope_assets=eff_out_of_scope_assets,
         )
+    har_app_headers = _filter_safe_har_app_headers(
+        seed_data.get("app_headers") if isinstance(seed_data, dict) else None,
+        har_flows_doc.get("recommended_app_headers") if isinstance(har_flows_doc, dict) else None,
+    )
+    operator_headers = _merge_header_maps(
+        scope_file_headers,
+        bundle_headers,
+        cli_global_headers,
+    )
+    if apply_har_headers and har_app_headers:
+        global_headers = _merge_header_maps(
+            har_app_headers,
+            operator_headers,
+        )
+    else:
+        global_headers = dict(operator_headers)
     if tech_hints:
         eff_discovery_hints = agentic_seed.enrich_tech_discovery_hints(
             tech_hints,
@@ -740,6 +870,12 @@ def run_agentic_target(
         ),
     }
 
+    asset_graph_manifest: dict[str, Any] | None = None
+    if asset_graph_doc is not None:
+        asset_graph_manifest = dict(asset_graph_doc.get("stats") or {})
+        if asset_graph_file is not None:
+            asset_graph_manifest["file"] = str(Path(asset_graph_file).expanduser().resolve())
+
     if not execute:
         plan_path = output / "agentic-plan.json"
         plan_actors = ActorManager(
@@ -769,7 +905,7 @@ def run_agentic_target(
             "discovery_hints": eff_discovery_hints,
             "seed_surface": dict(seed_data.get("stats") or {}) if seed_data is not None else None,
             "har_flows": dict(har_flows_doc.get("stats") or {}) if har_flows_doc is not None else None,
-            "asset_graph": dict(asset_graph_doc.get("stats") or {}) if asset_graph_doc is not None else None,
+            "asset_graph": dict(asset_graph_manifest) if asset_graph_manifest is not None else None,
             "stage0_crawl": dict(stage0_cfg),
             "prescan": dict(prescan_cfg),
             "oob_listener": dict(oob_summary),
@@ -861,7 +997,7 @@ def run_agentic_target(
         "discovery_hints": list(eff_discovery_hints),
         "seed_surface": dict(seed_data.get("stats") or {}) if seed_data is not None else None,
         "har_flows": dict(har_flows_doc.get("stats") or {}) if har_flows_doc is not None else None,
-        "asset_graph": dict(asset_graph_doc.get("stats") or {}) if asset_graph_doc is not None else None,
+        "asset_graph": dict(asset_graph_manifest) if asset_graph_manifest is not None else None,
         "stage0_crawl": dict(stage0_cfg),
         "prescan": dict(prescan_cfg),
         "oob_listener": dict(oob_summary),
@@ -883,14 +1019,22 @@ def run_agentic_target(
     dump(manifest_path, manifest)
 
     investigator: AgenticInvestigator | None = None
+    prescan_doc_final: dict[str, Any] | None = None
+    stage0_result_final: dict[str, Any] | None = None
+    raw_seed_data: dict[str, Any] | None = seed_data
     try:
+        has_resume_checkpoint = (
+            (output / "checkpoint.json").is_file()
+            or ((output / "shards").is_dir() and any((output / "shards").glob("*/checkpoint.json")))
+        )
+        if (not resume or has_resume_checkpoint) and any(
+            alias != "anon" and bool(sess.login_payload) and not sess.authenticated
+            for alias, sess in actors.actors.items()
+        ):
+            http_client.authenticate_all_actors()
+            manifest["auth"] = _build_auth_metadata(actors, login_path_source=login_path_source)
+
         if not resume:
-            if any(
-                alias != "anon" and bool(sess.login_payload) and not sess.authenticated
-                for alias, sess in actors.actors.items()
-            ):
-                http_client.authenticate_all_actors()
-                manifest["auth"] = _build_auth_metadata(actors, login_path_source=login_path_source)
             if eff_auto_crawl:
                 import agentic_stage0_crawl  # type: ignore[import-not-found]
 
@@ -903,6 +1047,7 @@ def run_agentic_target(
                     allow_forms=eff_auto_crawl_forms,
                 )
                 if isinstance(stage0_result, dict):
+                    stage0_result_final = stage0_result
                     stage0_stats = dict(stage0_result.get("stats") or {})
                     if stage0_result.get("status") is not None and "status" not in stage0_stats:
                         stage0_stats["status"] = str(stage0_result.get("status"))
@@ -941,22 +1086,65 @@ def run_agentic_target(
                     dump(manifest_path, manifest)
 
         prescan_handoff = ""
+        initial_waf_vendors: list[str] = []
         if eff_prescan and not resume:
             try:
+                operator_keys_low = {k.lower() for k in operator_headers}
+                if apply_har_headers:
+                    raw_prescan_har_headers = _filter_safe_har_app_headers(
+                        seed_data.get("app_headers") if isinstance(seed_data, dict) else None,
+                        har_flows_doc.get("recommended_app_headers") if isinstance(har_flows_doc, dict) else None,
+                    )
+                    prescan_har_headers = {
+                        hk: hv
+                        for hk, hv in raw_prescan_har_headers.items()
+                        if hk.lower() not in operator_keys_low
+                    }
+                    if isinstance(har_flows_doc, dict):
+                        safe_rec = _filter_safe_har_app_headers(har_flows_doc.get("recommended_app_headers"))
+                        prescan_har_flows: dict[str, Any] | None = {
+                            **har_flows_doc,
+                            "recommended_app_headers": {
+                                hk: hv for hk, hv in safe_rec.items() if hk.lower() not in operator_keys_low
+                            },
+                        }
+                    else:
+                        prescan_har_flows = None
+                else:
+                    prescan_har_headers = {}
+                    prescan_har_flows = (
+                        {**har_flows_doc, "recommended_app_headers": {}}
+                        if isinstance(har_flows_doc, dict)
+                        else None
+                    )
+                prescan_extra = _supported_kwargs(
+                    agentic_prescan.run_deterministic_prescan,
+                    {
+                        "har_flows": prescan_har_flows,
+                        "extra_headers": prescan_har_headers or None,
+                    },
+                )
                 prescan_doc = agentic_prescan.run_deterministic_prescan(
                     http_client,
                     output_dir=output,
                     seed_surface=seed_data,
                     candidate_urls=eff_discovery_hints,
                     max_requests=eff_prescan_max_requests,
+                    **prescan_extra,
                 )
+                prescan_doc_final = prescan_doc
                 prescan_stats = dict(prescan_doc.get("stats") or {})
+                initial_waf_vendors = [
+                    str(v).strip()
+                    for v in (prescan_doc.get("waf_vendors_seen") or [])
+                    if str(v).strip()
+                ]
                 manifest["prescan"] = {
                     **prescan_cfg,
                     **prescan_stats,
                     "status": str(prescan_doc.get("status") or "ok"),
                     "leads_count": len(prescan_doc.get("leads") or []),
-                    "waf_vendors_seen": list(prescan_doc.get("waf_vendors_seen") or []),
+                    "waf_vendors_seen": list(initial_waf_vendors),
                     "summary_file": str(prescan_doc.get("summary_file") or ""),
                 }
                 prescan_handoff = agentic_prescan.format_prescan_handoff(prescan_doc, max_chars=2400)
@@ -970,6 +1158,19 @@ def run_agentic_target(
                     "error": type(exc).__name__,
                 }
                 dump(manifest_path, manifest)
+        elif resume and (output / "prescan-summary.json").is_file():
+            try:
+                prior_prescan = json.loads((output / "prescan-summary.json").read_text(encoding="utf-8"))
+                if isinstance(prior_prescan, dict):
+                    prescan_doc_final = prior_prescan
+                    prescan_handoff = agentic_prescan.format_prescan_handoff(prior_prescan, max_chars=2400)
+                    initial_waf_vendors = [
+                        str(v).strip()
+                        for v in (prior_prescan.get("waf_vendors_seen") or [])
+                        if str(v).strip()
+                    ]
+            except (OSError, ValueError):
+                pass
 
         worker_model_id = models["worker"].split("/", 1)[1]
         investigator = AgenticInvestigator(
@@ -1005,6 +1206,8 @@ def run_agentic_target(
             prescan_handoff=prescan_handoff,
             har_flows_handoff=har_flows_handoff,
             asset_graph_handoff=asset_graph_handoff,
+            initial_waf_vendors=initial_waf_vendors,
+            cancel_event=cancel_event,
         )
         run_info = investigator.run(resume=resume)
         manifest.update(run_info)
@@ -1026,7 +1229,20 @@ def run_agentic_target(
             findings_list = json.loads(findings_file.read_text(encoding="utf-8"))
         except (OSError, ValueError):
             findings_list = []
-        if isinstance(findings_list, list) and findings_list:
+        if not isinstance(findings_list, list):
+            findings_list = []
+        else:
+            findings_list = [item for item in findings_list if isinstance(item, dict)]
+        shards_dir = output / "shards"
+        if shards_dir.is_dir():
+            for shard_findings_path in sorted(shards_dir.glob("*/findings.json")):
+                try:
+                    shard_items = json.loads(shard_findings_path.read_text(encoding="utf-8"))
+                except (OSError, ValueError):
+                    continue
+                if isinstance(shard_items, list):
+                    findings_list.extend(item for item in shard_items if isinstance(item, dict))
+        if findings_list:
             actor_meta_map = {
                 row["alias"]: {
                     "alias": row["alias"],
@@ -1066,6 +1282,72 @@ def run_agentic_target(
             manifest["process_metrics_md"] = str(m_md)
             manifest["process_metrics"] = metrics_doc
         dump(private_dir / "budget.json", snap)
+        try:
+            surface_map_mod: Any = importlib.import_module("agentic_surface_map")
+        except ImportError:
+            surface_map_mod = None
+        if surface_map_mod is not None:
+            try:
+                all_receipts: list[dict[str, Any]] = []
+                for rid in receipt_store.list_ids():
+                    try:
+                        all_receipts.append(receipt_store.get(rid))
+                    except (KeyError, ValueError, OSError):
+                        continue
+                stage0_docs_for_map: list[dict[str, Any]] = []
+                if isinstance(stage0_result_final, dict):
+                    stage0_docs_for_map.append(stage0_result_final)
+                elif (output / "stage0-seed.json").is_file():
+                    try:
+                        disk_s0 = json.loads((output / "stage0-seed.json").read_text(encoding="utf-8"))
+                        if isinstance(disk_s0, dict):
+                            stage0_docs_for_map.append(disk_s0)
+                    except (OSError, ValueError):
+                        pass
+                post_auth_s0_path = output / "stage0-post-auth-seed.json"
+                if post_auth_s0_path.is_file():
+                    try:
+                        disk_post_s0 = json.loads(post_auth_s0_path.read_text(encoding="utf-8"))
+                        if isinstance(disk_post_s0, dict):
+                            stage0_docs_for_map.append(disk_post_s0)
+                    except (OSError, ValueError):
+                        pass
+                stage0_for_map: dict[str, Any] | None = None
+                if len(stage0_docs_for_map) == 1:
+                    stage0_for_map = stage0_docs_for_map[0]
+                elif len(stage0_docs_for_map) > 1:
+                    merge_s0_fn = getattr(surface_map_mod, "_merge_stage0_docs", None)
+                    stage0_for_map = (
+                        merge_s0_fn(stage0_docs_for_map)
+                        if callable(merge_s0_fn)
+                        else stage0_docs_for_map[0]
+                    )
+                sm_kwargs = _supported_kwargs(
+                    surface_map_mod.build_surface_map,
+                    {
+                        "base_url": base,
+                        "receipts": all_receipts,
+                        "seed_surface": raw_seed_data,
+                        "stage0_result": stage0_for_map,
+                        "har_flows": har_flows_doc,
+                        "asset_graph": asset_graph_raw,
+                        "prescan_doc": prescan_doc_final,
+                        "surface_tracker": investigator.dispatcher.surface_tracker if investigator is not None else None,
+                        "in_scope_assets": eff_in_scope_assets,
+                        "out_of_scope_assets": eff_out_of_scope_assets,
+                        "excluded_paths": eff_excluded_paths,
+                    },
+                )
+                surface_map = surface_map_mod.build_surface_map(**sm_kwargs)
+                sm_json, sm_md = surface_map_mod.write_surface_map_artifacts(output, surface_map)
+                sm_stats = surface_map.get("stats") if isinstance(surface_map, dict) else {}
+                manifest["surface_map"] = {
+                    "json": str(sm_json),
+                    "md": str(sm_md),
+                    **(sm_stats if isinstance(sm_stats, dict) else {}),
+                }
+            except Exception as sm_exc:
+                manifest["surface_map_error"] = type(sm_exc).__name__
         dump(manifest_path, manifest)
         dump(output / "launch.json", manifest)
         report_md_text: str | None = None
@@ -1296,6 +1578,19 @@ def main(argv: list[str] | None = None, *, force_plan_only: bool = False) -> int
         help="Maximum HTTP requests budgeted for deterministic prescan (default: 24)",
     )
     parser.add_argument(
+        "--apply-har-headers",
+        action="store_true",
+        default=argparse.SUPPRESS,
+        help="Merge strictly non-secret HAR/seed application headers at lowest precedence into global headers",
+    )
+    parser.add_argument(
+        "--no-apply-har-headers",
+        action="store_false",
+        dest="apply_har_headers",
+        default=argparse.SUPPRESS,
+        help="Disable merging non-secret HAR/seed application headers into global headers (overrides config)",
+    )
+    parser.add_argument(
         "--oob-bind-host",
         default=argparse.SUPPRESS,
         help="Optional OOB callback bind IP (default 127.0.0.1; private Docker bridge IP permitted)",
@@ -1343,6 +1638,7 @@ def main(argv: list[str] | None = None, *, force_plan_only: bool = False) -> int
         import agentic_tui
 
         done_event = threading.Event()
+        cancel_event = threading.Event()
         result_box: dict[str, Any] = {}
 
         def _worker() -> None:
@@ -1351,6 +1647,7 @@ def main(argv: list[str] | None = None, *, force_plan_only: bool = False) -> int
                     **effective,
                     preset=eff_preset,
                     config_file=config_path,
+                    cancel_event=cancel_event,
                     _options_resolved=True,
                 )
                 result_box["result"] = (r_path, r_doc)
@@ -1368,10 +1665,31 @@ def main(argv: list[str] | None = None, *, force_plan_only: bool = False) -> int
                 stop_event=done_event,
             )
         finally:
-            thread.join()
+            if not done_event.is_set():
+                cancel_event.set()
+            thread.join(timeout=5.0)
         if "error" in result_box:
             raise result_box["error"]
-        path, doc = result_box["result"]
+        if "result" in result_box:
+            path, doc = result_box["result"]
+        else:
+            out_dir_resolved = Path(effective["output_dir"]).expanduser().resolve()
+            path = out_dir_resolved / "manifest.json"
+            doc = {}
+            if path.is_file():
+                try:
+                    loaded_doc = json.loads(path.read_text(encoding="utf-8"))
+                    if isinstance(loaded_doc, dict):
+                        doc = loaded_doc
+                except (OSError, ValueError):
+                    doc = {}
+            if str(doc.get("status") or "").strip().lower() in {"", "starting", "running"}:
+                doc["status"] = "interrupted"
+            doc.setdefault("mode", "agentic")
+            doc.setdefault("target", str(effective.get("target") or ""))
+            doc.setdefault("llm_calls", 0)
+            doc.setdefault("target_requests", 0)
+            doc.setdefault("findings_count", 0)
     else:
         path, doc = run_agentic_target(
             **effective,
@@ -1396,6 +1714,11 @@ def main(argv: list[str] | None = None, *, force_plan_only: bool = False) -> int
     if doc.get("preset"):
         summary["preset"] = doc["preset"]
     print(json.dumps(summary))
+    status_str = str(doc.get("status") or "").strip().lower()
+    if status_str == "interrupted":
+        return 130
+    if status_str == "failed" or status_str.startswith("error:"):
+        return 1
     return 0
 
 

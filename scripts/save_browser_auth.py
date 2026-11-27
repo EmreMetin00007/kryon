@@ -34,10 +34,17 @@ from agentic_http import parse_custom_headers  # noqa: E402
 from kryon_core.vault.otp_core import OtpError, fetch_latest_otp  # noqa: E402
 
 AUTH_DIR = Path(os.environ.get("CCO_AUTH_DIR", "~/.cco/auth")).expanduser()
-PROXY = os.environ.get("CCO_PROXY", "http://127.0.0.1:8080").strip()
+PROXY = os.environ.get("CCO_PROXY", "").strip()
 DEFAULT_USER_AGENT = (
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+)
+_WAF_BLOCK_TITLE_SUBSTRINGS: tuple[str, ...] = (
+    "attention required",
+    "access denied",
+    "just a moment",
+    "güvenlik",
+    "guvenlik",
 )
 
 OTP_CANDIDATES = [
@@ -47,18 +54,23 @@ OTP_CANDIDATES = [
 ]
 
 
-def _proxy_args() -> dict:
-    if not PROXY:
+def _resolve_proxy_args(proxy_url: str) -> dict:
+    clean = str(proxy_url or "").strip()
+    if not clean:
         return {}
     try:
         import socket
         from urllib.parse import urlparse
-        u = urlparse(PROXY)
+        u = urlparse(clean)
         with socket.create_connection((u.hostname or "127.0.0.1", u.port or 8080), timeout=1.0):
-            return {"proxy": {"server": PROXY}}
+            return {"proxy": {"server": clean}}
     except OSError:
         print("[auth] proxy erisilemiyor, direkt baglaniliyor", flush=True)
         return {}
+
+
+def _proxy_args() -> dict:
+    return _resolve_proxy_args(PROXY)
 
 
 def _load_login(path: Path) -> dict:
@@ -158,6 +170,11 @@ def main(argv: list[str] | None = None) -> int:
         help="Operator header sent on every browser request (repeatable; e.g. -H 'Pentest: Cyberbounty')",
     )
     ap.add_argument("--headed", action="store_true")
+    ap.add_argument(
+        "--proxy",
+        default="",
+        help="Optional HTTP/SOCKS proxy URL (overrides CCO_PROXY; disabled by default)",
+    )
     ap.add_argument("--timeout", type=int, default=30000)
     a = ap.parse_args(argv)
 
@@ -197,13 +214,14 @@ def main(argv: list[str] | None = None) -> int:
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=not eff_headed, args=["--no-sandbox"])
+        proxy_kwargs = _resolve_proxy_args(a.proxy) if str(a.proxy or "").strip() else _proxy_args()
         context_kwargs: dict = {
             "viewport": {"width": 1366, "height": 800},
             "locale": "tr-TR",
             "timezone_id": "Europe/Istanbul",
             "user_agent": eff_user_agent,
             "ignore_https_errors": True,
-            **_proxy_args(),
+            **proxy_kwargs,
         }
         if extra_http_headers:
             context_kwargs["extra_http_headers"] = extra_http_headers
@@ -214,6 +232,32 @@ def main(argv: list[str] | None = None) -> int:
         ctx = browser.new_context(**context_kwargs)
         page = ctx.new_page()
         page.set_default_timeout(a.timeout)
+        active_pages: list = [page]
+        on_fn = getattr(ctx, "on", None)
+        if callable(on_fn):
+            def _on_popup_page(new_page) -> None:
+                try:
+                    set_to = getattr(new_page, "set_default_timeout", None)
+                    if callable(set_to):
+                        set_to(a.timeout)
+                except Exception:
+                    pass
+                active_pages.append(new_page)
+
+            on_fn("page", _on_popup_page)
+
+        def _current_page():
+            for cand in reversed(active_pages):
+                is_closed_fn = getattr(cand, "is_closed", None)
+                if callable(is_closed_fn):
+                    try:
+                        if is_closed_fn():
+                            continue
+                    except Exception:
+                        continue
+                return cand
+            return page
+
         print(f"[auth] login sayfasi aciliyor: {a.login_url}", flush=True)
         resp = page.goto(a.login_url, wait_until="domcontentloaded")
         page.wait_for_timeout(2000)
@@ -223,7 +267,8 @@ def main(argv: list[str] | None = None) -> int:
             except EOFError:
                 pass
         else:
-            if (resp and resp.status == 403) or "güvenlik" in page.title().lower():
+            title_low = (page.title() or "").lower()
+            if (resp and resp.status == 403) or any(tok in title_low for tok in _WAF_BLOCK_TITLE_SUBSTRINGS):
                 browser.close()
                 print("[auth] HATA: WAF headless'i yakaladi (403/Güvenlik). "
                       "--headed ile tekrar dene.", flush=True)
@@ -234,11 +279,26 @@ def main(argv: list[str] | None = None) -> int:
             page.click(a.submit_selector)
             page.wait_for_timeout(4000)
 
-            otp_sel = _find_otp_field(page, a.otp_selector)
+            active_page = _current_page()
+            if active_page is not page:
+                wait_load = getattr(active_page, "wait_for_load_state", None)
+                if callable(wait_load):
+                    try:
+                        wait_load("domcontentloaded", timeout=a.timeout)
+                    except Exception:
+                        pass
+
+            otp_page = active_page
+            otp_sel = _find_otp_field(otp_page, a.otp_selector)
+            if not otp_sel and otp_page is not page:
+                otp_sel = _find_otp_field(page, a.otp_selector)
+                if otp_sel:
+                    otp_page = page
             if otp_sel:
                 print(f"[auth] OTP alani bulundu ({otp_sel}), kod bekleniyor", flush=True)
                 code = None
-                for i in range(max(1, a.otp_retries)):
+                attempts = max(1, a.otp_retries)
+                for i in range(attempts):
                     try:
                         res = fetch_latest_otp(sender=a.otp_sender, max_age_minutes=5)
                         code, age = res["code"], res["age_seconds"]
@@ -246,18 +306,19 @@ def main(argv: list[str] | None = None) -> int:
                         break
                     except OtpError as e:
                         print(f"[auth] OTP deneme {i + 1}/{a.otp_retries}: {e}", flush=True)
-                        time.sleep(a.otp_wait)
+                        if i + 1 < attempts:
+                            time.sleep(a.otp_wait)
                 if not code:
                     browser.close()
                     print("[auth] HATA: OTP kodu alinamadi", flush=True)
                     return 2
-                page.fill(otp_sel, code)
-                page.wait_for_timeout(1000)
+                otp_page.fill(otp_sel, code)
+                otp_page.wait_for_timeout(1000)
                 try:
-                    page.click(a.submit_selector, timeout=5000)
+                    otp_page.click(a.submit_selector, timeout=5000)
                 except Exception:
-                    page.keyboard.press("Enter")
-                page.wait_for_timeout(4000)
+                    otp_page.keyboard.press("Enter")
+                otp_page.wait_for_timeout(4000)
             else:
                 print("[auth] OTP alani gorunmedi, direkt login varsayiliyor", flush=True)
 
@@ -275,8 +336,9 @@ def main(argv: list[str] | None = None) -> int:
         except OSError:
             pass
         cookies = ctx.cookies()
+        final_page = _current_page()
         print(f"[auth] storage kaydedildi: {storage} ({len(cookies)} cookie)", flush=True)
-        print(f"[auth] son URL: {page.url[:120]} | baslik: {page.title()[:80]}", flush=True)
+        print(f"[auth] son URL: {final_page.url[:120]} | baslik: {final_page.title()[:80]}", flush=True)
         ctx.close()
         if har_path is not None:
             try:

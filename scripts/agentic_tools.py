@@ -3,14 +3,18 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 import copy
+import inspect
 import json
 import os
 from pathlib import Path
 import re
 import tempfile
 import threading
-from typing import Any
-from urllib.parse import urlsplit
+from typing import Any, Callable, Sequence
+from urllib.parse import parse_qsl, urljoin, urlsplit
+import uuid
+
+from full_agent_budget import compact_json_text
 
 from agentic_evidence import (
     MAX_CONTROL_EXCERPT_CHARS as MAX_CONTROL_EXCERPT_CHARS,
@@ -543,6 +547,161 @@ def _is_multipart_receipt(receipt: dict[str, Any]) -> bool:
     return False
 
 
+_JSON_ESCAPE_RE = re.compile(r'\\(u[0-9a-fA-F]{4}|["\\/bfnrt])')
+_JSON_SIMPLE_UNESCAPE: dict[str, str] = {
+    '"': '"',
+    "\\": "\\",
+    "/": "/",
+    "b": "\b",
+    "f": "\f",
+    "n": "\n",
+    "r": "\r",
+    "t": "\t",
+}
+_GRAPHQL_OP_RE = re.compile(
+    r"^\s*(?:(query|mutation|subscription)\b(?:\s+([A-Za-z_][A-Za-z0-9_]*))?[^\{]*)?\{\s*([A-Za-z_][A-Za-z0-9_]*)",
+    re.IGNORECASE,
+)
+_NON_ANCHORED_JWT_RE = re.compile(r"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{4,}\b")
+
+
+def _supported_kwargs(fn: Any, candidate_kwargs: dict[str, Any]) -> dict[str, Any]:
+    """Filter optional kwargs against `fn`'s current signature for cross-module compatibility."""
+    try:
+        sig = inspect.signature(fn)
+    except (TypeError, ValueError):
+        return {}
+    params = sig.parameters
+    if any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()):
+        return dict(candidate_kwargs)
+    return {k: v for k, v in candidate_kwargs.items() if k in params}
+
+
+def _unescape_json_escapes(text: str) -> str:
+    """Decode single-pass JSON string escapes (``\\\"``, ``\\/``, ``\\uXXXX``, etc.)."""
+    def _repl(match: re.Match[str]) -> str:
+        tok = match.group(1)
+        if tok.startswith("u"):
+            return chr(int(tok[1:], 16))
+        return _JSON_SIMPLE_UNESCAPE.get(tok, match.group(0))
+
+    return _JSON_ESCAPE_RE.sub(_repl, text)
+
+
+def _extract_finding_origin(url_or_path: str, base_url: str = "") -> str:
+    """Return normalized ``scheme://host:port`` origin for finding deduplication."""
+    raw = str(url_or_path or "").strip()
+    parsed = urlsplit(raw)
+    if (not parsed.scheme or not parsed.netloc) and base_url:
+        parsed = urlsplit(urljoin(base_url, raw))
+    scheme = (parsed.scheme or "").lower()
+    if scheme not in {"http", "https"} or not parsed.netloc:
+        return ""
+    hostname = (parsed.hostname or "").strip().lower().rstrip(".")
+    if not hostname:
+        return ""
+    try:
+        port = parsed.port
+    except ValueError:
+        return ""
+    if port is None:
+        port = 443 if scheme == "https" else 80
+    host_part = f"[{hostname}]" if ":" in hostname else hostname
+    return f"{scheme}://{host_part}:{port}"
+
+
+def _parse_graphql_op_from_payload(op_name: str, query_str: str) -> str:
+    clean_name = str(op_name or "").strip()
+    clean_query = str(query_str or "").strip()
+    if clean_query:
+        m = _GRAPHQL_OP_RE.search(clean_query)
+        if m:
+            kind = str(m.group(1) or "query").lower()
+            named = str(m.group(2) or "").strip()
+            root_field = str(m.group(3) or "").strip()
+            target_name = clean_name or named or root_field
+            if target_name:
+                return f"{kind}:{target_name}"
+        if clean_name:
+            return f"query:{clean_name}"
+    if clean_name:
+        return clean_name
+    return ""
+
+
+def _extract_graphql_op(
+    route_template: str,
+    receipts: Sequence[dict[str, Any]],
+    *,
+    raw_url: str = "",
+    existing_finding: dict[str, Any] | None = None,
+) -> str:
+    """Extract normalized GraphQL operation identifier from finding metadata or proof receipts."""
+    if isinstance(existing_finding, dict):
+        saved_op = str(existing_finding.get("graphql_op") or "").strip()
+        if saved_op:
+            return saved_op
+    tmpl_low = str(route_template or "").lower()
+    looks_gql = "graphql" in tmpl_low or tmpl_low.endswith("/gql") or "/gql/" in tmpl_low
+    for rec in receipts:
+        if not isinstance(rec, dict):
+            continue
+        req_body = str(rec.get("request_body") or "").strip()
+        if req_body.startswith("{"):
+            try:
+                parsed = json.loads(req_body)
+            except ValueError:
+                parsed = None
+            if isinstance(parsed, dict) and ("query" in parsed or "operationName" in parsed):
+                op = _parse_graphql_op_from_payload(
+                    str(parsed.get("operationName") or ""),
+                    str(parsed.get("query") or ""),
+                )
+                if op:
+                    return op
+        elif req_body.startswith("["):
+            try:
+                parsed_list = json.loads(req_body)
+            except ValueError:
+                parsed_list = None
+            if isinstance(parsed_list, list):
+                ops: list[str] = []
+                for item in parsed_list:
+                    if isinstance(item, dict) and ("query" in item or "operationName" in item):
+                        op = _parse_graphql_op_from_payload(
+                            str(item.get("operationName") or ""),
+                            str(item.get("query") or ""),
+                        )
+                        if op and op not in ops:
+                            ops.append(op)
+                if ops:
+                    return ",".join(ops[:3])
+        elif looks_gql and req_body:
+            op = _parse_graphql_op_from_payload("", req_body)
+            if op:
+                return op
+        rec_url = str(rec.get("url") or "")
+        if rec_url and ("?" in rec_url or looks_gql):
+            q_map = dict(parse_qsl(urlsplit(rec_url).query, keep_blank_values=False))
+            if "query" in q_map or "operationName" in q_map:
+                op = _parse_graphql_op_from_payload(
+                    str(q_map.get("operationName") or ""),
+                    str(q_map.get("query") or ""),
+                )
+                if op:
+                    return op
+    if raw_url and "?" in raw_url:
+        q_map = dict(parse_qsl(urlsplit(raw_url).query, keep_blank_values=False))
+        if "query" in q_map or "operationName" in q_map:
+            op = _parse_graphql_op_from_payload(
+                str(q_map.get("operationName") or ""),
+                str(q_map.get("query") or ""),
+            )
+            if op:
+                return op
+    return ""
+
+
 class ToolDispatcher:
     """Executes investigation and QA verification tools against the harness."""
 
@@ -558,6 +717,8 @@ class ToolDispatcher:
         findings_path: str | Path | None = None,
         persist_findings: bool = True,
         oob_server: LoopbackCallbackServer | None = None,
+        oob_provider: Callable[..., LoopbackCallbackServer | None] | None = None,
+        waf_pivot: WAFPivotTracker | None = None,
         bootstrap_stage1_virgin_guard: bool = False,
         http_reserve_floor: int = 0,
     ):
@@ -568,6 +729,7 @@ class ToolDispatcher:
         self.oracle = oracle
         self.telemetry = telemetry
         self._oob_server: LoopbackCallbackServer | None = oob_server
+        self._oob_provider = oob_provider
         self._owns_oob_server: bool = False
         self._oob_lock = threading.Lock()
         self.bootstrap_stage1_virgin_guard: bool = bool(bootstrap_stage1_virgin_guard)
@@ -596,12 +758,21 @@ class ToolDispatcher:
             if self.persist_findings
             else []
         )
+        tracker_extra = _supported_kwargs(
+            SurfaceFrontierTracker,
+            {
+                "in_scope_assets": tuple(getattr(self.http, "in_scope_assets", ()) or ()),
+                "out_of_scope_assets": tuple(getattr(self.http, "out_of_scope_assets", ()) or ()),
+                "excluded_paths": tuple(getattr(self.http, "excluded_paths", ()) or ()),
+            },
+        )
         self.surface_tracker = SurfaceFrontierTracker(
             base_url=self.http.base_url,
             allowed_methods=sorted(self.http.allowed_methods),
             actor_summaries=self.http.actors.summaries(),
+            **tracker_extra,
         )
-        self.waf_pivot = WAFPivotTracker()
+        self.waf_pivot = waf_pivot if waf_pivot is not None else WAFPivotTracker()
         self.coverage_gate_enabled: bool = True
         self.discovery_finish_gate: bool = False
         self._auth_barrier_or_write_seen: bool = False
@@ -703,6 +874,12 @@ class ToolDispatcher:
     def _get_oob_server(self, *, start: bool = False) -> LoopbackCallbackServer | None:
         with self._oob_lock:
             if self._oob_server is None:
+                if self._oob_provider is not None:
+                    srv = self._oob_provider(start=start)
+                    if srv is not None:
+                        self._oob_server = srv
+                        self._owns_oob_server = False
+                        return self._oob_server
                 if not start:
                     return None
                 if (
@@ -929,7 +1106,14 @@ class ToolDispatcher:
             or url_path.endswith(".css")
             or has_discovery_headers
         ):
-            hints = _build_surface_hints(receipt, self.http.base_url)
+            hints_extra = _supported_kwargs(
+                _build_surface_hints,
+                {
+                    "in_scope_assets": tuple(getattr(self.http, "in_scope_assets", ()) or ()),
+                    "out_of_scope_assets": tuple(getattr(self.http, "out_of_scope_assets", ()) or ()),
+                },
+            )
+            hints = _build_surface_hints(receipt, self.http.base_url, **hints_extra)
             if hints:
                 preview["surface_hints"] = hints
         waf_info = detect_waf_block(receipt)
@@ -1142,6 +1326,23 @@ class ToolDispatcher:
     def _extract_actor_jwt_claims(self, alias: str) -> tuple[dict[str, Any], dict[str, Any], list[str]] | None:
         session = self.http.actors.get(alias)
         candidates: list[str] = []
+
+        def _collect_local_storage_map(ls_map: Any) -> tuple[list[str], list[str]]:
+            primary_ls: list[str] = []
+            secondary_ls: list[str] = []
+            if not isinstance(ls_map, dict):
+                return primary_ls, secondary_ls
+            for lk, lv in ls_map.items():
+                val_str = str(lv or "").strip()
+                if not val_str:
+                    continue
+                bucket = secondary_ls if "refresh" in str(lk or "").lower() else primary_ls
+                bucket.append(val_str)
+                if val_str.startswith(("{", "[")):
+                    for jwt_match in _NON_ANCHORED_JWT_RE.findall(val_str):
+                        bucket.append(jwt_match)
+            return primary_ls, secondary_ls
+
         with session._lock:
             if session.access_token:
                 candidates.append(session.access_token)
@@ -1151,6 +1352,19 @@ class ToolDispatcher:
             for cv in session.cookies.values():
                 if cv:
                     candidates.append(str(cv))
+            ls_primary: list[str] = []
+            ls_secondary: list[str] = []
+            p1, s1 = _collect_local_storage_map(getattr(session, "local_storage", None))
+            ls_primary.extend(p1)
+            ls_secondary.extend(s1)
+            ls_by_origin = getattr(session, "local_storage_by_origin", None)
+            if isinstance(ls_by_origin, dict):
+                for origin_map in ls_by_origin.values():
+                    p2, s2 = _collect_local_storage_map(origin_map)
+                    ls_primary.extend(p2)
+                    ls_secondary.extend(s2)
+            candidates.extend(ls_primary)
+            candidates.extend(ls_secondary)
         for raw_cand in candidates:
             tok = _strip_bearer(raw_cand)
             parts = tok.split(".")
@@ -1246,7 +1460,14 @@ class ToolDispatcher:
                     if hdr_name.lower() != "authorization":
                         self.http.register_discovered_auth_header(hdr_name)
                         break
-        surface = _extract_surface_summary(receipt, self.http.base_url)
+        summary_extra = _supported_kwargs(
+            _extract_surface_summary,
+            {
+                "in_scope_assets": tuple(getattr(self.http, "in_scope_assets", ()) or ()),
+                "out_of_scope_assets": tuple(getattr(self.http, "out_of_scope_assets", ()) or ()),
+            },
+        )
+        surface = _extract_surface_summary(receipt, self.http.base_url, **summary_extra)
         self.surface_tracker.ingest_receipt(receipt)
         self.surface_tracker.ingest_surface(surface, actor=str(receipt.get("actor") or ""))
         if self.bsag is not None:
@@ -1353,6 +1574,7 @@ class ToolDispatcher:
         self._enforce_http_reserve_floor(needed=count)
 
         barrier = threading.Barrier(count, timeout=10.0)
+        req_extra = _supported_kwargs(self.http.request, {"concurrent_burst": True})
 
         def _worker() -> dict[str, Any]:
             try:
@@ -1369,6 +1591,7 @@ class ToolDispatcher:
                 form_body=copy.deepcopy(form_body) if form_body is not None else None,
                 raw_body=raw_body,
                 force=True,
+                **req_extra,
             )
 
         with ThreadPoolExecutor(max_workers=count) as pool:
@@ -1378,12 +1601,15 @@ class ToolDispatcher:
         for rec in receipts:
             self._ingest_receipt_hooks(rec)
 
+        burst_id = f"burst-{uuid.uuid4().hex[:12]}"
         status_counts: dict[str, int] = {}
         receipt_ids: list[str] = []
         distinct_hashes: list[str] = []
         seen_hashes: set[str] = set()
         results: list[dict[str, Any]] = []
+        any_waf_block = False
         for rec in receipts:
+            rec["concurrent_burst_id"] = burst_id
             rid = str(rec.get("receipt_id") or "")
             st_key = str(int(rec.get("status") or 0))
             status_counts[st_key] = status_counts.get(st_key, 0) + 1
@@ -1396,16 +1622,26 @@ class ToolDispatcher:
             preview_body = str(rec.get("body") or "")[:300]
             item: dict[str, Any] = {
                 "receipt_id": rid,
+                "concurrent_burst_id": burst_id,
                 "status": int(rec.get("status") or 0),
                 "elapsed_ms": rec.get("elapsed_ms"),
                 "response_sha256": sha[:16],
                 "body_preview": preview_body if preview_body else "<empty>",
             }
+            waf_info = detect_waf_block(rec)
+            if waf_info is not None:
+                any_waf_block = True
+                item["waf_block"] = waf_info
+                self.waf_pivot.record_block(
+                    str(waf_info.get("vendor") or "generic"),
+                    str(rec.get("path") or rec.get("url") or "/"),
+                )
             if rec.get("error"):
                 item["error"] = rec["error"]
             results.append(item)
 
-        return wrap_untrusted({
+        payload: dict[str, Any] = {
+            "concurrent_burst_id": burst_id,
             "count": len(receipts),
             "method": norm_method,
             "url": clean_url,
@@ -1414,7 +1650,10 @@ class ToolDispatcher:
             "receipt_ids": receipt_ids,
             "distinct_body_hashes": distinct_hashes,
             "results": results,
-        })
+        }
+        if any_waf_block and self.waf_pivot.should_pivot():
+            payload["waf_pivot_guidance"] = self.waf_pivot.guidance()
+        return wrap_untrusted(payload)
 
     @staticmethod
     def _format_response_headers(receipt: dict[str, Any]) -> str:
@@ -1471,15 +1710,49 @@ class ToolDispatcher:
 
     def _receipt_contains_evidence(self, receipt: dict[str, Any], evidence: str) -> tuple[bool, str]:
         needle = evidence.strip()
+        if not needle:
+            return False, ""
         lower_needle = needle.lower()
-        body = receipt.get("body") or ""
-        loc = receipt.get("redirect_location") or ""
+        body = str(receipt.get("body") or "")
+        loc = str(receipt.get("redirect_location") or "")
         raw_headers = receipt.get("response_headers") or {}
         headers_lines = self._format_response_headers(receipt)
         headers_text = json.dumps(raw_headers, ensure_ascii=False)
 
         if needle in body or lower_needle in body.lower():
             return True, build_receipt_excerpt(receipt, needle, max_chars=MAX_PROOF_EXCERPT_CHARS)
+        if body:
+            compacted_needle = compact_json_text(needle)
+            try:
+                parsed_body = json.loads(body)
+            except ValueError:
+                parsed_body = None
+            if parsed_body is not None:
+                redumped_body = json.dumps(parsed_body, ensure_ascii=False, separators=(",", ":"))
+                if (
+                    needle in redumped_body
+                    or lower_needle in redumped_body.lower()
+                    or compacted_needle in redumped_body
+                    or compacted_needle.lower() in redumped_body.lower()
+                ):
+                    return True, build_receipt_excerpt(receipt, needle, max_chars=MAX_PROOF_EXCERPT_CHARS)
+            unescaped_body = _unescape_json_escapes(body)
+            if needle in unescaped_body or lower_needle in unescaped_body.lower():
+                esc_hint = json.dumps(needle, ensure_ascii=True)[1:-1]
+                excerpt_needle = esc_hint if esc_hint in body else needle
+                return True, build_receipt_excerpt(receipt, excerpt_needle, max_chars=MAX_PROOF_EXCERPT_CHARS)
+            compacted_body = compact_json_text(body)
+            if (
+                compacted_needle in compacted_body
+                or compacted_needle.lower() in compacted_body.lower()
+            ):
+                return True, build_receipt_excerpt(receipt, needle, max_chars=MAX_PROOF_EXCERPT_CHARS)
+            compacted_unescaped = compact_json_text(unescaped_body)
+            if (
+                compacted_needle in compacted_unescaped
+                or compacted_needle.lower() in compacted_unescaped.lower()
+            ):
+                return True, build_receipt_excerpt(receipt, needle, max_chars=MAX_PROOF_EXCERPT_CHARS)
         if needle in loc or lower_needle in loc.lower():
             return True, build_receipt_excerpt(receipt, needle, max_chars=MAX_PROOF_EXCERPT_CHARS)
         if headers_lines and lower_needle in headers_lines.lower():
@@ -1494,7 +1767,7 @@ class ToolDispatcher:
         evidence_value: str,
     ) -> tuple[str, list[str], list[dict[str, Any]]]:
         """Inspect proof receipts and evidence for callback_listener tokens/hits."""
-        oob_srv = self._oob_server
+        oob_srv = self._get_oob_server(start=False)
         ev = str(evidence_value or "").strip()
         cb_pat = re.compile(r"/cb/([A-Za-z0-9_-]{6,})")
         cb_refs: list[str] = list(cb_pat.findall(ev))
@@ -1606,12 +1879,18 @@ class ToolDispatcher:
         title: str = "",
         summary: str = "",
         severity: str = "",
+        origin: str = "",
+        graphql_op: str = "",
     ) -> dict[str, Any] | None:
-        """Merge into an existing finding sharing `(route_template, class_type)`, cross-class overlap, or alias/family root cause under `_findings_lock`."""
+        """Merge into an existing finding sharing `(origin, route_template, graphql_op, class_type)`, cross-class overlap, or alias/family root cause under `_findings_lock`."""
+        cur_origin = origin or _extract_finding_origin(raw_url, self.http.base_url)
+        cur_graphql_op = str(graphql_op or "").strip()
         norm_sev = str(severity or "").strip().lower()
         incoming_stub: dict[str, Any] = {
             "class_type": canonical_class,
             "route_template": route_template,
+            "origin": cur_origin,
+            "graphql_op": cur_graphql_op,
             "method": method,
             "url": raw_url,
             "path": effective_norm_path,
@@ -1643,6 +1922,38 @@ class ToolDispatcher:
                 existing.get("route_template")
                 or normalize_route_template(str(existing.get("url") or existing.get("path") or ""))
             )
+            existing_origin = str(
+                existing.get("origin")
+                or _extract_finding_origin(
+                    str(existing.get("url") or existing.get("path") or ""),
+                    self.http.base_url,
+                )
+            )
+            if cur_origin and existing_origin and existing_origin != cur_origin:
+                continue
+
+            existing_graphql_op = str(existing.get("graphql_op") or "").strip()
+            if not existing_graphql_op and (
+                cur_graphql_op
+                or "graphql" in existing_tmpl.lower()
+                or existing_tmpl.lower().endswith("/gql")
+                or "/gql/" in existing_tmpl.lower()
+            ):
+                ex_proof_recs: list[dict[str, Any]] = []
+                for rid in (existing.get("proof_receipt_ids") or []):
+                    try:
+                        ex_proof_recs.append(self.receipts.get(str(rid)))
+                    except (KeyError, ValueError):
+                        continue
+                existing_graphql_op = _extract_graphql_op(
+                    existing_tmpl,
+                    ex_proof_recs,
+                    raw_url=str(existing.get("url") or existing.get("path") or ""),
+                    existing_finding=existing,
+                )
+            if existing_graphql_op != cur_graphql_op:
+                continue
+
             existing_norm = {
                 **existing,
                 "class_type": existing_class,
@@ -1697,6 +2008,10 @@ class ToolDispatcher:
             return None
 
         existing = matched_existing
+        if cur_origin and not existing.get("origin"):
+            existing["origin"] = cur_origin
+        if cur_graphql_op and not existing.get("graphql_op"):
+            existing["graphql_op"] = cur_graphql_op
         existing_class = matched_existing_class
         existing_tmpl = matched_existing_tmpl
         existing_norm_for_rank = {
@@ -1897,9 +2212,19 @@ class ToolDispatcher:
 
         # Resolve proof matching claimed actor_alias and target URL/path (anti-hallucination check).
         target_norm_path = _norm_path(raw_url)
+        explicit_target_origin = (
+            _extract_finding_origin(raw_url, self.http.base_url)
+            if urlsplit(raw_url).netloc
+            else ""
+        )
         matching_proofs = [
             r for r in proof_receipts
-            if r["actor"] == actor_alias and _norm_path(r["url"]) == target_norm_path
+            if r["actor"] == actor_alias
+            and _norm_path(r["url"]) == target_norm_path
+            and (
+                not explicit_target_origin
+                or _extract_finding_origin(r["url"], self.http.base_url) == explicit_target_origin
+            )
         ]
         if not matching_proofs:
             return json.dumps({
@@ -1911,6 +2236,7 @@ class ToolDispatcher:
             })
         write_primary = matching_proofs[0]
         primary = write_primary
+        primary_origin = _extract_finding_origin(primary["url"], self.http.base_url)
         if primary["method"] != method and not (canonical_class == "mass_assignment" and primary["method"] == "GET"):
             return json.dumps({
                 "rejected": True,
@@ -1960,6 +2286,8 @@ class ToolDispatcher:
             if not is_persistent_get:
                 if normalize_route_template(r["url"]) != route_template:
                     return False
+                if primary_origin and _extract_finding_origin(r["url"], self.http.base_url) != primary_origin:
+                    return False
                 if r_method != method and not (canonical_class == "mass_assignment" and r_method == "GET"):
                     return False
             if canonical_class == "auth_bypass" and not self._is_genuine_anon_proof(r, actor_meta):
@@ -1993,22 +2321,34 @@ class ToolDispatcher:
             and int(primary.get("status") or 0) == 204
             and not str(primary.get("body") or "").strip()
         )
+        ev_clean = evidence_value.strip()
         is_cors_wildcard = (
             canonical_class == "cors_misconfiguration"
-            and evidence_value == "*"
+            and ev_clean == "*"
             and any(
                 str(k).strip().lower() == "access-control-allow-origin" and str(v).strip() == "*"
                 for r in (compatible_proofs or [primary])
                 for k, v in (r.get("response_headers") or {}).items()
             )
         )
+        is_cors_null_origin = (
+            canonical_class == "cors_misconfiguration"
+            and ev_clean.lower() == "null"
+            and any(
+                str(k).strip().lower() == "access-control-allow-origin"
+                and str(v).strip().lower() == "null"
+                for r in (compatible_proofs or [primary])
+                for k, v in (r.get("response_headers") or {}).items()
+            )
+        )
+        is_cors_exempt = is_cors_wildcard or is_cors_null_origin
         allow_delete_204_ev = is_empty_delete_204 and self._delete_204_evidence_supported(
             primary,
             control_receipts,
             evidence_value,
         )
 
-        if not is_cors_wildcard and not allow_delete_204_ev and (
+        if not is_cors_exempt and not allow_delete_204_ev and (
             not evidence_value or evidence_value.lower() in _TRIVIAL_EVIDENCE or len(evidence_value) < 3
         ):
             if len(proof_receipts) > 1 and compatible_proofs:
@@ -2041,6 +2381,18 @@ class ToolDispatcher:
                     raw_hdrs = r.get("response_headers") or {}
                     if any(
                         str(k).strip().lower() == "access-control-allow-origin" and str(v).strip() == "*"
+                        for k, v in raw_hdrs.items()
+                    ):
+                        found_in_proof = True
+                        primary = r
+                        excerpt = self._format_response_headers(r)[:MAX_PROOF_EXCERPT_CHARS]
+                        break
+            elif is_cors_null_origin:
+                for r in [*matching_proofs, *compatible_proofs]:
+                    raw_hdrs = r.get("response_headers") or {}
+                    if any(
+                        str(k).strip().lower() == "access-control-allow-origin"
+                        and str(v).strip().lower() == "null"
                         for k, v in raw_hdrs.items()
                     ):
                         found_in_proof = True
@@ -2157,16 +2509,48 @@ class ToolDispatcher:
 
         effective_actor = str(primary.get("actor") or actor_alias).strip() or actor_alias
         effective_norm_path = _norm_path(primary["url"])
+        finding_origin = _extract_finding_origin(primary["url"] or raw_url, self.http.base_url)
+        finding_graphql_op = _extract_graphql_op(
+            route_template,
+            [primary, *compatible_proofs],
+            raw_url=raw_url,
+        )
 
         # Class-specific anti-false-positive checks.
         if canonical_class == "open_redirect":
             loc = primary.get("redirect_location") or ""
             if not (300 <= primary["status"] < 400 and loc):
                 return json.dumps({"rejected": True, "reason": "open_redirect requires 3xx status with Location header"})
-            loc_host = urlsplit(loc).netloc
+            loc_str = str(loc).strip()
+            if loc_str.startswith("//"):
+                base_scheme = urlsplit(str(primary.get("url") or self.http.base_url)).scheme or "https"
+                parsed_loc = urlsplit(f"{base_scheme}:{loc_str}")
+            else:
+                parsed_loc = urlsplit(loc_str)
+            loc_host = parsed_loc.netloc
             base_host = urlsplit(self.http.base_url).netloc
             if not loc_host or loc_host == base_host:
                 return json.dumps({"rejected": True, "reason": f"redirect Location {loc!r} is not an external host"})
+            scope_guard = getattr(self.http, "scope_guard", None)
+            if scope_guard is not None:
+                loc_scheme = (parsed_loc.scheme or urlsplit(self.http.base_url).scheme or "http").lower()
+                loc_hostname = (parsed_loc.hostname or "").strip().lower().rstrip(".")
+                try:
+                    loc_port = parsed_loc.port
+                except ValueError:
+                    loc_port = None
+                if loc_port is None:
+                    loc_port = 443 if loc_scheme == "https" else (80 if loc_scheme == "http" else None)
+                if (
+                    loc_scheme in {"http", "https"}
+                    and loc_hostname
+                    and isinstance(loc_port, int)
+                    and scope_guard.check_origin(loc_scheme, loc_hostname, loc_port)
+                ):
+                    return json.dumps({
+                        "rejected": True,
+                        "reason": f"redirect Location {loc!r} targets an authorized in-scope origin, not an external host",
+                    })
             if all(urlsplit(c.get("redirect_location") or "").netloc == loc_host for c in control_receipts):
                 return json.dumps({"rejected": True, "reason": "control receipt also redirected to same external host"})
 
@@ -2390,7 +2774,7 @@ class ToolDispatcher:
 
         excerpt_by_rid = {r["receipt_id"]: ex for r, ex in valid_proof_records}
 
-        # Deduplicate & merge by route_template, cross-class overlap, or alias/family root cause.
+        # Deduplicate & merge by (origin, route_template, graphql_op), cross-class overlap, or alias/family root cause.
         norm_severity = severity if severity in {"critical", "high", "medium", "low"} else "high"
         with self._findings_lock:
             merged_resp = self._try_merge_existing_finding_locked(
@@ -2407,6 +2791,8 @@ class ToolDispatcher:
                 title=title,
                 summary=summary,
                 severity=norm_severity,
+                origin=finding_origin,
+                graphql_op=finding_graphql_op,
             )
             if merged_resp is not None:
                 return json.dumps(merged_resp)
@@ -2481,7 +2867,7 @@ class ToolDispatcher:
                 actor_meta_map=actor_meta,
                 surface_tracker=self.surface_tracker,
                 inferred_owner=inferred_bola_owner,
-                oob_server=self._oob_server,
+                oob_server=self._get_oob_server(start=False),
                 oob_hits=matching_oob_hits,
                 setup_receipts=caller_setup_receipts,
             )
@@ -2553,6 +2939,12 @@ class ToolDispatcher:
             )
             best_evidence = f"{best_evidence}\n{oob_note}" if best_evidence else oob_note
         resolved_url, clean_path, _ = self.http.resolve_in_scope(best_primary["url"] or raw_url)
+        resolved_origin = _extract_finding_origin(resolved_url, self.http.base_url) or finding_origin
+        resolved_graphql_op = _extract_graphql_op(
+            route_template,
+            valid_receipts_only,
+            raw_url=resolved_url,
+        ) or finding_graphql_op
         with self._findings_lock:
             merged_resp = self._try_merge_existing_finding_locked(
                 canonical_class=canonical_class,
@@ -2568,12 +2960,14 @@ class ToolDispatcher:
                 title=title,
                 summary=summary,
                 severity=norm_severity,
+                origin=resolved_origin,
+                graphql_op=resolved_graphql_op,
             )
             if merged_resp is not None:
                 return json.dumps(merged_resp)
 
             finding_id = f"F-{len(self.findings) + 1:03d}"
-            finding = {
+            finding: dict[str, Any] = {
                 "finding_id": finding_id,
                 "title": title,
                 "class_type": canonical_class,
@@ -2618,6 +3012,10 @@ class ToolDispatcher:
                     for c in control_receipts
                 ],
             }
+            if resolved_origin:
+                finding["origin"] = resolved_origin
+            if resolved_graphql_op:
+                finding["graphql_op"] = resolved_graphql_op
             self.findings.append(finding)
             self._save_findings()
             total_findings = len(self.findings)

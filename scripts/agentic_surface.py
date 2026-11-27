@@ -46,6 +46,7 @@ from kryon_core.surface.normalize import (  # noqa: E402
     normalize_bare_hostport_url,
 )
 from kryon_core.surface.openapi import LocalSchema  # noqa: E402
+from target_bootstrap import ScopeGuard  # noqa: E402
 
 _UUID_SEG_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.I)
 _HEX_ID_SEG_RE = re.compile(r"^[0-9a-f]{16,}$", re.I)
@@ -1843,7 +1844,7 @@ def apply_openapi_path_prefix(raw_path: str, prefix: str) -> str:
 
 
 def _is_auth_utility_path(path: str) -> bool:
-    low = path.lower()
+    low = (urlsplit(str(path or "")).path or "/").lower()
     return any(f"/{tok}" in low or low.endswith(tok) for tok in _AUTH_PATH_TOKENS)
 
 
@@ -1966,9 +1967,9 @@ def _extract_route_family(path: str) -> str:
 def _extract_api_subfamily(path: str, umbrella: str) -> str | None:
     """Return the normalized non-ID sub-family under an API umbrella prefix, or None."""
     raw = str(path or "")
-    if is_non_endpoint_source_path(raw) or not _ROUTE_API_PATH_RE.search(raw):
-        return None
     raw_path = urlsplit(raw.strip()).path or "/"
+    if is_non_endpoint_source_path(raw) or not _ROUTE_API_PATH_RE.search(raw_path):
+        return None
     segments = [seg for seg in raw_path.split("/") if seg]
     while segments and (
         _ROUTE_FAMILY_PREFIX_RE.fullmatch(segments[0])
@@ -2088,6 +2089,92 @@ def score_route_input_risk(
     return score, reason_text
 
 
+_ABS_HTTP_URL_CAND_RE = re.compile(r"""https?://[^\s"'<>`()\\]+""", re.IGNORECASE)
+_GQL_OP_NAME_RE = re.compile(r"^[_A-Za-z][_0-9A-Za-z]{0,127}$")
+
+
+def _extract_graphql_op_name(parsed_req: dict[str, Any] | None) -> str:
+    """Extract GraphQL operationName or parsed query/mutation root name from a JSON request body."""
+    if not isinstance(parsed_req, dict):
+        return ""
+    op_name = str(parsed_req.get("operationName") or "").strip()
+    if op_name and _GQL_OP_NAME_RE.fullmatch(op_name):
+        return op_name
+    raw_query = parsed_req.get("query")
+    if isinstance(raw_query, str) and raw_query.strip():
+        try:
+            from kryon_core.surface.operation import graphql_operation
+
+            op_info = graphql_operation(raw_query, op_name)
+            parsed_name = str(op_info.get("name") or "").strip()
+            if parsed_name and _GQL_OP_NAME_RE.fullmatch(parsed_name):
+                return parsed_name
+            fields = op_info.get("fields") or []
+            if fields and isinstance(fields[0], str):
+                root_field = fields[0].split(".", 1)[0].strip()
+                if root_field and _GQL_OP_NAME_RE.fullmatch(root_field):
+                    return root_field
+        except Exception:
+            pass
+    return ""
+
+
+def _collect_authorized_sibling_origins(
+    text: str,
+    *,
+    primary_url: str,
+    scope_guard: ScopeGuard | None,
+    limit: int = 12,
+) -> list[str]:
+    """Return distinct in-scope sibling ``scheme://netloc/`` origins referenced in ``text``."""
+    if not text or scope_guard is None or not scope_guard.is_multi_origin:
+        return []
+    parsed_primary = urlsplit(str(primary_url or "").strip())
+    primary_key = (parsed_primary.scheme.lower(), parsed_primary.netloc.lower())
+    base_parsed = urlsplit(scope_guard.base_origin)
+    base_key = (base_parsed.scheme.lower(), base_parsed.netloc.lower())
+    origins: list[str] = []
+    seen: set[str] = set()
+    for match in _ABS_HTTP_URL_CAND_RE.finditer(text[:524_288]):
+        cand = match.group(0).rstrip(".,;:!?]")
+        if cand.endswith(")") and "(" not in cand:
+            cand = cand[:-1]
+        try:
+            parsed = urlsplit(cand)
+        except ValueError:
+            continue
+        scheme = parsed.scheme.lower()
+        netloc = parsed.netloc.lower()
+        if scheme not in {"http", "https"} or not netloc:
+            continue
+        if (scheme, netloc) in {primary_key, base_key}:
+            continue
+        origin_url = f"{scheme}://{netloc}/"
+        if origin_url in seen:
+            continue
+        try:
+            scope_guard.check_url(cand)
+        except ValueError:
+            continue
+        seen.add(origin_url)
+        origins.append(origin_url)
+        if len(origins) >= limit:
+            break
+    return origins
+
+
+def _explicit_sibling_url_present(body_lower: str, candidate_url: str, sib_netloc_lower: str) -> bool:
+    """Return True when ``candidate_url`` explicitly targets ``sib_netloc_lower`` in ``body_lower``."""
+    parsed = urlsplit(str(candidate_url or "").strip())
+    if parsed.netloc.lower() != sib_netloc_lower:
+        return False
+    path = (parsed.path or "/").lower()
+    path_prefix = path.split("{", 1)[0]
+    if f"://{sib_netloc_lower}{path_prefix}" in body_lower:
+        return True
+    return f"://{sib_netloc_lower}" in body_lower and (path_prefix == "/" or path_prefix in body_lower)
+
+
 class SurfaceFrontierTracker:
     """Passively tracks discovered routes, per-actor objects, write ops, and untested frontier items."""
 
@@ -2099,10 +2186,32 @@ class SurfaceFrontierTracker:
         base_url: str,
         allowed_methods: Sequence[str] = ("GET", "HEAD"),
         actor_summaries: Sequence[dict[str, str]] = (),
+        in_scope_assets: Sequence[str] = (),
+        out_of_scope_assets: Sequence[str] = (),
+        excluded_paths: Sequence[str] = (),
     ):
         self.base_url = normalize_origin(base_url)
         parsed_origin = urlsplit(self.base_url)
         self._origin = (parsed_origin.scheme, parsed_origin.netloc)
+        self.in_scope_assets: tuple[str, ...] = tuple(
+            str(x).strip() for x in (in_scope_assets or ()) if str(x or "").strip()
+        )
+        self.out_of_scope_assets: tuple[str, ...] = tuple(
+            str(x).strip() for x in (out_of_scope_assets or ()) if str(x or "").strip()
+        )
+        self.excluded_paths: tuple[str, ...] = tuple(
+            str(x).strip() for x in (excluded_paths or ()) if str(x or "").strip()
+        )
+        self._scope_guard: ScopeGuard | None = (
+            ScopeGuard(
+                self.base_url,
+                excluded_paths=self.excluded_paths,
+                in_scope_assets=self.in_scope_assets,
+                out_of_scope_assets=self.out_of_scope_assets,
+            )
+            if (self.in_scope_assets or self.out_of_scope_assets)
+            else None
+        )
         self._allow_canonical_host_aliases = is_loopback_or_private_base_url(self.base_url)
         self.internal_canonical_hosts: set[str] = set()
         self.allowed_methods = frozenset(
@@ -2175,6 +2284,54 @@ class SurfaceFrontierTracker:
         self.discovered_body_templates: dict[tuple[str, str], dict[str, Any]] = {}
         # key: route_template -> set of validation field hints (e.g. "body.data:list_type")
         self.discovered_schema_hints: dict[str, set[str]] = {}
+
+    def _is_primary_origin(self, scheme: str, netloc: str) -> bool:
+        low_s = str(scheme or "").strip().lower()
+        low_n = str(netloc or "").strip().lower()
+        if (low_s, low_n) == (self._origin[0].lower(), self._origin[1].lower()):
+            return True
+        try:
+            parsed_cand = urlsplit(f"{low_s}://{low_n}")
+            parsed_base = urlsplit(self.base_url)
+            cand_port = parsed_cand.port or (443 if low_s == "https" else 80)
+            base_port = parsed_base.port or (443 if parsed_base.scheme.lower() == "https" else 80)
+        except ValueError:
+            return False
+        return (
+            low_s == parsed_base.scheme.lower()
+            and (parsed_cand.hostname or "").lower() == (parsed_base.hostname or "").lower()
+            and cand_port == base_port
+        )
+
+    def _format_scoped_path(self, resolved_url: str) -> str:
+        raw = str(resolved_url or "").strip()
+        parsed = urlsplit(raw)
+        norm_p = normalize_path(parsed.path or "/")
+        if parsed.scheme.lower() in {"http", "https"} and parsed.netloc:
+            if not self._is_primary_origin(parsed.scheme, parsed.netloc):
+                return f"{parsed.scheme.lower()}://{parsed.netloc.lower()}{norm_p}"
+        return norm_p
+
+    def _scoped_template(self, scoped_path: str) -> str:
+        raw = str(scoped_path or "").strip()
+        if not raw:
+            return "/"
+        gql_frag = ""
+        if "#" in raw:
+            base_part, frag_part = raw.split("#", 1)
+            clean_frag = frag_part.strip()
+            path_low = (urlsplit(base_part).path or "/").lower().rstrip("/")
+            if clean_frag and not clean_frag.startswith("/") and path_low.endswith(("/graphql", "/gql")):
+                gql_frag = f"#{clean_frag}"
+                raw = base_part
+        if raw.lower().startswith(("http://", "https://")):
+            parsed = urlsplit(raw)
+            if parsed.netloc:
+                path = parsed.path or "/"
+                if self._is_primary_origin(parsed.scheme, parsed.netloc):
+                    return route_template_of(path) + gql_frag
+                return f"{parsed.scheme.lower()}://{parsed.netloc.lower()}{route_template_of(path)}{gql_frag}"
+        return route_template_of(raw) + gql_frag
 
     def _add_discovered_params(self, tmpl: str, names: Sequence[str]) -> None:
         """Add parameter names to `discovered_params[tmpl]` within per-template bounds."""
@@ -2416,7 +2573,8 @@ class SurfaceFrontierTracker:
         clean_actor = str(actor or "").strip()
         if not clean_actor:
             return False
-        norm_p = normalize_path(url_or_path)
+        raw_in = str(url_or_path or "").strip()
+        norm_p = self._format_scoped_path(raw_in) if raw_in.lower().startswith(("http://", "https://")) else normalize_path(raw_in)
         if clean_actor in (self.collection_listed_objects.get(norm_p) or set()):
             return True
         entry = self.discovered_objects.get(norm_p)
@@ -2424,6 +2582,8 @@ class SurfaceFrontierTracker:
             return True
 
         # Check UI <-> API concrete sibling equivalence for the same (resource_family, concrete_id).
+        if norm_p.lower().startswith(("http://", "https://")):
+            return False
         api_prefix = _extract_api_prefix(norm_p)
         if api_prefix:
             remainder = norm_p[len(api_prefix):].lstrip("/")
@@ -2440,6 +2600,8 @@ class SurfaceFrontierTracker:
             if info is not None and info[2]:
                 res_name, _, cid = info
                 for prefix in self._ranked_api_prefixes():
+                    if not prefix.startswith("/"):
+                        continue
                     api_sibling = f"{prefix}/{res_name}/{cid}"
                     if clean_actor in (self.collection_listed_objects.get(api_sibling) or set()):
                         return True
@@ -2455,6 +2617,8 @@ class SurfaceFrontierTracker:
             return []
         matched: list[str] = []
         for prefix in self._ranked_api_prefixes():
+            if not prefix.startswith("/"):
+                continue
             base = f"{prefix}/{res_low}"
             base_slash = f"{base}/"
             in_prefix = any(
@@ -2462,7 +2626,8 @@ class SurfaceFrontierTracker:
                 for p in (self.api_prefix_routes.get(prefix) or ())
             )
             in_disc = any(
-                normalize_path(p).lower() == base or normalize_path(p).lower().startswith(base_slash)
+                not p.lower().startswith(("http://", "https://"))
+                and (normalize_path(p).lower() == base or normalize_path(p).lower().startswith(base_slash))
                 for _, p in self.discovered_routes
             )
             if in_prefix or in_disc:
@@ -2512,6 +2677,7 @@ class SurfaceFrontierTracker:
     ) -> None:
         if is_non_endpoint_source_path(norm_p) or _is_passive_spec_path(norm_p):
             return
+        is_sibling = norm_p.lower().startswith(("http://", "https://"))
         api_prefix = _extract_api_prefix(norm_p)
         if api_prefix:
             low_ct = ctype.lower()
@@ -2524,14 +2690,21 @@ class SurfaceFrontierTracker:
                 or (status in (401, 403) and (is_json_api_ct or was_discovered))
             )
             if should_register_api:
-                self.api_prefix_routes.setdefault(api_prefix, set()).add(norm_p)
-                remainder = norm_p[len(api_prefix):].lstrip("/")
-                if remainder:
-                    res_seg = remainder.split("/", 1)[0].lower()
-                    if res_seg in self.ui_resource_families:
-                        self._sync_ui_api_concrete_siblings(res_seg)
+                if is_sibling:
+                    parsed_s = urlsplit(norm_p)
+                    stored_prefix = f"{parsed_s.scheme.lower()}://{parsed_s.netloc.lower()}{api_prefix}"
+                    self.api_prefix_routes.setdefault(stored_prefix, set()).add(norm_p)
+                else:
+                    self.api_prefix_routes.setdefault(api_prefix, set()).add(norm_p)
+                    remainder = norm_p[len(api_prefix):].lstrip("/")
+                    if remainder:
+                        res_seg = remainder.split("/", 1)[0].lower()
+                        if res_seg in self.ui_resource_families:
+                            self._sync_ui_api_concrete_siblings(res_seg)
             return
 
+        if is_sibling:
+            return
         low_ct = ctype.lower()
         if any(tok in low_ct for tok in ("javascript", "ecmascript", "text/css")) or low_ct.startswith(("image/", "font/")):
             return
@@ -2558,7 +2731,9 @@ class SurfaceFrontierTracker:
 
     def _is_port_in_path_noise(self, url_or_path: str) -> bool:
         """Return True if a path/URL matches a target-port-in-path artifact for this tracker's origin."""
-        return is_port_in_path_artifact(url_or_path, origin_url=self.base_url)
+        raw = str(url_or_path or "").strip()
+        origin_ref = raw if raw.lower().startswith(("http://", "https://")) else self.base_url
+        return is_port_in_path_artifact(raw, origin_url=origin_ref)
 
     def _resolve_same_origin(self, raw_url: str, current_url: str = "") -> tuple[str, str] | None:
         raw_input = str(raw_url or "")
@@ -2579,13 +2754,30 @@ class SurfaceFrontierTracker:
             return None
         resolved = urljoin(base_ref, raw)
         parsed = urlsplit(resolved)
-        if (parsed.scheme, parsed.netloc) != self._origin:
+        scheme_low = parsed.scheme.lower()
+        netloc_low = parsed.netloc.lower()
+        if scheme_low not in {"http", "https"} or not netloc_low:
             return None
+        is_primary = self._is_primary_origin(scheme_low, netloc_low)
+        if not is_primary:
+            if self._scope_guard is None:
+                return None
+            try:
+                self._scope_guard.check_url(resolved)
+            except ValueError:
+                return None
+        elif self._scope_guard is not None:
+            try:
+                self._scope_guard.check_url(resolved)
+            except ValueError:
+                return None
         if (is_static_asset_url(parsed.path) and not _extract_path_embedded_params(parsed.path)) or is_non_endpoint_source_path(resolved):
             return None
         norm_p = normalize_path(parsed.path)
         if self._is_port_in_path_noise(norm_p):
             return None
+        if not is_primary:
+            return f"{scheme_low}://{netloc_low}{norm_p}", parsed.query
         return norm_p, parsed.query
 
     def _resolve_same_origin_ws(self, raw_url: str, current_url: str = "") -> tuple[str, str] | None:
@@ -2595,11 +2787,11 @@ class SurfaceFrontierTracker:
             return None
         low = raw.lower()
         if low.startswith("ws://"):
-            if self._origin[0] != "http":
+            if self._origin[0] != "http" and self._scope_guard is None:
                 return None
             raw = "http://" + raw[5:]
         elif low.startswith("wss://"):
-            if self._origin[0] != "https":
+            if self._origin[0] != "https" and self._scope_guard is None:
                 return None
             raw = "https://" + raw[6:]
         return self._resolve_same_origin(raw, current_url=current_url)
@@ -2624,7 +2816,7 @@ class SurfaceFrontierTracker:
         norm_p, query = resolved
         if is_non_endpoint_source_path(norm_p):
             return
-        tmpl = route_template_of(norm_p)
+        tmpl = self._scoped_template(norm_p)
 
         spa_only = _is_spa_only_source(source_tag, sources)
         neutral_js_string = str(source_tag or "").strip().lower() == "js-string"
@@ -2672,7 +2864,7 @@ class SurfaceFrontierTracker:
                 existing_samples = [
                     existing_disp
                     for (m_k, p_k), existing_disp in self.discovered_routes.items()
-                    if m_k == norm_method and route_template_of(p_k) == tmpl
+                    if m_k == norm_method and self._scoped_template(p_k) == tmpl
                 ]
                 if len(existing_samples) >= _MAX_CATALOG_DISCOVERED_PER_TEMPLATE:
                     existing_qkeys = {
@@ -2692,11 +2884,20 @@ class SurfaceFrontierTracker:
 
         if norm_method in {"POST", "PUT", "PATCH"} and norm_method in self.allowed_methods:
             if not _is_auth_utility_path(norm_p):
-                key_w = (norm_method, tmpl)
-                self.declared_write_ops.add(key_w)
-                existing_sample = self.discovered_write_ops.get(key_w, "")
-                if not existing_sample or ("{" in existing_sample and "{" not in norm_p):
-                    self.discovered_write_ops[key_w] = norm_p
+                gql_prefix = f"{tmpl}#"
+                has_named_gql = (
+                    (urlsplit(norm_p).path or "/").lower().rstrip("/").endswith(("/graphql", "/gql"))
+                    and any(
+                        m_w == norm_method and t_w.startswith(gql_prefix)
+                        for m_w, t_w in (*self.declared_write_ops, *self.discovered_write_ops)
+                    )
+                )
+                if not has_named_gql:
+                    key_w = (norm_method, tmpl)
+                    self.declared_write_ops.add(key_w)
+                    existing_sample = self.discovered_write_ops.get(key_w, "")
+                    if not existing_sample or ("{" in existing_sample and "{" not in norm_p):
+                        self.discovered_write_ops[key_w] = norm_p
 
         # Check if norm_p is a concrete object URL (has `{id}` in template, not a literal `{...}` template itself).
         if "{id}" in tmpl and "{" not in norm_p and not norm_p.lower().endswith((".js", ".mjs", ".html")):
@@ -2721,10 +2922,11 @@ class SurfaceFrontierTracker:
     ) -> None:
         if is_non_endpoint_source_path(concrete_path) or self._is_port_in_path_noise(concrete_path):
             return
-        norm_p = normalize_path(concrete_path)
+        raw_c = str(concrete_path or "").strip()
+        norm_p = self._format_scoped_path(raw_c) if raw_c.lower().startswith(("http://", "https://")) else normalize_path(raw_c)
         if is_non_endpoint_source_path(norm_p) or self._is_port_in_path_noise(norm_p):
             return
-        tmpl = route_template_of(norm_p)
+        tmpl = self._scoped_template(norm_p)
         if is_non_endpoint_source_path(tmpl):
             return
         if "{id}" not in tmpl or "{" in norm_p or norm_p.lower().endswith((".js", ".mjs", ".html")):
@@ -2772,7 +2974,8 @@ class SurfaceFrontierTracker:
 
         # If PUT or PATCH is allowed on this target, concrete REST object paths are candidate write ops
         # and also resolve `{id}` placeholders on already-declared OpenAPI/form write operations.
-        if norm_p.startswith("/api/") and not _is_auth_utility_path(norm_p):
+        path_only = urlsplit(norm_p).path or "/"
+        if path_only.startswith("/api/") and not _is_auth_utility_path(norm_p):
             for write_m in ("PUT", "PATCH"):
                 if write_m in self.allowed_methods:
                     key_w = (write_m, tmpl)
@@ -2782,11 +2985,13 @@ class SurfaceFrontierTracker:
 
     def _extract_collection_item_paths(self, collection_path: str, parsed_json: Any, actor: str) -> None:
         """Synthesize `/api/.../<collection>/<id>` object paths from plural REST collection JSON responses."""
-        norm_col = normalize_path(collection_path)
-        col_tmpl = route_template_of(norm_col)
-        if "{id}" in col_tmpl or not norm_col.startswith("/api/"):
+        raw_col = str(collection_path or "").strip()
+        norm_col = self._format_scoped_path(raw_col) if raw_col.lower().startswith(("http://", "https://")) else normalize_path(raw_col)
+        col_tmpl = self._scoped_template(norm_col)
+        col_path_only = urlsplit(norm_col).path or "/"
+        if "{id}" in col_tmpl or not col_path_only.startswith("/api/"):
             return
-        last_seg = norm_col.rsplit("/", 1)[-1].lower().replace("-", "_")
+        last_seg = col_path_only.rsplit("/", 1)[-1].lower().replace("-", "_")
         # Only synthesize `/{id}` on plural collection resource nouns (never on action/export/custom/overview endpoints).
         if not last_seg.endswith("s") or last_seg.endswith(
             ("ss", "us", "is", "status", "details", "settings", "metrics", "analytics")
@@ -2841,16 +3046,46 @@ class SurfaceFrontierTracker:
         method = str(receipt.get("method") or "GET").strip().upper()
         raw_url = str(receipt.get("url") or receipt.get("path") or "/")
         url = urljoin(self.base_url, raw_url)
+        if self._allow_canonical_host_aliases and self.internal_canonical_hosts:
+            url = rewrite_internal_canonical_url(
+                url,
+                base_url=self.base_url,
+                canonical_hosts=self.internal_canonical_hosts,
+            )
         status = int(receipt.get("status") or 0)
         body = str(receipt.get("body") or "")
         ctype = str(receipt.get("content_type") or "").lower()
 
         self.exercised_actors.add(actor)
-        norm_p = normalize_path(url)
-        tmpl = route_template_of(norm_p)
+        norm_p = self._format_scoped_path(url)
+        tmpl = self._scoped_template(norm_p)
+        parsed_url = urlsplit(url)
+        norm_path_low = (urlsplit(norm_p).path or "/").lower().rstrip("/")
+        is_graphql_endpoint = norm_path_low.endswith(("/graphql", "/gql"))
+
+        req_body = str(receipt.get("request_body") or "")
+        stripped_req = req_body.strip()
+        is_multipart_summary = stripped_req.lower().startswith("multipart/form-data ")
+        parsed_req_obj: dict[str, Any] | None = None
+        if stripped_req and not is_multipart_summary and stripped_req.startswith("{"):
+            try:
+                cand_req = json.loads(stripped_req)
+            except ValueError:
+                cand_req = None
+            if isinstance(cand_req, dict):
+                parsed_req_obj = cand_req
+        gql_op_name = (
+            _extract_graphql_op_name(parsed_req_obj)
+            if (is_graphql_endpoint and parsed_req_obj is not None)
+            else ""
+        )
 
         self.visited_method_paths.add((method, norm_p))
-        self.visited_method_templates.add((method, tmpl))
+        if gql_op_name:
+            self.visited_method_paths.add((method, f"{norm_p}#{gql_op_name}"))
+            self.visited_method_templates.add((method, f"{tmpl}#{gql_op_name}"))
+        else:
+            self.visited_method_templates.add((method, tmpl))
         self.actors_by_path.setdefault(norm_p, set()).add(actor)
         self.actors_by_template.setdefault(tmpl, set()).add(actor)
         if status and status != 404:
@@ -2862,7 +3097,15 @@ class SurfaceFrontierTracker:
         path_param_pairs = _extract_path_embedded_param_pairs(norm_p)
         observed_param_pairs: list[tuple[str, str]] = []
         if raw_path_pairs and not path_param_pairs:
-            raw_tmpl = route_template_of(raw_norm_p)
+            raw_tmpl = (
+                f"{parsed_url.scheme.lower()}://{parsed_url.netloc.lower()}{route_template_of(raw_norm_p)}"
+                if (
+                    parsed_url.scheme.lower() in {"http", "https"}
+                    and parsed_url.netloc
+                    and not self._is_primary_origin(parsed_url.scheme, parsed_url.netloc)
+                )
+                else route_template_of(raw_norm_p)
+            )
             active_probe_tmpl = raw_tmpl
             if status != 404:
                 self._add_discovered_params(raw_tmpl, [k for k, _ in raw_path_pairs])
@@ -2879,7 +3122,6 @@ class SurfaceFrontierTracker:
                 self._record_param_probes(tmpl, concrete_path_pairs)
                 observed_param_pairs.extend(concrete_path_pairs)
 
-        parsed_url = urlsplit(url)
         query_str = str(receipt.get("query") or parsed_url.query or "")
         q_pairs = [(k.strip(), v) for k, v in parse_qsl(query_str, keep_blank_values=True) if k.strip()]
         if q_pairs:
@@ -2887,9 +3129,12 @@ class SurfaceFrontierTracker:
             observed_param_pairs.extend(q_pairs)
 
         if method in _MUTATING_HTTP_METHODS:
-            self.actively_probed_templates.add(tmpl)
-            if active_probe_tmpl != tmpl:
-                self.actively_probed_templates.add(active_probe_tmpl)
+            if is_graphql_endpoint and gql_op_name:
+                self.actively_probed_templates.add(f"{tmpl}#{gql_op_name}")
+            else:
+                self.actively_probed_templates.add(tmpl)
+                if active_probe_tmpl != tmpl:
+                    self.actively_probed_templates.add(active_probe_tmpl)
         elif observed_param_pairs:
             self._maybe_mark_param_actively_probed(active_probe_tmpl, observed_param_pairs)
             if active_probe_tmpl != tmpl and q_pairs:
@@ -2962,11 +3207,11 @@ class SurfaceFrontierTracker:
                 prefix_counts: dict[str, int] = {}
                 tmpl_counts: dict[str, int] = {}
                 for p in bucket:
-                    p_segs = [s for s in p.split("/") if s]
+                    p_segs = [s for s in (urlsplit(p).path or "/").split("/") if s]
                     p_prefix = "/" + "/".join(p_segs[:-1]) if len(p_segs) > 1 else "/"
                     if p_prefix != "/":
                         prefix_counts[p_prefix] = prefix_counts.get(p_prefix, 0) + 1
-                    p_tmpl = route_template_of(p)
+                    p_tmpl = self._scoped_template(p)
                     tmpl_counts[p_tmpl] = tmpl_counts.get(p_tmpl, 0) + 1
                     if 200 <= status < 400 and p_tmpl not in self._non_fallback_templates and p_tmpl not in self.discovered_form_templates:
                         self.html_or_form_templates.discard(p_tmpl)
@@ -2993,7 +3238,7 @@ class SurfaceFrontierTracker:
             self._spa_404_templates.discard(tmpl)
             self._spa_shell_templates.discard(tmpl)
             self.suppressed_spa_fallback_paths.discard(norm_p)
-            p_segs = [s for s in norm_p.split("/") if s]
+            p_segs = [s for s in (urlsplit(norm_p).path or "/").split("/") if s]
             p_prefix = "/" + "/".join(p_segs[:-1]) if len(p_segs) > 1 else "/"
             if p_prefix != "/" and actor != "anon":
                 self._spa_shell_prefixes.discard(p_prefix)
@@ -3008,18 +3253,7 @@ class SurfaceFrontierTracker:
 
         body_probe_pairs: list[tuple[str, str]] = []
         if method in {"POST", "PUT", "PATCH", "DELETE"}:
-            req_body = str(receipt.get("request_body") or "")
-            stripped_req = req_body.strip()
-            is_multipart_summary = stripped_req.lower().startswith("multipart/form-data ")
-            parsed_req_obj: dict[str, Any] | None = None
-            if stripped_req and not is_multipart_summary and stripped_req.startswith("{"):
-                try:
-                    cand_req = json.loads(stripped_req)
-                except ValueError:
-                    cand_req = None
-                if isinstance(cand_req, dict):
-                    parsed_req_obj = cand_req
-
+            bt_tmpl = f"{tmpl}#{gql_op_name}" if (is_graphql_endpoint and gql_op_name) else tmpl
             if parsed_req_obj is not None:
                 json_probe_pairs = [
                     (str(k).strip(), "<redacted>" if _is_secret_key(str(k)) else str(v)[:64])
@@ -3027,17 +3261,22 @@ class SurfaceFrontierTracker:
                     if str(k).strip()
                 ]
                 if json_probe_pairs:
-                    self._record_param_probes(tmpl, json_probe_pairs)
+                    self._record_param_probes(bt_tmpl, json_probe_pairs)
+                    if bt_tmpl != tmpl:
+                        self._record_param_probes(tmpl, json_probe_pairs)
                     body_probe_pairs.extend(json_probe_pairs)
                 if method in {"POST", "PUT", "PATCH"} and 200 <= status < 400 and parsed_req_obj:
-                    self._record_body_template(method, tmpl, parsed_req_obj)
+                    self._record_body_template(method, bt_tmpl, parsed_req_obj)
             elif stripped_req and not is_multipart_summary and not stripped_req.startswith(("{", "[")):
                 body_pairs = [(k.strip(), v) for k, v in parse_qsl(req_body, keep_blank_values=True) if k.strip()]
                 if body_pairs:
                     self._record_param_probes(tmpl, body_pairs)
                     body_probe_pairs.extend(body_pairs)
             if not _is_auth_utility_path(norm_p):
-                self.tested_write_ops.add((method, tmpl))
+                if is_graphql_endpoint and gql_op_name:
+                    self.tested_write_ops.add((method, f"{tmpl}#{gql_op_name}"))
+                else:
+                    self.tested_write_ops.add((method, tmpl))
 
         delta_pairs = [*observed_param_pairs, *body_probe_pairs]
         self._record_error_delta_observations(
@@ -3119,7 +3358,7 @@ class SurfaceFrontierTracker:
             else:
                 obj_entry["tested_by"].add(actor)
 
-        # Follow same-origin redirect Location
+        # Follow same-origin / in-scope redirect Location
         loc = str(receipt.get("redirect_location") or "").strip()
         if not loc:
             resp_hdrs = receipt.get("response_headers")
@@ -3165,6 +3404,17 @@ class SurfaceFrontierTracker:
 
         is_collection_2xx = (200 <= status < 300) and ("{id}" not in tmpl) and norm_p != "/"
         col_prefix = f"{norm_p}/"
+        is_multi_origin = bool(self._scope_guard is not None and self._scope_guard.is_multi_origin)
+        sibling_origins = (
+            _collect_authorized_sibling_origins(
+                extract_body,
+                primary_url=url,
+                scope_guard=self._scope_guard,
+            )
+            if is_multi_origin
+            else []
+        )
+        extract_body_low = extract_body.lower() if sibling_origins else ""
 
         # Passive extraction from JSON / OpenAPI / HTML / JS / robots / sitemap
         stripped = body.lstrip()
@@ -3178,7 +3428,12 @@ class SurfaceFrontierTracker:
                     self._ingest_validation_hints(tmpl, parsed, method=method)
                 if isinstance(parsed, dict) and "paths" in parsed and ("openapi" in parsed or "swagger" in parsed):
                     self._ingest_openapi_spec(parsed, spec_url=url)
-                hypermedia, _ = extract_json_hypermedia(parsed, url, origin_url=self.base_url)
+                hypermedia_origin = url if is_multi_origin else self.base_url
+                hypermedia, _ = extract_json_hypermedia(parsed, url, origin_url=hypermedia_origin)
+                if sibling_origins:
+                    for sib_orig in sibling_origins:
+                        sib_hm, _ = extract_json_hypermedia(parsed, url, origin_url=sib_orig)
+                        hypermedia.extend(sib_hm)
                 for item in hypermedia:
                     raw_hm_url = str(item.get("url") or "")
                     hm_resolved = self._resolve_same_origin(raw_hm_url, current_url=url)
@@ -3197,11 +3452,24 @@ class SurfaceFrontierTracker:
                     )
                 if 200 <= status < 300:
                     self._extract_collection_item_paths(norm_p, parsed, actor)
-                for spec_u in find_spec_urls(extract_body, url):
+                spec_candidates = list(find_spec_urls(extract_body, url, allow_subdomains=is_multi_origin))
+                for sib_orig in sibling_origins:
+                    sib_netloc = urlsplit(sib_orig).netloc.lower()
+                    for cand_u in find_spec_urls(extract_body, sib_orig, allow_subdomains=True):
+                        if _explicit_sibling_url_present(extract_body_low, cand_u, sib_netloc):
+                            spec_candidates.append(cand_u)
+                for spec_u in spec_candidates:
                     self._register_discovered_url(spec_u, method="GET", actor=actor, current_url=url)
 
         if is_html_resp or "href=" in body.lower() or "action=" in body.lower():
-            for rec in extract_html(extract_body, url):
+            html_records = list(extract_html(extract_body, url, allow_subdomains=is_multi_origin))
+            if sibling_origins:
+                for sib_orig in sibling_origins:
+                    sib_netloc = urlsplit(sib_orig).netloc.lower()
+                    for rec in extract_html(extract_body, sib_orig, allow_subdomains=True):
+                        if _explicit_sibling_url_present(extract_body_low, str(rec.get("url") or ""), sib_netloc):
+                            html_records.append(rec)
+            for rec in html_records:
                 raw_h_url = str(rec.get("url") or "")
                 h_resolved = self._resolve_same_origin(raw_h_url, current_url=url)
                 h_listed = bool(
@@ -3219,7 +3487,21 @@ class SurfaceFrontierTracker:
                     listed_from_collection=h_listed,
                 )
             for script in extract_inline_scripts(extract_body):
-                for jc in extract_js_calls(script, url, limit=40):
+                script_low = script.lower() if sibling_origins else ""
+                base_jcs = extract_js_calls(script, url, allow_subdomains=is_multi_origin, limit=40)
+                base_jc_sigs = {(str(c.get("method") or "GET").upper(), urlsplit(str(c.get("url") or "")).path) for c in base_jcs}
+                all_jcs = list(base_jcs)
+                for sib_orig in sibling_origins:
+                    sib_netloc = urlsplit(sib_orig).netloc.lower()
+                    for jc in extract_js_calls(script, sib_orig, allow_subdomains=True, limit=40):
+                        jc_u = str(jc.get("url") or "")
+                        jc_p = urlsplit(jc_u)
+                        if jc_p.netloc.lower() != sib_netloc:
+                            continue
+                        sig = (str(jc.get("method") or "GET").upper(), jc_p.path)
+                        if sig not in base_jc_sigs or _explicit_sibling_url_present(script_low, jc_u, sib_netloc):
+                            all_jcs.append(jc)
+                for jc in all_jcs:
                     self._register_discovered_url(
                         str(jc.get("url") or ""),
                         method=str(jc.get("method") or "GET"),
@@ -3227,7 +3509,7 @@ class SurfaceFrontierTracker:
                         actor=actor,
                         current_url=url,
                     )
-                for sr in extract_spa_routes(script, url, limit=40):
+                for sr in extract_spa_routes(script, url, allow_subdomains=is_multi_origin, limit=40):
                     self._register_discovered_url(
                         str(sr.get("url") or ""),
                         method="GET",
@@ -3235,11 +3517,30 @@ class SurfaceFrontierTracker:
                         current_url=url,
                         sources=sr.get("sources") or ("spa-route",),
                     )
-                for spec_u in find_spec_urls(script, url):
+                script_specs = list(find_spec_urls(script, url, allow_subdomains=is_multi_origin))
+                for sib_orig in sibling_origins:
+                    sib_netloc = urlsplit(sib_orig).netloc.lower()
+                    for cand_u in find_spec_urls(script, sib_orig, allow_subdomains=True):
+                        if _explicit_sibling_url_present(script_low, cand_u, sib_netloc):
+                            script_specs.append(cand_u)
+                for spec_u in script_specs:
                     self._register_discovered_url(spec_u, method="GET", actor=actor, current_url=url)
 
-        if "javascript" in ctype or norm_p.lower().endswith((".js", ".mjs")):
-            for jc in extract_js_calls(extract_body, url, limit=80):
+        if "javascript" in ctype or norm_path_low.endswith((".js", ".mjs")):
+            base_jcs = extract_js_calls(extract_body, url, allow_subdomains=is_multi_origin, limit=80)
+            base_jc_sigs = {(str(c.get("method") or "GET").upper(), urlsplit(str(c.get("url") or "")).path) for c in base_jcs}
+            all_jcs = list(base_jcs)
+            for sib_orig in sibling_origins:
+                sib_netloc = urlsplit(sib_orig).netloc.lower()
+                for jc in extract_js_calls(extract_body, sib_orig, allow_subdomains=True, limit=80):
+                    jc_u = str(jc.get("url") or "")
+                    jc_p = urlsplit(jc_u)
+                    if jc_p.netloc.lower() != sib_netloc:
+                        continue
+                    sig = (str(jc.get("method") or "GET").upper(), jc_p.path)
+                    if sig not in base_jc_sigs or _explicit_sibling_url_present(extract_body_low, jc_u, sib_netloc):
+                        all_jcs.append(jc)
+            for jc in all_jcs:
                 self._register_discovered_url(
                     str(jc.get("url") or ""),
                     method=str(jc.get("method") or "GET"),
@@ -3248,7 +3549,19 @@ class SurfaceFrontierTracker:
                     current_url=url,
                 )
             kept_js = 0
-            for rec in extract_js(extract_body, url, limit=240):
+            base_js_recs = extract_js(extract_body, url, allow_subdomains=is_multi_origin, limit=240)
+            base_js_paths = {urlsplit(str(r.get("url") or "")).path for r in base_js_recs}
+            all_js_recs = list(base_js_recs)
+            for sib_orig in sibling_origins:
+                sib_netloc = urlsplit(sib_orig).netloc.lower()
+                for rec in extract_js(extract_body, sib_orig, allow_subdomains=True, limit=240):
+                    rec_u = str(rec.get("url") or "")
+                    rec_p = urlsplit(rec_u)
+                    if rec_p.netloc.lower() != sib_netloc:
+                        continue
+                    if rec_p.path not in base_js_paths or _explicit_sibling_url_present(extract_body_low, rec_u, sib_netloc):
+                        all_js_recs.append(rec)
+            for rec in all_js_recs:
                 cand_u = str(rec.get("url") or "")
                 if is_non_endpoint_source_path(cand_u):
                     continue
@@ -3264,7 +3577,7 @@ class SurfaceFrontierTracker:
                 if kept_js >= 60:
                     break
             kept_spa = 0
-            for sr in extract_spa_routes(extract_body, url, limit=160):
+            for sr in extract_spa_routes(extract_body, url, allow_subdomains=is_multi_origin, limit=160):
                 cand_u = str(sr.get("url") or "")
                 if is_non_endpoint_source_path(cand_u):
                     continue
@@ -3278,21 +3591,78 @@ class SurfaceFrontierTracker:
                 kept_spa += 1
                 if kept_spa >= 60:
                     break
-            for spec_u in find_spec_urls(extract_body, url):
+            js_specs = list(find_spec_urls(extract_body, url, allow_subdomains=is_multi_origin))
+            for sib_orig in sibling_origins:
+                sib_netloc = urlsplit(sib_orig).netloc.lower()
+                for cand_u in find_spec_urls(extract_body, sib_orig, allow_subdomains=True):
+                    if _explicit_sibling_url_present(extract_body_low, cand_u, sib_netloc):
+                        js_specs.append(cand_u)
+            for spec_u in js_specs:
                 self._register_discovered_url(spec_u, method="GET", actor=actor, current_url=url)
 
-        if norm_p.lower().endswith("/robots.txt"):
+        if norm_path_low.endswith("/robots.txt"):
             for rec in extract_robots(body, url):
                 self._register_discovered_url(str(rec.get("url") or ""), method="GET", actor=actor, current_url=url)
         if "xml" in ctype or "<urlset" in body[:512].lower() or "<sitemapindex" in body[:512].lower():
-            for rec in extract_sitemap(extract_body, url):
+            sitemap_recs = list(extract_sitemap(extract_body, url, allow_subdomains=is_multi_origin))
+            for sib_orig in sibling_origins:
+                sib_netloc = urlsplit(sib_orig).netloc.lower()
+                for rec in extract_sitemap(extract_body, sib_orig, allow_subdomains=True):
+                    if _explicit_sibling_url_present(extract_body_low, str(rec.get("url") or ""), sib_netloc):
+                        sitemap_recs.append(rec)
+            for rec in sitemap_recs:
                 self._register_discovered_url(str(rec.get("url") or ""), method="GET", actor=actor, current_url=url)
+
+    def _resolve_openapi_target_origin(self, spec: dict[str, Any], *, spec_url: str = "") -> str:
+        """Resolve an in-scope target origin from OpenAPI ``servers`` or Swagger 2 ``host``, falling back to ``spec_url``/``base_url``."""
+        servers = spec.get("servers")
+        if isinstance(servers, list):
+            for srv in servers:
+                if not isinstance(srv, dict):
+                    continue
+                srv_url = str(srv.get("url") or "").strip()
+                if not srv_url:
+                    continue
+                if srv_url.lower().startswith(("http://", "https://")):
+                    parsed_srv = urlsplit(srv_url)
+                    if "{" in parsed_srv.netloc or not parsed_srv.netloc:
+                        continue
+                    if self._resolve_same_origin(f"{parsed_srv.scheme.lower()}://{parsed_srv.netloc}/") is not None:
+                        return f"{parsed_srv.scheme.lower()}://{parsed_srv.netloc.lower()}/"
+                    break
+
+        raw_host = str(spec.get("host") or "").strip()
+        if raw_host and "{" not in raw_host:
+            raw_schemes = spec.get("schemes")
+            schemes = (
+                [str(s).strip().lower() for s in raw_schemes if str(s).strip().lower() in {"http", "https"}]
+                if isinstance(raw_schemes, list)
+                else []
+            )
+            fallback_scheme = (
+                urlsplit(spec_url).scheme.lower()
+                if spec_url and urlsplit(spec_url).scheme.lower() in {"http", "https"}
+                else self._origin[0].lower()
+            )
+            chosen_scheme = "https" if "https" in schemes else (schemes[0] if schemes else fallback_scheme)
+            cand_origin = f"{chosen_scheme}://{raw_host}/"
+            if self._resolve_same_origin(cand_origin) is not None:
+                return cand_origin.lower()
+
+        if spec_url:
+            parsed_spec = urlsplit(str(spec_url).strip())
+            if parsed_spec.scheme.lower() in {"http", "https"} and parsed_spec.netloc:
+                spec_origin = f"{parsed_spec.scheme.lower()}://{parsed_spec.netloc.lower()}/"
+                if self._resolve_same_origin(spec_origin) is not None:
+                    return spec_origin
+        return self.base_url
 
     def _ingest_openapi_spec(self, spec: dict[str, Any], *, spec_url: str = "") -> None:
         resolver = LocalSchema(spec)
         paths = spec.get("paths")
         if not isinstance(paths, dict):
             return
+        target_origin = self._resolve_openapi_target_origin(spec, spec_url=spec_url)
         mount_prefix = infer_openapi_mount_prefix(spec, spec_url)
         for raw_path, path_item in paths.items():
             if not isinstance(raw_path, str) or not isinstance(path_item, dict):
@@ -3318,7 +3688,7 @@ class SurfaceFrontierTracker:
                     eff_path,
                     method=m_up,
                     params=q_params,
-                    current_url=self.base_url,
+                    current_url=target_origin,
                 )
 
     def ingest_surface(self, surface: dict[str, Any], *, actor: str = "") -> None:
@@ -3335,7 +3705,7 @@ class SurfaceFrontierTracker:
             if resolved is None:
                 return
             norm_p, _ = resolved
-            tmpl = route_template_of(norm_p)
+            tmpl = self._scoped_template(norm_p)
             bt = item.get("body_template")
             if isinstance(bt, dict) and bt and norm_method in {"POST", "PUT", "PATCH"}:
                 self._record_body_template(norm_method, tmpl, bt)
@@ -3389,6 +3759,27 @@ class SurfaceFrontierTracker:
                     sources=item_sources,
                 )
                 _ingest_item_schemas(item_url, item_method, item)
+                if not is_link_bucket and isinstance(item.get("operation"), dict):
+                    op_meta = item["operation"]
+                    if op_meta.get("protocol") == "graphql":
+                        op_name = str(op_meta.get("name") or "").strip()
+                        res_gql = self._resolve_same_origin(item_url, current_url=curr_url)
+                        norm_m = str(item_method or "POST").strip().upper()
+                        if (
+                            op_name
+                            and _GQL_OP_NAME_RE.fullmatch(op_name)
+                            and res_gql is not None
+                            and norm_m in {"POST", "PUT", "PATCH"}
+                            and norm_m in self.allowed_methods
+                            and not _is_auth_utility_path(res_gql[0])
+                        ):
+                            gql_norm = res_gql[0]
+                            gql_tmpl = self._scoped_template(gql_norm)
+                            op_tmpl = f"{gql_tmpl}#{op_name}"
+                            self.declared_write_ops.add((norm_m, op_tmpl))
+                            self.discovered_write_ops[(norm_m, op_tmpl)] = f"{gql_norm}#{op_name}"
+                            self.declared_write_ops.discard((norm_m, gql_tmpl))
+                            self.discovered_write_ops.pop((norm_m, gql_tmpl), None)
         for item in (surface.get("spa_routes") or []):
             if isinstance(item, dict):
                 item_url = str(item.get("url") or "")
@@ -3418,7 +3809,7 @@ class SurfaceFrontierTracker:
                     if isinstance(p, dict) and p.get("name") and p.get("in") == "query"
                 ]
                 self._register_discovered_url(
-                    str(op.get("path") or op.get("url") or ""),
+                    str(op.get("url") or op.get("path") or ""),
                     method=str(op.get("method") or "GET"),
                     params=pnames,
                     actor=actor,
@@ -3456,6 +3847,31 @@ class SurfaceFrontierTracker:
                 actor=actor,
                 current_url=curr_url,
             )
+            res_gql = self._resolve_same_origin(curr_url, current_url=curr_url)
+            if (
+                res_gql is not None
+                and "POST" in self.allowed_methods
+                and not _is_auth_utility_path(res_gql[0])
+            ):
+                gql_norm = res_gql[0]
+                gql_tmpl = self._scoped_template(gql_norm)
+                added_named_gql = False
+                for gop in (surface.get("graphql_ops") or []):
+                    if not isinstance(gop, dict):
+                        continue
+                    op_name = str(gop.get("name") or "").strip()
+                    if not op_name or not _GQL_OP_NAME_RE.fullmatch(op_name):
+                        continue
+                    added_named_gql = True
+                    op_tmpl = f"{gql_tmpl}#{op_name}"
+                    self.declared_write_ops.add(("POST", op_tmpl))
+                    self.discovered_write_ops[("POST", op_tmpl)] = f"{gql_norm}#{op_name}"
+                    raw_args = gop.get("args")
+                    if isinstance(raw_args, list) and raw_args:
+                        self._add_discovered_params(op_tmpl, [str(a) for a in raw_args if a])
+                if added_named_gql:
+                    self.declared_write_ops.discard(("POST", gql_tmpl))
+                    self.discovered_write_ops.pop(("POST", gql_tmpl), None)
 
         body_templates = surface.get("body_templates")
         if isinstance(body_templates, dict):
@@ -3473,7 +3889,7 @@ class SurfaceFrontierTracker:
                 if resolved is None:
                     continue
                 norm_p, _ = resolved
-                tmpl = route_template_of(norm_p)
+                tmpl = self._scoped_template(norm_p)
                 top_keys = [
                     clean
                     for k in doc
@@ -3505,7 +3921,7 @@ class SurfaceFrontierTracker:
                 if resolved is None:
                     continue
                 norm_p, _ = resolved
-                tmpl = route_template_of(norm_p)
+                tmpl = self._scoped_template(norm_p)
                 mp_params = self._record_multipart_schema(tmpl, schema)
                 self._register_discovered_url(
                     mp_path,
@@ -3530,7 +3946,7 @@ class SurfaceFrontierTracker:
                 if resolved_ws is None:
                     continue
                 norm_p, query = resolved_ws
-                tmpl = route_template_of(norm_p)
+                tmpl = self._scoped_template(norm_p)
                 if "GET" in self.allowed_methods:
                     ws_target = f"{norm_p}?{query}" if query else norm_p
                     self._register_discovered_url(
@@ -3556,20 +3972,21 @@ class SurfaceFrontierTracker:
                 or (is_static_asset_url(norm_p) and not _extract_path_embedded_params(norm_p))
             ):
                 continue
-            tmpl = route_template_of(norm_p)
+            tmpl = self._scoped_template(norm_p)
             if method == "GET" and (
                 norm_p in self.pruned_spa_routes
                 or (tmpl in self.pruned_spa_routes and tmpl not in self._non_404_templates)
             ):
                 continue
-            is_api = bool(_ROUTE_API_PATH_RE.search(norm_p))
+            norm_path_only = urlsplit(norm_p).path or "/"
+            is_api = bool(_ROUTE_API_PATH_RE.search(norm_path_only))
             disc_p = self.discovered_params.get(tmpl) or set()
             has_params = bool(disc_p) or ("?" in display)
             is_form = tmpl in self.discovered_form_templates
             is_write = (method in _MUTATING_HTTP_METHODS) or any(
                 w_t == tmpl for _, w_t in (*self.declared_write_ops, *self.discovered_write_ops)
             )
-            p_segs = [s for s in norm_p.split("/") if s]
+            p_segs = [s for s in norm_path_only.split("/") if s]
             parent_prefix = "/" + "/".join(p_segs[:-1]) if len(p_segs) > 1 else "/"
             is_demoted_spa = False
             if method == "GET" and not is_api and not has_params and not is_form and not is_write:
@@ -3635,7 +4052,7 @@ class SurfaceFrontierTracker:
         visited_tmpls = {tmpl for _, tmpl in self.visited_method_templates}
         sample_path_by_tmpl: dict[str, str] = {}
         for _, path in sorted(self.visited_method_paths):
-            t = route_template_of(path)
+            t = self._scoped_template(path)
             if t not in sample_path_by_tmpl:
                 sample_path_by_tmpl[t] = path
 
@@ -3811,7 +4228,7 @@ class SurfaceFrontierTracker:
             for norm_p, ok_actors in sorted(self.route_2xx_actors.items()):
                 if is_non_endpoint_source_path(norm_p):
                     continue
-                tmpl = route_template_of(norm_p)
+                tmpl = self._scoped_template(norm_p)
                 if "{id}" in tmpl or _is_auth_utility_path(norm_p):
                     continue
                 tested_on_path = self.actors_by_path.get(norm_p) or set()
@@ -3826,8 +4243,9 @@ class SurfaceFrontierTracker:
             for norm_p, ok_actors in sorted(self.route_2xx_actors.items()):
                 if is_non_endpoint_source_path(norm_p):
                     continue
-                tmpl = route_template_of(norm_p)
-                if "{id}" in tmpl or not norm_p.startswith("/api/") or _is_auth_utility_path(norm_p):
+                tmpl = self._scoped_template(norm_p)
+                path_only = urlsplit(norm_p).path or "/"
+                if "{id}" in tmpl or not path_only.startswith("/api/") or _is_auth_utility_path(norm_p):
                     continue
                 tested_on_path = self.actors_by_path.get(norm_p) or set()
                 if "anon" not in tested_on_path and any(a != "anon" for a in ok_actors):
@@ -3839,7 +4257,7 @@ class SurfaceFrontierTracker:
             self.discovered_objects.items(),
             key=lambda kv: (
                 len(kv[1].get("tested_by") or ()),
-                0 if kv[0].startswith("/api/") else 1,
+                0 if (urlsplit(kv[0]).path or "/").startswith("/api/") else 1,
                 kv[0],
             ),
         )
@@ -3922,7 +4340,7 @@ class SurfaceFrontierTracker:
 
     def untested_api_parity(self) -> list[str]:
         """Return inferred API-parity candidates for UI resource families not yet probed under an observed API prefix."""
-        prefixes = self._ranked_api_prefixes()
+        prefixes = [p for p in self._ranked_api_prefixes() if p.startswith("/")]
         if not prefixes:
             return []
         primary_prefix = prefixes[0]
@@ -3960,7 +4378,7 @@ class SurfaceFrontierTracker:
         """Return `(all_methods, allowed_methods)` observed or declared for `tmpl`."""
         all_methods: set[str] = set()
         for m, norm_p in self.discovered_routes:
-            if route_template_of(norm_p) == tmpl:
+            if self._scoped_template(norm_p) == tmpl:
                 all_methods.add(str(m or "GET").strip().upper())
         for m, v_tmpl in self.visited_method_templates:
             if v_tmpl == tmpl:
@@ -3986,7 +4404,7 @@ class SurfaceFrontierTracker:
             return True
         path_tokens = {
             tok
-            for seg in tmpl.lower().split("/")
+            for seg in (urlsplit(tmpl).path or "/").lower().split("/")
             if seg and not seg.startswith("{")
             for tok in _TOKEN_SPLIT_RE.split(seg.rsplit(".", 1)[0] if "." in seg else seg)
             if tok
@@ -4027,7 +4445,7 @@ class SurfaceFrontierTracker:
         methods: Sequence[str] | None = None,
     ) -> bool:
         """Return True if `route_template` has been actively probed rather than merely passively observed."""
-        tmpl = route_template_of(route_template) if str(route_template or "").strip() else "/"
+        tmpl = self._scoped_template(route_template) if str(route_template or "").strip() else "/"
         if tmpl in self.actively_probed_templates:
             return True
         if any(
@@ -4058,7 +4476,7 @@ class SurfaceFrontierTracker:
         params: Sequence[str] | None = None,
     ) -> tuple[int, str]:
         """Score `route_template` using this tracker's known methods, params, forms, and schemas."""
-        tmpl = route_template_of(route_template) if str(route_template or "").strip() else "/"
+        tmpl = self._scoped_template(route_template) if str(route_template or "").strip() else "/"
         if methods is None:
             _, allowed = self._template_known_methods(tmpl)
             eff_methods = sorted(allowed) if allowed else (["GET"] if "GET" in self.allowed_methods else sorted(self.allowed_methods)[:1])
@@ -4104,7 +4522,7 @@ class SurfaceFrontierTracker:
             raw = str(raw_path or "").strip()
             if not raw or is_non_endpoint_source_path(raw) or self._is_port_in_path_noise(raw):
                 return None
-            tmpl = route_template_of(raw)
+            tmpl = self._scoped_template(raw)
             if (
                 is_non_endpoint_source_path(tmpl)
                 or self._is_port_in_path_noise(tmpl)
@@ -4147,7 +4565,7 @@ class SurfaceFrontierTracker:
 
         non_404_templates = set(self._non_404_templates)
         for ok_p in self.route_2xx_actors:
-            non_404_templates.add(route_template_of(ok_p))
+            non_404_templates.add(self._scoped_template(ok_p))
         for tmpl, pmap in self.param_probes_by_template.items():
             if tmpl in candidate_templates or tmpl in non_404_templates:
                 clean_t = _add_candidate(tmpl)
@@ -4371,7 +4789,7 @@ class SurfaceFrontierTracker:
 
     def to_dict(self) -> dict[str, Any]:
         """Serialize tracker state for checkpoint persistence."""
-        return {
+        payload: dict[str, Any] = {
             "base_url": self.base_url,
             "allowed_methods": sorted(self.allowed_methods),
             "actors": dict(self.actors),
@@ -4464,11 +4882,37 @@ class SurfaceFrontierTracker:
                 k: sorted(v) for k, v in sorted(self.discovered_schema_hints.items()) if v
             },
         }
+        if self.in_scope_assets:
+            payload["in_scope_assets"] = list(self.in_scope_assets)
+        if self.out_of_scope_assets:
+            payload["out_of_scope_assets"] = list(self.out_of_scope_assets)
+        if self.excluded_paths:
+            payload["excluded_paths"] = list(self.excluded_paths)
+        return payload
 
     def load_dict(self, data: dict[str, Any]) -> None:
         """Restore tracker state from a checkpoint dictionary."""
         if not isinstance(data, dict):
             return
+        if not self.in_scope_assets and isinstance(data.get("in_scope_assets"), list):
+            self.in_scope_assets = tuple(
+                str(x).strip() for x in data["in_scope_assets"] if str(x or "").strip()
+            )
+        if not self.out_of_scope_assets and isinstance(data.get("out_of_scope_assets"), list):
+            self.out_of_scope_assets = tuple(
+                str(x).strip() for x in data["out_of_scope_assets"] if str(x or "").strip()
+            )
+        if not self.excluded_paths and isinstance(data.get("excluded_paths"), list):
+            self.excluded_paths = tuple(
+                str(x).strip() for x in data["excluded_paths"] if str(x or "").strip()
+            )
+        if self._scope_guard is None and (self.in_scope_assets or self.out_of_scope_assets):
+            self._scope_guard = ScopeGuard(
+                self.base_url,
+                excluded_paths=self.excluded_paths,
+                in_scope_assets=self.in_scope_assets,
+                out_of_scope_assets=self.out_of_scope_assets,
+            )
         self.exercised_actors = set(data.get("exercised_actors") or [])
         self.visited_method_paths = {(str(x[0]), str(x[1])) for x in (data.get("visited_method_paths") or []) if len(x) == 2}
         self.visited_method_templates = {(str(x[0]), str(x[1])) for x in (data.get("visited_method_templates") or []) if len(x) == 2}
@@ -4636,19 +5080,23 @@ class SurfaceFrontierTracker:
                     or self._is_port_in_path_noise(obj_path)
                 ):
                     continue
-                norm_obj = normalize_path(obj_path)
-                obj_tmpl = str(v.get("template") or route_template_of(norm_obj))
+                norm_obj = (
+                    self._format_scoped_path(obj_path)
+                    if obj_path.lower().startswith(("http://", "https://"))
+                    else normalize_path(obj_path)
+                )
+                obj_tmpl = str(v.get("template") or self._scoped_template(norm_obj))
                 if (
                     is_non_endpoint_source_path(norm_obj)
                     or is_non_endpoint_source_path(obj_tmpl)
                     or self._is_port_in_path_noise(norm_obj)
                     or "{id}" not in obj_tmpl
                     or "{" in norm_obj
-                    or norm_obj.lower().endswith((".js", ".mjs", ".html"))
+                    or (urlsplit(norm_obj).path or norm_obj).lower().endswith((".js", ".mjs", ".html"))
                 ):
                     continue
                 self.discovered_objects[obj_key] = {
-                    "path": obj_path,
+                    "path": norm_obj if norm_obj else obj_path,
                     "template": obj_tmpl,
                     "owner_actor": str(v.get("owner_actor") or ""),
                     "seen_by": set(v.get("seen_by") or []),
@@ -4703,6 +5151,15 @@ class SurfaceFrontierTracker:
                     continue
                 prefix = _extract_api_prefix(path)
                 if prefix:
+                    p_str = str(path)
+                    if p_str.lower().startswith(("http://", "https://")):
+                        parsed_p = urlsplit(p_str)
+                        if not self._is_primary_origin(parsed_p.scheme, parsed_p.netloc):
+                            prefix_key = f"{parsed_p.scheme.lower()}://{parsed_p.netloc.lower()}{prefix}"
+                            self.api_prefix_routes.setdefault(prefix_key, set()).add(
+                                self._format_scoped_path(p_str)
+                            )
+                            continue
                     self.api_prefix_routes.setdefault(prefix, set()).add(normalize_path(path))
 
         if isinstance(data.get("ui_resource_families"), dict):
@@ -4760,6 +5217,9 @@ class SurfaceFrontierTracker:
         base_url: str = "",
         allowed_methods: Sequence[str] | None = None,
         actor_summaries: Sequence[dict[str, str]] | None = None,
+        in_scope_assets: Sequence[str] | None = None,
+        out_of_scope_assets: Sequence[str] | None = None,
+        excluded_paths: Sequence[str] | None = None,
     ) -> SurfaceFrontierTracker:
         """Instantiate and restore a `SurfaceFrontierTracker` from a checkpoint dictionary."""
         raw = data if isinstance(data, dict) else {}
@@ -4776,10 +5236,31 @@ class SurfaceFrontierTracker:
             if actor_summaries is not None
             else ([v for v in raw_actors.values() if isinstance(v, dict)] if isinstance(raw_actors, dict) else ())
         )
+        raw_in_scope = raw.get("in_scope_assets")
+        eff_in_scope: Sequence[str] = (
+            in_scope_assets
+            if in_scope_assets is not None
+            else ([str(x) for x in raw_in_scope if str(x or "").strip()] if isinstance(raw_in_scope, list) else ())
+        )
+        raw_out_scope = raw.get("out_of_scope_assets")
+        eff_out_scope: Sequence[str] = (
+            out_of_scope_assets
+            if out_of_scope_assets is not None
+            else ([str(x) for x in raw_out_scope if str(x or "").strip()] if isinstance(raw_out_scope, list) else ())
+        )
+        raw_excl = raw.get("excluded_paths")
+        eff_excl: Sequence[str] = (
+            excluded_paths
+            if excluded_paths is not None
+            else ([str(x) for x in raw_excl if str(x or "").strip()] if isinstance(raw_excl, list) else ())
+        )
         tracker = cls(
             base_url=eff_base,
             allowed_methods=eff_methods,
             actor_summaries=eff_actors,
+            in_scope_assets=eff_in_scope,
+            out_of_scope_assets=eff_out_scope,
+            excluded_paths=eff_excl,
         )
         tracker.load_dict(raw)
         return tracker

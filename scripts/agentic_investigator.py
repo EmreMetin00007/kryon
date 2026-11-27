@@ -3,7 +3,9 @@ from __future__ import annotations
 
 import concurrent.futures
 import copy
+import inspect
 import json
+import os
 from pathlib import Path
 import re
 import threading
@@ -94,7 +96,13 @@ from agentic_surface import (
 )
 from agentic_telemetry import TelemetryLogger, write_process_metrics
 from agentic_tools import TOOL_SCHEMAS, ToolDispatcher, canonicalize_and_deduplicate_findings
-from full_agent_budget import BudgetError, SharedBudget, compact_tools
+from full_agent_budget import (
+    FRAMING_TOKENS,
+    BudgetError,
+    SharedBudget,
+    compact_tools,
+    prompt_bound,
+)
 from full_agent_provider import MeteredProviderTransport, SessionGate
 from kryon_core.surface.extract import has_double_slash_path
 from target_bootstrap import (
@@ -575,6 +583,74 @@ def _build_assistant_history_entry(msg: dict[str, Any]) -> dict[str, Any]:
     return entry
 
 
+def _supported_kwargs(fn: Any, candidate_kwargs: dict[str, Any]) -> dict[str, Any]:
+    """Filter optional kwargs against `fn`'s signature for cross-module compatibility."""
+    try:
+        sig = inspect.signature(fn)
+    except (TypeError, ValueError):
+        return {}
+    params = sig.parameters
+    if any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()):
+        return dict(candidate_kwargs)
+    return {k: v for k, v in candidate_kwargs.items() if k in params}
+
+
+def _restore_waf_pivot_from_summary(tracker: Any, summary: dict[str, Any]) -> None:
+    """Restore a `WAFPivotTracker` from its serialized `summary()` dictionary."""
+    if tracker is None or not isinstance(summary, dict):
+        return
+    lock = getattr(tracker, "_lock", None)
+
+    def _apply() -> None:
+        tracker._total_blocks = 0
+        tracker._by_vendor.clear()
+        tracker._by_pair.clear()
+        tracker._paths_by_vendor.clear()
+        tracker._all_paths.clear()
+
+        recorded_by_vendor: dict[str, int] = {}
+        route_counts = summary.get("route_counts")
+        blocked_paths = [str(p) for p in (summary.get("blocked_paths") or ()) if str(p)]
+        if isinstance(route_counts, dict):
+            path_order = {p: idx for idx, p in enumerate(blocked_paths)}
+            ordered_items = sorted(
+                route_counts.items(),
+                key=lambda kv: (
+                    path_order.get(kv[0].split(":", 1)[1], 10_000) if ":" in str(kv[0]) else 10_000,
+                    str(kv[0]),
+                ),
+            )
+            for pair_key, raw_cnt in ordered_items:
+                if ":" not in str(pair_key):
+                    continue
+                vendor, path_tmpl = str(pair_key).split(":", 1)
+                cnt = max(0, int(raw_cnt or 0))
+                for _ in range(cnt):
+                    tracker._record_block_locked(vendor, path_tmpl)
+                clean_v = str(vendor or "").strip().lower() or "generic"
+                recorded_by_vendor[clean_v] = recorded_by_vendor.get(clean_v, 0) + cnt
+
+        vendors = summary.get("vendors")
+        if isinstance(vendors, dict):
+            fallback_path = blocked_paths[0] if blocked_paths else "/"
+            for raw_v, raw_cnt in sorted(vendors.items()):
+                clean_v = str(raw_v or "").strip().lower() or "generic"
+                target_cnt = max(0, int(raw_cnt or 0))
+                rem = target_cnt - recorded_by_vendor.get(clean_v, 0)
+                for _ in range(max(0, rem)):
+                    tracker._record_block_locked(clean_v, fallback_path)
+
+        total_target = max(0, int(summary.get("total_blocks") or 0))
+        while tracker._total_blocks < total_target:
+            tracker._record_block_locked("generic", blocked_paths[0] if blocked_paths else "/")
+
+    if lock is not None:
+        with lock:
+            _apply()
+    else:
+        _apply()
+
+
 class AgenticInvestigator:
     """ReAct tool-calling security investigator backed by MeteredProviderTransport."""
 
@@ -618,6 +694,8 @@ class AgenticInvestigator:
         prescan_handoff: str = "",
         har_flows_handoff: str = "",
         asset_graph_handoff: str = "",
+        initial_waf_vendors: Sequence[str] = (),
+        cancel_event: threading.Event | None = None,
     ):
         self.http = http_client
         self.receipts = receipt_store
@@ -648,6 +726,8 @@ class AgenticInvestigator:
         self._handoff_summary: dict[str, Any] | None = None
         self._sharding_summary: dict[str, Any] | None = None
         self._stats_lock = threading.Lock()
+        self._checkpoint_lock = threading.Lock()
+        self.cancel_event: threading.Event | None = cancel_event
         self.root_dir = Path(root_dir).expanduser().resolve()
         self.checkpoint_path = self.root_dir / "checkpoint.json"
         self.discovery_hints = [str(h) for h in (discovery_hints or ["/"]) if str(h).strip()] or ["/"]
@@ -672,6 +752,9 @@ class AgenticInvestigator:
         self.prescan_handoff = str(prescan_handoff or "").strip()[:3200]
         self.har_flows_handoff = str(har_flows_handoff or "").strip()[:3200]
         self.asset_graph_handoff = str(asset_graph_handoff or "").strip()[:2000]
+        self.initial_waf_vendors: tuple[str, ...] = tuple(
+            str(v).strip() for v in (initial_waf_vendors or ()) if str(v).strip()
+        )
 
         use_telem = bool(enable_telemetry) if enable_telemetry is not None else (
             self.execution_mode == "ephemeral" or self.use_bsag
@@ -688,6 +771,9 @@ class AgenticInvestigator:
             else None
         )
         self._oob_server: LoopbackCallbackServer | None = oob_server
+        self._shared_oob_server: LoopbackCallbackServer | None = oob_server
+        self._owns_shared_oob: bool = False
+        self._shared_oob_lock = threading.Lock()
         self.oracle: DifferentialOracle = DifferentialOracle(
             http_client=http_client,
             receipt_store=receipt_store,
@@ -707,7 +793,10 @@ class AgenticInvestigator:
             oracle=self.oracle,
             telemetry=self.telemetry,
             oob_server=self._oob_server,
+            oob_provider=self._get_or_create_shared_oob_server,
         )
+        for vendor in self.initial_waf_vendors:
+            self.dispatcher.waf_pivot.record_block(vendor, "/")
         self.seeded_surface_count: int = (
             apply_seed_surface(self.dispatcher.surface_tracker, seed_surface)
             if isinstance(seed_surface, dict)
@@ -718,6 +807,75 @@ class AgenticInvestigator:
         self._epoch_turn_start: int = 0
         self._epoch_summary_text: str = ""
         self._epoch_advancements: int = 0
+        self._stage1_completed: bool = False
+        self._stage1_boot_turns: int = 0
+        self._stage1_boot_status: str = ""
+        self._stage1_boot_findings_snap: list[dict[str, Any]] = []
+        self._stage1_boot_usage: dict[str, int] = _new_usage_dict()
+        self._stage1_boot_calls: int = 0
+        self._stage1_post_auth_summary: dict[str, Any] | None = None
+        self._stage1_surface_frontier: dict[str, Any] | None = None
+        self._completed_shards: dict[str, dict[str, Any]] = {}
+
+    def _get_or_create_shared_oob_server(self, *, start: bool = False) -> LoopbackCallbackServer | None:
+        """Return the single run-level LoopbackCallbackServer, creating it lazily on demand."""
+        with self._shared_oob_lock:
+            if self._shared_oob_server is None:
+                disp_srv = getattr(self.dispatcher, "_oob_server", None)
+                if disp_srv is not None:
+                    self._shared_oob_server = disp_srv
+                    if getattr(self.dispatcher, "_owns_oob_server", False):
+                        self._owns_shared_oob = True
+                        self.dispatcher._owns_oob_server = False
+                elif start:
+                    if (
+                        str(os.environ.get("CCO_OOB_BIND_HOST") or "").strip()
+                        or str(os.environ.get("CCO_OOB_ADVERTISE_HOST") or "").strip()
+                    ):
+                        self._shared_oob_server = LoopbackCallbackServer.from_env()
+                    else:
+                        self._shared_oob_server = LoopbackCallbackServer()
+                    self._owns_shared_oob = True
+                    self.dispatcher._oob_server = self._shared_oob_server
+                    self.dispatcher._owns_oob_server = False
+                self._oob_server = self._shared_oob_server
+                if self._shared_oob_server is not None and getattr(self.oracle, "oob_server", None) is None:
+                    self.oracle.oob_server = self._shared_oob_server
+            if start and self._shared_oob_server is not None:
+                self._shared_oob_server.start()
+                if getattr(self.oracle, "oob_server", None) is None:
+                    self.oracle.oob_server = self._shared_oob_server
+            return self._shared_oob_server
+
+    def _close_shared_oob_server(self) -> None:
+        """Close the run-level lazily created OOB server once the investigator run ends."""
+        with self._shared_oob_lock:
+            srv = self._shared_oob_server
+            owns = self._owns_shared_oob
+            if owns:
+                self._shared_oob_server = None
+                self._oob_server = None
+                self._owns_shared_oob = False
+                if getattr(self.dispatcher, "_oob_server", None) is srv:
+                    self.dispatcher._oob_server = None
+        if srv is not None and owns:
+            srv.close()
+
+    def _make_surface_tracker(self) -> SurfaceFrontierTracker:
+        tracker_extra = _supported_kwargs(
+            SurfaceFrontierTracker,
+            {
+                "in_scope_assets": tuple(getattr(self.http, "in_scope_assets", ()) or ()),
+                "out_of_scope_assets": tuple(getattr(self.http, "out_of_scope_assets", ()) or ()),
+                "excluded_paths": tuple(getattr(self.http, "excluded_paths", ()) or ()),
+            },
+        )
+        return SurfaceFrontierTracker(
+            base_url=self.http.base_url,
+            allowed_methods=sorted(self.http.allowed_methods),
+            actor_summaries=self.http.actors.summaries(),
+            **tracker_extra,
+        )
 
     def _initial_priority_brief(self) -> str:
         """Return optional bounded Turn-1 asset-graph/prescan/HAR workflow handoff block (zero secrets)."""
@@ -900,6 +1058,16 @@ class AgenticInvestigator:
             else ""
         )
         sec_rem = int(max(0.0, float(self.budget.remaining_seconds())))
+        waf_pivot = getattr(eff_disp, "waf_pivot", None)
+        waf_line = ""
+        if (
+            waf_pivot is not None
+            and callable(getattr(waf_pivot, "should_pivot", None))
+            and waf_pivot.should_pivot()
+        ):
+            waf_guidance = str(waf_pivot.guidance() or "").strip()
+            if waf_guidance:
+                waf_line = f"\n[WAF-PIVOT] {waf_guidance}"
         return (
             f"\n[STATE] http_budget: {http_rem}/{self.http.budget.limit} left | "
             f"llm_tokens: {tok_rem}/{tok_lim} left | time_left: {sec_rem}s | turn: {turn}/{eff_max_turns} | "
@@ -908,6 +1076,7 @@ class AgenticInvestigator:
             f"{shard_line}"
             f"{nb_line}"
             f"{frontier_line}"
+            f"{waf_line}"
             f"{write_nudge}"
             f"{wrapup_line}"
         )
@@ -1025,24 +1194,28 @@ class AgenticInvestigator:
         wire_tools_default = compact_tools(schemas, description_limit=140, strip_annotations=False)
         wire_tools_tight = compact_tools(schemas, description_limit=96, strip_annotations=True)
 
-        def _serialized_len(msgs: list[dict[str, Any]], tools_payload: list[dict[str, Any]]) -> int:
-            return len(
-                json.dumps(
-                    {"messages": msgs, "tools": tools_payload},
-                    ensure_ascii=False,
-                    separators=(",", ":"),
-                ).encode("utf-8")
-            )
+        def _serialized_raw(msgs: list[dict[str, Any]], tools_payload: list[dict[str, Any]]) -> bytes:
+            return json.dumps(
+                {"messages": msgs, "tools": tools_payload},
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ).encode("utf-8")
 
-        def _fits_epoch_budget(byte_len: int) -> bool:
+        extra_framing = max(0, _FRAMING_RESERVE_TOKENS - FRAMING_TOKENS)
+
+        def _prompt_tokens_bound(raw: bytes) -> int:
+            upper, _profile = prompt_bound(raw)
+            return int(upper) + extra_framing
+
+        def _fits_epoch_budget(raw: bytes) -> bool:
             return (
-                byte_len <= self.epoch_char_limit
-                and byte_len + _FRAMING_RESERVE_TOKENS + 256 <= avail
+                len(raw) <= self.epoch_char_limit
+                and _prompt_tokens_bound(raw) + 256 <= avail
             )
 
         chosen_msgs: list[dict[str, Any]] | None = None
         chosen_tools: list[dict[str, Any]] = wire_tools_default
-        serialized_bytes = 0
+        serialized_raw = b""
 
         turn_groups = _group_turns(messages)
         cur_epoch_start = int(epoch_state.get("turn_start", 0)) if epoch_state is not None else self._epoch_turn_start
@@ -1057,11 +1230,11 @@ class AgenticInvestigator:
                 max_tool_chars=5200,
                 epoch_state=epoch_state,
             )
-            epoch_bytes = _serialized_len(epoch_msgs, wire_tools_default)
-            if _fits_epoch_budget(epoch_bytes):
+            epoch_raw = _serialized_raw(epoch_msgs, wire_tools_default)
+            if _fits_epoch_budget(epoch_raw):
                 chosen_msgs = epoch_msgs
                 chosen_tools = wire_tools_default
-                serialized_bytes = epoch_bytes
+                serialized_raw = epoch_raw
             elif len(turn_groups) - cur_epoch_start > 1:
                 cand_start = max(cur_epoch_start + 1, len(turn_groups) - 1)
                 cand_summary = _build_rolled_history_summary(
@@ -1075,8 +1248,8 @@ class AgenticInvestigator:
                     epoch_summary_text=cand_summary,
                     epoch_state=epoch_state,
                 )
-                cand_bytes = _serialized_len(cand_msgs, wire_tools_default)
-                if _fits_epoch_budget(cand_bytes):
+                cand_raw = _serialized_raw(cand_msgs, wire_tools_default)
+                if _fits_epoch_budget(cand_raw):
                     if epoch_state is not None:
                         epoch_state["turn_start"] = cand_start
                         epoch_state["summary_text"] = cand_summary
@@ -1088,7 +1261,7 @@ class AgenticInvestigator:
                         self._epoch_advancements += 1
                     chosen_msgs = cand_msgs
                     chosen_tools = wire_tools_default
-                    serialized_bytes = cand_bytes
+                    serialized_raw = cand_raw
 
         if chosen_msgs is None:
             schedules: tuple[tuple[int, int, int, bool], ...] = (
@@ -1130,14 +1303,14 @@ class AgenticInvestigator:
                 tools_payload = wire_tools_tight if use_tight_tools else wire_tools_default
                 chosen_msgs = candidate
                 chosen_tools = tools_payload
-                serialized_bytes = _serialized_len(candidate, tools_payload)
+                serialized_raw = _serialized_raw(candidate, tools_payload)
                 if (
-                    serialized_bytes <= _PROMPT_HARD_CHAR_LIMIT
-                    and serialized_bytes + _FRAMING_RESERVE_TOKENS + 256 <= avail
+                    len(serialized_raw) <= _PROMPT_HARD_CHAR_LIMIT
+                    and _prompt_tokens_bound(serialized_raw) + 256 <= avail
                 ):
                     break
 
-        headroom = avail - (serialized_bytes + _FRAMING_RESERVE_TOKENS)
+        headroom = avail - _prompt_tokens_bound(serialized_raw)
         max_out = min(8192, max(256, headroom)) if headroom > 0 else 2048
         body: dict[str, Any] = {
             "model": model_override or self._active_model,
@@ -1230,35 +1403,52 @@ class AgenticInvestigator:
                 raise
 
     def _save_checkpoint(self, *, turn: int, status: str, messages: list[dict[str, Any]]) -> None:
-        if self.bsag is not None:
-            self.bsag.save()
-        _atomic_write_json(
-            self.checkpoint_path,
-            {
-                "schema": "agentic-checkpoint/1",
-                "turn": turn,
-                "status": status,
-                "execution_mode": self.execution_mode,
-                "messages": messages,
-                "notebook": self.dispatcher.notebook_state,
-                "findings": self.dispatcher.findings,
-                "surface_frontier": self.dispatcher.surface_tracker.to_dict(),
-                "bsag": self.bsag.to_dict() if self.bsag is not None else None,
-                "scheduler": self.scheduler.to_dict() if self.execution_mode == "ephemeral" else None,
-                "finish_rejections": self.dispatcher.finish_rejections,
-                "http_used": self.http.budget.used,
-                "http_limit": self.http.budget.limit,
-                "receipt_count": self.receipts.count(),
-                "llm_calls": self.transport.calls,
-                "token_usage": dict(self.token_usage),
-                "finished": self.dispatcher.finished,
-                "finish_summary": self.dispatcher.finish_summary,
-                "untested_areas": self.dispatcher.untested_areas,
-                "epoch_turn_start": self._epoch_turn_start,
-                "epoch_summary_text": self._epoch_summary_text,
-                "epoch_advancements": self._epoch_advancements,
-            },
-        )
+        with self._checkpoint_lock:
+            if self.bsag is not None:
+                self.bsag.save()
+            waf_pivot_summary = (
+                self.dispatcher.waf_pivot.summary()
+                if getattr(self.dispatcher, "waf_pivot", None) is not None
+                and callable(getattr(self.dispatcher.waf_pivot, "summary", None))
+                else None
+            )
+            _atomic_write_json(
+                self.checkpoint_path,
+                {
+                    "schema": "agentic-checkpoint/1",
+                    "turn": turn,
+                    "status": status,
+                    "execution_mode": self.execution_mode,
+                    "messages": messages,
+                    "notebook": self.dispatcher.notebook_state,
+                    "findings": self.dispatcher.findings,
+                    "surface_frontier": self.dispatcher.surface_tracker.to_dict(),
+                    "bsag": self.bsag.to_dict() if self.bsag is not None else None,
+                    "scheduler": self.scheduler.to_dict() if self.execution_mode == "ephemeral" else None,
+                    "finish_rejections": self.dispatcher.finish_rejections,
+                    "http_used": self.http.budget.used,
+                    "http_limit": self.http.budget.limit,
+                    "receipt_count": self.receipts.count(),
+                    "llm_calls": self.transport.calls,
+                    "token_usage": dict(self.token_usage),
+                    "finished": self.dispatcher.finished,
+                    "finish_summary": self.dispatcher.finish_summary,
+                    "untested_areas": self.dispatcher.untested_areas,
+                    "epoch_turn_start": self._epoch_turn_start,
+                    "epoch_summary_text": self._epoch_summary_text,
+                    "epoch_advancements": self._epoch_advancements,
+                    "waf_pivot": waf_pivot_summary,
+                    "stage1_completed": self._stage1_completed,
+                    "stage1_boot_turns": self._stage1_boot_turns,
+                    "stage1_boot_status": self._stage1_boot_status,
+                    "stage1_boot_findings_snap": self._stage1_boot_findings_snap,
+                    "stage1_boot_usage": dict(self._stage1_boot_usage),
+                    "stage1_boot_calls": self._stage1_boot_calls,
+                    "stage1_post_auth_summary": self._stage1_post_auth_summary,
+                    "stage1_surface_frontier": self._stage1_surface_frontier,
+                    "completed_shards": copy.deepcopy(self._completed_shards),
+                },
+            )
 
     def _load_checkpoint(self) -> tuple[int, list[dict[str, Any]]] | None:
         if not self.checkpoint_path.is_file():
@@ -1290,6 +1480,47 @@ class AgenticInvestigator:
             for k in self.token_usage:
                 if type(data["token_usage"].get(k)) is int:
                     self.token_usage[k] = data["token_usage"][k]
+        if isinstance(data.get("waf_pivot"), dict):
+            _restore_waf_pivot_from_summary(self.dispatcher.waf_pivot, data["waf_pivot"])
+        self._stage1_completed = bool(data.get("stage1_completed", False))
+        raw_boot_turns = data.get("stage1_boot_turns", 0)
+        self._stage1_boot_turns = (
+            max(0, raw_boot_turns)
+            if isinstance(raw_boot_turns, int) and not isinstance(raw_boot_turns, bool)
+            else 0
+        )
+        self._stage1_boot_status = str(data.get("stage1_boot_status") or "")
+        self._stage1_boot_findings_snap = (
+            [dict(f) for f in data["stage1_boot_findings_snap"] if isinstance(f, dict)]
+            if isinstance(data.get("stage1_boot_findings_snap"), list)
+            else []
+        )
+        if isinstance(data.get("stage1_boot_usage"), dict):
+            for k in self._stage1_boot_usage:
+                if type(data["stage1_boot_usage"].get(k)) is int:
+                    self._stage1_boot_usage[k] = data["stage1_boot_usage"][k]
+        raw_boot_calls = data.get("stage1_boot_calls", 0)
+        self._stage1_boot_calls = (
+            max(0, raw_boot_calls)
+            if isinstance(raw_boot_calls, int) and not isinstance(raw_boot_calls, bool)
+            else 0
+        )
+        self._stage1_post_auth_summary = (
+            dict(data["stage1_post_auth_summary"])
+            if isinstance(data.get("stage1_post_auth_summary"), dict)
+            else None
+        )
+        self._stage1_surface_frontier = (
+            dict(data["stage1_surface_frontier"])
+            if isinstance(data.get("stage1_surface_frontier"), dict)
+            else None
+        )
+        raw_comp_shards = data.get("completed_shards")
+        self._completed_shards = (
+            {str(k): dict(v) for k, v in raw_comp_shards.items() if isinstance(v, dict)}
+            if isinstance(raw_comp_shards, dict)
+            else {}
+        )
         self.dispatcher.finished = bool(data.get("finished", False))
         self.dispatcher.finish_summary = str(data.get("finish_summary") or "")
         self.dispatcher.untested_areas = list(data.get("untested_areas") or [])
@@ -1486,6 +1717,9 @@ class AgenticInvestigator:
 
         try:
             while total_turns < self.max_turns:
+                if self.cancel_event is not None and self.cancel_event.is_set():
+                    status = "interrupted"
+                    break
                 if self.budget.remaining_seconds() <= 5 or self.budget.available("tokens") < 2500:
                     status = "budget_exhausted"
                     break
@@ -1576,6 +1810,10 @@ class AgenticInvestigator:
                 stop_reason = "completed"
 
                 while worker_steps < self.micro_budget and total_turns < self.max_turns:
+                    if self.cancel_event is not None and self.cancel_event.is_set():
+                        stop_reason = "interrupted"
+                        status = "interrupted"
+                        break
                     if self.budget.remaining_seconds() <= 5 or self.budget.available("tokens") < 2500:
                         stop_reason = "budget_exhausted"
                         status = "budget_exhausted"
@@ -1699,7 +1937,7 @@ class AgenticInvestigator:
                 self.dispatcher.finished = False
                 self._save_checkpoint(turn=total_turns, status="in_progress", messages=worker_messages[-4:])
 
-                if status in {"budget_exhausted", "http_budget_exhausted"}:
+                if status in {"budget_exhausted", "http_budget_exhausted", "interrupted"}:
                     break
                 # Stop campaign cleanly when all priority arms are covered or budget exhausted
                 if (
@@ -1728,6 +1966,7 @@ class AgenticInvestigator:
             raise
         finally:
             self._close_dispatcher(self.dispatcher)
+            self._close_shared_oob_server()
             if self.telemetry is not None or self.bsag is not None:
                 self.write_metrics()
 
@@ -1832,6 +2071,7 @@ class AgenticInvestigator:
             "remaining high-value targets (write endpoints, untested concrete object IDs across actors, unprobed parameters, "
             "and multi-step workflows) without repeating verified findings.\n\n"
             + "\n".join(lines)
+            + self._initial_priority_brief()
             + self._state_banner(next_turn)
         )
         return sys_prompt, user_prompt
@@ -2050,6 +2290,12 @@ class AgenticInvestigator:
 
         try:
             for turn in range(start_turn, max_turns + 1):
+                if self.cancel_event is not None and self.cancel_event.is_set():
+                    status = "interrupted"
+                    if checkpoint_fn is not None:
+                        checkpoint_fn(last_completed_turn, status, messages)
+                    break
+
                 if handoff_scout_cfg is not None and self._handoff_phase == "scout":
                     scout_tokens_used = self.token_usage["total_tokens"] - handoff_scout_cfg["start_tokens"]
                     if turn > handoff_scout_cfg["turn_limit"] or scout_tokens_used >= handoff_scout_cfg["token_cap"]:
@@ -2113,6 +2359,24 @@ class AgenticInvestigator:
                     calls_sink=calls_sink,
                     excluded_tools=excluded_tools,
                 )
+                if self.telemetry is not None:
+                    with self._stats_lock:
+                        cur_total_tokens = int(self.token_usage.get("total_tokens", 0))
+                        fallback_calls = int(
+                            self.token_usage.get("provider_reported_calls", 0)
+                            + self.token_usage.get("estimated_calls", 0)
+                        )
+                    cur_calls = max(int(getattr(self.transport, "calls", 0) or 0), fallback_calls)
+                    telem_fields: dict[str, Any] = {
+                        "turn": turn,
+                        "total_tokens": cur_total_tokens,
+                        "llm_calls": cur_calls,
+                    }
+                    if shard_cluster is not None:
+                        telem_fields["shard_id"] = shard_cluster.shard_id
+                    elif dispatcher.active_worker_id:
+                        telem_fields["worker_id"] = dispatcher.active_worker_id
+                    self.telemetry.emit("token_usage", **telem_fields)
                 choice = (resp.get("choices") or [{}])[0]
                 msg = choice.get("message") or {}
                 tool_calls = msg.get("tool_calls") or []
@@ -2379,6 +2643,7 @@ class AgenticInvestigator:
             )
         finally:
             self._close_dispatcher(self.dispatcher)
+            self._close_shared_oob_server()
             if self._handoff_summary is not None:
                 self._handoff_summary.update(
                     deep_calls=max(0, self.transport.calls - scout_start_calls - self._handoff_summary["scout_calls"]),
@@ -2729,10 +2994,12 @@ class AgenticInvestigator:
 
     def _run_sharded(self, *, resume: bool = False) -> dict[str, Any]:
         """Run 2-stage subsystem-clustered parallel monolithic execution."""
+        loaded: tuple[int, list[dict[str, Any]]] | None = None
         if resume:
             loaded = self._load_checkpoint()
             if loaded is not None and self.dispatcher.finished:
                 self._close_dispatcher(self.dispatcher)
+                self._close_shared_oob_server()
                 return self._result_summary("finished")
 
         boot_model = self.bootstrap_model or self.model
@@ -2830,148 +3097,207 @@ class AgenticInvestigator:
         }
 
         try:
-            self.dispatcher.bootstrap_stage1_virgin_guard = True
-            try:
-                boot_status, boot_last_turn, boot_messages = self._execute_monolithic_loop(
-                    dispatcher=self.dispatcher,
-                    messages=boot_messages,
-                    start_turn=1,
-                    max_turns=boot_max_turns,
-                    epoch_state=boot_epoch_state,
-                    model_name=boot_model,
-                    allow_coverage_gate=boot_allow_coverage_gate,
-                    allow_discovery_gate=boot_allow_discovery_gate,
-                    disable_gate_last_n_turns=2 if (boot_allow_coverage_gate or boot_allow_discovery_gate) else 0,
-                    checkpoint_fn=lambda t, st, msgs: self._save_checkpoint(turn=t, status=st, messages=msgs),
-                    usage_sink=boot_usage,
-                    calls_sink=boot_calls,
-                    excluded_tools=boot_excluded_tools,
-                )
-            finally:
-                self.dispatcher.bootstrap_stage1_virgin_guard = False
-            self.dispatcher.discovery_finish_gate = False
-            boot_findings_snap = copy.deepcopy(self.dispatcher.findings)
+            resumed_from_completed_stage1 = bool(resume and loaded is not None and self._stage1_completed)
+            if resumed_from_completed_stage1:
+                assert loaded is not None
+                boot_last_turn = self._stage1_boot_turns or loaded[0]
+                boot_status = self._stage1_boot_status or "finished"
+                boot_findings_snap = copy.deepcopy(self._stage1_boot_findings_snap)
+                boot_usage = dict(self._stage1_boot_usage)
+                boot_calls = [self._stage1_boot_calls]
+                post_auth_stage0_summary = self._stage1_post_auth_summary
+            else:
+                boot_start_turn = 1
+                if resume and loaded is not None and not self._stage1_completed:
+                    loaded_turn, loaded_msgs = loaded
+                    if loaded_msgs and loaded_turn >= 0:
+                        boot_start_turn = loaded_turn + 1
+                        boot_messages = loaded_msgs
+                if boot_start_turn > boot_max_turns:
+                    boot_status = "max_turns_reached"
+                    boot_last_turn = boot_start_turn - 1
+                else:
+                    self.dispatcher.bootstrap_stage1_virgin_guard = True
+                    try:
+                        boot_status, boot_last_turn, boot_messages = self._execute_monolithic_loop(
+                            dispatcher=self.dispatcher,
+                            messages=boot_messages,
+                            start_turn=boot_start_turn,
+                            max_turns=boot_max_turns,
+                            epoch_state=boot_epoch_state,
+                            model_name=boot_model,
+                            allow_coverage_gate=boot_allow_coverage_gate,
+                            allow_discovery_gate=boot_allow_discovery_gate,
+                            disable_gate_last_n_turns=2 if (boot_allow_coverage_gate or boot_allow_discovery_gate) else 0,
+                            checkpoint_fn=lambda t, st, msgs: self._save_checkpoint(turn=t, status=st, messages=msgs),
+                            usage_sink=boot_usage,
+                            calls_sink=boot_calls,
+                            excluded_tools=boot_excluded_tools,
+                        )
+                    finally:
+                        self.dispatcher.bootstrap_stage1_virgin_guard = False
+                self.dispatcher.discovery_finish_gate = False
+                boot_findings_snap = copy.deepcopy(self.dispatcher.findings)
 
-            if (
-                boot_status in {"budget_exhausted", "service_degraded"}
-                or self.budget.remaining_seconds() <= 5
-                or self.budget.available("tokens") < 2500
-                or (self.http.budget.limit - self.http.budget.used) <= 0
-            ):
+                if boot_status == "interrupted" or (self.cancel_event is not None and self.cancel_event.is_set()):
+                    self._sharding_summary = _build_sharding_summary(
+                        boot_turns=boot_last_turn,
+                        boot_findings_count=len(boot_findings_snap),
+                        fallback_to_monolithic=False,
+                        shards=[],
+                    )
+                    self._save_checkpoint(turn=boot_last_turn, status="interrupted", messages=boot_messages)
+                    return self._result_summary("interrupted")
+
+                if (
+                    boot_status in {"budget_exhausted", "service_degraded"}
+                    or self.budget.remaining_seconds() <= 5
+                    or self.budget.available("tokens") < 2500
+                    or (self.http.budget.limit - self.http.budget.used) <= 0
+                ):
+                    self._sharding_summary = _build_sharding_summary(
+                        boot_turns=boot_last_turn,
+                        boot_findings_count=len(boot_findings_snap),
+                        fallback_to_monolithic=False,
+                        shards=[],
+                    )
+                    final_status = boot_status if boot_status != "running" else "budget_exhausted"
+                    return self._result_summary(final_status)
+
+                post_auth_stage0_summary = None
+                new_auth_actors = sorted(
+                    alias
+                    for alias, sess in list(self.http.actors.actors.items())
+                    if alias != "anon" and sess.authenticated and alias not in initial_auth_actors
+                )
+                rem_http_pre_post_auth = self.http.budget.limit - self.http.budget.used
+                if (
+                    self.stage0_post_auth_enabled
+                    and new_auth_actors
+                    and rem_http_pre_post_auth >= 40
+                    and self.budget.remaining_seconds() >= 30
+                ):
+                    post_auth_extra_seeds = self._derive_post_auth_extra_seed_paths(new_auth_actors, limit=6)
+                    post_auth_starts = ["/", *post_auth_extra_seeds][:8]
+                    post_auth_skip_probes, post_auth_max_probes = self._collect_post_auth_probe_dedup_args(
+                        new_auth_actors
+                    )
+                    try:
+                        import agentic_stage0_crawl  # type: ignore[import-not-found]
+
+                        stage0_post_result = agentic_stage0_crawl.run_stage0_crawl(
+                            self.http,
+                            output_dir=self.root_dir,
+                            start_paths=post_auth_starts,
+                            extra_seed_paths=post_auth_extra_seeds,
+                            max_pages=8,
+                            max_actions=16,
+                            allow_forms=self.stage0_allow_forms,
+                            actors=new_auth_actors,
+                            seed_filename="stage0-post-auth-seed.json",
+                            max_passive_probes=post_auth_max_probes,
+                            skip_probe_paths=post_auth_skip_probes,
+                        )
+                        routes_ingested = 0
+                        stage0_stats: dict[str, Any] = {}
+                        actors_crawled: list[str] = []
+                        seed_file = ""
+                        crawl_status = "ok"
+                        if isinstance(stage0_post_result, dict):
+                            stage0_stats = dict(stage0_post_result.get("stats") or {})
+                            actors_crawled = [str(a) for a in (stage0_post_result.get("actors_crawled") or ())]
+                            seed_file = str(stage0_post_result.get("seed_file") or "")
+                            crawl_status = str(
+                                stage0_stats.get("status")
+                                or stage0_post_result.get("status")
+                                or "ok"
+                            )
+                            for row in self.http.actors.summaries():
+                                self.dispatcher.surface_tracker.actors[row["alias"]] = {
+                                    "alias": row["alias"],
+                                    "role": str(row.get("role") or "").strip().lower(),
+                                    "tenant": str(row.get("tenant") or "").strip().lower(),
+                                }
+                            excluded_paths = tuple(getattr(self.http, "excluded_paths", ()) or ())
+                            in_scope_assets = tuple(getattr(self.http, "in_scope_assets", ()) or ())
+                            out_of_scope_assets = tuple(getattr(self.http, "out_of_scope_assets", ()) or ())
+                            merged_post_seed = merge_seed_surfaces(
+                                [stage0_post_result],
+                                base_url=self.http.base_url,
+                                excluded_paths=excluded_paths,
+                                in_scope_assets=in_scope_assets,
+                                out_of_scope_assets=out_of_scope_assets,
+                            )
+                            if merged_post_seed is not None:
+                                post_actor = new_auth_actors[0] if len(new_auth_actors) == 1 else "stage0-post-auth"
+                                routes_ingested = apply_seed_surface(
+                                    self.dispatcher.surface_tracker,
+                                    merged_post_seed,
+                                    actor=post_actor,
+                                )
+                                for hint in merged_post_seed.get("discovery_hints") or []:
+                                    if isinstance(hint, str) and hint.strip() and hint not in self.discovery_hints:
+                                        self.discovery_hints.append(hint)
+                        post_auth_stage0_summary = {
+                            "triggered": True,
+                            "status": crawl_status,
+                            "actors": list(new_auth_actors),
+                            "actors_crawled": actors_crawled,
+                            "start_paths": list(post_auth_starts),
+                            "extra_seed_paths": list(post_auth_extra_seeds),
+                            "pages_visited": int(stage0_stats.get("pages_visited") or 0),
+                            "ui_actions_taken": int(stage0_stats.get("ui_actions_taken") or 0),
+                            "routes_ingested": int(routes_ingested),
+                            "requests_charged": int(stage0_stats.get("requests_charged") or 0),
+                            "seed_file": seed_file,
+                        }
+                    except Exception as exc:
+                        post_auth_stage0_summary = {
+                            "triggered": True,
+                            "status": "error",
+                            "actors": list(new_auth_actors),
+                            "actors_crawled": [],
+                            "start_paths": list(post_auth_starts),
+                            "extra_seed_paths": list(post_auth_extra_seeds),
+                            "pages_visited": 0,
+                            "ui_actions_taken": 0,
+                            "routes_ingested": 0,
+                            "requests_charged": 0,
+                            "seed_file": "",
+                            "error": type(exc).__name__,
+                        }
+
+                self._stage1_completed = True
+                self._stage1_boot_turns = boot_last_turn
+                self._stage1_boot_status = boot_status
+                self._stage1_boot_findings_snap = copy.deepcopy(boot_findings_snap)
+                self._stage1_boot_usage = dict(boot_usage)
+                self._stage1_boot_calls = boot_calls[0]
+                self._stage1_post_auth_summary = post_auth_stage0_summary
+                self._stage1_surface_frontier = copy.deepcopy(self.dispatcher.surface_tracker.to_dict())
+                self._save_checkpoint(turn=boot_last_turn, status="stage1_completed", messages=[])
+
+            if self.cancel_event is not None and self.cancel_event.is_set():
                 self._sharding_summary = _build_sharding_summary(
                     boot_turns=boot_last_turn,
                     boot_findings_count=len(boot_findings_snap),
                     fallback_to_monolithic=False,
                     shards=[],
+                    post_auth_stage0_crawl=post_auth_stage0_summary,
                 )
-                final_status = boot_status if boot_status != "running" else "budget_exhausted"
-                return self._result_summary(final_status)
+                self._save_checkpoint(turn=boot_last_turn, status="interrupted", messages=[])
+                return self._result_summary("interrupted")
 
-            post_auth_stage0_summary: dict[str, Any] | None = None
-            new_auth_actors = sorted(
-                alias
-                for alias, sess in list(self.http.actors.actors.items())
-                if alias != "anon" and sess.authenticated and alias not in initial_auth_actors
-            )
-            rem_http_pre_post_auth = self.http.budget.limit - self.http.budget.used
-            if (
-                self.stage0_post_auth_enabled
-                and new_auth_actors
-                and rem_http_pre_post_auth >= 40
-                and self.budget.remaining_seconds() >= 30
-            ):
-                post_auth_extra_seeds = self._derive_post_auth_extra_seed_paths(new_auth_actors, limit=6)
-                post_auth_starts = ["/", *post_auth_extra_seeds][:8]
-                post_auth_skip_probes, post_auth_max_probes = self._collect_post_auth_probe_dedup_args(
-                    new_auth_actors
-                )
-                try:
-                    import agentic_stage0_crawl  # type: ignore[import-not-found]
-
-                    stage0_post_result = agentic_stage0_crawl.run_stage0_crawl(
-                        self.http,
-                        output_dir=self.root_dir,
-                        start_paths=post_auth_starts,
-                        extra_seed_paths=post_auth_extra_seeds,
-                        max_pages=8,
-                        max_actions=16,
-                        allow_forms=self.stage0_allow_forms,
-                        actors=new_auth_actors,
-                        seed_filename="stage0-post-auth-seed.json",
-                        max_passive_probes=post_auth_max_probes,
-                        skip_probe_paths=post_auth_skip_probes,
-                    )
-                    routes_ingested = 0
-                    stage0_stats: dict[str, Any] = {}
-                    actors_crawled: list[str] = []
-                    seed_file = ""
-                    crawl_status = "ok"
-                    if isinstance(stage0_post_result, dict):
-                        stage0_stats = dict(stage0_post_result.get("stats") or {})
-                        actors_crawled = [str(a) for a in (stage0_post_result.get("actors_crawled") or ())]
-                        seed_file = str(stage0_post_result.get("seed_file") or "")
-                        crawl_status = str(
-                            stage0_stats.get("status")
-                            or stage0_post_result.get("status")
-                            or "ok"
-                        )
-                        for row in self.http.actors.summaries():
-                            self.dispatcher.surface_tracker.actors[row["alias"]] = {
-                                "alias": row["alias"],
-                                "role": str(row.get("role") or "").strip().lower(),
-                                "tenant": str(row.get("tenant") or "").strip().lower(),
-                            }
-                        excluded_paths = tuple(getattr(self.http, "excluded_paths", ()) or ())
-                        in_scope_assets = tuple(getattr(self.http, "in_scope_assets", ()) or ())
-                        out_of_scope_assets = tuple(getattr(self.http, "out_of_scope_assets", ()) or ())
-                        merged_post_seed = merge_seed_surfaces(
-                            [stage0_post_result],
-                            base_url=self.http.base_url,
-                            excluded_paths=excluded_paths,
-                            in_scope_assets=in_scope_assets,
-                            out_of_scope_assets=out_of_scope_assets,
-                        )
-                        if merged_post_seed is not None:
-                            post_actor = new_auth_actors[0] if len(new_auth_actors) == 1 else "stage0-post-auth"
-                            routes_ingested = apply_seed_surface(
-                                self.dispatcher.surface_tracker,
-                                merged_post_seed,
-                                actor=post_actor,
-                            )
-                            for hint in merged_post_seed.get("discovery_hints") or []:
-                                if isinstance(hint, str) and hint.strip() and hint not in self.discovery_hints:
-                                    self.discovery_hints.append(hint)
-                    post_auth_stage0_summary = {
-                        "triggered": True,
-                        "status": crawl_status,
-                        "actors": list(new_auth_actors),
-                        "actors_crawled": actors_crawled,
-                        "start_paths": list(post_auth_starts),
-                        "extra_seed_paths": list(post_auth_extra_seeds),
-                        "pages_visited": int(stage0_stats.get("pages_visited") or 0),
-                        "ui_actions_taken": int(stage0_stats.get("ui_actions_taken") or 0),
-                        "routes_ingested": int(routes_ingested),
-                        "requests_charged": int(stage0_stats.get("requests_charged") or 0),
-                        "seed_file": seed_file,
-                    }
-                except Exception as exc:
-                    post_auth_stage0_summary = {
-                        "triggered": True,
-                        "status": "error",
-                        "actors": list(new_auth_actors),
-                        "actors_crawled": [],
-                        "start_paths": list(post_auth_starts),
-                        "extra_seed_paths": list(post_auth_extra_seeds),
-                        "pages_visited": 0,
-                        "ui_actions_taken": 0,
-                        "routes_ingested": 0,
-                        "requests_charged": 0,
-                        "seed_file": "",
-                        "error": type(exc).__name__,
-                    }
+            if self._stage1_surface_frontier:
+                cluster_tracker = self._make_surface_tracker()
+                cluster_tracker.load_dict(copy.deepcopy(self._stage1_surface_frontier))
+                bootstrap_surface_snap = copy.deepcopy(self._stage1_surface_frontier)
+            else:
+                cluster_tracker = self.dispatcher.surface_tracker
+                bootstrap_surface_snap = copy.deepcopy(self.dispatcher.surface_tracker.to_dict())
 
             clusters = cluster_discovered_surface(
-                self.dispatcher.surface_tracker,
+                cluster_tracker,
                 max_shards=self.max_shards,
             )
             if len(clusters) <= 1 or self.budget.available("tokens") < 40_000:
@@ -2986,8 +3312,22 @@ class AgenticInvestigator:
                     self.dispatcher.finish_rejections = 0
                     self.dispatcher.finish_summary = ""
                     self._active_model = self.model
-                    if bootstrap_discovery_only:
+                    cont_start_turn = boot_last_turn + 1
+                    resumed_cont_msgs = (
+                        loaded[1]
+                        if (resumed_from_completed_stage1 and loaded is not None and loaded[1] and loaded[0] >= boot_last_turn)
+                        else None
+                    )
+                    if resumed_cont_msgs is not None:
                         cont_epoch_state: dict[str, Any] = {
+                            "turn_start": self._epoch_turn_start,
+                            "summary_text": self._epoch_summary_text,
+                            "advancements": self._epoch_advancements,
+                        }
+                        cont_messages = list(resumed_cont_msgs)
+                        cont_start_turn = loaded[0] + 1  # type: ignore[index]
+                    elif bootstrap_discovery_only:
+                        cont_epoch_state = {
                             "turn_start": 0,
                             "summary_text": "",
                             "advancements": 0,
@@ -3007,6 +3347,7 @@ class AgenticInvestigator:
                             "and call `record_finding` for every confirmed issue.\n\n"
                             f"[LIVE ACTORS]\n{json.dumps(self.http.actors.summaries(), ensure_ascii=False)}\n"
                             f"{frontier_banner}"
+                            + self._initial_priority_brief()
                             + self._state_banner(
                                 boot_last_turn + 1,
                                 dispatcher=self.dispatcher,
@@ -3014,7 +3355,7 @@ class AgenticInvestigator:
                                 allow_coverage_gate=True,
                             )
                         )
-                        cont_messages: list[dict[str, Any]] = [
+                        cont_messages = [
                             {"role": "system", "content": cont_sys_prompt},
                             {"role": "user", "content": cont_user_prompt},
                         ]
@@ -3025,7 +3366,7 @@ class AgenticInvestigator:
                     cont_status, _, _ = self._execute_monolithic_loop(
                         dispatcher=self.dispatcher,
                         messages=cont_messages,
-                        start_turn=boot_last_turn + 1,
+                        start_turn=cont_start_turn,
                         max_turns=self.max_turns,
                         epoch_state=cont_epoch_state,
                         model_name=self.model,
@@ -3075,7 +3416,6 @@ class AgenticInvestigator:
             else:
                 token_share = 0.85 if stage3_http_reserve > 0 else 0.90
                 eff_shard_token_quota = max(25_000, int((rem_tokens * token_share) / num_shards))
-            bootstrap_surface_snap = copy.deepcopy(self.dispatcher.surface_tracker.to_dict())
             shard_base_sys_prompt = build_system_prompt(
                 base_url=self.http.base_url,
                 allowed_methods=sorted(self.http.allowed_methods),
@@ -3084,14 +3424,56 @@ class AgenticInvestigator:
                 http_budget=self.http.budget.limit,
             )
 
+            _terminal_done_shard_statuses = {
+                "finished",
+                "max_turns_reached",
+                "budget_exhausted",
+                "http_budget_exhausted",
+                "stopped_no_tool_calls",
+            }
+
+            def _restore_completed_shard_result(cluster: SubsystemCluster) -> dict[str, Any]:
+                saved = self._completed_shards[cluster.shard_id]
+                shard_dir = self.root_dir / "shards" / cluster.shard_id
+                shard_findings_file = shard_dir / "findings.json"
+                saved_findings: list[dict[str, Any]] = []
+                if shard_findings_file.is_file():
+                    try:
+                        loaded_f = json.loads(shard_findings_file.read_text(encoding="utf-8"))
+                        if isinstance(loaded_f, list):
+                            saved_findings = [f for f in loaded_f if isinstance(f, dict)]
+                    except (OSError, ValueError):
+                        saved_findings = []
+                if not saved_findings and isinstance(saved.get("findings"), list):
+                    saved_findings = [f for f in saved["findings"] if isinstance(f, dict)]
+                restored_tracker = self._make_surface_tracker()
+                if isinstance(saved.get("surface_tracker"), dict):
+                    restored_tracker.load_dict(copy.deepcopy(saved["surface_tracker"]))
+                else:
+                    restored_tracker.load_dict(copy.deepcopy(bootstrap_surface_snap))
+                return {
+                    "shard_id": cluster.shard_id,
+                    "name": str(saved.get("name") or cluster.name),
+                    "families": list(saved.get("families") or cluster.families),
+                    "calls": int(saved.get("calls") or 0),
+                    "tokens": int(saved.get("tokens") or 0),
+                    "effective_tokens": int(saved.get("effective_tokens") or 0),
+                    "cached_tokens": int(saved.get("cached_tokens") or 0),
+                    "uncached_tokens": int(saved.get("uncached_tokens") or 0),
+                    "reasoning_tokens": int(saved.get("reasoning_tokens") or 0),
+                    "epoch_advancements": int(saved.get("epoch_advancements") or 0),
+                    "shard_token_quota": int(saved.get("shard_token_quota") or eff_shard_token_quota),
+                    "findings": saved_findings,
+                    "status": str(saved.get("status") or "finished"),
+                    "surface_tracker": restored_tracker,
+                    "finish_summary": str(saved.get("finish_summary") or ""),
+                    "untested_areas": list(saved.get("untested_areas") or []),
+                }
+
             def _run_shard_worker(cluster: SubsystemCluster) -> dict[str, Any]:
                 shard_dir = self.root_dir / "shards" / cluster.shard_id
                 shard_dir.mkdir(parents=True, exist_ok=True)
-                shared_oob = (
-                    self._oob_server
-                    if self._oob_server is not None
-                    else getattr(self.dispatcher, "_oob_server", None)
-                )
+                shared_oob = self._get_or_create_shared_oob_server(start=False)
                 shard_dispatcher = ToolDispatcher(
                     http_client=self.http,
                     receipt_store=self.receipts,
@@ -3100,6 +3482,8 @@ class AgenticInvestigator:
                     oracle=self.oracle,
                     telemetry=self.telemetry,
                     oob_server=shared_oob,
+                    oob_provider=self._get_or_create_shared_oob_server,
+                    waf_pivot=self.dispatcher.waf_pivot,
                     http_reserve_floor=stage3_http_reserve,
                 )
                 try:
@@ -3120,6 +3504,18 @@ class AgenticInvestigator:
                         shard_token_quota=eff_shard_token_quota,
                         shard_tokens_used=0,
                     )
+                    waf_guidance = (
+                        str(shard_dispatcher.waf_pivot.guidance() or "").strip()
+                        if shard_dispatcher.waf_pivot.should_pivot()
+                        else ""
+                    )
+                    shard_handoff_extra: dict[str, Any] = {
+                        "prescan_handoff": self.prescan_handoff,
+                        "har_flows_handoff": self.har_flows_handoff,
+                        "asset_graph_handoff": self.asset_graph_handoff,
+                        "waf_pivot_guidance": waf_guidance,
+                    }
+                    accepted_shard_handoffs = _supported_kwargs(build_shard_prompts, shard_handoff_extra)
                     s_sys, s_usr = build_shard_prompts(
                         cluster,
                         base_system_prompt=shard_base_sys_prompt,
@@ -3127,7 +3523,19 @@ class AgenticInvestigator:
                         receipts=self.receipts,
                         state_banner=init_banner,
                         surface_tracker=shard_dispatcher.surface_tracker,
+                        **accepted_shard_handoffs,
                     )
+                    unaccepted_blocks = [
+                        val
+                        for key, val in shard_handoff_extra.items()
+                        if key not in accepted_shard_handoffs
+                        and isinstance(val, str)
+                        and val.strip()
+                        and val.strip() not in s_usr
+                        and val.strip() not in s_sys
+                    ]
+                    if unaccepted_blocks:
+                        s_usr = s_usr + "\n\n" + "\n\n".join(unaccepted_blocks)
                     shard_messages: list[dict[str, Any]] = [
                         {"role": "system", "content": s_sys},
                         {"role": "user", "content": s_usr},
@@ -3146,29 +3554,32 @@ class AgenticInvestigator:
                             },
                         )
 
-                    try:
-                        s_status, _, _ = self._execute_monolithic_loop(
-                            dispatcher=shard_dispatcher,
-                            messages=shard_messages,
-                            start_turn=1,
-                            max_turns=self.shard_turns,
-                            epoch_state=shard_epoch_state,
-                            model_name=self.model,
-                            allow_coverage_gate=False,
-                            allow_discovery_gate=False,
-                            checkpoint_fn=_shard_ckpt,
-                            shard_cluster=cluster,
-                            usage_sink=shard_usage,
-                            calls_sink=shard_calls,
-                            shard_token_quota=eff_shard_token_quota,
-                            excluded_tools=None,
-                        )
-                    except BudgetError as exc:
-                        s_status = self._classify_budget_error(exc, is_shard=True)
-                    except Exception as exc:
-                        s_status = f"error:{type(exc).__name__}"
+                    if self.cancel_event is not None and self.cancel_event.is_set():
+                        s_status = "interrupted"
+                    else:
+                        try:
+                            s_status, _, _ = self._execute_monolithic_loop(
+                                dispatcher=shard_dispatcher,
+                                messages=shard_messages,
+                                start_turn=1,
+                                max_turns=self.shard_turns,
+                                epoch_state=shard_epoch_state,
+                                model_name=self.model,
+                                allow_coverage_gate=False,
+                                allow_discovery_gate=False,
+                                checkpoint_fn=_shard_ckpt,
+                                shard_cluster=cluster,
+                                usage_sink=shard_usage,
+                                calls_sink=shard_calls,
+                                shard_token_quota=eff_shard_token_quota,
+                                excluded_tools=None,
+                            )
+                        except BudgetError as exc:
+                            s_status = self._classify_budget_error(exc, is_shard=True)
+                        except Exception as exc:
+                            s_status = f"error:{type(exc).__name__}"
 
-                    return {
+                    result_doc = {
                         "shard_id": cluster.shard_id,
                         "name": cluster.name,
                         "families": list(cluster.families),
@@ -3186,17 +3597,79 @@ class AgenticInvestigator:
                         "finish_summary": shard_dispatcher.finish_summary,
                         "untested_areas": list(shard_dispatcher.untested_areas),
                     }
+                    if s_status in _terminal_done_shard_statuses:
+                        with self._stats_lock:
+                            self._completed_shards[cluster.shard_id] = {
+                                **result_doc,
+                                "surface_tracker": shard_dispatcher.surface_tracker.to_dict(),
+                            }
+                        self._save_checkpoint(turn=boot_last_turn, status="stage2_in_progress", messages=[])
+                    return result_doc
                 finally:
                     self._close_dispatcher(shard_dispatcher)
 
+            pending_clusters: list[SubsystemCluster] = []
+            completed_by_id: dict[str, dict[str, Any]] = {}
+            for cluster in clusters:
+                saved_shard = self._completed_shards.get(cluster.shard_id)
+                if (
+                    resume
+                    and isinstance(saved_shard, dict)
+                    and str(saved_shard.get("status") or "") in _terminal_done_shard_statuses
+                ):
+                    completed_by_id[cluster.shard_id] = _restore_completed_shard_result(cluster)
+                else:
+                    pending_clusters.append(cluster)
+
             shard_results: list[dict[str, Any]] = []
-            with concurrent.futures.ThreadPoolExecutor(max_workers=len(clusters)) as pool:
-                futures = [pool.submit(_run_shard_worker, cluster) for cluster in clusters]
-                for fut in futures:
-                    shard_results.append(fut.result())
+            actor_meta_map = {
+                row["alias"]: {
+                    "alias": row["alias"],
+                    "role": str(row.get("role") or "").lower(),
+                    "tenant": str(row.get("tenant") or "").lower(),
+                }
+                for row in self.http.actors.summaries()
+            }
+            try:
+                if pending_clusters:
+                    with concurrent.futures.ThreadPoolExecutor(max_workers=len(pending_clusters)) as pool:
+                        fut_map = {
+                            cluster.shard_id: pool.submit(_run_shard_worker, cluster)
+                            for cluster in pending_clusters
+                        }
+                        for cluster in clusters:
+                            if cluster.shard_id in completed_by_id:
+                                shard_results.append(completed_by_id[cluster.shard_id])
+                            else:
+                                shard_results.append(fut_map[cluster.shard_id].result())
+                else:
+                    shard_results = [completed_by_id[c.shard_id] for c in clusters]
+            finally:
+                rescued_findings: list[dict[str, Any]] = [
+                    *boot_findings_snap,
+                    *self.dispatcher.findings,
+                ]
+                for sres in shard_results:
+                    rescued_findings.extend(sres.get("findings") or [])
+                shards_root = self.root_dir / "shards"
+                if shards_root.is_dir():
+                    for shard_findings_path in sorted(shards_root.glob("*/findings.json")):
+                        try:
+                            disk_items = json.loads(shard_findings_path.read_text(encoding="utf-8"))
+                        except (OSError, ValueError):
+                            continue
+                        if isinstance(disk_items, list):
+                            rescued_findings.extend(item for item in disk_items if isinstance(item, dict))
+                if rescued_findings:
+                    self.dispatcher.findings = canonicalize_and_deduplicate_findings(
+                        rescued_findings,
+                        actor_meta_map=actor_meta_map,
+                        receipt_store=self.receipts,
+                    )
+                    self.dispatcher._save_findings()
 
             # Merge surface trackers and findings from bootstrap + all shards.
-            merged_findings: list[dict[str, Any]] = list(boot_findings_snap)
+            merged_findings: list[dict[str, Any]] = [*boot_findings_snap, *self.dispatcher.findings]
             shard_summaries_text: list[str] = []
             merged_untested: list[str] = list(self.dispatcher.untested_areas)
             for sres in shard_results:
@@ -3215,14 +3688,6 @@ class AgenticInvestigator:
                     "tenant": str(row.get("tenant") or "").strip().lower(),
                 }
 
-            actor_meta_map = {
-                row["alias"]: {
-                    "alias": row["alias"],
-                    "role": str(row.get("role") or "").lower(),
-                    "tenant": str(row.get("tenant") or "").lower(),
-                }
-                for row in self.http.actors.summaries()
-            }
             self.dispatcher.findings = canonicalize_and_deduplicate_findings(
                 merged_findings,
                 actor_meta_map=actor_meta_map,
@@ -3236,7 +3701,11 @@ class AgenticInvestigator:
             self.dispatcher.untested_areas = merged_untested
 
             shard_statuses = [r["status"] for r in shard_results]
-            if all(st == "finished" for st in shard_statuses):
+            if any(st == "interrupted" for st in shard_statuses) or (
+                self.cancel_event is not None and self.cancel_event.is_set()
+            ):
+                overall_status = "interrupted"
+            elif all(st == "finished" for st in shard_statuses):
                 overall_status = "finished"
             elif any(st == "finished" for st in shard_statuses):
                 overall_status = "finished"
@@ -3254,7 +3723,9 @@ class AgenticInvestigator:
             )
             stage3_summary: dict[str, Any] | None = None
             if (
-                self.enable_cross_shard_synthesis
+                overall_status != "interrupted"
+                and not (self.cancel_event is not None and self.cancel_event.is_set())
+                and self.enable_cross_shard_synthesis
                 and synth_ctx.get("should_trigger")
                 and (self.http.budget.limit - self.http.budget.used) >= 6
                 and self.budget.available("tokens") >= 18_000
@@ -3262,11 +3733,7 @@ class AgenticInvestigator:
             ):
                 stage3_dir = self.root_dir / "shards" / "stage3-synthesis"
                 stage3_dir.mkdir(parents=True, exist_ok=True)
-                shared_oob = (
-                    self._oob_server
-                    if self._oob_server is not None
-                    else getattr(self.dispatcher, "_oob_server", None)
-                )
+                shared_oob = self._get_or_create_shared_oob_server(start=False)
                 stage3_dispatcher = ToolDispatcher(
                     http_client=self.http,
                     receipt_store=self.receipts,
@@ -3275,6 +3742,8 @@ class AgenticInvestigator:
                     oracle=self.oracle,
                     telemetry=self.telemetry,
                     oob_server=shared_oob,
+                    oob_provider=self._get_or_create_shared_oob_server,
+                    waf_pivot=self.dispatcher.waf_pivot,
                     bootstrap_stage1_virgin_guard=False,
                     http_reserve_floor=0,
                 )
@@ -3312,13 +3781,40 @@ class AgenticInvestigator:
                         max_turns_override=s3_max_turns,
                         allow_coverage_gate=False,
                     )
+                    s3_waf_guidance = (
+                        str(stage3_dispatcher.waf_pivot.guidance() or "").strip()
+                        if stage3_dispatcher.waf_pivot.should_pivot()
+                        else ""
+                    )
+                    s3_handoff_extra: dict[str, Any] = {
+                        "prescan_handoff": self.prescan_handoff,
+                        "har_flows_handoff": self.har_flows_handoff,
+                        "asset_graph_handoff": self.asset_graph_handoff,
+                        "waf_pivot_guidance": s3_waf_guidance,
+                    }
+                    accepted_s3_handoffs = _supported_kwargs(
+                        build_cross_shard_synthesis_prompts,
+                        s3_handoff_extra,
+                    )
                     s3_sys, s3_usr = build_cross_shard_synthesis_prompts(
                         base_system_prompt=shard_base_sys_prompt,
                         synthesis_context=synth_ctx,
                         actor_summaries=self.http.actors.summaries(),
                         http_budget_remaining=s3_http_rem,
                         state_banner=s3_banner,
+                        **accepted_s3_handoffs,
                     )
+                    unaccepted_s3_blocks = [
+                        val
+                        for key, val in s3_handoff_extra.items()
+                        if key not in accepted_s3_handoffs
+                        and isinstance(val, str)
+                        and val.strip()
+                        and val.strip() not in s3_usr
+                        and val.strip() not in s3_sys
+                    ]
+                    if unaccepted_s3_blocks:
+                        s3_usr = s3_usr + "\n\n" + "\n\n".join(unaccepted_s3_blocks)
                     s3_messages: list[dict[str, Any]] = [
                         {"role": "system", "content": s3_sys},
                         {"role": "user", "content": s3_usr},
@@ -3396,7 +3892,9 @@ class AgenticInvestigator:
                     for area in stage3_dispatcher.untested_areas:
                         if area not in self.dispatcher.untested_areas:
                             self.dispatcher.untested_areas.append(area)
-                    if overall_status != "finished" and s3_status == "finished":
+                    if s3_status == "interrupted":
+                        overall_status = "interrupted"
+                    elif overall_status != "finished" and s3_status == "finished":
                         overall_status = "finished"
                     stage3_summary = {
                         "triggered": True,
@@ -3444,6 +3942,7 @@ class AgenticInvestigator:
             return self._result_summary(overall_status)
         finally:
             self._close_dispatcher(self.dispatcher)
+            self._close_shared_oob_server()
             if self.telemetry is not None or self.bsag is not None:
                 self.write_metrics()
 

@@ -95,7 +95,9 @@ Düşük seviyeli ayarlar (`--epoch-char-limit`, `--cache-token-weight`, `--shar
 - `--preset quick|standard|bounty-safe|deep` (`standard`, `bounty-safe` ve `deep` deterministik 0-LLM `--prescan` ön taramasını otomatik açar)
 - `--prescan` / `--no-prescan` / `--prescan-max-requests <N>` (0-LLM-token CORS/redirect/GraphQL/secret + 2-aktörlü BOLA/BFLA ön matrisi)
 - `cco-agent recon --target <url> --output-dir <dir>` → çıkan `asset-graph.json` dosyasını `--asset-graph <path>` ile doğrudan koşuya bağla
+- `cco-agent map <run_dir>` (veya `--target <url> --seed-surface <burp.xml|openapi.yaml|postman.json|traffic.har|urls.txt> --output-dir <dir>`) → birleşik çoklu-origin `surface-map.json` + `surface-map.md` üretir (0 trafik)
 - `cco-agent save-auth --program <ad> --login-url <url> --manual --record-har ~/cco-work/traffic.har` (tek seferde hem çoklu-origin `storage_state` hem HAR kaydı)
+- `--apply-har-headers` (HAR içinde gözlenen gizli-olmayan BFF uygulama başlıklarını en düşük öncelikle isteklere ekler; opt-in)
 - `--refresh-path <path>` (koşu ortası `401` oturum/JWT otomatik yenileme ucu)
 - `--config <run.json>` (`cco-run/1`)
 - `--target <url>`

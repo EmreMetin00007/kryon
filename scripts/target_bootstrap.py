@@ -2,19 +2,24 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from fnmatch import fnmatch
+from fnmatch import fnmatch, fnmatchcase
+import ipaddress
 import json
 import os
 from pathlib import Path
 import posixpath
 import re
+import socket
 import stat
-from typing import Any, Sequence
+from typing import Any, Callable, Sequence
 from urllib.parse import unquote, urljoin, urlsplit
 
 _ADMIN_ROLES = frozenset({"platform_admin", "tenant_admin", "admin", "superadmin"})
 _HOST_LABEL_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
+_HOST_GLOB_LABEL_RE = re.compile(r"^[a-z0-9*?](?:[a-z0-9-*?]{0,61}[a-z0-9*?])?$")
 _GLOB_CHARS = frozenset("*?[")
+_HOST_GLOB_CHARS = frozenset("*?")
+_CGNAT_NETWORK = ipaddress.IPv4Network((0x64400000, 10))
 
 # Executable/handler endpoint extensions stripped from the final path segment when
 # classifying operational lifecycle and logout routes (deliberately excluding static
@@ -107,6 +112,24 @@ def load_credentials_bundle(path: Path | None) -> dict[str, Any]:
     return data
 
 
+def _has_account_auth(row: dict[str, Any]) -> bool:
+    """Return True when an account has a password or pre-authenticated session material."""
+    if row.get("password"):
+        return True
+    for str_key in ("access_token", "bearer_token", "session_token", "auth_header", "cookie"):
+        val = row.get(str_key)
+        if isinstance(val, str) and val.strip():
+            return True
+    for map_key in ("headers", "cookies", "local_storage"):
+        val = row.get(map_key)
+        if isinstance(val, dict) and any(
+            str(k or "").strip() and v is not None and str(v) != ""
+            for k, v in val.items()
+        ):
+            return True
+    return False
+
+
 def select_representative_accounts(
     accounts: Sequence[dict[str, Any]],
     *,
@@ -114,7 +137,11 @@ def select_representative_accounts(
     max_admins: int = 1,
 ) -> list[dict[str, Any]]:
     """Select bounded synthetic accounts spanning tenants, roles, and peer comparisons."""
-    cleaned = [dict(row) for row in accounts if isinstance(row, dict) and row.get("alias") and row.get("password")]
+    cleaned = [
+        dict(row)
+        for row in accounts
+        if isinstance(row, dict) and str(row.get("alias") or "").strip() and _has_account_auth(row)
+    ]
     if max_members < 0 or max_admins < 0:
         raise ValueError("account limits must be non-negative")
     admins = [row for row in cleaned if str(row.get("role") or "").lower() in _ADMIN_ROLES]
@@ -147,31 +174,158 @@ def _default_port(scheme: str) -> int:
     return 443 if scheme == "https" else 80
 
 
+def _canonicalize_host(host: str) -> str:
+    """Normalize a validated host or IPv6 literal to canonical lowercase/compressed form."""
+    clean = host.strip().lower().rstrip(".")
+    if clean.startswith("[") and clean.endswith("]") and ":" in clean:
+        clean = clean[1:-1]
+    if ":" in clean and "%" not in clean:
+        try:
+            addr = ipaddress.ip_address(clean)
+            return addr.compressed
+        except ValueError:
+            return clean
+    return clean
+
+
 def _is_valid_host(host: str) -> bool:
     clean = host.strip().lower().rstrip(".")
-    if not clean or any(ch.isspace() for ch in clean):
+    if not clean or any(ch.isspace() or ord(ch) < 32 for ch in clean):
         return False
     if ":" in clean:
-        return all(ch in "0123456789abcdef:." for ch in clean)
+        if "%" in clean:
+            return False
+        try:
+            return isinstance(ipaddress.ip_address(clean), ipaddress.IPv6Address)
+        except ValueError:
+            return False
     labels = clean.split(".")
     return all(bool(_HOST_LABEL_RE.match(label)) for label in labels)
 
 
-def _host_matches(target_host: str, pattern: str) -> bool:
-    target = target_host.strip().lower().rstrip(".")
-    pat = pattern.strip().lower().rstrip(".")
-    if not target or not pat:
+def _is_valid_host_pattern(pattern: str) -> bool:
+    """Return True if ``pattern`` is a valid exact host, IPv6 literal, or safe DNS glob pattern."""
+    clean = pattern.strip().lower().rstrip(".")
+    if not clean or any(ch.isspace() or ord(ch) < 32 for ch in clean):
         return False
-    if pat.startswith("*."):
-        base = pat[2:]
-        if not base or "*" in base or not _is_valid_host(base):
+    if "[" in clean or "]" in clean:
+        return False
+    if ":" in clean:
+        if any(ch in _HOST_GLOB_CHARS for ch in clean):
             return False
+        return _is_valid_host(clean)
+    if not any(ch in _HOST_GLOB_CHARS for ch in clean):
+        return _is_valid_host(clean)
+    labels = clean.split(".")
+    if len(labels) < 2 or not all(bool(_HOST_GLOB_LABEL_RE.match(lbl)) for lbl in labels):
+        return False
+    # Require at least two wildcard-free tail labels so patterns like *.com or *target.com are rejected.
+    concrete_tail = 0
+    for lbl in reversed(labels):
+        if any(ch in _HOST_GLOB_CHARS for ch in lbl):
+            break
+        if not _HOST_LABEL_RE.match(lbl):
+            return False
+        concrete_tail += 1
+    return concrete_tail >= 2
+
+
+def _host_matches(target_host: str, pattern: str) -> bool:
+    target = _canonicalize_host(target_host)
+    pat = _canonicalize_host(pattern)
+    if not _is_valid_host(target) or not _is_valid_host_pattern(pat):
+        return False
+    if ":" in pat or not any(ch in _HOST_GLOB_CHARS for ch in pat):
+        return target == pat
+    if pat.startswith("*.") and not any(ch in _HOST_GLOB_CHARS for ch in pat[2:]):
+        base = pat[2:]
         return target.endswith("." + base) and len(target) > len(base) + 1
-    if "*" in pat:
+    return fnmatchcase(target, pat)
+
+
+def _is_loopback_host(host: str) -> bool:
+    clean = _canonicalize_host(host)
+    if not clean:
         return False
-    if not _is_valid_host(pat):
+    if clean in {"127.0.0.1", "localhost", "::1"} or clean.endswith(".localhost"):
+        return True
+    try:
+        ip = ipaddress.ip_address(clean)
+    except ValueError:
         return False
-    return target == pat
+    mapped = getattr(ip, "ipv4_mapped", None)
+    eff = mapped if mapped is not None else ip
+    return bool(eff.is_loopback)
+
+
+def _check_ip_forbidden_reason(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> str | None:
+    """Return a non-empty reason if ``ip`` (or its IPv4-mapped address) is non-public/SSRF-unsafe."""
+    candidates: list[ipaddress.IPv4Address | ipaddress.IPv6Address] = [ip]
+    mapped = getattr(ip, "ipv4_mapped", None)
+    if mapped is not None:
+        candidates.append(mapped)
+    for addr in candidates:
+        if addr.is_loopback:
+            return "loopback"
+        if addr.is_link_local:
+            return "link-local"
+        if addr.is_private:
+            return "private"
+        if isinstance(addr, ipaddress.IPv4Address) and addr in _CGNAT_NETWORK:
+            return "cgnat"
+        if addr.is_multicast:
+            return "multicast"
+        if addr.is_unspecified:
+            return "unspecified"
+    return None
+
+
+def check_dns_safety(
+    host: str,
+    port: int,
+    *,
+    resolver: Callable[..., Any] | None = None,
+) -> None:
+    """Reject IP literals and DNS resolutions pointing to loopback, private, IMDS, CGNAT, multicast, or unspecified IPs."""
+    clean_host = _canonicalize_host(str(host or ""))
+    if not clean_host:
+        raise ValueError("DNS resolution blocked: empty host")
+    try:
+        ip_lit = ipaddress.ip_address(clean_host)
+    except ValueError:
+        ip_lit = None
+    if ip_lit is not None:
+        reason = _check_ip_forbidden_reason(ip_lit)
+        if reason is not None:
+            raise ValueError(f"DNS resolution blocked: {clean_host!r} is a {reason} IP address")
+        return
+
+    eff_resolver = resolver or socket.getaddrinfo
+    try:
+        resolved_entries = eff_resolver(clean_host, port)
+    except socket.gaierror:
+        if resolver is None and (clean_host == "localhost" or clean_host.endswith(".localhost")):
+            raise ValueError(f"DNS resolution blocked: {clean_host!r} is a loopback hostname") from None
+        raise
+
+    for entry in resolved_entries or ():
+        raw_ip = ""
+        if isinstance(entry, (tuple, list)) and len(entry) >= 5 and isinstance(entry[4], (tuple, list)) and entry[4]:
+            raw_ip = str(entry[4][0])
+        elif isinstance(entry, (str, ipaddress.IPv4Address, ipaddress.IPv6Address)):
+            raw_ip = str(entry)
+        if not raw_ip:
+            continue
+        clean_ip = raw_ip.split("%", 1)[0].strip()
+        try:
+            addr = ipaddress.ip_address(clean_ip)
+        except ValueError:
+            continue
+        reason = _check_ip_forbidden_reason(addr)
+        if reason is not None:
+            raise ValueError(
+                f"DNS resolution blocked: {clean_host!r} resolved to {reason} address {addr.compressed}"
+            )
 
 
 def _normalize_explicit_origin(raw_url: str) -> tuple[str, str, str, int]:
@@ -181,7 +335,11 @@ def _normalize_explicit_origin(raw_url: str) -> tuple[str, str, str, int]:
         raise ValueError("target URL is required")
     if any(ch.isspace() or ord(ch) < 32 for ch in raw):
         raise ValueError(f"target URL contains invalid whitespace or control characters: {raw_url!r}")
-    parsed = urlsplit(raw)
+    try:
+        parsed = urlsplit(raw)
+        explicit_port = parsed.port
+    except ValueError as exc:
+        raise ValueError(f"target URL is invalid: {raw_url!r}") from exc
     scheme = parsed.scheme.lower()
     if scheme not in {"http", "https"}:
         raise ValueError(f"target URL must use http:// or https:// scheme: {raw_url!r}")
@@ -189,10 +347,10 @@ def _normalize_explicit_origin(raw_url: str) -> tuple[str, str, str, int]:
         raise ValueError("target URL must not embed credentials")
     if parsed.path not in {"", "/"} or parsed.query or parsed.fragment:
         raise ValueError("target URL must be a clean origin without path, credentials, query, or fragment")
-    hostname = (parsed.hostname or "").strip().lower().rstrip(".")
-    if not hostname or not _is_valid_host(hostname):
+    raw_hostname = (parsed.hostname or "").strip().lower().rstrip(".")
+    if not raw_hostname or not _is_valid_host(raw_hostname):
         raise ValueError(f"target URL has invalid hostname: {raw_url!r}")
-    explicit_port = parsed.port
+    hostname = _canonicalize_host(raw_hostname)
     if explicit_port is not None and explicit_port <= 0:
         raise ValueError(f"target URL has invalid port: {raw_url!r}")
     default_port = _default_port(scheme)
@@ -373,13 +531,10 @@ def _parse_scope_asset(entry: Any) -> _AssetRule | None:
         if parsed.username is not None or parsed.password is not None or "@" in parsed.netloc:
             return None
         scheme = parsed.scheme.lower()
-        host_pat = (parsed.hostname or "").strip().lower().rstrip(".")
-        if not host_pat:
+        raw_host_pat = (parsed.hostname or "").strip().lower().rstrip(".")
+        if not raw_host_pat or not _is_valid_host_pattern(raw_host_pat):
             return None
-        if not (host_pat.startswith("*.") or _is_valid_host(host_pat)):
-            return None
-        if host_pat.startswith("*.") and not _is_valid_host(host_pat[2:]):
-            return None
+        host_pat = _canonicalize_host(raw_host_pat)
         if explicit_port is not None and explicit_port <= 0:
             return None
         eff_port = explicit_port if explicit_port is not None else _default_port(scheme)
@@ -391,6 +546,21 @@ def _parse_scope_asset(entry: Any) -> _AssetRule | None:
             path=parsed.path or "",
         )
 
+    # Support unbracketed IPv6 literals (e.g. "::1" or "0:0:0:0:0:0:0:1").
+    if "/" not in raw and "[" not in raw and "]" not in raw and ":" in raw and "%" not in raw:
+        try:
+            ipv6_addr = ipaddress.ip_address(raw.lower().rstrip("."))
+        except ValueError:
+            ipv6_addr = None
+        if isinstance(ipv6_addr, ipaddress.IPv6Address):
+            return _AssetRule(
+                raw=raw,
+                scheme=None,
+                host_pattern=ipv6_addr.compressed,
+                port=None,
+                path="",
+            )
+
     try:
         parsed = urlsplit(f"http://{raw}")
         explicit_port = parsed.port
@@ -398,14 +568,10 @@ def _parse_scope_asset(entry: Any) -> _AssetRule | None:
         return None
     if parsed.username is not None or parsed.password is not None or "@" in parsed.netloc:
         return None
-    host_pat = (parsed.hostname or "").strip().lower().rstrip(".")
-    if not host_pat:
+    raw_host_pat = (parsed.hostname or "").strip().lower().rstrip(".")
+    if not raw_host_pat or not _is_valid_host_pattern(raw_host_pat):
         return None
-    if host_pat.startswith("*."):
-        if not _is_valid_host(host_pat[2:]):
-            return None
-    elif not _is_valid_host(host_pat):
-        return None
+    host_pat = _canonicalize_host(raw_host_pat)
     if explicit_port is not None and explicit_port <= 0:
         return None
     return _AssetRule(
@@ -415,6 +581,54 @@ def _parse_scope_asset(entry: Any) -> _AssetRule | None:
         port=explicit_port,
         path=parsed.path or "",
     )
+
+
+def _is_empty_scope_entry(entry: Any) -> bool:
+    if entry is None:
+        return True
+    if isinstance(entry, str):
+        return not entry.strip()
+    if isinstance(entry, dict):
+        return len(entry) == 0
+    return False
+
+
+def _is_prose_out_of_scope_entry(entry: Any) -> bool:
+    """Return True only for plain-English policy prose strings (e.g. 'DoS / load testing')."""
+    if not isinstance(entry, str):
+        return False
+    raw = entry.strip()
+    if not raw or " " not in raw or raw.startswith("/"):
+        return False
+    if any(ord(ch) < 32 or ch == "\x7f" or ch in "\t\n\r" for ch in raw):
+        return False
+    if any(tok in raw for tok in ("://", "*", "?", "[", "]", "@", ":", ".")):
+        return False
+    return True
+
+
+def _parse_out_of_scope_entry(
+    entry: Any,
+    *,
+    allow_prose: bool,
+    allow_path: bool,
+    label: str,
+) -> tuple[str, _AssetRule | None, str | None]:
+    """Classify and strictly validate an out_of_scope / excluded_assets entry (fail-closed)."""
+    if _is_empty_scope_entry(entry):
+        return "empty", None, None
+    raw, is_path_field = _extract_entry_text(entry)
+    if not raw:
+        raise ValueError(f"invalid {label} entry: {entry!r}")
+    if allow_prose and _is_prose_out_of_scope_entry(entry):
+        return "prose", None, None
+    if allow_path and (is_path_field or raw.startswith("/")):
+        norm_path = _normalize_excluded_pattern(raw)
+        return "path", None, norm_path
+    rule = _parse_scope_asset(entry)
+    if rule is None:
+        raise ValueError(f"unparseable {label} entry: {entry!r}")
+    return "asset", rule, None
 
 
 def _extract_excluded_paths(
@@ -438,16 +652,27 @@ def _extract_excluded_paths(
             _add(item.strip())
 
     for entry in scope_doc.get("out_of_scope") or []:
-        raw, is_path_field = _extract_entry_text(entry)
-        if not raw or any(ch.isspace() or ord(ch) < 32 for ch in raw):
+        kind, rule, norm_path = _parse_out_of_scope_entry(
+            entry,
+            allow_prose=True,
+            allow_path=True,
+            label="out_of_scope",
+        )
+        if kind == "path" and norm_path is not None:
+            if norm_path not in seen:
+                seen.add(norm_path)
+                collected.append(norm_path)
             continue
-        if is_path_field or raw.startswith("/"):
-            _add(raw)
-            continue
-        if target_scheme is not None and target_host is not None and target_port is not None:
-            rule = _parse_scope_asset(entry)
-            if rule is not None and rule.path not in {"", "/"} and rule.matches_origin(target_scheme, target_host, target_port):
-                _add(rule.path)
+        if (
+            kind == "asset"
+            and rule is not None
+            and target_scheme is not None
+            and target_host is not None
+            and target_port is not None
+            and rule.path not in {"", "/"}
+            and rule.matches_origin(target_scheme, target_host, target_port)
+        ):
+            _add(rule.path)
 
     return collected
 
@@ -511,9 +736,15 @@ def _extract_scope_asset_lists(scope_doc: dict[str, Any]) -> tuple[list[str], li
     out_assets: list[str] = []
     seen_out: set[str] = set()
     for list_key in ("out_of_scope", "excluded_assets"):
+        is_excluded_assets = list_key == "excluded_assets"
         for entry in scope_doc.get(list_key) or []:
-            rule = _parse_scope_asset(entry)
-            if rule is not None and rule.raw not in seen_out:
+            kind, rule, _ = _parse_out_of_scope_entry(
+                entry,
+                allow_prose=not is_excluded_assets,
+                allow_path=not is_excluded_assets,
+                label=list_key,
+            )
+            if kind == "asset" and rule is not None and rule.raw not in seen_out:
                 seen_out.add(rule.raw)
                 out_assets.append(rule.raw)
     return in_assets, out_assets
@@ -568,6 +799,7 @@ def load_scope_file(path: Path) -> dict[str, Any]:
     for entry in data.get("out_of_scope") or []:
         if not isinstance(entry, (str, dict)):
             raise ValueError("scope file 'out_of_scope' entries must be strings or objects")
+        _parse_out_of_scope_entry(entry, allow_prose=True, allow_path=True, label="out_of_scope")
 
     for entry in data.get("excluded_paths") or []:
         if not isinstance(entry, str) or not entry.strip():
@@ -576,6 +808,7 @@ def load_scope_file(path: Path) -> dict[str, Any]:
     for entry in data.get("excluded_assets") or []:
         if not isinstance(entry, str) or not entry.strip():
             raise ValueError("scope file 'excluded_assets' entries must be non-empty strings")
+        _parse_out_of_scope_entry(entry, allow_prose=False, allow_path=False, label="excluded_assets")
 
     for hdr_key in ("request_headers", "custom_headers"):
         if hdr_key in data and data[hdr_key] is not None:
@@ -628,9 +861,15 @@ def resolve_target_origin(
         raise ValueError(f"target origin {origin} is not authorized by in_scope in {scope_path}")
 
     for list_key in ("out_of_scope", "excluded_assets"):
+        is_excluded_assets = list_key == "excluded_assets"
         for entry in scope_doc.get(list_key) or []:
-            rule = _parse_scope_asset(entry)
-            if rule is not None and rule.path in {"", "/"} and rule.matches_origin(scheme, host, port):
+            kind, rule, _ = _parse_out_of_scope_entry(
+                entry,
+                allow_prose=not is_excluded_assets,
+                allow_path=not is_excluded_assets,
+                label=list_key,
+            )
+            if kind == "asset" and rule is not None and rule.path in {"", "/"} and rule.matches_origin(scheme, host, port):
                 raise ValueError(f"target origin {origin} is excluded by {list_key} entry {rule.raw!r}")
 
     excluded_paths = _extract_excluded_paths(
@@ -660,6 +899,7 @@ class ScopeGuard:
     allow_lifecycle_routes: bool = False
     in_scope_assets: tuple[str, ...] = ()
     out_of_scope_assets: tuple[str, ...] = ()
+    loopback_only: bool | None = None
     _origin_key: tuple[str, str, int] = field(init=False, repr=False)
     _in_scope_rules: tuple[_AssetRule, ...] = field(init=False, repr=False)
     _out_of_scope_origin_rules: tuple[_AssetRule, ...] = field(init=False, repr=False)
@@ -696,19 +936,20 @@ class ScopeGuard:
         out_raws: list[str] = []
         seen_out: set[str] = set()
         for entry in self.out_of_scope_assets or ():
-            raw_text, is_path_field = _extract_entry_text(entry)
-            if not raw_text:
+            kind, rule, norm_path_pat = _parse_out_of_scope_entry(
+                entry,
+                allow_prose=True,
+                allow_path=True,
+                label="out_of_scope_assets",
+            )
+            if kind in {"empty", "prose"}:
                 continue
-            if is_path_field or raw_text.startswith("/"):
-                if not any(ch.isspace() or ord(ch) < 32 for ch in raw_text):
-                    norm_path_pat = _normalize_excluded_pattern(raw_text)
-                    if norm_path_pat not in seen:
-                        seen.add(norm_path_pat)
-                        normalized.append(norm_path_pat)
+            if kind == "path" and norm_path_pat is not None:
+                if norm_path_pat not in seen:
+                    seen.add(norm_path_pat)
+                    normalized.append(norm_path_pat)
                 continue
-            rule = _parse_scope_asset(entry)
-            if rule is None:
-                continue
+            assert rule is not None
             if rule.raw not in seen_out:
                 seen_out.add(rule.raw)
                 out_raws.append(rule.raw)
@@ -723,6 +964,16 @@ class ScopeGuard:
         self._in_scope_rules = tuple(in_rules)
         self._out_of_scope_origin_rules = tuple(out_origin_rules)
         self._out_of_scope_path_rules = tuple(out_path_rules)
+        if self.loopback_only is None:
+            base_is_lb = _is_loopback_host(host)
+            rules_are_lb = all(
+                not any(ch in r.host_pattern for ch in _HOST_GLOB_CHARS)
+                and _is_loopback_host(r.host_pattern)
+                for r in in_rules
+            )
+            self.loopback_only = bool(base_is_lb and rules_are_lb)
+        else:
+            self.loopback_only = bool(self.loopback_only)
 
     @property
     def is_multi_origin(self) -> bool:
@@ -730,17 +981,32 @@ class ScopeGuard:
         return any(
             rule.scheme is None
             or rule.port is None
-            or rule.host_pattern.startswith("*.")
+            or any(ch in rule.host_pattern for ch in _HOST_GLOB_CHARS)
             or (rule.scheme, rule.host_pattern, rule.port) != self._origin_key
             for rule in self._in_scope_rules
         )
 
+    def check_dns_safety(
+        self,
+        host: str,
+        port: int,
+        *,
+        resolver: Callable[..., Any] | None = None,
+    ) -> None:
+        """Enforce non-loopback DNS / private-IP SSRF guard when ``not self.loopback_only``."""
+        if self.loopback_only:
+            return
+        check_dns_safety(host, port, resolver=resolver)
+
     def check_origin(self, scheme: str, host: str, port: int) -> bool:
         """Return True if ``(scheme, host, port)`` is authorized and not excluded by origin rules."""
         norm_scheme = str(scheme or "").strip().lower()
-        norm_host = str(host or "").strip().lower().rstrip(".")
-        if norm_scheme not in {"http", "https"} or not norm_host or not _is_valid_host(norm_host):
+        raw_host = str(host or "").strip().lower().rstrip(".")
+        if raw_host.startswith("[") and raw_host.endswith("]") and ":" in raw_host:
+            raw_host = raw_host[1:-1]
+        if norm_scheme not in {"http", "https"} or not raw_host or not _is_valid_host(raw_host):
             return False
+        norm_host = _canonicalize_host(raw_host)
         if isinstance(port, bool) or not isinstance(port, int) or port <= 0:
             return False
         for rule in self._out_of_scope_origin_rules:
@@ -766,7 +1032,7 @@ class ScopeGuard:
             raise ValueError(f"out-of-scope URL scheme in {resolved!r}; allowed origin is {self.base_origin}")
         if parsed.username is not None or parsed.password is not None or "@" in parsed.netloc:
             raise ValueError(f"URL must not embed credentials: {resolved!r}")
-        hostname = (parsed.hostname or "").strip().lower().rstrip(".")
+        hostname = _canonicalize_host(parsed.hostname or "")
         port = parsed.port if parsed.port is not None else _default_port(scheme)
         if not self.check_origin(scheme, hostname, port):
             raise ValueError(f"out-of-scope URL {resolved!r}; allowed origin is {self.base_origin}")

@@ -57,6 +57,16 @@ from agentic_browser import (  # noqa: E402
     _resolve_and_check_scope,
     _run_sync,
 )
+try:
+    from agentic_browser import (  # noqa: E402
+        _build_multi_origin_localstorage_init_script,
+        _extract_actor_cookie_records,
+        _extract_actor_local_storage_by_origin,
+    )
+except ImportError:  # pragma: no cover - backward-compatible fallback
+    _build_multi_origin_localstorage_init_script = None  # type: ignore[assignment]
+    _extract_actor_cookie_records = None  # type: ignore[assignment]
+    _extract_actor_local_storage_by_origin = None  # type: ignore[assignment]
 from agentic_http import (  # noqa: E402
     AgenticHTTPClient,
     BudgetExhaustedError,
@@ -92,6 +102,10 @@ from agentic_surface import (  # noqa: E402
     route_template_of,
 )
 from target_bootstrap import (  # noqa: E402
+    _normalize_excluded_pattern,
+    _parse_out_of_scope_entry,
+    _path_matches_excluded,
+    check_dns_safety,
     is_destructive_lifecycle_route,
     is_logout_route,
     normalize_path,
@@ -102,6 +116,16 @@ try:
     from kryon_core.surface.openapi import LocalSchema  # noqa: E402
 except Exception:  # pragma: no cover - optional fallback
     LocalSchema = None  # type: ignore[assignment,misc]
+
+try:
+    from kryon_core.js.sourcemap import parse_source_map as _parse_source_map  # noqa: E402
+except Exception:  # pragma: no cover - optional fallback
+    _parse_source_map = None  # type: ignore[assignment]
+
+try:
+    import requests as _requests  # noqa: E402
+except Exception:  # pragma: no cover - optional fallback
+    _requests = None  # type: ignore[assignment]
 
 try:
     from playwright.sync_api import sync_playwright as _sync_playwright  # type: ignore[import-not-found]
@@ -279,7 +303,213 @@ _SAFE_OPENAPI_HEADER_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _MAX_OPENAPI_SPEC_BYTES = 512 * 1024
 
 _MAX_JS_CHUNKS = 96
-_MAX_JS_CHUNK_BYTES = 256 * 1024
+_MAX_JS_CHUNK_BYTES = 1024 * 1024
+_MAX_SOURCEMAPS_FETCHED = 4
+_MAX_SOURCEMAP_BYTES = 1024 * 1024
+_MAX_SOURCEMAP_FILES_PER_MAP = 24
+_MAX_SOURCEMAP_CONTENT_CHARS = 128 * 1024
+_MAX_SOURCEMAP_TOTAL_CHARS = 512 * 1024
+_MAX_SIBLING_SPEC_PROBE_ORIGINS = 2
+_MAX_OBSERVED_APP_HEADERS = 24
+_MAX_OBSERVED_APP_HEADER_VALUE_CHARS = 256
+_SIBLING_SPEC_PROBES: tuple[str, ...] = (
+    "/openapi.json",
+    "/swagger.json",
+    "/v3/api-docs",
+    "/graphql",
+)
+_HIGH_SIGNAL_LAZY_CHUNK_KEYWORDS: tuple[str, ...] = (
+    "admin",
+    "auth",
+    "account",
+    "billing",
+    "checkout",
+    "order",
+    "settings",
+    "api",
+    "graphql",
+    "dashboard",
+)
+_SOURCEMAP_URL_RE = re.compile(
+    r"""(?://|/\*)[@#][ \t]*sourceMappingURL=([^\s*'"`<>]+)""",
+)
+_INLINE_SOURCEMAP_DATA_RE = re.compile(
+    r"""^data:application/json(?:;[a-z0-9_.\-+]+=[^;,]+)*;base64,([A-Za-z0-9+/=_-]+)$""",
+    re.IGNORECASE,
+)
+_NEXT_DATA_SCRIPT_RE = re.compile(
+    r"""<script\b[^>]*\bid\s*=\s*["']__NEXT_DATA__["'][^>]*>([\s\S]*?)</script>""",
+    re.IGNORECASE,
+)
+_LINK_TAG_RE = re.compile(r"<link\b([^>]+)>", re.IGNORECASE)
+_LINK_REL_RE = re.compile(r"""\brel\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))""", re.IGNORECASE)
+_LINK_HREF_RE = re.compile(r"""\bhref\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))""", re.IGNORECASE)
+_LINK_AS_RE = re.compile(r"""\bas\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))""", re.IGNORECASE)
+_NEXT_BUILD_ID_RE = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
+_SORTED_PAGES_RE = re.compile(
+    r"""sortedPages\s*:\s*\[((?:\s*(?:"[^"\\]{1,240}"|'[^'\\]{1,240}')\s*,?)*\s*)\]"""
+)
+_QUOTED_ROUTE_STR_RE = re.compile(r"""["'](/[A-Za-z0-9_.\-/\[\]:]+)["']""")
+_BUILD_MANIFEST_ROUTE_KEY_RE = re.compile(
+    r"""["'](/[A-Za-z0-9_.\-/\[\]]+)["']\s*:\s*\[((?:\s*(?:"[^"\\]{1,300}"|'[^'\\]{1,300}')\s*,?)*\s*)\]"""
+)
+_QUOTED_JS_CHUNK_RE = re.compile(
+    r"""["'`]((?:/|https?://|static/|assets/|chunks/|_next/|_nuxt/|js/)?[A-Za-z0-9_.\-/\[\]]{1,240}\.(?:js|mjs|cjs))["'`]"""
+)
+_NEXT_DYNAMIC_SEG_RE = re.compile(r"\[{1,2}\.{0,3}([A-Za-z0-9_-]+)\]{1,2}")
+_NEXT_INTERNAL_ROUTES: frozenset[str] = frozenset({"/_app", "/_error", "/_document", "/404", "/500"})
+
+_SAFE_APP_HEADER_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+_APP_HEADER_CAMEL_RE = re.compile(r"([a-z0-9])([A-Z])")
+_APP_HEADER_SEP_RE = re.compile(r"[^a-z0-9]+")
+_JWT_HEADER_VAL_RE = re.compile(r"eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}")
+_AWS_HEADER_VAL_RE = re.compile(r"\b(?:AKIA|ASIA)[0-9A-Z]{12,}\b")
+_KNOWN_SECRET_HEADER_VAL_RE = re.compile(
+    r"(?:^|[^A-Za-z0-9_])(?:ghp_[A-Za-z0-9]{4,}|sk_live_[A-Za-z0-9]{4,}|xox[A-Za-z0-9-]{4,}|AIza[0-9A-Za-z_-]{6,})"
+)
+_EMAIL_HEADER_VAL_RE = re.compile(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}")
+_CANONICAL_APP_HEADERS: dict[str, str] = {
+    "x-storefront": "X-Storefront",
+    "x-api-version": "X-Api-Version",
+    "x-requested-with": "X-Requested-With",
+    "x-apollo-operation-name": "X-Apollo-Operation-Name",
+    "x-tenant-id": "X-Tenant-Id",
+    "x-client-version": "X-Client-Version",
+    "x-platform": "X-Platform",
+    "x-channel": "X-Channel",
+    "x-locale": "X-Locale",
+    "x-currency": "X-Currency",
+    "x-graphql-client": "X-GraphQL-Client",
+}
+_STRIPPED_OBSERVED_APP_HEADERS: frozenset[str] = frozenset({
+    "authorization",
+    "proxy-authorization",
+    "cookie",
+    "cookie2",
+    "set-cookie",
+    "set-cookie2",
+    "x-api-key",
+    "x-apikey",
+    "api-key",
+    "apikey",
+    "x-auth-token",
+    "auth-token",
+    "x-access-token",
+    "access-token",
+    "x-token",
+    "x-session-token",
+    "x-api-token",
+    "x-refresh-token",
+    "x-csrf-token",
+    "x-csrftoken",
+    "x-xsrf-token",
+    "x-csrf-token-next",
+    "csrf-token",
+    "xsrf-token",
+    "x-auth",
+    "x-session-id",
+    "x-session",
+    "x-user-token",
+    "x-jwt",
+    "x-bearer-token",
+    "x-client-secret",
+    "x-secret-key",
+    "x-signature",
+    "x-hmac-signature",
+    "host",
+    "content-type",
+    "content-length",
+    "user-agent",
+    "connection",
+    "keep-alive",
+    "proxy-connection",
+    "te",
+    "trailer",
+    "transfer-encoding",
+    "upgrade",
+    "referer",
+    "origin",
+    "accept",
+    "accept-charset",
+    "accept-encoding",
+    "accept-language",
+    "cache-control",
+    "pragma",
+    "priority",
+    "dnt",
+    "upgrade-insecure-requests",
+    "if-modified-since",
+    "if-none-match",
+    "if-match",
+    "if-unmodified-since",
+    "range",
+    "expect",
+    "date",
+    "from",
+    "via",
+    "warning",
+    "forwarded",
+    "x-forwarded-for",
+    "x-forwarded-host",
+    "x-forwarded-proto",
+    "x-real-ip",
+    "x-request-id",
+    "x-correlation-id",
+    "x-trace-id",
+    "traceparent",
+    "tracestate",
+    "x-amzn-trace-id",
+    "x-cloud-trace-context",
+    "purpose",
+})
+_STRIPPED_OBSERVED_HEADER_PREFIXES: tuple[str, ...] = ("sec-", "x-b3-", ":", "cf-", "x-amz-")
+_SECRET_OBSERVED_HEADER_TOKENS: frozenset[str] = frozenset({
+    "auth",
+    "authorization",
+    "token",
+    "secret",
+    "password",
+    "passwd",
+    "pass",
+    "pwd",
+    "cookie",
+    "jwt",
+    "bearer",
+    "apikey",
+    "api_key",
+    "credential",
+    "credentials",
+    "private",
+    "private_key",
+    "signature",
+    "hmac",
+    "csrf",
+    "xsrf",
+    "session",
+    "session_id",
+    "key",
+})
+_SECRET_OBSERVED_HEADER_SUBSTRINGS: tuple[str, ...] = (
+    "auth",
+    "jwt",
+    "bearer",
+    "signature",
+    "credential",
+    "hmac",
+    "session",
+    "csrf",
+    "xsrf",
+    "private",
+    "secret",
+    "token",
+    "key",
+    "pass",
+    "cookie",
+    "apikey",
+    "api_key",
+    "passwd",
+    "password",
+)
 _MAX_STAGE0_SCRIPT_ASSETS = 160
 _MAX_STAGE0_CDN_SCRIPT_ASSETS = 16
 _MAX_CDN_JS_FULFILL_BYTES = 4 * 1024 * 1024
@@ -1010,6 +1240,8 @@ def _empty_result(
         "network_requests_captured": 0,
         "js_chunks_parsed": 0,
         "cdn_js_chunks_parsed": 0,
+        "source_maps_parsed": 0,
+        "lazy_chunks_discovered": 0,
         "passive_probes_sent": 0,
         "probed_paths": [],
         "discovered_auth_headers": [],
@@ -1033,11 +1265,389 @@ def _empty_result(
         "body_templates": {},
         "multipart_schemas": {},
         "auth_headers": [],
+        "observed_app_headers": {},
         "discovered_api_hosts": [],
         "discovery_hints": [],
         "seed_file": "",
         "stats": stats,
     }
+
+
+def _scoped_storage_key(url: str, base_url: str, *, include_query: bool = False) -> str:
+    """Return ``/path`` for primary-origin URLs or ``scheme://netloc/path`` for sibling origins."""
+    raw = str(url or "").strip()
+    if not raw:
+        return "/"
+    parsed = urlsplit(raw)
+    try:
+        norm_p = normalize_path(parsed.path or "/")
+    except ValueError:
+        norm_p = parsed.path or "/"
+    path_key = f"{norm_p}?{parsed.query}" if (include_query and parsed.query) else norm_p
+    url_parts = _normalized_origin_parts(raw)
+    base_parts = _normalized_origin_parts(base_url)
+    if (
+        url_parts is not None
+        and base_parts is not None
+        and url_parts[:3] != base_parts[:3]
+    ):
+        return f"{url_parts[3]}{path_key}"
+    return path_key
+
+
+def _sanitize_observed_app_headers(
+    raw_headers: dict[str, Any],
+    *,
+    blocked_names: set[str] | frozenset[str] = frozenset(),
+) -> dict[str, str]:
+    """Extract non-secret, non-boilerplate XHR app headers from observed browser requests."""
+    if not isinstance(raw_headers, dict) or not raw_headers:
+        return {}
+    cleaned: dict[str, str] = {}
+    for raw_k, raw_v in raw_headers.items():
+        if not isinstance(raw_k, str) or raw_v is None:
+            continue
+        name = raw_k.strip()
+        if not name or not _SAFE_APP_HEADER_NAME_RE.fullmatch(name):
+            continue
+        low = name.lower()
+        if low in _STRIPPED_OBSERVED_APP_HEADERS or low in blocked_names:
+            continue
+        if any(low.startswith(prefix) for prefix in _STRIPPED_OBSERVED_HEADER_PREFIXES):
+            continue
+        split_camel = _APP_HEADER_CAMEL_RE.sub(r"\1_\2", name)
+        snake = _APP_HEADER_SEP_RE.sub("_", split_camel.lower()).strip("_")
+        tokens = tuple(tok for tok in snake.split("_") if tok)
+        if snake in _SECRET_OBSERVED_HEADER_TOKENS or any(tok in _SECRET_OBSERVED_HEADER_TOKENS for tok in tokens):
+            continue
+        if any(sub in snake for sub in _SECRET_OBSERVED_HEADER_SUBSTRINGS):
+            continue
+        # Only capture recognized app headers or explicit X-* custom app headers.
+        if low not in _CANONICAL_APP_HEADERS and not low.startswith("x-"):
+            continue
+        val = str(raw_v).strip()
+        if (
+            not val
+            or len(val) > _MAX_OBSERVED_APP_HEADER_VALUE_CHARS
+            or any(ord(ch) < 32 or ord(ch) == 127 for ch in val)
+        ):
+            continue
+        val_low = val.lower()
+        if (
+            "<redacted" in val_low
+            or val_low.startswith(("bearer ", "basic ", "digest ", "token ", "aws4-hmac-sha256"))
+            or "aws4-hmac-sha256" in val_low
+            or "-----begin " in val_low
+            or "-----end " in val_low
+            or _JWT_HEADER_VAL_RE.search(val)
+            or _AWS_HEADER_VAL_RE.search(val)
+            or _KNOWN_SECRET_HEADER_VAL_RE.search(val)
+            or _EMAIL_HEADER_VAL_RE.search(val)
+            or (";" in val and "=" in val)
+        ):
+            continue
+        if low in _CANONICAL_APP_HEADERS:
+            canon_name = _CANONICAL_APP_HEADERS[low]
+        elif name.islower():
+            canon_name = "-".join(part.capitalize() for part in name.split("-"))
+        else:
+            canon_name = name
+        cleaned[canon_name] = val
+        if len(cleaned) >= _MAX_OBSERVED_APP_HEADERS:
+            break
+    return cleaned
+
+
+def _is_explicitly_excluded_by_scope(scope_guard: Any, raw_url: str) -> bool:
+    """Return True if ``raw_url`` matches ``scope_guard`` out-of-scope assets or excluded paths."""
+    if scope_guard is None:
+        return False
+    origin_parts = _normalized_origin_parts(raw_url)
+    if origin_parts is None:
+        return True
+    scheme, host, port, _orig = origin_parts
+    parsed = urlsplit(str(raw_url or "").strip())
+    try:
+        norm_path_lower = normalize_path(parsed.path or "/").lower()
+    except ValueError:
+        return True
+
+    excluded_paths = getattr(scope_guard, "excluded_paths", ()) or ()
+    for pattern in excluded_paths:
+        pat_str = str(pattern or "").strip().lower()
+        if pat_str and _path_matches_excluded(norm_path_lower, pat_str):
+            return True
+
+    out_origin_rules = getattr(scope_guard, "_out_of_scope_origin_rules", None)
+    out_path_rules = getattr(scope_guard, "_out_of_scope_path_rules", None)
+    if out_origin_rules is not None or out_path_rules is not None:
+        for rule in out_origin_rules or ():
+            if rule.matches_origin(scheme, host, port):
+                return True
+        for rule, path_pattern in out_path_rules or ():
+            if rule.matches_origin(scheme, host, port) and _path_matches_excluded(norm_path_lower, path_pattern):
+                return True
+        return False
+
+    for entry in getattr(scope_guard, "out_of_scope_assets", ()) or ():
+        try:
+            kind, rule, norm_pat = _parse_out_of_scope_entry(
+                entry,
+                allow_prose=True,
+                allow_path=True,
+                label="out_of_scope_assets",
+            )
+        except ValueError:
+            return True
+        if kind == "path" and norm_pat is not None:
+            if _path_matches_excluded(norm_path_lower, norm_pat):
+                return True
+        elif kind == "asset" and rule is not None and rule.matches_origin(scheme, host, port):
+            if rule.path in {"", "/"}:
+                return True
+            if _path_matches_excluded(norm_path_lower, _normalize_excluded_pattern(rule.path)):
+                return True
+    return False
+
+
+def _is_allowed_cdn_sourcemap_url(
+    map_url: str,
+    base_url: str,
+    *,
+    referrer_url: str = "",
+    scope_guard: Any = None,
+    resolve_dns: bool = True,
+    fail_closed_on_dns_error: bool = False,
+) -> bool:
+    """Return True strictly for safe, read-only, non-tracker, public cross-origin CDN .map URLs."""
+    origin_parts = _normalized_origin_parts(map_url)
+    if origin_parts is None:
+        return False
+    req_scheme, req_host, req_port, _req_origin = origin_parts
+    base_parts = _normalized_origin_parts(base_url)
+    if base_parts is not None and (req_scheme, req_host, req_port) == base_parts[:3]:
+        return False
+    if scope_guard is not None and _is_explicitly_excluded_by_scope(scope_guard, map_url):
+        return False
+    if str(referrer_url or "").strip():
+        ref_parts = _normalized_origin_parts(referrer_url)
+        if ref_parts is None or (req_scheme, req_host, req_port) != ref_parts[:3]:
+            return False
+    # ALWAYS reject loopback, private, link-local, CGNAT, multicast, reserved, unspecified,
+    # and internal hosts regardless of whether base_url is loopback/private.
+    if _is_link_local_metadata_host(req_host) or _is_non_public_or_internal_host(req_host):
+        return False
+    if _is_tracker_or_telemetry_host(req_host):
+        return False
+    parsed = urlsplit(str(map_url or "").strip())
+    path = parsed.path or "/"
+    low_path = path.lower()
+    if (
+        not low_path.endswith(".map")
+        or _API_PATH_RE.search(low_path)
+        or _extract_path_embedded_params(path)
+        or is_destructive_lifecycle_route(path)
+        or is_logout_route(path)
+    ):
+        return False
+    if resolve_dns:
+        try:
+            check_dns_safety(req_host, req_port)
+        except ValueError:
+            return False
+        except OSError:
+            if fail_closed_on_dns_error:
+                return False
+    return True
+
+
+def _normalize_inline_sourcemap_b64(raw_b64: str) -> str:
+    """Normalize standard or URL-safe Base64 inline source map payload with proper ``=`` padding."""
+    cleaned = str(raw_b64 or "").strip().replace("-", "+").replace("_", "/")
+    if not cleaned:
+        return ""
+    rem = len(cleaned) % 4
+    if rem == 1:
+        return ""
+    if rem:
+        cleaned += "=" * (4 - rem)
+    return cleaned
+
+
+def _extract_sourcemap_references(js_text: str, js_url: str) -> dict[str, list[str]]:
+    """Extract inline base64 and resolved external ``//# sourceMappingURL=...`` references."""
+    inline_refs: list[str] = []
+    external_refs: list[str] = []
+    seen_inline: set[str] = set()
+    seen_external: set[str] = set()
+    text = str(js_text or "")
+    if not text or "sourceMappingURL" not in text:
+        return {"inline": inline_refs, "external": external_refs}
+
+    for match in _SOURCEMAP_URL_RE.finditer(text):
+        raw_ref = str(match.group(1) or "").strip().rstrip(";,)")
+        if not raw_ref or "${" in raw_ref:
+            continue
+        m_inline = _INLINE_SOURCEMAP_DATA_RE.fullmatch(raw_ref)
+        if m_inline:
+            norm_b64 = _normalize_inline_sourcemap_b64(m_inline.group(1))
+            if not norm_b64:
+                continue
+            norm_uri = f"data:application/json;base64,{norm_b64}"
+            if norm_uri not in seen_inline and len(inline_refs) < 4:
+                seen_inline.add(norm_uri)
+                inline_refs.append(norm_uri)
+            continue
+        if "+" in raw_ref:
+            continue
+        if raw_ref.lower().startswith(_NON_HTTP_SCHEMES) or raw_ref.startswith("//"):
+            continue
+        resolved = urljoin(str(js_url or ""), raw_ref)
+        if resolved.lower().startswith(("http://", "https://")):
+            parsed_r = urlsplit(resolved)
+            if (parsed_r.path or "").lower().endswith(".map"):
+                clean_r = urlunsplit((parsed_r.scheme.lower(), parsed_r.netloc, parsed_r.path, parsed_r.query, ""))
+                if clean_r not in seen_external and len(external_refs) < 8:
+                    seen_external.add(clean_r)
+                    external_refs.append(clean_r)
+    return {"inline": inline_refs, "external": external_refs}
+
+
+def _normalize_spa_route_candidate(raw_route: str) -> str:
+    """Convert Next.js/Nuxt dynamic route patterns (``[id]``/``[...slug]``/``[[...slug]]``) into normalized route paths."""
+    cand = str(raw_route or "").strip()
+    if not cand or not cand.startswith("/") or cand.startswith("//"):
+        return ""
+    if any(ch.isspace() for ch in cand) or len(cand) > 180:
+        return ""
+    if cand in _NEXT_INTERNAL_ROUTES or cand.startswith("/_next/"):
+        return ""
+    cand = _NEXT_DYNAMIC_SEG_RE.sub(r"{\1}", cand)
+    try:
+        norm = normalize_path(cand)
+    except ValueError:
+        return ""
+    if is_static_asset_url(norm) or is_non_endpoint_source_path(norm):
+        return ""
+    return norm
+
+
+def _extract_lazy_spa_routes_and_chunks(
+    html_or_js_text: str,
+    *,
+    doc_url: str,
+    base_url: str,
+) -> dict[str, list[str]]:
+    """Extract Next.js/Vite/Webpack/Nuxt lazy SPA routes, manifests, and high-signal chunk paths."""
+    routes: list[str] = []
+    chunks: list[str] = []
+    manifests: list[str] = []
+    seen_routes: set[str] = set()
+    seen_chunks: set[str] = set()
+    seen_manifests: set[str] = set()
+
+    text = str(html_or_js_text or "")
+    if not text:
+        return {"routes": routes, "chunks": chunks, "manifests": manifests}
+
+    resolve_base = str(doc_url or base_url or "").strip()
+    is_next_context = bool(
+        "__NEXT_DATA__" in text
+        or "__BUILD_MANIFEST" in text
+        or "_next/static/" in text
+        or "/_next/" in resolve_base.lower()
+        or "_buildmanifest.js" in resolve_base.lower()
+    )
+
+    def _add_route(raw_r: str) -> None:
+        norm_r = _normalize_spa_route_candidate(raw_r)
+        if norm_r and norm_r not in seen_routes and len(routes) < 120:
+            seen_routes.add(norm_r)
+            routes.append(norm_r)
+
+    def _resolve_chunk_ref(raw_c: str, *, next_manifest_relative: bool = False) -> str:
+        c = str(raw_c or "").strip()
+        if not c or c.lower().startswith(_NON_HTTP_SCHEMES) or c.startswith("//"):
+            return ""
+        if c.startswith("static/") and (next_manifest_relative or is_next_context):
+            c = f"/_next/{c}"
+        elif not c.startswith(("/", "http://", "https://")):
+            c = urljoin(resolve_base, c) if resolve_base else "/" + c
+        return c
+
+    def _add_chunk(raw_c: str, *, next_manifest_relative: bool = False) -> None:
+        norm_c = _resolve_chunk_ref(raw_c, next_manifest_relative=next_manifest_relative)
+        if norm_c and norm_c not in seen_chunks and len(chunks) < 120:
+            seen_chunks.add(norm_c)
+            chunks.append(norm_c)
+
+    def _add_manifest(raw_m: str) -> None:
+        norm_m = _resolve_chunk_ref(raw_m, next_manifest_relative=True)
+        if norm_m and norm_m not in seen_manifests and len(manifests) < 8:
+            seen_manifests.add(norm_m)
+            manifests.append(norm_m)
+            _add_chunk(norm_m, next_manifest_relative=True)
+
+    # 1. Next.js __NEXT_DATA__ script JSON
+    for nm in _NEXT_DATA_SCRIPT_RE.finditer(text):
+        raw_json = (nm.group(1) or "").strip()
+        if not raw_json or len(raw_json) > 512 * 1024:
+            continue
+        try:
+            next_data = json.loads(raw_json)
+        except ValueError:
+            continue
+        if not isinstance(next_data, dict):
+            continue
+        page_val = next_data.get("page")
+        if isinstance(page_val, str):
+            _add_route(page_val)
+        build_id = str(next_data.get("buildId") or "").strip()
+        if build_id and _NEXT_BUILD_ID_RE.fullmatch(build_id):
+            _add_manifest(f"/_next/static/{build_id}/_buildManifest.js")
+
+    # 2. Next.js _buildManifest.js sortedPages & route chunk map
+    for sp_match in _SORTED_PAGES_RE.finditer(text):
+        for r_match in _QUOTED_ROUTE_STR_RE.finditer(sp_match.group(1)):
+            _add_route(r_match.group(1))
+    if "__BUILD_MANIFEST" in text or "sortedPages" in text:
+        for bm_match in _BUILD_MANIFEST_ROUTE_KEY_RE.finditer(text):
+            _add_route(bm_match.group(1))
+            for cm in _QUOTED_JS_CHUNK_RE.finditer(bm_match.group(2)):
+                _add_chunk(cm.group(1), next_manifest_relative=True)
+
+    # 3. <link rel="modulepreload" href="..."> / script preload chunks (Vite / Nuxt / ESM)
+    if "<link" in text.lower():
+        for lm in _LINK_TAG_RE.finditer(text):
+            attrs = lm.group(1) or ""
+            rel_m = _LINK_REL_RE.search(attrs)
+            if not rel_m:
+                continue
+            rel_val = (rel_m.group(1) or rel_m.group(2) or rel_m.group(3) or "").lower()
+            rel_tokens = set(rel_val.split())
+            is_mod_preload = "modulepreload" in rel_tokens
+            if not is_mod_preload and "preload" in rel_tokens:
+                as_m = _LINK_AS_RE.search(attrs)
+                as_val = (as_m.group(1) or as_m.group(2) or as_m.group(3) or "").lower() if as_m else ""
+                is_mod_preload = as_val == "script"
+            if not is_mod_preload:
+                continue
+            href_m = _LINK_HREF_RE.search(attrs)
+            if not href_m:
+                continue
+            href_val = (href_m.group(1) or href_m.group(2) or href_m.group(3) or "").strip()
+            if href_val:
+                _add_chunk(href_val)
+
+    # 4. Webpack / Vite / Nuxt chunk path strings referencing high-signal modules
+    scan_text = text[:_MAX_JS_CHUNK_BYTES]
+    for cm in _QUOTED_JS_CHUNK_RE.finditer(scan_text):
+        raw_chunk = cm.group(1)
+        low_chunk = raw_chunk.lower()
+        if any(kw in low_chunk for kw in _HIGH_SIGNAL_LAZY_CHUNK_KEYWORDS):
+            _add_chunk(raw_chunk)
+
+    return {"routes": routes, "chunks": chunks, "manifests": manifests}
 
 
 def _check_http_scope(
@@ -1196,14 +1806,7 @@ def _is_link_local_metadata_host(host: str) -> bool:
 def _is_non_public_or_internal_host(host: str) -> bool:
     """Return True for loopback, private, link-local, CGNAT, reserved, or internal hostnames."""
     clean = str(host or "").strip().lower().rstrip(".")
-    if not clean:
-        return True
-    if (
-        clean == "localhost"
-        or clean == "ip6-localhost"
-        or clean.endswith((".localhost", ".local", ".internal", ".localdomain", ".home.arpa"))
-        or "." not in clean
-    ):
+    if not clean or "%" in clean:
         return True
     ip = _parse_ip_literal(clean)
     if ip is not None:
@@ -1219,6 +1822,14 @@ def _is_non_public_or_internal_host(host: str) -> bool:
             return True
         if isinstance(ip, ipaddress.IPv4Address) and ip in ipaddress.IPv4Network("100.64.0.0/10"):
             return True
+        return False
+    if (
+        clean == "localhost"
+        or clean == "ip6-localhost"
+        or clean.endswith((".localhost", ".local", ".internal", ".localdomain", ".home.arpa"))
+        or "." not in clean
+    ):
+        return True
     return False
 
 
@@ -1628,7 +2239,22 @@ def _select_crawl_actors(
                     return True
         cookie_hdr, extra_hdrs = _extract_actor_browser_auth(http_client, alias)
         local_storage = _extract_actor_local_storage(http_client, alias)
-        return bool(cookie_hdr or extra_hdrs or local_storage)
+        local_storage_by_origin = (
+            _extract_actor_local_storage_by_origin(http_client, alias)
+            if callable(_extract_actor_local_storage_by_origin)
+            else {}
+        )
+        cookie_records = (
+            _extract_actor_cookie_records(
+                http_client,
+                alias,
+                base_url=http_client.base_url,
+                fallback_cookie_hdr=cookie_hdr,
+            )
+            if callable(_extract_actor_cookie_records)
+            else []
+        )
+        return bool(cookie_hdr or extra_hdrs or local_storage or local_storage_by_origin or cookie_records)
 
     auth_members: list[dict[str, str]] = []
     auth_admins: list[dict[str, str]] = []
@@ -1789,10 +2415,122 @@ def _synthesize_schema_value(resolver: Any, raw_schema: Any, *, depth: int = 0) 
     return "sample"
 
 
+def _resolve_openapi_spec_origin_and_prefix(
+    spec: dict[str, Any],
+    *,
+    base_url: str = "",
+    spec_url: str = "",
+    path_prefix: str = "",
+    scope_guard: Any = None,
+) -> tuple[str, str]:
+    """Resolve OpenAPI 3 ``servers`` / Swagger 2 ``host`` + ``basePath`` into ``(target_origin, effective_prefix)``."""
+    base_parts = _normalized_origin_parts(base_url) if base_url else None
+    spec_parts = _normalized_origin_parts(spec_url) if spec_url else None
+
+    def _is_origin_allowed(scheme: str, host: str, port: int) -> bool:
+        if scope_guard is not None and hasattr(scope_guard, "check_origin"):
+            try:
+                return bool(scope_guard.check_origin(scheme, host, port))
+            except Exception:
+                return False
+        if base_parts is not None:
+            return (scheme, host, port) == base_parts[:3]
+        return True
+
+    def _cross_origin_for(parts: tuple[str, str, int, str] | None) -> str:
+        if parts is None:
+            return ""
+        if base_parts is not None and parts[:3] == base_parts[:3]:
+            return ""
+        return parts[3]
+
+    resolved_origin = ""
+    resolved_prefix = ""
+
+    servers = spec.get("servers")
+    if isinstance(servers, list):
+        for srv in servers[:8]:
+            if not isinstance(srv, dict):
+                continue
+            srv_url = str(srv.get("url") or "").strip()
+            if not srv_url:
+                continue
+            variables = srv.get("variables")
+            if isinstance(variables, dict) and "{" in srv_url:
+                for vname, vmeta in variables.items():
+                    if isinstance(vmeta, dict) and vmeta.get("default") is not None:
+                        srv_url = srv_url.replace("{" + str(vname) + "}", str(vmeta["default"]))
+            if srv_url.lower().startswith(("http://", "https://")):
+                srv_parts = _normalized_origin_parts(srv_url)
+                if srv_parts is None:
+                    continue
+                parsed_srv = urlsplit(srv_url)
+                srv_path = (parsed_srv.path or "").strip()
+                norm_srv_path = ""
+                if srv_path and srv_path != "/" and "{" not in srv_path:
+                    try:
+                        cand_p = normalize_path(srv_path)
+                        if cand_p != "/":
+                            norm_srv_path = cand_p
+                    except ValueError:
+                        norm_srv_path = ""
+                if _is_origin_allowed(srv_parts[0], srv_parts[1], srv_parts[2]):
+                    resolved_origin = _cross_origin_for(srv_parts)
+                    resolved_prefix = norm_srv_path
+                    break
+                if norm_srv_path and not resolved_prefix:
+                    resolved_prefix = norm_srv_path
+            elif srv_url.startswith("/") and "{" not in srv_url:
+                try:
+                    cand_p = normalize_path(srv_url)
+                    if cand_p != "/":
+                        resolved_prefix = cand_p
+                        break
+                except ValueError:
+                    continue
+
+    if not resolved_origin:
+        raw_host = str(spec.get("host") or "").strip()
+        raw_bp = str(spec.get("basePath") or "").strip()
+        bp_prefix = ""
+        if raw_bp and raw_bp != "/" and "{" not in raw_bp:
+            try:
+                cand_bp = normalize_path(raw_bp if raw_bp.startswith("/") else "/" + raw_bp)
+                if cand_bp != "/":
+                    bp_prefix = cand_bp
+            except ValueError:
+                bp_prefix = ""
+        if raw_host and "{" not in raw_host:
+            raw_schemes = spec.get("schemes")
+            schemes = (
+                [str(s).strip().lower() for s in raw_schemes if str(s).strip().lower() in {"http", "https"}]
+                if isinstance(raw_schemes, list)
+                else []
+            )
+            default_scheme = base_parts[0] if base_parts is not None else (spec_parts[0] if spec_parts is not None else "https")
+            scheme_order = list(dict.fromkeys(([default_scheme] if default_scheme in schemes else []) + schemes + [default_scheme]))
+            for sch in scheme_order:
+                host_parts = _normalized_origin_parts(f"{sch}://{raw_host}")
+                if host_parts is not None and _is_origin_allowed(host_parts[0], host_parts[1], host_parts[2]):
+                    resolved_origin = _cross_origin_for(host_parts)
+                    break
+        if bp_prefix and not resolved_prefix:
+            resolved_prefix = bp_prefix
+
+    if not resolved_origin and spec_parts is not None and _is_origin_allowed(spec_parts[0], spec_parts[1], spec_parts[2]):
+        resolved_origin = _cross_origin_for(spec_parts)
+
+    eff_prefix = path_prefix if path_prefix else resolved_prefix
+    return resolved_origin, eff_prefix
+
+
 def _extract_openapi_templates(
     spec: dict[str, Any],
     *,
     path_prefix: str = "",
+    base_url: str = "",
+    spec_url: str = "",
+    scope_guard: Any = None,
 ) -> tuple[
     dict[tuple[str, str], dict[str, Any]],
     dict[tuple[str, str], dict[str, list[str]]],
@@ -1802,6 +2540,13 @@ def _extract_openapi_templates(
     if not isinstance(spec, dict) or not isinstance(spec.get("paths"), dict):
         return {}, {}, []
     resolver = LocalSchema(spec) if LocalSchema is not None else None
+    target_origin, eff_prefix = _resolve_openapi_spec_origin_and_prefix(
+        spec,
+        base_url=base_url,
+        spec_url=spec_url,
+        path_prefix=path_prefix,
+        scope_guard=scope_guard,
+    )
     templates: dict[tuple[str, str], dict[str, Any]] = {}
     multipart_map: dict[tuple[str, str], dict[str, list[str]]] = {}
     ops_meta: list[tuple[str, str, list[str]]] = []
@@ -1811,7 +2556,8 @@ def _extract_openapi_templates(
             continue
         if not raw_path.startswith("/"):
             continue
-        eff_path = apply_openapi_path_prefix(raw_path, path_prefix) if path_prefix else raw_path
+        eff_path_only = apply_openapi_path_prefix(raw_path, eff_prefix) if eff_prefix else raw_path
+        eff_path = f"{target_origin}{eff_path_only}" if target_origin else eff_path_only
         for method_low in ("get", "post", "put", "patch", "delete", "head", "options"):
             op = path_item.get(method_low)
             if not isinstance(op, dict):
@@ -2010,27 +2756,47 @@ def _ingest_openapi_spec(
     summary_rec: dict[str, Any] | None = None,
 ) -> None:
     """Ingest operations, templates, and custom header auth schemes from a parsed OpenAPI/Swagger spec."""
+    scope_guard = getattr(http_client, "scope_guard", None)
+    in_scope_assets = tuple(getattr(scope_guard, "in_scope_assets", ()) or ())
+    out_of_scope_assets = tuple(getattr(scope_guard, "out_of_scope_assets", ()) or ())
     oa_prefix = infer_openapi_mount_prefix(parsed_spec, spec_url)
+    target_origin, eff_prefix = _resolve_openapi_spec_origin_and_prefix(
+        parsed_spec,
+        base_url=http_client.base_url,
+        spec_url=spec_url,
+        path_prefix=oa_prefix,
+        scope_guard=scope_guard,
+    )
+    spec_origin_base = f"{target_origin}/" if target_origin else http_client.base_url
+
     if summary_rec is not None:
         try:
-            summary = _extract_surface_summary(summary_rec, http_client.base_url)
+            summary = _extract_surface_summary(
+                summary_rec,
+                http_client.base_url,
+                in_scope_assets=in_scope_assets,
+                out_of_scope_assets=out_of_scope_assets,
+            )
             collector.ingest_surface_summary(
                 summary,
-                source_url=spec_url,
-                openapi_path_prefix=oa_prefix,
+                source_url=spec_origin_base,
+                openapi_path_prefix=eff_prefix,
             )
         except Exception:
             pass
 
     oa_templates, oa_multipart, oa_ops = _extract_openapi_templates(
         parsed_spec,
-        path_prefix=oa_prefix,
+        path_prefix=eff_prefix,
+        base_url=http_client.base_url,
+        spec_url=spec_url,
+        scope_guard=scope_guard,
     )
     for op_method, op_path, op_params in oa_ops:
         collector.record_route(
             method=op_method,
             raw_url=op_path,
-            current_url=http_client.base_url,
+            current_url=spec_origin_base,
             params=op_params,
             body_template=oa_templates.get((op_method, op_path)),
             body_template_observed=False,
@@ -2275,6 +3041,7 @@ class _Stage0Collector:
         self.probed_paths: set[str] = set()
         self.discovered_auth_headers: list[str] = []
         self._seen_auth_headers_low: set[str] = set()
+        self.observed_app_headers: dict[str, str] = {}
         self.server_headers: list[str] = []
         self.powered_by_headers: list[str] = []
         self.body_snippets: list[str] = []
@@ -2284,6 +3051,7 @@ class _Stage0Collector:
         self.cdn_script_assets_requests = 0
         self.external_api_hosts: dict[str, _ExternalAPIHostRecord] = {}
         self._seo_buffer_counts: dict[str, int] = {}
+        self._lazy_chunks_seen: set[str] = set()
         self._seen_order = 0
         self._lock = threading.Lock()
 
@@ -2296,7 +3064,45 @@ class _Stage0Collector:
         self.network_requests_captured = 0
         self.js_chunks_parsed = 0
         self.cdn_js_chunks_parsed = 0
+        self.source_maps_parsed = 0
+        self.lazy_chunks_discovered = 0
         self.passive_probes_sent = 0
+
+    def record_observed_app_headers(
+        self,
+        raw_headers: dict[str, Any],
+        *,
+        blocked_names: set[str] | frozenset[str] = frozenset(),
+    ) -> None:
+        """Record safe non-secret XHR app headers observed during network interception."""
+        safe = _sanitize_observed_app_headers(raw_headers, blocked_names=blocked_names)
+        if not safe:
+            return
+        with self._lock:
+            existing_low = {k.lower(): k for k in self.observed_app_headers}
+            for hk, hv in safe.items():
+                low = hk.lower()
+                if low in existing_low or low in self._seen_auth_headers_low:
+                    continue
+                if len(self.observed_app_headers) >= _MAX_OBSERVED_APP_HEADERS:
+                    break
+                self.observed_app_headers[hk] = hv
+                existing_low[low] = hk
+
+    def record_lazy_chunks(self, chunk_refs: Sequence[str]) -> int:
+        """Track unique discovered lazy SPA chunk/manifest references."""
+        added = 0
+        with self._lock:
+            for raw_c in chunk_refs:
+                c = str(raw_c or "").strip()
+                if not c or c in self._lazy_chunks_seen:
+                    continue
+                if len(self._lazy_chunks_seen) >= 256:
+                    break
+                self._lazy_chunks_seen.add(c)
+                added += 1
+            self.lazy_chunks_discovered = len(self._lazy_chunks_seen)
+        return added
 
     def record_discovered_auth_header(self, header_name: str) -> bool:
         """Record a custom OpenAPI auth header name once (case-insensitive)."""
@@ -2656,8 +3462,8 @@ class _Stage0Collector:
                 if len(rec.multipart_files) < 16:
                     rec.multipart_files.add(mfl)
 
-            if 200 <= int(status or 0) < 300 and norm_method == "GET" and not route_origin:
-                self.fetched_2xx_paths.add(norm_p)
+            if 200 <= int(status or 0) < 300 and norm_method == "GET":
+                self.fetched_2xx_paths.add(route_key_target)
         return True
 
     def record_document(
@@ -2708,12 +3514,14 @@ class _Stage0Collector:
                 "is_cdn": cross_origin_doc,
             }
             if is_css:
-                store, store_key, cap = self.captured_css, norm_p, _MAX_CSS_DOCS
+                css_key = f"{doc_parts[3]}{norm_p}" if (cross_origin_doc and doc_parts is not None) else norm_p
+                store, store_key, cap = self.captured_css, css_key, _MAX_CSS_DOCS
             elif is_js:
                 js_key = f"{doc_parts[3]}{norm_p}" if (cross_origin_doc and doc_parts is not None) else norm_p
                 store, store_key, cap = self.captured_js, js_key, _MAX_JS_CHUNKS
             else:
-                doc_key = f"{norm_p}?{parsed.query}" if parsed.query else norm_p
+                doc_path_q = f"{norm_p}?{parsed.query}" if parsed.query else norm_p
+                doc_key = f"{doc_parts[3]}{doc_path_q}" if (cross_origin_doc and doc_parts is not None) else doc_path_q
                 store, store_key, cap = self.captured_html, doc_key, _MAX_HTML_DOCS
             if store_key not in store and len(store) < cap:
                 store[store_key] = entry
@@ -2761,13 +3569,20 @@ class _Stage0Collector:
                 elif isinstance(p, str):
                     pnames.append(p)
             pnames.extend(str(f) for f in (op.get("body_fields") or ()) if f)
-            raw_op_url = str(op.get("path") or op.get("url") or "")
+            op_full_url = str(op.get("url") or "").strip()
+            op_rel_path = str(op.get("path") or "").strip()
+            raw_op_url = op_full_url if op_full_url.lower().startswith(("http://", "https://")) else (op_rel_path or op_full_url)
             if openapi_path_prefix and raw_op_url:
-                raw_op_url = apply_openapi_path_prefix(urlsplit(raw_op_url).path or raw_op_url, openapi_path_prefix)
+                op_parsed = urlsplit(raw_op_url)
+                prefixed_path = apply_openapi_path_prefix(op_parsed.path or raw_op_url, openapi_path_prefix)
+                if op_parsed.scheme in {"http", "https"} and op_parsed.netloc:
+                    raw_op_url = f"{op_parsed.scheme.lower()}://{op_parsed.netloc}{prefixed_path}"
+                else:
+                    raw_op_url = prefixed_path
             self.record_route(
                 method=str(op.get("method") or "GET"),
                 raw_url=raw_op_url,
-                current_url=self.http.base_url,
+                current_url=source_url or self.http.base_url,
                 params=pnames,
             )
         for pop in summary.get("postman_ops") or ():
@@ -2798,14 +3613,15 @@ class _Stage0Collector:
             if not isinstance(spec_u, str) or not spec_u.strip():
                 continue
             try:
-                _u, sp_path, _q = _check_http_scope(self.http, spec_u, allow_fragment=False)
+                clean_sp_u, sp_path, _q = _check_http_scope(self.http, spec_u, allow_fragment=False)
                 norm_sp = normalize_path(sp_path)
             except (ScopeViolationError, ValueError):
                 continue
             if not _is_skipped_surface_url(norm_sp):
+                spec_key = _scoped_storage_key(clean_sp_u, self.http.base_url)
                 with self._lock:
-                    if norm_sp not in self.discovered_spec_urls and len(self.discovered_spec_urls) < 12:
-                        self.discovered_spec_urls.append(norm_sp)
+                    if spec_key not in self.discovered_spec_urls and len(self.discovered_spec_urls) < 12:
+                        self.discovered_spec_urls.append(spec_key)
 
 
 def _detect_canonical_hosts_from_dom(
@@ -3113,12 +3929,40 @@ def _crawl_actor_playwright(
     operator_headers = _operator_browser_headers(http_client)
     operator_override_names = frozenset(k.lower() for k in operator_headers)
     local_storage = _extract_actor_local_storage(http_client, actor)
-    actor_secrets = _collect_actor_secrets(
-        http_client,
-        cookie_hdr,
-        extra_headers,
-        local_storage=local_storage,
+    local_storage_by_origin = (
+        _extract_actor_local_storage_by_origin(http_client, actor)
+        if callable(_extract_actor_local_storage_by_origin)
+        else {}
     )
+    cookie_records = (
+        _extract_actor_cookie_records(
+            http_client,
+            actor,
+            base_url=http_client.base_url,
+            fallback_cookie_hdr=cookie_hdr,
+        )
+        if callable(_extract_actor_cookie_records)
+        else [
+            {"name": cname, "value": cval, "url": http_client.base_url}
+            for cname, cval in _parse_cookie_pairs(cookie_hdr)
+        ]
+    )
+    try:
+        actor_secrets = _collect_actor_secrets(
+            http_client,
+            cookie_hdr,
+            extra_headers,
+            local_storage=local_storage,
+            cookie_records=cookie_records,
+            local_storage_by_origin=local_storage_by_origin,
+        )
+    except TypeError:
+        actor_secrets = _collect_actor_secrets(
+            http_client,
+            cookie_hdr,
+            extra_headers,
+            local_storage=local_storage,
+        )
     base_actor_auth_header_names: set[str] = {
         k.strip().lower()
         for k in extra_headers
@@ -3159,16 +4003,19 @@ def _crawl_actor_playwright(
     pending_redirect_urls: list[tuple[str, str]] = []
 
     try:
-        ls_init_script = _build_origin_localstorage_init_script(http_client.base_url, local_storage)
+        if callable(_build_multi_origin_localstorage_init_script):
+            ls_init_script = _build_multi_origin_localstorage_init_script(
+                local_storage_by_origin,
+                fallback_origin=http_client.base_url,
+                fallback_local_storage=local_storage,
+            )
+        else:
+            ls_init_script = _build_origin_localstorage_init_script(http_client.base_url, local_storage)
         if ls_init_script:
             context.add_init_script(ls_init_script)
 
-        cookie_pairs = _parse_cookie_pairs(cookie_hdr)
-        if cookie_pairs:
-            context.add_cookies([
-                {"name": cname, "value": cval, "url": http_client.base_url}
-                for cname, cval in cookie_pairs
-            ])
+        if cookie_records:
+            context.add_cookies(cookie_records)
 
         def _on_ws_route(ws_route: Any) -> None:
             ws_url = str(getattr(ws_route, "url", "") or "")
@@ -3412,6 +4259,13 @@ def _crawl_actor_playwright(
                 hdrs = dict(getattr(req, "headers", None) or {})
             except Exception:
                 hdrs = {}
+            blocked_app_hdrs = set(base_actor_auth_header_names) | set(operator_override_names)
+            if callable(sensitive_fn):
+                for sh in sensitive_fn() or ():
+                    low_sh = str(sh or "").strip().lower()
+                    if low_sh:
+                        blocked_app_hdrs.add(low_sh)
+            collector.record_observed_app_headers(hdrs, blocked_names=blocked_app_hdrs)
             ctype = str(hdrs.get("content-type") or hdrs.get("Content-Type") or "")
 
             post_data_text: str | None = None
@@ -3595,13 +4449,10 @@ def _crawl_actor_playwright(
                     path=resp_path,
                 )
                 if parsed_doc is not None:
-                    try:
-                        norm_sp = normalize_path(resp_path or "/")
-                    except ValueError:
-                        norm_sp = resp_path or "/"
+                    spec_key = _scoped_storage_key(resp_url, http_client.base_url)
                     with collector._lock:
-                        if norm_sp not in collector.captured_specs and len(collector.captured_specs) < 8:
-                            collector.captured_specs[norm_sp] = (resp_url, parsed_doc)
+                        if spec_key not in collector.captured_specs and len(collector.captured_specs) < 16:
+                            collector.captured_specs[spec_key] = (resp_url, parsed_doc)
                 return
             if is_html and collector._allow_canonical_host_aliases:
                 collector.register_canonical_hosts(
@@ -3638,6 +4489,23 @@ def _crawl_actor_playwright(
         submitted_forms: set[tuple[Any, ...]] = set()
         actor_pages_visited = 0
         actor_actions_taken = 0
+
+        def _scoped_bfs_template_key(
+            url_str: str,
+            norm_path_str: str,
+            query_str: str,
+            frag_str: str,
+        ) -> tuple[str, frozenset[str], str]:
+            q_keys = frozenset(k for k, _ in parse_qsl(query_str, keep_blank_values=True) if k)
+            tmpl_path = route_template_of(norm_path_str)
+            u_parts = _normalized_origin_parts(url_str)
+            is_cross = bool(
+                u_parts is not None
+                and base_origin_parts is not None
+                and u_parts[:3] != base_origin_parts[:3]
+            )
+            scoped_tmpl = f"{u_parts[3]}{tmpl_path}" if (is_cross and u_parts is not None) else tmpl_path
+            return (scoped_tmpl, q_keys, _normalize_hash_route(f"#{frag_str}" if frag_str else ""))
 
         def _enqueue_url(raw_candidate: str, current_page_url: str, *, allow_seo_front: bool = False) -> None:
             cand = str(raw_candidate or "").strip()
@@ -3676,8 +4544,7 @@ def _crawl_actor_playwright(
             if full_u in queued_urls or full_u in visited_urls:
                 return
             frag = urlsplit(full_u).fragment
-            q_keys = frozenset(k for k, _ in parse_qsl(query_u, keep_blank_values=True) if k)
-            tmpl_key = (route_template_of(norm_p), q_keys, _normalize_hash_route(f"#{frag}" if frag else ""))
+            tmpl_key = _scoped_bfs_template_key(full_u, norm_p, query_u, frag)
             if template_visit_counts.get(tmpl_key, 0) >= _MAX_VISITS_PER_TEMPLATE:
                 return
             seo_cls = _classify_seo_route_pattern(norm_p)
@@ -3870,8 +4737,7 @@ def _crawl_actor_playwright(
                 norm_t_path = normalize_path(parsed_t.path or "/")
             except ValueError:
                 continue
-            q_keys = frozenset(k for k, _ in parse_qsl(parsed_t.query, keep_blank_values=True) if k)
-            tmpl_key = (route_template_of(norm_t_path), q_keys, _normalize_hash_route(f"#{parsed_t.fragment}" if parsed_t.fragment else ""))
+            tmpl_key = _scoped_bfs_template_key(target_url, norm_t_path, parsed_t.query, parsed_t.fragment)
             if template_visit_counts.get(tmpl_key, 0) >= _MAX_VISITS_PER_TEMPLATE:
                 continue
 
@@ -3934,10 +4800,7 @@ def _crawl_actor_playwright(
                 except Exception:
                     pass
 
-            try:
-                canon_path = normalize_path(urlsplit(final_url).path or "/")
-            except ValueError:
-                canon_path = "/"
+            canon_path = _scoped_storage_key(final_url, http_client.base_url)
             frag_part = urlsplit(final_url).fragment
             canon_with_hash = f"{canon_path}#{frag_part}" if frag_part.startswith("/") else canon_path
             dom_hash = _compute_dom_state_hash(dom_data)
@@ -4205,6 +5068,204 @@ def _scan_document_for_external_api_hosts(
         )
 
 
+def _fetch_cdn_sourcemap_anonymously(
+    http_client: AgenticHTTPClient,
+    map_url: str,
+    *,
+    referrer_url: str = "",
+    stage0_budget: _Stage0Budget | None = None,
+) -> str:
+    """Fetch a safe, read-only CDN ``.map`` file strictly anonymously (cookie-free, TLS-verified, 1 MiB cap)."""
+    if _requests is None:
+        return ""
+    scope_guard = getattr(http_client, "scope_guard", None)
+    eff_referrer = str(referrer_url or map_url).strip()
+    curr_url = map_url
+    hdrs = {
+        "Accept": "application/json, */*",
+        "User-Agent": _operator_user_agent(http_client, default_ua=_BROWSER_USER_AGENT),
+    }
+    sess = _requests.Session()
+    sess.trust_env = False
+    try:
+        for hop in range(3):
+            if not _is_allowed_cdn_sourcemap_url(
+                curr_url,
+                http_client.base_url,
+                referrer_url=eff_referrer,
+                scope_guard=scope_guard,
+                resolve_dns=True,
+                fail_closed_on_dns_error=True,
+            ):
+                return ""
+            if stage0_budget is not None:
+                if not stage0_budget.try_consume(include_reserve=True):
+                    return ""
+            else:
+                wire_budget = getattr(http_client, "budget", None)
+                consume_fn = getattr(wire_budget, "consume", None)
+                if callable(consume_fn):
+                    allowed, _reason = consume_fn()
+                    if not allowed:
+                        return ""
+            acquire_slot = getattr(http_client, "_acquire_rate_limit_slot", None)
+            if callable(acquire_slot):
+                acquire_slot()
+            try:
+                resp = sess.get(
+                    curr_url,
+                    headers=hdrs,
+                    timeout=6.0,
+                    allow_redirects=False,
+                    stream=True,
+                    verify=True,
+                )
+            except Exception:
+                return ""
+            try:
+                status_code = int(getattr(resp, "status_code", 0) or 0)
+                if 300 <= status_code < 400:
+                    if hop >= 2:
+                        return ""
+                    loc = str(resp.headers.get("Location") or resp.headers.get("location") or "").strip()
+                    next_url = urljoin(curr_url, loc) if loc else ""
+                    if not next_url:
+                        return ""
+                    curr_url = next_url
+                    continue
+                if status_code < 200 or status_code >= 300:
+                    return ""
+                raw_cl = str(resp.headers.get("Content-Length") or "").strip()
+                if raw_cl.isdigit() and int(raw_cl) > _MAX_SOURCEMAP_BYTES:
+                    return ""
+                chunks: list[bytes] = []
+                total = 0
+                for chunk in resp.iter_content(chunk_size=16384):
+                    if not chunk:
+                        continue
+                    total += len(chunk)
+                    if total > _MAX_SOURCEMAP_BYTES:
+                        return ""
+                    chunks.append(chunk)
+                return b"".join(chunks).decode("utf-8", errors="replace")
+            except Exception:
+                return ""
+            finally:
+                try:
+                    resp.close()
+                except Exception:
+                    pass
+    finally:
+        try:
+            sess.close()
+        except Exception:
+            pass
+    return ""
+
+
+def _decode_and_ingest_sourcemap(
+    http_client: AgenticHTTPClient,
+    collector: _Stage0Collector,
+    raw_map: Any,
+    *,
+    source_url: str,
+    is_cdn: bool = False,
+    in_scope_assets: Sequence[str] = (),
+    out_of_scope_assets: Sequence[str] = (),
+    canonical_hosts: set[str] | None = None,
+) -> bool:
+    """Decode a Source Map v3 payload via ``kryon_core.js.sourcemap.parse_source_map`` and extract routes."""
+    if _parse_source_map is None or not raw_map:
+        return False
+    if isinstance(raw_map, str):
+        m_inline = _INLINE_SOURCEMAP_DATA_RE.fullmatch(raw_map.strip())
+        if m_inline:
+            norm_b64 = _normalize_inline_sourcemap_b64(m_inline.group(1))
+            if not norm_b64:
+                return False
+            raw_map = f"data:application/json;base64,{norm_b64}"
+    try:
+        meta, contents = _parse_source_map(raw_map)
+    except Exception:
+        return False
+    if not isinstance(meta, dict) or not meta.get("valid"):
+        return False
+
+    with collector._lock:
+        collector.source_maps_parsed += 1
+
+    raw_sources = meta.get("sources")
+    sources: list[Any] = raw_sources if isinstance(raw_sources, list) else []
+    indexed_pairs: list[tuple[int, str, str]] = []
+    for idx_s, src_content in enumerate(contents or ()):
+        if not isinstance(src_content, str) or not src_content.strip():
+            continue
+        src_name = str(sources[idx_s]) if idx_s < len(sources) else f"src-{idx_s}.js"
+        is_vendor = "node_modules/" in src_name.lower() or "webpack/runtime" in src_name.lower()
+        indexed_pairs.append((1 if is_vendor else 0, src_name, src_content))
+    indexed_pairs.sort(key=lambda item: item[0])
+
+    summary_doc_url = source_url
+    summary_source_url = source_url
+    if is_cdn:
+        doc_path = urlsplit(source_url).path or "/sourcemap-bundle.js"
+        summary_doc_url = urljoin(http_client.base_url, doc_path)
+        summary_source_url = http_client.base_url
+
+    total_chars = 0
+    files_processed = 0
+    for _prio, _src_name, src_text in indexed_pairs:
+        if files_processed >= _MAX_SOURCEMAP_FILES_PER_MAP or total_chars >= _MAX_SOURCEMAP_TOTAL_CHARS:
+            break
+        remaining_chars = _MAX_SOURCEMAP_TOTAL_CHARS - total_chars
+        snippet = src_text[: min(_MAX_SOURCEMAP_CONTENT_CHARS, remaining_chars)]
+        if not snippet.strip():
+            continue
+        files_processed += 1
+        total_chars += len(snippet)
+        if canonical_hosts:
+            snippet = rewrite_internal_canonical_urls_in_text(
+                snippet,
+                base_url=http_client.base_url,
+                canonical_hosts=canonical_hosts,
+            )
+        _scan_document_for_external_api_hosts(
+            collector,
+            snippet,
+            doc_url=source_url,
+            is_js=True,
+        )
+        lazy_info = _extract_lazy_spa_routes_and_chunks(
+            snippet,
+            doc_url=summary_source_url,
+            base_url=http_client.base_url,
+        )
+        for spa_r in lazy_info["routes"]:
+            collector.record_route(method="GET", raw_url=spa_r, current_url=summary_source_url)
+        if lazy_info["chunks"]:
+            collector.record_lazy_chunks(lazy_info["chunks"])
+
+        fake_rec = {
+            "receipt_id": f"stage0-smap-{collector.source_maps_parsed}-{files_processed}",
+            "url": summary_doc_url,
+            "content_type": "application/javascript",
+            "body": snippet,
+            "response_headers": {},
+            "redirect_location": "",
+        }
+        try:
+            summary = _extract_surface_summary(
+                fake_rec,
+                http_client.base_url,
+                in_scope_assets=in_scope_assets,
+                out_of_scope_assets=out_of_scope_assets,
+            )
+            collector.ingest_surface_summary(summary, source_url=summary_source_url)
+        except Exception:
+            continue
+    return True
+
+
 def _run_layer4_passive_fusion(
     http_client: AgenticHTTPClient,
     collector: _Stage0Collector,
@@ -4213,8 +5274,9 @@ def _run_layer4_passive_fusion(
     primary_actor: str,
     max_passive_probes: int,
     skip_probe_paths: Sequence[str] | None = None,
+    start_paths: Sequence[str] | None = None,
 ) -> None:
-    """Fuse captured HTML, JS chunks, and CSS via ``_extract_surface_summary`` and run bounded manifest probes."""
+    """Fuse captured HTML, JS chunks, source maps, and CSS via ``_extract_surface_summary`` and run bounded manifest probes."""
     if collector._allow_canonical_host_aliases:
         for doc in list(collector.captured_html.values()):
             hdrs = doc.get("headers") or {}
@@ -4228,6 +5290,14 @@ def _run_layer4_passive_fusion(
             )
     canonical_hosts = collector.canonical_hosts_snapshot()
     base_origin_parts = _normalized_origin_parts(http_client.base_url)
+    scope_guard = getattr(http_client, "scope_guard", None)
+    in_scope_assets = tuple(getattr(scope_guard, "in_scope_assets", ()) or ())
+    out_of_scope_assets = tuple(getattr(scope_guard, "out_of_scope_assets", ()) or ())
+
+    pending_external_sourcemaps: list[tuple[str, bool, str]] = []
+    seen_external_sourcemaps: set[str] = set()
+    discovered_lazy_manifests: list[str] = []
+    seen_lazy_manifests: set[str] = set()
 
     idx = 0
     for docs, prefix, default_ctype, is_js_batch in (
@@ -4283,6 +5353,40 @@ def _run_layer4_passive_fusion(
                     is_js=True,
                 )
 
+            if prefix in {"html", "js"} and doc_body:
+                route_resolve_base = http_client.base_url if is_cdn_doc else (doc_url or http_client.base_url)
+                lazy_info = _extract_lazy_spa_routes_and_chunks(
+                    doc_body,
+                    doc_url=route_resolve_base,
+                    base_url=http_client.base_url,
+                )
+                for spa_r in lazy_info["routes"]:
+                    collector.record_route(method="GET", raw_url=spa_r, current_url=route_resolve_base)
+                if lazy_info["chunks"]:
+                    collector.record_lazy_chunks(lazy_info["chunks"])
+                for m_ref in lazy_info["manifests"]:
+                    if m_ref not in seen_lazy_manifests and len(discovered_lazy_manifests) < 4:
+                        seen_lazy_manifests.add(m_ref)
+                        discovered_lazy_manifests.append(m_ref)
+
+            if is_js_batch and doc_body:
+                smap_refs = _extract_sourcemap_references(doc_body, doc_url)
+                for inline_uri in smap_refs["inline"]:
+                    _decode_and_ingest_sourcemap(
+                        http_client,
+                        collector,
+                        inline_uri,
+                        source_url=doc_url,
+                        is_cdn=is_cdn_doc,
+                        in_scope_assets=in_scope_assets,
+                        out_of_scope_assets=out_of_scope_assets,
+                        canonical_hosts=canonical_hosts,
+                    )
+                for ext_map_url in smap_refs["external"]:
+                    if ext_map_url not in seen_external_sourcemaps and len(pending_external_sourcemaps) < 16:
+                        seen_external_sourcemaps.add(ext_map_url)
+                        pending_external_sourcemaps.append((ext_map_url, is_cdn_doc, doc_url))
+
             summary_doc_url = doc_url
             summary_source_url = doc_url
             summary_ctype = str(doc.get("content_type") or default_ctype)
@@ -4303,7 +5407,12 @@ def _run_layer4_passive_fusion(
                 "redirect_location": "",
             }
             try:
-                summary = _extract_surface_summary(fake_rec, http_client.base_url)
+                summary = _extract_surface_summary(
+                    fake_rec,
+                    http_client.base_url,
+                    in_scope_assets=in_scope_assets,
+                    out_of_scope_assets=out_of_scope_assets,
+                )
                 collector.ingest_surface_summary(summary, source_url=summary_source_url)
             except Exception:
                 continue
@@ -4318,6 +5427,76 @@ def _run_layer4_passive_fusion(
 
     if max_passive_probes <= 0 or "GET" not in http_client.allowed_methods:
         return
+
+    # Bounded external .js.map fetch (up to _MAX_SOURCEMAPS_FETCHED = 4, 1 MiB each).
+    if pending_external_sourcemaps and _parse_source_map is not None:
+        sourcemaps_fetched = 0
+        for ext_map_url, map_is_cdn, map_referrer_url in pending_external_sourcemaps:
+            if sourcemaps_fetched >= _MAX_SOURCEMAPS_FETCHED:
+                break
+            in_scope_map_target = ""
+            try:
+                clean_m, _mp, _mq = _check_http_scope(http_client, ext_map_url, allow_fragment=False)
+                in_scope_map_target = _scoped_storage_key(clean_m, http_client.base_url, include_query=True)
+            except ScopeViolationError:
+                in_scope_map_target = ""
+
+            raw_map_text = ""
+            if in_scope_map_target:
+                if not stage0_budget.can_spend(include_reserve=True):
+                    continue
+                before_used = int(http_client.budget.used)
+                try:
+                    rec_m = http_client.request(actor=primary_actor, method="GET", url=in_scope_map_target)
+                except BudgetExhaustedError:
+                    stage0_budget.global_exhausted = True
+                    break
+                except ServiceDegradationError:
+                    break
+                except Exception:
+                    after_used = int(http_client.budget.used)
+                    stage0_budget.account_external(max(0, after_used - before_used))
+                    continue
+                after_used = int(http_client.budget.used)
+                stage0_budget.account_external(max(0, after_used - before_used))
+                sourcemaps_fetched += 1
+                if 200 <= int(rec_m.get("status") or 0) < 300:
+                    raw_map_text = str(rec_m.get("body") or "")[:_MAX_SOURCEMAP_BYTES]
+            elif (
+                not _is_explicitly_excluded_by_scope(scope_guard, ext_map_url)
+                and _is_allowed_cdn_sourcemap_url(
+                    ext_map_url,
+                    http_client.base_url,
+                    referrer_url=map_referrer_url,
+                    scope_guard=scope_guard,
+                    resolve_dns=True,
+                    fail_closed_on_dns_error=True,
+                )
+            ):
+                if not stage0_budget.can_spend(include_reserve=True):
+                    break
+                sourcemaps_fetched += 1
+                raw_map_text = _fetch_cdn_sourcemap_anonymously(
+                    http_client,
+                    ext_map_url,
+                    referrer_url=map_referrer_url,
+                    stage0_budget=stage0_budget,
+                )
+                map_is_cdn = True
+            else:
+                continue
+
+            if raw_map_text:
+                _decode_and_ingest_sourcemap(
+                    http_client,
+                    collector,
+                    raw_map_text,
+                    source_url=ext_map_url,
+                    is_cdn=map_is_cdn,
+                    in_scope_assets=in_scope_assets,
+                    out_of_scope_assets=out_of_scope_assets,
+                    canonical_hosts=canonical_hosts,
+                )
 
     detected_techs = detect_tech(
         server=" ".join(collector.server_headers),
@@ -4336,8 +5515,8 @@ def _run_layer4_passive_fusion(
         if not cand_skip:
             continue
         try:
-            _u, clean_skip, _q = _check_http_scope(http_client, cand_skip, allow_fragment=False)
-            norm_skip = normalize_path(clean_skip)
+            clean_skip_u, _clean_skip_p, _q = _check_http_scope(http_client, cand_skip, allow_fragment=False)
+            norm_skip = _scoped_storage_key(clean_skip_u, http_client.base_url)
         except (ScopeViolationError, ValueError):
             try:
                 norm_skip = normalize_path(urlsplit(cand_skip).path or "/")
@@ -4352,23 +5531,26 @@ def _run_layer4_passive_fusion(
         candidates: list[str] = []
         for raw_p in raw_paths:
             try:
-                _u, clean_p, _q = _check_http_scope(http_client, raw_p, allow_fragment=False)
+                clean_u, clean_p, _q = _check_http_scope(http_client, raw_p, allow_fragment=False)
                 norm_p = normalize_path(clean_p)
             except (ScopeViolationError, ValueError):
                 continue
             low_p = norm_p.lower()
             if any(sens in low_p for sens in _SENSITIVE_PROBE_SEGMENTS):
                 continue
-            if norm_p in seen_probes or norm_p in collector.fetched_2xx_paths:
+            probe_target = _scoped_storage_key(clean_u, http_client.base_url)
+            if probe_target in seen_probes or probe_target in collector.fetched_2xx_paths:
                 continue
-            seen_probes.add(norm_p)
-            candidates.append(norm_p)
+            seen_probes.add(probe_target)
+            candidates.append(probe_target)
         return candidates
 
-    def _execute_probe(probe_path: str) -> bool:
+    def _execute_probe(probe_path: str, *, probe_cap: int | None = None) -> bool:
         nonlocal stop_probing
         if collector.passive_probes_sent >= max_passive_probes:
             stop_probing = True
+            return False
+        if probe_cap is not None and collector.passive_probes_sent >= probe_cap:
             return False
         if not stage0_budget.can_spend(include_reserve=True):
             stop_probing = True
@@ -4407,17 +5589,94 @@ def _run_layer4_passive_fusion(
                 )
             )
             collector.record_route(method="GET", raw_url=loc_hdr, current_url=rec_url)
+
+        body_text = str(rec.get("body") or "")
+        rec_ctype = str(rec.get("content_type") or "")
+        rec_path_low = (urlsplit(rec_url).path or "").lower().rstrip("/")
+        if rec_path_low.endswith("/graphql"):
+            ctype_low = rec_ctype.lower()
+            body_stripped = body_text.lstrip()
+            body_low = body_stripped.lower()
+            is_html_resp = (
+                "text/html" in ctype_low
+                or "application/xhtml" in ctype_low
+                or body_low.startswith(("<!doctype", "<html", "<head", "<body"))
+                or "<html" in body_low[:512]
+            )
+            is_json_ctype = (
+                "application/json" in ctype_low
+                or "+json" in ctype_low
+                or "application/graphql" in ctype_low
+            )
+            parsed_gql_obj: dict[str, Any] | None = None
+            if body_stripped.startswith("{"):
+                try:
+                    cand_obj = json.loads(body_stripped[:262144])
+                    if isinstance(cand_obj, dict):
+                        parsed_gql_obj = cand_obj
+                except ValueError:
+                    parsed_gql_obj = None
+            has_gql_json_markers = bool(
+                parsed_gql_obj is not None
+                and (
+                    "errors" in parsed_gql_obj
+                    or "data" in parsed_gql_obj
+                    or "__schema" in body_stripped[:65536]
+                )
+            )
+            if is_html_resp:
+                is_gql_hit = False
+            elif 200 <= status < 300:
+                is_gql_hit = bool(
+                    has_gql_json_markers
+                    or (is_json_ctype and (parsed_gql_obj is not None or "__schema" in body_low))
+                )
+            elif status in {400, 405, 415}:
+                is_gql_hit = bool(
+                    has_gql_json_markers
+                    or (
+                        is_json_ctype
+                        and (
+                            "graphql" in body_low
+                            or '"errors"' in body_low
+                            or '"data"' in body_low
+                            or "__schema" in body_low
+                            or "query" in body_low
+                        )
+                    )
+                    or "graphql" in ctype_low
+                )
+            else:
+                is_gql_hit = False
+            if is_gql_hit:
+                collector.record_route(
+                    method="POST",
+                    raw_url=rec_url,
+                    params=("query", "variables", "operationName"),
+                    status=status,
+                )
+
         if not (200 <= status < 300):
             return False
 
         collector.record_route(method="GET", raw_url=rec_url, status=status)
 
-        body_text = str(rec.get("body") or "")
-        rec_ctype = str(rec.get("content_type") or "")
+        if rec_path_low.endswith("_buildmanifest.js") and body_text:
+            lazy_m = _extract_lazy_spa_routes_and_chunks(
+                body_text,
+                doc_url=rec_url,
+                base_url=http_client.base_url,
+            )
+            for spa_r in lazy_m["routes"]:
+                collector.record_route(method="GET", raw_url=spa_r, current_url=rec_url)
+            if lazy_m["chunks"]:
+                collector.record_lazy_chunks(lazy_m["chunks"])
+            return False
+
         parsed_spec = _parse_openapi_spec_document(
             body_text,
             content_type=rec_ctype,
-            path=probe_path,
+            path=urlsplit(rec_url).path or probe_path,
         )
 
         if parsed_spec is not None:
@@ -4443,7 +5702,12 @@ def _run_layer4_passive_fusion(
                     base_url=http_client.base_url,
                     canonical_hosts=cur_aliases,
                 )
-            summary = _extract_surface_summary(summary_rec_non_spec, http_client.base_url)
+            summary = _extract_surface_summary(
+                summary_rec_non_spec,
+                http_client.base_url,
+                in_scope_assets=in_scope_assets,
+                out_of_scope_assets=out_of_scope_assets,
+            )
             collector.ingest_surface_summary(
                 summary,
                 source_url=rec_url,
@@ -4452,32 +5716,132 @@ def _run_layer4_passive_fusion(
             pass
         return False
 
+    def _collect_in_scope_sibling_origins() -> list[str]:
+        candidates: list[tuple[int, int, str]] = []
+        seen_sib: set[str] = set()
+        obs_counts: dict[str, int] = {}
+
+        def _consider_origin(raw_u: str, obs_count: int = 0) -> None:
+            parts = _normalized_origin_parts(raw_u)
+            if parts is None:
+                return
+            if base_origin_parts is not None and parts[:3] == base_origin_parts[:3]:
+                return
+            _scheme, sib_host, _port, orig = parts
+            if orig in seen_sib:
+                obs_counts[orig] = max(obs_counts.get(orig, 0), obs_count)
+                return
+            first_label = sib_host.split(".", 1)[0] if "." in sib_host else sib_host
+            if _parse_ip_literal(sib_host) is None and "." in sib_host and first_label in _STATIC_CDN_SUBDOMAIN_PREFIXES:
+                return
+            any_allowed = False
+            for sp in _SIBLING_SPEC_PROBES:
+                try:
+                    _check_http_scope(http_client, f"{orig}{sp}", allow_fragment=False)
+                    any_allowed = True
+                    break
+                except ScopeViolationError:
+                    continue
+            if not any_allowed:
+                return
+            seen_sib.add(orig)
+            obs_counts[orig] = obs_count
+            if first_label in _API_SUBDOMAIN_HINTS:
+                api_rank = 0
+            elif any(tok in first_label for tok in ("api", "bff", "graphql", "gateway")):
+                api_rank = 1
+            else:
+                api_rank = 2
+            candidates.append((api_rank, 0, orig))
+
+        for host_row in collector.export_discovered_api_hosts():
+            _consider_origin(
+                str(host_row.get("origin") or ""),
+                obs_count=int(host_row.get("observations") or 0),
+            )
+        for raw_sp in start_paths or ():
+            _consider_origin(str(raw_sp or ""), obs_count=0)
+
+        candidates.sort(key=lambda item: (item[0], -obs_counts.get(item[2], 0), item[2]))
+        return [item[2] for item in candidates[:_MAX_SIBLING_SPEC_PROBE_ORIGINS]]
+
+    in_scope_sibling_origins = _collect_in_scope_sibling_origins()
+    avail_probe_slots = min(max_passive_probes, stage0_budget.remaining(include_reserve=True))
+    sibling_probe_reserve = min(4, avail_probe_slots // 2) if in_scope_sibling_origins else 0
+    primary_probe_limit = max(0, min(max_passive_probes, avail_probe_slots) - sibling_probe_reserve)
+
     for probe_path in _prepare_probe_candidates(collector.discovered_spec_urls):
-        if _execute_probe(probe_path):
+        if collector.passive_probes_sent >= primary_probe_limit:
+            break
+        if _execute_probe(probe_path, probe_cap=primary_probe_limit):
             found_openapi_spec = True
         if stop_probing:
             return
 
-    if not found_openapi_spec:
+    if not found_openapi_spec and collector.passive_probes_sent < primary_probe_limit:
         for probe_path in _prepare_probe_candidates(_ROOT_SPEC_PROBES):
-            if _execute_probe(probe_path):
+            if collector.passive_probes_sent >= primary_probe_limit:
+                break
+            if _execute_probe(probe_path, probe_cap=primary_probe_limit):
                 found_openapi_spec = True
                 break
             if stop_probing:
                 return
 
-    if not found_openapi_spec:
+    if not found_openapi_spec and collector.passive_probes_sent < primary_probe_limit:
         for probe_path in _prepare_probe_candidates(_API_PREFIXED_SPEC_PROBES):
-            if _execute_probe(probe_path):
+            if collector.passive_probes_sent >= primary_probe_limit:
+                break
+            if _execute_probe(probe_path, probe_cap=primary_probe_limit):
                 found_openapi_spec = True
                 break
             if stop_probing:
                 return
 
-    for probe_path in _prepare_probe_candidates([*_STANDARD_NON_SPEC_MANIFEST_PROBES, *tech_probes]):
-        _execute_probe(probe_path)
-        if stop_probing:
-            return
+    if collector.passive_probes_sent < primary_probe_limit:
+        for probe_path in _prepare_probe_candidates([*_STANDARD_NON_SPEC_MANIFEST_PROBES, *tech_probes]):
+            if collector.passive_probes_sent >= primary_probe_limit:
+                break
+            _execute_probe(probe_path, probe_cap=primary_probe_limit)
+            if stop_probing:
+                return
+
+    # Optional Next.js _buildManifest.js probe (at most 1) if discovered via __NEXT_DATA__.
+    for manifest_ref in discovered_lazy_manifests[:1]:
+        if (
+            stop_probing
+            or collector.passive_probes_sent >= primary_probe_limit
+            or not stage0_budget.can_spend(include_reserve=True)
+        ):
+            break
+        if manifest_ref in collector.captured_js:
+            continue
+        for m_cand in _prepare_probe_candidates([manifest_ref]):
+            _execute_probe(m_cand, probe_cap=primary_probe_limit)
+            if stop_probing:
+                return
+
+    # Sibling-Origin Passive Spec & GraphQL Probes (up to 2 in-scope sibling API origins).
+    if stop_probing or collector.passive_probes_sent >= max_passive_probes or not stage0_budget.can_spend(include_reserve=True):
+        return
+
+    in_scope_sibling_origins = _collect_in_scope_sibling_origins()
+
+    for sib_orig in in_scope_sibling_origins:
+        if stop_probing or collector.passive_probes_sent >= max_passive_probes or not stage0_budget.can_spend(include_reserve=True):
+            break
+        found_sib_spec = False
+        for spec_path in _SIBLING_SPEC_PROBES:
+            if stop_probing or collector.passive_probes_sent >= max_passive_probes or not stage0_budget.can_spend(include_reserve=True):
+                break
+            if found_sib_spec and spec_path in {"/swagger.json", "/v3/api-docs"}:
+                continue
+            full_sib_probe = f"{sib_orig}{spec_path}"
+            for probe_cand in _prepare_probe_candidates([full_sib_probe]):
+                if _execute_probe(probe_cand):
+                    found_sib_spec = True
+                if stop_probing:
+                    return
 
 
 def _finalize_routes(
@@ -4647,7 +6011,8 @@ def _normalize_stage0_seed_urls(
         if block_destructive and _DESTRUCTIVE_RE.search(norm_p):
             continue
         frag = urlsplit(full_s).fragment
-        canon_key = (norm_p, query_u, frag)
+        scoped_p = _scoped_storage_key(full_s, http_client.base_url)
+        canon_key = (scoped_p, query_u, frag)
         if canon_key in dedup_keys:
             continue
         dedup_keys.add(canon_key)
@@ -4713,7 +6078,11 @@ def run_stage0_crawl(
     )
     passive_reserve = 0
     if eff_max_probes > 0 and "GET" in http_client.allowed_methods and stage0_cap > 1:
-        passive_reserve = min(eff_max_probes, max(1, stage0_cap // 5), 8, stage0_cap - 1)
+        is_multi_orig = bool(getattr(getattr(http_client, "scope_guard", None), "is_multi_origin", False))
+        if is_multi_orig:
+            passive_reserve = min(eff_max_probes, max(4, stage0_cap // 4), 12, stage0_cap - 1)
+        else:
+            passive_reserve = min(eff_max_probes, max(1, stage0_cap // 5), 8, stage0_cap - 1)
     stage0_budget = _Stage0Budget(http_client, cap=stage0_cap, reserve=passive_reserve)
 
     if actors is not None and len(actors) > 0:
@@ -4853,6 +6222,7 @@ def run_stage0_crawl(
             primary_actor=primary_actor,
             max_passive_probes=eff_max_probes,
             skip_probe_paths=skip_probe_paths,
+            start_paths=valid_starts,
         )
 
     links, forms, body_templates_map, multipart_schemas_map, discovery_hints = _finalize_routes(collector)
@@ -4860,6 +6230,7 @@ def run_stage0_crawl(
     discovered_api_hosts = collector.export_discovered_api_hosts()
     probed_paths_sorted = sorted(collector.probed_paths)
     auth_headers_list = list(collector.discovered_auth_headers)
+    observed_app_headers = dict(sorted(collector.observed_app_headers.items()))
     elapsed = round(time.monotonic() - started, 3)
 
     if crawl_error and not links and not forms and not ws_endpoints:
@@ -4881,6 +6252,8 @@ def run_stage0_crawl(
         "network_requests_captured": int(collector.network_requests_captured),
         "js_chunks_parsed": int(collector.js_chunks_parsed),
         "cdn_js_chunks_parsed": int(collector.cdn_js_chunks_parsed),
+        "source_maps_parsed": int(collector.source_maps_parsed),
+        "lazy_chunks_discovered": int(collector.lazy_chunks_discovered),
         "passive_probes_sent": int(collector.passive_probes_sent),
         "probed_paths": probed_paths_sorted,
         "discovered_auth_headers": list(auth_headers_list),
@@ -4907,6 +6280,7 @@ def run_stage0_crawl(
         "body_templates": body_templates_map,
         "multipart_schemas": multipart_schemas_map,
         "auth_headers": auth_headers_list,
+        "observed_app_headers": observed_app_headers,
         "discovered_api_hosts": discovered_api_hosts,
         "discovery_hints": discovery_hints,
         "seed_file": "",

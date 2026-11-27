@@ -95,7 +95,8 @@ def _make_oracle_env(
         (400, '{"error":"validation_error","detail":"missing required field email"}', False),
         (400, '{"error":"invalid_json"}', False),
         (400, "", False),
-        (422, '{"error":"already exists"}', False),
+        (422, '{"error":"already exists"}', True),
+        (422, '{"error":"validation_error","detail":"invalid field"}', False),
         (403, '{"error":"conflict"}', False),
         (500, '{"error":"duplicate"}', False),
         (201, '{"status":"created"}', False),
@@ -619,6 +620,8 @@ def test_case_b_one_shot_post_create_conflict_positive_and_negative(tmp_path: Pa
                             self._send_json(400, {"error": "validation_error", "detail": "invalid payload"})
                         elif mode == "422_dup":
                             self._send_json(422, {"error": "already exists"})
+                        elif mode == "422_generic":
+                            self._send_json(422, {"error": "validation_error", "detail": "invalid field"})
                         elif mode == "500":
                             self._send_json(500, {"error": "internal_server_error"})
                         return
@@ -739,8 +742,27 @@ def test_case_b_one_shot_post_create_conflict_positive_and_negative(tmp_path: Pa
         assert v_204.verified is False
         assert v_204.verdict == "REFUTED"
 
-        # BN4: Replay status 422 or 500 (not 409 or 400 conflict) -> REFUTED!
-        for mode, exp_stage in (("422_dup", "failed_status_422"), ("500", "failed_status_500")):
+        # B4: POST 201 -> replay 422 with explicit conflict wording -> VERIFIED!
+        p_422_dup = client.request(
+            method="POST",
+            url="/api/projects",
+            actor="bob",
+            json_body={"slug": "proj-422_dup", "mode": "422_dup"},
+        )
+        assert p_422_dup["status"] == 201
+        v_422_dup = oracle.verify(
+            canonical_class="bfla",
+            primary_proof=p_422_dup,
+            proof_receipts=[p_422_dup],
+            control_receipts=[ctrl_403],
+            evidence_value="proj-422_dup",
+            actor_meta_map=actor_meta,
+        )
+        assert v_422_dup.verified is True
+        assert v_422_dup.stages["stage3_clean_replay"] == "passed_one_shot_create_conflict"
+
+        # BN4: Replay status generic 422 (no conflict indicator) or 500 -> REFUTED!
+        for mode, exp_stage in (("422_generic", "failed_status_422"), ("500", "failed_status_500")):
             p_other = client.request(
                 method="POST",
                 url="/api/projects",

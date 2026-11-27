@@ -10,6 +10,8 @@ from email.utils import parsedate_to_datetime
 import gzip
 import hashlib
 import html
+import io
+import ipaddress
 import json
 import math
 from pathlib import Path
@@ -23,6 +25,24 @@ from typing import Any, Callable, Sequence
 from urllib.parse import parse_qsl, quote, quote_plus, unquote, urlencode, urljoin, urlsplit, urlunsplit
 import uuid
 import zlib
+
+try:
+    from compression import zstd as _stdlib_zstd  # type: ignore[import-not-found]
+except ImportError:
+    _stdlib_zstd = None  # type: ignore[assignment]
+
+try:
+    import zstandard as _zstandard  # type: ignore[import-not-found]
+except ImportError:
+    _zstandard = None  # type: ignore[assignment]
+
+try:
+    import brotli as _brotli  # type: ignore[import-not-found]
+except ImportError:
+    try:
+        import brotlicffi as _brotli  # type: ignore[import-not-found,no-redef]
+    except ImportError:
+        _brotli = None  # type: ignore[assignment]
 
 import requests
 from urllib3 import exceptions as urllib3_exceptions
@@ -47,7 +67,9 @@ STATIC_EXTENSIONS = frozenset({
     ".woff", ".woff2", ".ttf", ".eot", ".map", ".webp",
 })
 _MUTATING_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
+_DEFAULT_REFRESH_PATH = "/api/v1/access/refresh"
 _AUTH_OVERRIDE_HEADERS = frozenset({"authorization", "cookie"})
+_LOOPBACK_COOKIE_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
 _CSRF_HEADER_NAMES = frozenset({"x-csrf-token", "x-csrftoken", "x-xsrf-token"})
 _CUSTOM_TOKEN_RESPONSE_HEADERS: tuple[str, ...] = (
     "x-access-token",
@@ -151,6 +173,27 @@ def _merge_headers_ci(base: dict[str, str], overlay: dict[str, str]) -> dict[str
             merged.pop(existing, None)
         merged[hk] = hv
     return merged
+
+
+def _header_get(headers: dict[str, str] | None, name: str, default: str = "") -> str:
+    """Case-insensitive lookup on a plain HTTP header dictionary."""
+    if not headers:
+        return default
+    target = name.strip().lower()
+    for k, v in headers.items():
+        if str(k).strip().lower() == target:
+            return str(v)
+    return default
+
+
+def _supported_accept_encodings() -> tuple[str, ...]:
+    """Return only encodings that ``_decode_raw_response`` can actually decode."""
+    encodings = ["gzip", "deflate"]
+    if _brotli is not None:
+        encodings.append("br")
+    if _stdlib_zstd is not None or _zstandard is not None:
+        encodings.append("zstd")
+    return tuple(encodings)
 _SESSION_ENVELOPE_SUBKEYS: tuple[str, ...] = (
     "data",
     "result",
@@ -258,17 +301,74 @@ class ServiceDegradationError(RuntimeError):
     """Raised when consecutive 429/502/503/504 or connection-error (status=0) responses indicate target degradation."""
 
 
+def _canonicalize_host(host: str) -> str:
+    clean = str(host or "").strip().lower().rstrip(".")
+    if clean.startswith("[") and clean.endswith("]") and ":" in clean:
+        clean = clean[1:-1]
+    if ":" in clean and "%" not in clean:
+        try:
+            return ipaddress.ip_address(clean).compressed
+        except ValueError:
+            return clean
+    return clean
+
+
+def _is_ip_literal(host: str) -> bool:
+    try:
+        ipaddress.ip_address(_canonicalize_host(host))
+        return True
+    except ValueError:
+        return False
+
+
+def _is_trustworthy_http_host(host: str) -> bool:
+    clean = _canonicalize_host(host)
+    return clean in _LOOPBACK_COOKIE_HOSTS or clean.endswith(".localhost")
+
+
+def _origin_tuple_from_url(raw_url: str) -> tuple[str, str, int]:
+    parsed = urlsplit(str(raw_url or ""))
+    scheme = parsed.scheme.lower()
+    host = _canonicalize_host(parsed.hostname or "")
+    default_port = 443 if scheme == "https" else 80
+    port = parsed.port if parsed.port is not None else default_port
+    return scheme, host, port
+
+
 def normalize_origin(raw_url: str) -> str:
     """Validate and normalize an explicit http(s) origin URL."""
     raw = str(raw_url or "").strip()
     if not raw:
         raise ValueError("target URL is required")
-    parsed = urlsplit(raw)
-    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+    try:
+        parsed = urlsplit(raw)
+        explicit_port = parsed.port
+    except ValueError as exc:
+        raise ValueError(f"invalid origin URL: {raw_url!r}") from exc
+    scheme = parsed.scheme.lower()
+    if scheme not in {"http", "https"} or not parsed.netloc:
         raise ValueError(f"invalid origin URL: {raw_url!r}")
-    if parsed.username or parsed.password:
+    if parsed.username is not None or parsed.password is not None or "@" in parsed.netloc:
         raise ValueError("target URL must not embed credentials")
-    return f"{parsed.scheme}://{parsed.netloc}/"
+    raw_host = (parsed.hostname or "").strip().lower().rstrip(".")
+    if not raw_host:
+        raise ValueError(f"invalid origin URL: {raw_url!r}")
+    if ":" in raw_host:
+        if "%" in raw_host:
+            raise ValueError(f"invalid origin URL: {raw_url!r}")
+        try:
+            host = ipaddress.ip_address(raw_host).compressed
+        except ValueError as exc:
+            raise ValueError(f"invalid origin URL: {raw_url!r}") from exc
+    else:
+        host = raw_host
+    if explicit_port is not None and explicit_port <= 0:
+        raise ValueError(f"invalid port in origin URL: {raw_url!r}")
+    default_port = 443 if scheme == "https" else 80
+    host_netloc = f"[{host}]" if ":" in host else host
+    if explicit_port is None or explicit_port == default_port:
+        return f"{scheme}://{host_netloc}/"
+    return f"{scheme}://{host_netloc}:{explicit_port}/"
 
 
 def is_static_asset_url(url: str) -> bool:
@@ -312,25 +412,142 @@ def _validate_auth_header_name(raw: Any, *, strict: bool = False) -> str:
     return clean
 
 
+_SET_COOKIE_START_RE = re.compile(r"^\s*[!#$%&'*+\-.^_`|~0-9A-Za-z]+\s*=")
+_EXPIRES_WEEKDAY_END_RE = re.compile(r"(?:^|;)\s*expires\s*=\s*[A-Za-z]{3,9}\s*$", re.IGNORECASE)
+_COOKIE_ATTR_NAMES = frozenset({"path", "expires", "max-age", "domain", "samesite", "secure", "httponly"})
+
+
+def _split_set_cookie_header(raw_header: str) -> list[str]:
+    """Split comma-joined Set-Cookie headers without splitting inside Expires HTTP-dates."""
+    if not raw_header or raw_header.startswith("<REDACTED"):
+        return []
+    entries: list[str] = []
+    for piece in raw_header.split(","):
+        if not entries:
+            entries.append(piece.strip())
+            continue
+        if _EXPIRES_WEEKDAY_END_RE.search(entries[-1]):
+            entries[-1] = f"{entries[-1]},{piece}"
+            continue
+        head = piece.split(";", 1)[0]
+        if _SET_COOKIE_START_RE.match(head):
+            entries.append(piece.strip())
+        else:
+            entries[-1] = f"{entries[-1]},{piece}"
+    return [e for e in entries if e]
+
+
+def _parse_set_cookie_details(
+    raw_headers: str | Sequence[str],
+    *,
+    request_url: str = "",
+    now: float | None = None,
+) -> tuple[dict[str, str], set[str], list[dict[str, Any]]]:
+    """Parse Set-Cookie header(s) into (active_cookies, deleted_names, cookie_records)."""
+    cookies: dict[str, str] = {}
+    deleted: set[str] = set()
+    records_by_key: dict[tuple[str, str, str], dict[str, Any]] = {}
+
+    if isinstance(raw_headers, str):
+        lines = _split_set_cookie_header(raw_headers)
+    else:
+        lines = []
+        for item in raw_headers:
+            if isinstance(item, str) and item.strip() and not item.startswith("<REDACTED"):
+                lines.append(item.strip())
+
+    req_host = ""
+    if request_url:
+        req_host = _canonicalize_host(urlsplit(request_url).hostname or "")
+    now_ts = time.time() if now is None else float(now)
+
+    for line in lines:
+        if not line or line.startswith("<REDACTED"):
+            continue
+        parts = [p.strip() for p in line.split(";")]
+        nv = parts[0]
+        if "=" not in nv:
+            continue
+        ck, cv = nv.split("=", 1)
+        ck_clean = ck.strip()
+        cv_clean = cv.strip()
+        if (
+            not ck_clean
+            or ck_clean.lower() in _COOKIE_ATTR_NAMES
+            or cv_clean.startswith("<REDACTED")
+        ):
+            continue
+
+        is_deleted = cv_clean == ""
+        domain_attr = ""
+        path_attr = "/"
+        secure_attr = False
+
+        for attr in parts[1:]:
+            if not attr:
+                continue
+            attr_name, _, attr_val = attr.partition("=")
+            an = attr_name.strip().lower()
+            av = attr_val.strip()
+            if an == "max-age":
+                try:
+                    if float(av) <= 0.0:
+                        is_deleted = True
+                except ValueError:
+                    pass
+            elif an == "expires" and av:
+                try:
+                    dt = parsedate_to_datetime(av)
+                except (TypeError, ValueError, OverflowError):
+                    dt = None
+                if dt is not None:
+                    if dt.tzinfo is None:
+                        dt = dt.replace(tzinfo=timezone.utc)
+                    if dt.timestamp() <= now_ts:
+                        is_deleted = True
+            elif an == "domain" and av:
+                domain_attr = _canonicalize_host(av.lstrip("."))
+            elif an == "path" and av.startswith("/"):
+                path_attr = av
+            elif an == "secure":
+                secure_attr = True
+
+        if is_deleted:
+            cookies.pop(ck_clean, None)
+            deleted.add(ck_clean)
+            for rk in [k for k in records_by_key if k[0] == ck_clean]:
+                records_by_key.pop(rk, None)
+            continue
+
+        deleted.discard(ck_clean)
+        cookies[ck_clean] = cv_clean
+        if domain_attr:
+            rec_domain = f".{domain_attr}" if not _is_ip_literal(domain_attr) else domain_attr
+            host_only = _is_ip_literal(domain_attr)
+            records_by_key[(ck_clean, rec_domain, path_attr)] = {
+                "name": ck_clean,
+                "value": cv_clean,
+                "domain": rec_domain,
+                "path": path_attr,
+                "secure": secure_attr,
+                "host_only": host_only,
+            }
+        elif req_host:
+            records_by_key[(ck_clean, req_host, path_attr)] = {
+                "name": ck_clean,
+                "value": cv_clean,
+                "domain": req_host,
+                "path": path_attr,
+                "secure": secure_attr,
+                "host_only": True,
+            }
+
+    return cookies, deleted, list(records_by_key.values())
+
+
 def _parse_set_cookie_header(raw_header: str) -> dict[str, str]:
     """Best-effort parser for comma-joined Set-Cookie response headers."""
-    cookies: dict[str, str] = {}
-    if not raw_header or raw_header.startswith("<REDACTED"):
-        return cookies
-    for part in raw_header.split(","):
-        nv = part.strip().split(";", 1)[0]
-        if "=" in nv:
-            ck, cv = nv.split("=", 1)
-            ck_clean = ck.strip()
-            cv_clean = cv.strip()
-            if (
-                ck_clean
-                and cv_clean
-                and not cv_clean.startswith("<REDACTED")
-                and ck_clean.lower()
-                not in {"path", "expires", "max-age", "domain", "samesite", "secure", "httponly"}
-            ):
-                cookies[ck_clean] = cv_clean
+    cookies, _, _ = _parse_set_cookie_details(raw_header)
     return cookies
 
 
@@ -420,7 +637,9 @@ class ActorSession:
     password: str = ""
     base_headers: dict[str, str] = field(default_factory=dict)
     cookies: dict[str, str] = field(default_factory=dict)
+    cookie_records: list[dict[str, Any]] = field(default_factory=list)
     local_storage: dict[str, str] = field(default_factory=dict)
+    local_storage_by_origin: dict[str, dict[str, str]] = field(default_factory=dict)
     access_token: str = ""
     auth_header_name: str = ""
     auth_header_prefix: str = ""
@@ -478,15 +697,104 @@ class ActorSession:
             for val in self.cookies.values():
                 if val and len(val) >= 4:
                     secrets.append(val)
+            for rec in self.cookie_records:
+                val = str(rec.get("value") or "")
+                if val and len(val) >= 4 and val not in secrets:
+                    secrets.append(val)
             for val in self.local_storage.values():
                 if val and len(val) >= 4:
                     secrets.append(val)
+            for origin_map in self.local_storage_by_origin.values():
+                for val in origin_map.values():
+                    if val and len(val) >= 4 and val not in secrets:
+                        secrets.append(val)
             for val in self._registered_secrets:
                 if val and len(val) >= 4 and val not in secrets:
                     secrets.append(val)
             return secrets
 
-    def build_headers(self, method: str, extra_headers: dict[str, str] | None = None) -> dict[str, str]:
+    @staticmethod
+    def _cookie_record_matches(
+        rec: dict[str, Any],
+        *,
+        req_scheme: str,
+        req_host: str,
+        req_path: str,
+    ) -> bool:
+        c_name = str(rec.get("name") or "").strip()
+        c_val = str(rec.get("value") or "")
+        if not c_name or not c_val:
+            return False
+        if bool(rec.get("secure", False)) and req_scheme != "https" and not _is_trustworthy_http_host(req_host):
+            return False
+        raw_dom = str(rec.get("domain") or "").strip().lower()
+        if not raw_dom:
+            return False
+        c_host_only = bool(rec.get("host_only", not raw_dom.startswith(".")))
+        c_domain = _canonicalize_host(raw_dom.lstrip("."))
+        if not c_domain or not req_host:
+            return False
+        if c_host_only:
+            if req_host != c_domain:
+                return False
+        else:
+            if req_host != c_domain:
+                if _is_ip_literal(req_host) or _is_ip_literal(c_domain):
+                    return False
+                if not req_host.endswith("." + c_domain):
+                    return False
+        c_path = str(rec.get("path") or "/").strip() or "/"
+        if c_path == req_path:
+            return True
+        if req_path.startswith(c_path):
+            return c_path.endswith("/") or req_path[len(c_path)] == "/"
+        return False
+
+    def _select_cookies_for_target(self, target_url: str) -> dict[str, str]:
+        if not target_url or not self.cookie_records:
+            return dict(self.cookies)
+        parsed = urlsplit(target_url)
+        req_scheme = parsed.scheme.lower()
+        req_host = _canonicalize_host(parsed.hostname or "")
+        req_path = parsed.path or "/"
+        if not req_host:
+            return dict(self.cookies)
+
+        recorded_names: set[str] = set()
+        matched_by_name: dict[str, tuple[tuple[int, int, int], str]] = {}
+        for rec in self.cookie_records:
+            c_name = str(rec.get("name") or "").strip()
+            if not c_name:
+                continue
+            recorded_names.add(c_name)
+            if not self._cookie_record_matches(
+                rec,
+                req_scheme=req_scheme,
+                req_host=req_host,
+                req_path=req_path,
+            ):
+                continue
+            c_path = str(rec.get("path") or "/").strip() or "/"
+            c_dom = _canonicalize_host(str(rec.get("domain") or "").lstrip("."))
+            c_host_only = bool(rec.get("host_only", not str(rec.get("domain") or "").startswith(".")))
+            spec = (len(c_path), 1 if c_host_only else 0, len(c_dom))
+            prev = matched_by_name.get(c_name)
+            if prev is None or spec >= prev[0]:
+                matched_by_name[c_name] = (spec, str(rec.get("value") or ""))
+
+        selected: dict[str, str] = {name: item[1] for name, item in matched_by_name.items()}
+        for k, v in self.cookies.items():
+            if k not in recorded_names and k not in selected:
+                selected[k] = v
+        return selected
+
+    def build_headers(
+        self,
+        method: str,
+        extra_headers: dict[str, str] | None = None,
+        *,
+        target_url: str = "",
+    ) -> dict[str, str]:
         with self._lock:
             extra_items = list((extra_headers or {}).items())
             extra_low = {str(k).strip().lower(): ("" if v is None else str(v)) for k, v in extra_items}
@@ -528,9 +836,10 @@ class ActorSession:
                     if not (override_cookie and "authorization" not in extra_low):
                         if not any(k.lower() == "authorization" for k in headers):
                             headers["Authorization"] = f"Bearer {self.access_token}"
-            if self.cookies and not (override_auth and "cookie" not in extra_low):
+            eff_cookies = self._select_cookies_for_target(target_url)
+            if eff_cookies and not (override_auth and "cookie" not in extra_low):
                 if not any(k.lower() == "cookie" for k in headers):
-                    headers["Cookie"] = "; ".join(f"{k}={v}" for k, v in sorted(self.cookies.items()))
+                    headers["Cookie"] = "; ".join(f"{k}={v}" for k, v in sorted(eff_cookies.items()))
             if method.upper() in _MUTATING_METHODS and self.csrf_token:
                 has_caller_csrf = any(k in _CSRF_HEADER_NAMES for k in extra_low)
                 has_existing_csrf = any(k.lower() in _CSRF_HEADER_NAMES for k in headers)
@@ -796,7 +1105,9 @@ class ActorManager:
                     account_headers["Authorization"] = raw["auth_header"].strip()
             auth_header_name = _validate_auth_header_name(raw.get("auth_header_name"), strict=False)
             auth_header_prefix = str(raw.get("auth_header_prefix") or "")
-            access_token = str(raw.get("session_token") or raw.get("access_token") or "").strip()
+            access_token = str(
+                raw.get("session_token") or raw.get("access_token") or raw.get("bearer_token") or ""
+            ).strip()
             if not access_token:
                 auth_val = next(
                     (v for k, v in account_headers.items() if k.lower() == "authorization"),
@@ -810,12 +1121,45 @@ class ActorManager:
             if isinstance(raw.get("cookie"), str) and raw["cookie"].strip():
                 if not any(k.lower() == "cookie" for k in account_headers):
                     account_headers["Cookie"] = raw["cookie"].strip()
+            cookie_records: list[dict[str, Any]] = []
+            if isinstance(raw.get("cookie_records"), list):
+                for rec in raw["cookie_records"]:
+                    if not isinstance(rec, dict):
+                        continue
+                    c_name = str(rec.get("name") or "").strip()
+                    c_val = str(rec.get("value") or "")
+                    c_dom = str(rec.get("domain") or "").strip().lower()
+                    if not c_name or not c_val or not c_dom:
+                        continue
+                    c_path = str(rec.get("path") or "/").strip() or "/"
+                    c_secure = bool(rec.get("secure", False))
+                    c_host_only = bool(rec.get("host_only", not c_dom.startswith(".")))
+                    cookie_records.append({
+                        "name": c_name,
+                        "value": c_val,
+                        "domain": c_dom,
+                        "path": c_path,
+                        "secure": c_secure,
+                        "host_only": c_host_only,
+                    })
+                    cookies.setdefault(c_name, c_val)
             base_headers = _merge_headers_ci(clean_global_headers, account_headers)
             local_storage: dict[str, str] = {}
             if isinstance(raw.get("local_storage"), dict):
                 for lk, lv in raw["local_storage"].items():
                     if isinstance(lk, str) and isinstance(lv, str) and lk.strip():
                         local_storage[lk.strip()] = lv
+            local_storage_by_origin: dict[str, dict[str, str]] = {}
+            if isinstance(raw.get("local_storage_by_origin"), dict):
+                for orig_k, orig_map in raw["local_storage_by_origin"].items():
+                    if not isinstance(orig_k, str) or not orig_k.strip() or not isinstance(orig_map, dict):
+                        continue
+                    cleaned_orig: dict[str, str] = {}
+                    for lk, lv in orig_map.items():
+                        if isinstance(lk, str) and isinstance(lv, str) and lk.strip():
+                            cleaned_orig[lk.strip()] = lv
+                    if cleaned_orig:
+                        local_storage_by_origin[orig_k.strip()] = cleaned_orig
             login_graphql_query = str(raw.get("login_graphql_query") or "").strip()
             password = str(raw.get("password") or "")
             login_payload: dict[str, str] = {}
@@ -826,7 +1170,14 @@ class ActorManager:
                     if isinstance(val, str) and val.strip():
                         login_payload[key] = val.strip()
                         break
-            has_preauth = bool(account_headers or access_token or cookies or local_storage)
+            has_preauth = bool(
+                account_headers
+                or access_token
+                or cookies
+                or cookie_records
+                or local_storage
+                or local_storage_by_origin
+            )
             self.actors[alias] = ActorSession(
                 alias=alias,
                 role=str(raw.get("role") or "member").strip() or "member",
@@ -836,7 +1187,9 @@ class ActorManager:
                 password=password,
                 base_headers=base_headers,
                 cookies=cookies,
+                cookie_records=cookie_records,
                 local_storage=local_storage,
+                local_storage_by_origin=local_storage_by_origin,
                 access_token=access_token,
                 auth_header_name=auth_header_name,
                 auth_header_prefix=auth_header_prefix,
@@ -895,11 +1248,32 @@ class ActorManager:
             self._global_headers = _merge_headers_ci(self._global_headers, incoming)
             merged_global = dict(self._global_headers)
             sessions = list(self.actors.values())
+            disc_hdr = self._discovered_auth_header.strip().lower()
+        base_auth_names = (
+            {"authorization", "cookie", "proxy-authorization", "x-api-key"}
+            | _ANON_OBSERVED_AUTH_HEADERS
+            | _CSRF_HEADER_NAMES
+        )
+        if disc_hdr:
+            base_auth_names.add(disc_hdr)
         for session in sessions:
             with session._lock:
-                # Preserve existing actor-specific headers over newly attached defaults only when
-                # they are auth headers; operator custom headers apply to every actor.
-                session.base_headers = _merge_headers_ci(session.base_headers, incoming)
+                # Preserve existing actor-specific auth headers over newly attached global defaults.
+                session_auth_names = set(base_auth_names)
+                if session.auth_header_name.strip():
+                    session_auth_names.add(session.auth_header_name.strip().lower())
+                existing_auth_low = {
+                    k.strip().lower()
+                    for k, v in session.base_headers.items()
+                    if str(v or "").strip() and k.strip().lower() in session_auth_names
+                }
+                filtered_incoming = {
+                    hk: hv
+                    for hk, hv in incoming.items()
+                    if hk.strip().lower() not in existing_auth_low
+                }
+                if filtered_incoming:
+                    session.base_headers = _merge_headers_ci(session.base_headers, filtered_incoming)
         return merged_global
 
     def get(self, alias: str) -> ActorSession:
@@ -1118,36 +1492,121 @@ class ActorManager:
         cap_csrf_field: str,
         cap_auth_header: str,
         cap_token_source: str,
-    ) -> None:
-        """Apply extracted session tokens/cookies onto an actor session and retain secrets for redaction."""
+        deleted_cookies: set[str] | None = None,
+        cap_cookie_records: Sequence[dict[str, Any]] | None = None,
+    ) -> bool:
+        """Apply extracted session tokens/cookies onto an actor session; return True if state changed."""
         if alias == "anon":
-            return
+            return False
         with self._lock:
             session = self.actors.get(alias)
             disc_hdr = self._discovered_auth_header
             disc_pfx = self._discovered_auth_prefix
         if session is None:
-            return
+            return False
         rotated_secrets: list[str] = []
+        mutated = False
+        del_names = {str(d).strip() for d in (deleted_cookies or ()) if str(d).strip()}
         with session._lock:
+            if del_names:
+                for cookie_hdr_key in [k for k in session.base_headers if k.lower() == "cookie"]:
+                    raw_cookie_hdr = str(session.base_headers.get(cookie_hdr_key) or "")
+                    kept_pairs: list[str] = []
+                    removed_any = False
+                    for part in raw_cookie_hdr.split(";"):
+                        if "=" in part:
+                            ck, cv = part.split("=", 1)
+                            ck_c = ck.strip()
+                            if ck_c in del_names:
+                                removed_any = True
+                                if cv.strip():
+                                    session.register_secret(cv.strip())
+                                continue
+                        if part.strip():
+                            kept_pairs.append(part.strip())
+                    if removed_any:
+                        mutated = True
+                        if kept_pairs:
+                            session.base_headers[cookie_hdr_key] = "; ".join(kept_pairs)
+                        else:
+                            session.base_headers.pop(cookie_hdr_key, None)
+                for del_name in del_names:
+                    prev_val = session.cookies.pop(del_name, None)
+                    if prev_val:
+                        session.register_secret(prev_val)
+                        mutated = True
+                    remaining_recs: list[dict[str, Any]] = []
+                    for rec in session.cookie_records:
+                        if str(rec.get("name") or "").strip() == del_name:
+                            rv = str(rec.get("value") or "")
+                            if rv:
+                                session.register_secret(rv)
+                            mutated = True
+                        else:
+                            remaining_recs.append(rec)
+                    session.cookie_records = remaining_recs
+
             if cap_cookies:
                 for cookie_hdr_key in [k for k in session.base_headers if k.lower() == "cookie"]:
                     raw_cookie_hdr = str(session.base_headers.pop(cookie_hdr_key, "") or "")
                     if raw_cookie_hdr:
                         session.register_secret(raw_cookie_hdr)
+                        mutated = True
                     for part in raw_cookie_hdr.split(";"):
                         if "=" in part:
                             ck, cv = part.split("=", 1)
-                            if ck.strip() and cv.strip():
+                            if ck.strip() and cv.strip() and ck.strip() not in del_names:
                                 session.cookies.setdefault(ck.strip(), cv.strip())
                                 session.register_secret(cv.strip())
                 for k, v in cap_cookies.items():
                     prev_cookie = session.cookies.get(k, "")
+                    if prev_cookie != v:
+                        mutated = True
                     if prev_cookie and prev_cookie != v:
                         session.register_secret(prev_cookie)
                     session.cookies[k] = v
                     rotated_secrets.append(v)
+
+            if cap_cookie_records:
+                for new_rec in cap_cookie_records:
+                    r_name = str(new_rec.get("name") or "").strip()
+                    r_val = str(new_rec.get("value") or "")
+                    r_dom = str(new_rec.get("domain") or "").strip().lower()
+                    r_path = str(new_rec.get("path") or "/").strip() or "/"
+                    if not r_name or not r_val or not r_dom:
+                        continue
+                    replaced = False
+                    for idx, existing_rec in enumerate(session.cookie_records):
+                        if (
+                            str(existing_rec.get("name") or "").strip() == r_name
+                            and str(existing_rec.get("domain") or "").strip().lower() == r_dom
+                            and (str(existing_rec.get("path") or "/").strip() or "/") == r_path
+                        ):
+                            if existing_rec != new_rec:
+                                mutated = True
+                            old_v = str(existing_rec.get("value") or "")
+                            if old_v and old_v != r_val:
+                                session.register_secret(old_v)
+                            session.cookie_records[idx] = dict(new_rec)
+                            replaced = True
+                            break
+                    if not replaced:
+                        session.cookie_records.append(dict(new_rec))
+                        mutated = True
+                    rotated_secrets.append(r_val)
+            elif cap_cookies and session.cookie_records:
+                for existing_rec in session.cookie_records:
+                    r_name = str(existing_rec.get("name") or "").strip()
+                    if r_name in cap_cookies and existing_rec.get("value") != cap_cookies[r_name]:
+                        old_v = str(existing_rec.get("value") or "")
+                        if old_v:
+                            session.register_secret(old_v)
+                        existing_rec["value"] = cap_cookies[r_name]
+                        mutated = True
+
             if cap_csrf:
+                if session.csrf_token != cap_csrf:
+                    mutated = True
                 if session.csrf_token and session.csrf_token != cap_csrf:
                     session.register_secret(session.csrf_token)
                     session.register_secret(quote_plus(session.csrf_token))
@@ -1157,10 +1616,16 @@ class ActorManager:
                 rotated_secrets.append(quote_plus(cap_csrf))
                 rotated_secrets.append(quote(cap_csrf, safe=""))
             if cap_csrf_header:
+                if session.csrf_header_name != cap_csrf_header:
+                    mutated = True
                 session.csrf_header_name = cap_csrf_header
             if cap_csrf_field:
+                if session.csrf_field_name != cap_csrf_field:
+                    mutated = True
                 session.csrf_field_name = cap_csrf_field
             if cap_bearer:
+                if session.access_token != cap_bearer:
+                    mutated = True
                 if session.access_token and session.access_token != cap_bearer:
                     session.register_secret(session.access_token)
                     if session.auth_header_prefix:
@@ -1196,14 +1661,20 @@ class ActorManager:
                         extracted_prev = _extract_token_from_auth(popped_auth)
                         if extracted_prev:
                             session.register_secret(extracted_prev)
+                        mutated = True
+                if not session.authenticated:
+                    mutated = True
                 session.authenticated = True
             if cap_refresh:
+                if session.refresh_token != cap_refresh:
+                    mutated = True
                 if session.refresh_token and session.refresh_token != cap_refresh:
                     session.register_secret(session.refresh_token)
                 session.refresh_token = cap_refresh
                 rotated_secrets.append(cap_refresh)
         if rotated_secrets:
             self.register_secrets(rotated_secrets, alias=alias)
+        return mutated
 
     def update_from_response(
         self,
@@ -1212,10 +1683,23 @@ class ActorManager:
         headers: dict[str, str],
         cookies: dict[str, str],
         body_text: str,
-    ) -> None:
-        """Capture rotated CSRF tokens, refreshed tokens, and session cookies."""
+        request_url: str = "",
+        deleted_cookies: set[str] | None = None,
+        cookie_records: Sequence[dict[str, Any]] | None = None,
+    ) -> bool:
+        """Capture rotated CSRF tokens, refreshed tokens, and session cookies/deletions."""
         if alias == "anon":
-            return
+            return False
+        raw_sc = _header_get(headers, "Set-Cookie")
+        sc_cookies, sc_deleted, sc_records = _parse_set_cookie_details(raw_sc, request_url=request_url)
+        eff_deleted = set(deleted_cookies or ()) | sc_deleted
+        eff_cookies = {str(k): str(v) for k, v in (cookies or {}).items() if k and v is not None}
+        for dk in eff_deleted:
+            eff_cookies.pop(dk, None)
+        for ck, cv in sc_cookies.items():
+            eff_cookies[ck] = cv
+            eff_deleted.discard(ck)
+        eff_records = list(cookie_records) if cookie_records is not None else sc_records
         (
             cap_cookies,
             cap_bearer,
@@ -1227,10 +1711,10 @@ class ActorManager:
             cap_token_source,
         ) = _extract_session_material_full(
             headers=headers,
-            cookies=cookies,
+            cookies=eff_cookies,
             body_text=body_text,
         )
-        self._apply_session_material(
+        return self._apply_session_material(
             alias,
             cap_cookies=cap_cookies,
             cap_bearer=cap_bearer,
@@ -1240,6 +1724,8 @@ class ActorManager:
             cap_csrf_field=cap_csrf_field,
             cap_auth_header=cap_auth_header,
             cap_token_source=cap_token_source,
+            deleted_cookies=eff_deleted,
+            cap_cookie_records=eff_records,
         )
 
     def get_browser_auth_state(self, actor_alias: str) -> dict[str, Any]:
@@ -1400,23 +1886,56 @@ def _read_sse_bounded(
     return bytes(buf)
 
 
-def _decode_raw_response(raw_bytes: bytes, content_encoding: str) -> bytes:
-    """Best-effort decompression that survives mismatched gzip headers."""
-    enc = (content_encoding or "").strip().lower()
-    if enc == "gzip":
+def _decode_single_encoding(data: bytes, enc: str) -> bytes:
+    """Decode one HTTP Content-Encoding token best-effort, returning ``data`` unchanged on mismatch."""
+    if not enc or enc == "identity":
+        return data
+    if enc in {"gzip", "x-gzip"}:
         try:
-            return gzip.decompress(raw_bytes)
+            return gzip.decompress(data)
         except (OSError, EOFError, zlib.error):
-            return raw_bytes
+            return data
     if enc == "deflate":
         try:
-            return zlib.decompress(raw_bytes)
+            return zlib.decompress(data)
         except zlib.error:
             try:
-                return zlib.decompress(raw_bytes, -zlib.MAX_WBITS)
+                return zlib.decompress(data, -zlib.MAX_WBITS)
             except zlib.error:
-                return raw_bytes
-    return raw_bytes
+                return data
+    if enc == "zstd":
+        if _stdlib_zstd is not None:
+            try:
+                return _stdlib_zstd.decompress(data)
+            except (OSError, ValueError, _stdlib_zstd.ZstdError):
+                return data
+        if _zstandard is not None:
+            try:
+                dctx = _zstandard.ZstdDecompressor()
+                with dctx.stream_reader(io.BytesIO(data)) as reader:
+                    return reader.read()
+            except Exception:
+                return data
+        return data
+    if enc == "br":
+        if _brotli is not None:
+            try:
+                return _brotli.decompress(data)
+            except Exception:
+                return data
+        return data
+    return data
+
+
+def _decode_raw_response(raw_bytes: bytes, content_encoding: str) -> bytes:
+    """Best-effort decompression supporting chained encodings (e.g. ``gzip, deflate``, ``zstd``, ``br``)."""
+    encodings = [part.strip().lower() for part in (content_encoding or "").split(",") if part.strip()]
+    if not encodings:
+        return raw_bytes
+    current = raw_bytes
+    for enc in reversed(encodings):
+        current = _decode_single_encoding(current, enc)
+    return current
 
 
 def _sanitize_multipart_header_value(raw: str, *, label: str) -> str:
@@ -1634,7 +2153,10 @@ class AgenticHTTPClient:
         self._lock = threading.Lock()
         self._auth_lock = threading.RLock()
         self._in_session_refresh: bool = False
+        self._refreshing_actors: set[str] = set()
         self._refresh_already_attempted: bool = False
+        self._dns_guard_enabled: bool = not bool(self.scope_guard.loopback_only)
+        self._last_burst_degradation_at: float | None = None
 
     def _acquire_rate_limit_slot(self, *, skip_adaptive: bool = False) -> None:
         """Pace live wire calls monotonically using max_rps and adaptive 429 delay."""
@@ -1691,10 +2213,19 @@ class AgenticHTTPClient:
             sess = requests.Session()
             sess.trust_env = False
             sess.headers["User-Agent"] = DEFAULT_BROWSER_USER_AGENT
+            sess.headers["Accept-Encoding"] = ", ".join(_supported_accept_encodings())
             self._thread_local.session = sess
             with self._sessions_lock:
                 self._sessions.append(sess)
         return sess
+
+    def _invalidate_actor_cache(self, actor: str) -> None:
+        target = str(actor or "").strip()
+        if not target:
+            return
+        with self._lock:
+            for key in [k for k in self._cache if k and k[0] == target]:
+                self._cache.pop(key, None)
 
     def close(self) -> None:
         with self._sessions_lock:
@@ -1767,7 +2298,11 @@ class AgenticHTTPClient:
             return clean_ws_url, ws_path, parsed_ws.query
 
         resolved = urljoin(self.base_url, raw)
-        parsed = urlsplit(resolved)
+        try:
+            parsed = urlsplit(resolved)
+            explicit_port = parsed.port
+        except ValueError as exc:
+            raise ScopeViolationError(str(exc)) from exc
         raw_clean_url = urlunsplit((parsed.scheme, parsed.netloc, parsed.path or "/", parsed.query, ""))
         try:
             self.scope_guard.check_url(
@@ -1776,10 +2311,15 @@ class AgenticHTTPClient:
             )
         except ValueError as exc:
             raise ScopeViolationError(str(exc)) from exc
-        host_norm = (parsed.hostname or "").strip().lower().rstrip(".")
+        host_norm = _canonicalize_host(parsed.hostname or "")
         host_part = f"[{host_norm}]" if ":" in host_norm else host_norm
-        netloc_norm = f"{host_part}:{parsed.port}" if parsed.port is not None else host_part
-        clean_url = urlunsplit((parsed.scheme.lower(), netloc_norm, parsed.path or "/", parsed.query, ""))
+        scheme_norm = parsed.scheme.lower()
+        default_port = 443 if scheme_norm == "https" else 80
+        if explicit_port is not None and explicit_port != default_port:
+            netloc_norm = f"{host_part}:{explicit_port}"
+        else:
+            netloc_norm = host_part
+        clean_url = urlunsplit((scheme_norm, netloc_norm, parsed.path or "/", parsed.query, ""))
         return clean_url, parsed.path or "/", parsed.query
 
     def _merge_query(
@@ -1882,22 +2422,53 @@ class AgenticHTTPClient:
                 "actor='anon' or an explicit Authorization/Cookie headers override instead"
             )
 
-    def _record_degradation_status(self, *, status: int, url: str) -> None:
+    def _record_degradation_status(
+        self,
+        *,
+        status: int,
+        url: str,
+        is_burst: bool = False,
+    ) -> None:
         """Track consecutive degraded/unreachable responses (status=0 or 429/502/503/504) and stop gracefully."""
         if self.max_degradation_streak <= 0 or status < 0:
             return
         streak = 0
+        now_mono = time.monotonic()
         with self._lock:
             if status == 0 or status in _DEGRADATION_STATUS_CODES:
+                if is_burst:
+                    if (
+                        self._last_burst_degradation_at is not None
+                        and (now_mono - self._last_burst_degradation_at) < 0.5
+                    ):
+                        return
+                    self._last_burst_degradation_at = now_mono
                 self._degradation_streak += 1
                 streak = self._degradation_streak
             else:
                 self._degradation_streak = 0
+                if is_burst:
+                    self._last_burst_degradation_at = None
         if streak >= self.max_degradation_streak:
             raise ServiceDegradationError(
                 f"target service degradation detected after {streak} consecutive "
                 f"degraded/unreachable responses (status={status}, url={url})"
             )
+
+    def _enforce_live_dns_safety(self, url: str) -> None:
+        if not self._dns_guard_enabled:
+            return
+        try:
+            parsed_wire = urlsplit(url)
+            wire_host = _canonicalize_host(parsed_wire.hostname or "")
+            default_port = 443 if parsed_wire.scheme.lower() == "https" else 80
+            wire_port = parsed_wire.port if parsed_wire.port is not None else default_port
+            self.scope_guard.check_dns_safety(wire_host, wire_port)
+        except ValueError as exc:
+            raise ScopeViolationError(str(exc)) from exc
+        except socket.gaierror:
+            # Allow offline unit-test mocks and normal requests connection errors to proceed.
+            pass
 
     def _send_wire(
         self,
@@ -1916,12 +2487,16 @@ class AgenticHTTPClient:
         out_cookies: dict[str, str] | None = None,
         record_degradation: bool = True,
         skip_adaptive_pacing: bool = False,
+        skip_rate_limit: bool = False,
+        is_burst: bool = False,
     ) -> dict[str, Any]:
+        self._enforce_live_dns_safety(url)
         allowed, reason = self.budget.consume()
         if not allowed:
             raise BudgetExhaustedError(reason)
 
-        self._acquire_rate_limit_slot(skip_adaptive=skip_adaptive_pacing)
+        if not skip_rate_limit:
+            self._acquire_rate_limit_slot(skip_adaptive=skip_adaptive_pacing)
 
         wire_headers = dict(headers)
         if not any(k.lower() == "user-agent" for k in wire_headers):
@@ -1955,8 +2530,8 @@ class AgenticHTTPClient:
             try:
                 status = int(resp.status_code)
                 resp_headers = {str(k): str(v) for k, v in resp.headers.items()}
-                content_type = resp_headers.get("Content-Type", "").split(";", 1)[0].strip().lower()
-                redirect_location = resp_headers.get("Location", "")
+                content_type = _header_get(resp_headers, "Content-Type").split(";", 1)[0].strip().lower()
+                redirect_location = _header_get(resp_headers, "Location")
                 if content_type == "text/event-stream":
                     raw_stream = _read_sse_bounded(
                         resp,
@@ -1967,15 +2542,30 @@ class AgenticHTTPClient:
                     raw_stream = resp.raw.read(self.max_response_bytes + 1, decode_content=False)
                     if len(raw_stream) > self.max_response_bytes:
                         raw_stream = raw_stream[: self.max_response_bytes]
-                raw_bytes = _decode_raw_response(raw_stream, resp_headers.get("Content-Encoding", ""))
+                raw_bytes = _decode_raw_response(raw_stream, _header_get(resp_headers, "Content-Encoding"))
                 if is_grpc_web_content_type(content_type):
                     decoded_grpc = decode_grpc_web_frames(raw_bytes, content_type=content_type)
                     text = json.dumps(decoded_grpc, ensure_ascii=False)
                 else:
                     text = raw_bytes.decode("utf-8", errors="replace")
-                cookies = {c.name: c.value for c in resp.cookies}
-                if not cookies and "Set-Cookie" in resp_headers:
-                    cookies = _parse_set_cookie_header(resp_headers["Set-Cookie"])
+
+                raw_hdr_obj = getattr(getattr(resp, "raw", None), "headers", None)
+                getlist_fn = getattr(raw_hdr_obj, "getlist", None) or getattr(raw_hdr_obj, "get_all", None)
+                sc_source: str | list[str]
+                if callable(getlist_fn):
+                    sc_list = list(getlist_fn("Set-Cookie") or ())
+                    sc_source = sc_list if sc_list else _header_get(resp_headers, "Set-Cookie")
+                else:
+                    sc_source = _header_get(resp_headers, "Set-Cookie")
+                sc_cookies, sc_deleted, sc_records = _parse_set_cookie_details(sc_source, request_url=url)
+                cookies = {
+                    c.name: c.value
+                    for c in resp.cookies
+                    if c.name and c.value is not None and not str(c.value).startswith("<REDACTED")
+                }
+                for dk in sc_deleted:
+                    cookies.pop(dk, None)
+                cookies.update(sc_cookies)
                 if out_cookies is not None and cookies:
                     out_cookies.update(cookies)
                 http_session.cookies.clear()
@@ -2036,9 +2626,17 @@ class AgenticHTTPClient:
                         if dyn.auth_header_name:
                             saved_session_meta["auth_header"] = dyn.auth_header_name
                 elif not clean_save_alias:
-                    self.actors.update_from_response(
-                        actor, headers=resp_headers, cookies=cookies, body_text=text
+                    mutated = self.actors.update_from_response(
+                        actor,
+                        headers=resp_headers,
+                        cookies=cookies,
+                        body_text=text,
+                        request_url=url,
+                        deleted_cookies=sc_deleted,
+                        cookie_records=sc_records,
                     )
+                    if mutated:
+                        self._invalidate_actor_cache(actor)
                     if record_receipt:
                         self._maybe_register_openapi_auth_header(
                             status=status,
@@ -2048,7 +2646,7 @@ class AgenticHTTPClient:
             finally:
                 http_session.cookies.clear()
                 resp.close()
-        except (BudgetExhaustedError, ServiceDegradationError):
+        except (BudgetExhaustedError, ServiceDegradationError, ScopeViolationError):
             raise
         except Exception as exc:
             error = f"{type(exc).__name__}: {str(exc)[:200]}"
@@ -2059,7 +2657,7 @@ class AgenticHTTPClient:
         elapsed_ms = (time.monotonic() - started) * 1000.0
         if not record_receipt:
             if record_degradation:
-                self._record_degradation_status(status=int(status), url=str(url))
+                self._record_degradation_status(status=int(status), url=str(url), is_burst=is_burst)
             graphql_has_errors = False
             stripped_body = text.lstrip()
             if stripped_body.startswith("{"):
@@ -2111,7 +2709,7 @@ class AgenticHTTPClient:
             rec = dict(rec)
             rec["saved_session"] = saved_session_meta
         if record_degradation:
-            self._record_degradation_status(status=int(status), url=str(url))
+            self._record_degradation_status(status=int(status), url=str(url), is_burst=is_burst)
         return rec
 
     def _send_wire_with_rate_limit_retry(
@@ -2128,6 +2726,8 @@ class AgenticHTTPClient:
         save_session_as: str = "",
         auth_header_name: str = "",
         out_cookies: dict[str, str] | None = None,
+        skip_rate_limit: bool = False,
+        is_burst: bool = False,
     ) -> dict[str, Any]:
         """Send wire request with bounded 429/503 Retry-After backoff, adaptive pacing, and degradation accounting."""
         receipt: dict[str, Any] = {}
@@ -2146,6 +2746,8 @@ class AgenticHTTPClient:
                 out_cookies=out_cookies,
                 record_degradation=False,
                 skip_adaptive_pacing=(attempt > 0),
+                skip_rate_limit=skip_rate_limit,
+                is_burst=is_burst,
             )
             status = int(receipt["status"])
             retry_after_s = _parse_retry_after_seconds(
@@ -2177,7 +2779,7 @@ class AgenticHTTPClient:
             if out_cookies is not None:
                 out_cookies.clear()
 
-        self._record_degradation_status(status=int(receipt["status"]), url=str(url))
+        self._record_degradation_status(status=int(receipt["status"]), url=str(url), is_burst=is_burst)
         return receipt
 
     def _send_websocket_wire(
@@ -2192,6 +2794,7 @@ class AgenticHTTPClient:
         body_preview: str,
     ) -> dict[str, Any]:
         """Execute a scope-verified, budgeted, rate-limited RFC-6455 WebSocket probe."""
+        self._enforce_live_dns_safety(url)
         allowed, reason = self.budget.consume()
         if not allowed:
             raise BudgetExhaustedError(reason)
@@ -2279,7 +2882,11 @@ class AgenticHTTPClient:
                 try:
                     r_url, r_path, r_query = self.resolve_in_scope(eff_refresh_path, allow_websocket=False)
                     r_body = json.dumps({"refresh_token": refresh_tok}).encode("utf-8")
-                    r_headers = session.build_headers("POST", {"Content-Type": "application/json"})
+                    r_headers = session.build_headers(
+                        "POST",
+                        {"Content-Type": "application/json"},
+                        target_url=r_url,
+                    )
                     receipt = self._send_wire(
                         actor=alias,
                         method="POST",
@@ -2297,6 +2904,7 @@ class AgenticHTTPClient:
                             session.last_auth_path = r_path
                             session.last_auth_error = ""
                             session.authenticated = True
+                        self._invalidate_actor_cache(alias)
                         return True
                 except (BudgetExhaustedError, ServiceDegradationError):
                     raise
@@ -2340,7 +2948,7 @@ class AgenticHTTPClient:
                 url=login_url,
                 path=login_path,
                 query=login_query,
-                headers=session.build_headers("POST", {"Content-Type": active_content_type}),
+                headers=session.build_headers("POST", {"Content-Type": active_content_type}, target_url=login_url),
                 body_bytes=active_body_bytes,
                 body_preview=active_body_preview,
                 record_receipt=False,
@@ -2355,7 +2963,7 @@ class AgenticHTTPClient:
                     url=login_url,
                     path=login_path,
                     query=login_query,
-                    headers=session.build_headers("POST", {"Content-Type": active_content_type}),
+                    headers=session.build_headers("POST", {"Content-Type": active_content_type}, target_url=login_url),
                     body_bytes=active_body_bytes,
                     body_preview=active_body_preview,
                     record_receipt=False,
@@ -2382,7 +2990,7 @@ class AgenticHTTPClient:
                         url=h_url,
                         path=h_path,
                         query=h_query,
-                        headers=session.build_headers("GET"),
+                        headers=session.build_headers("GET", target_url=h_url),
                         body_bytes=None,
                         body_preview="",
                         record_receipt=False,
@@ -2391,7 +2999,11 @@ class AgenticHTTPClient:
                         harvested = True
                         break
                 if harvested:
-                    retry_headers = session.build_headers("POST", {"Content-Type": active_content_type})
+                    retry_headers = session.build_headers(
+                        "POST",
+                        {"Content-Type": active_content_type},
+                        target_url=login_url,
+                    )
                     with session._lock:
                         if (
                             session.csrf_token
@@ -2420,7 +3032,11 @@ class AgenticHTTPClient:
                         active_content_type = "application/x-www-form-urlencoded"
                         active_body_bytes = _build_form_login_bytes()
                         active_body_preview = "<REDACTED_FORM_LOGIN>"
-                        retry_form_headers = session.build_headers("POST", {"Content-Type": active_content_type})
+                        retry_form_headers = session.build_headers(
+                            "POST",
+                            {"Content-Type": active_content_type},
+                            target_url=login_url,
+                        )
                         with session._lock:
                             if (
                                 session.csrf_token
@@ -2457,6 +3073,8 @@ class AgenticHTTPClient:
                 with session._lock:
                     session.authenticated = True
                     session.last_auth_error = ""
+                if force_login:
+                    self._invalidate_actor_cache(alias)
                 return True
             return False
 
@@ -2611,9 +3229,9 @@ class AgenticHTTPClient:
             return False
         session = self.actors.get(alias)
         with self._lock:
-            if self._in_session_refresh:
+            if self._in_session_refresh or alias in self._refreshing_actors:
                 return False
-            self._in_session_refresh = True
+            self._refreshing_actors.add(alias)
         try:
             with self._auth_lock:
                 with session._lock:
@@ -2630,7 +3248,10 @@ class AgenticHTTPClient:
 
                 attempted_step1_refresh = False
                 eff_refresh_path = actor_refresh_path or self.actors.refresh_path
-                can_cookie_refresh = bool(actor_refresh_path) and has_cookies
+                has_explicit_refresh_path = bool(actor_refresh_path) or (
+                    bool(self.actors.refresh_path) and self.actors.refresh_path != _DEFAULT_REFRESH_PATH
+                )
+                can_cookie_refresh = has_explicit_refresh_path and has_cookies
                 if eff_refresh_path and (refresh_tok or can_cookie_refresh):
                     attempted_step1_refresh = True
                     try:
@@ -2644,7 +3265,11 @@ class AgenticHTTPClient:
                         else:
                             r_body = b"{}"
                             r_body_preview = "{}"
-                        r_headers = session.build_headers("POST", {"Content-Type": "application/json"})
+                        r_headers = session.build_headers(
+                            "POST",
+                            {"Content-Type": "application/json"},
+                            target_url=r_url,
+                        )
                         r_receipt = self._send_wire(
                             actor=alias,
                             method="POST",
@@ -2670,10 +3295,14 @@ class AgenticHTTPClient:
                                 if isinstance(raw_cookies, dict)
                                 else {}
                             )
-                            if not r_resp_cookies:
-                                for hk, hv in r_resp_hdrs.items():
-                                    if hk.strip().lower() == "set-cookie":
-                                        r_resp_cookies.update(_parse_set_cookie_header(hv))
+                            sc_cookies, sc_deleted, sc_records = _parse_set_cookie_details(
+                                _header_get(r_resp_hdrs, "Set-Cookie"),
+                                request_url=r_url,
+                            )
+                            for dk in sc_deleted:
+                                r_resp_cookies.pop(dk, None)
+                            for ck, cv in sc_cookies.items():
+                                r_resp_cookies[ck] = cv
                             r_resp_body = str(r_receipt.get("body") or "")
                             if r_resp_hdrs or r_resp_cookies or r_resp_body:
                                 (
@@ -2700,6 +3329,8 @@ class AgenticHTTPClient:
                                     cap_csrf_field=cap_csrf_field,
                                     cap_auth_header=cap_auth_header,
                                     cap_token_source=cap_token_source,
+                                    deleted_cookies=sc_deleted,
+                                    cap_cookie_records=sc_records,
                                 )
                             with session._lock:
                                 session.last_auth_status = r_status
@@ -2708,6 +3339,7 @@ class AgenticHTTPClient:
                                 session.authenticated = True
                                 rotated_secrets = session.collect_secrets()
                             self.actors.register_secrets(rotated_secrets, alias=alias)
+                            self._invalidate_actor_cache(alias)
                             return True
                     except (BudgetExhaustedError, ServiceDegradationError):
                         raise
@@ -2718,13 +3350,16 @@ class AgenticHTTPClient:
                     prev_skip = self._refresh_already_attempted
                     self._refresh_already_attempted = attempted_step1_refresh
                     try:
-                        return bool(self.authenticate_actor(alias, force_login=True))
+                        refreshed_via_login = bool(self.authenticate_actor(alias, force_login=True))
+                        if refreshed_via_login:
+                            self._invalidate_actor_cache(alias)
+                        return refreshed_via_login
                     finally:
                         self._refresh_already_attempted = prev_skip
                 return False
         finally:
             with self._lock:
-                self._in_session_refresh = False
+                self._refreshing_actors.discard(alias)
 
     def _auth_exempt_paths(self, actor_refresh_path: str = "") -> set[str]:
         """Return normalized paths (login / refresh) that must never trigger mid-run auto-refresh."""
@@ -2787,7 +3422,14 @@ class AgenticHTTPClient:
                 files,
                 form_fields=eff_form_fields,
             )
-            if not any(k.lower() == "content-type" for k in eff_headers):
+            existing_ct_keys = [k for k in eff_headers if k.lower() == "content-type"]
+            existing_ct_val = eff_headers.get(existing_ct_keys[-1], "") if existing_ct_keys else ""
+            existing_ct_low = existing_ct_val.strip().lower()
+            if not existing_ct_keys or (
+                existing_ct_low.startswith("multipart/") and "boundary=" not in existing_ct_low
+            ):
+                for ek in existing_ct_keys:
+                    eff_headers.pop(ek, None)
                 eff_headers["Content-Type"] = multipart_ct
         elif json_body is not None:
             body_preview = json.dumps(json_body, ensure_ascii=False)
@@ -2809,16 +3451,36 @@ class AgenticHTTPClient:
                 base_ct,
             )
             media_type = str(explicit_ct or "").split(";", 1)[0].strip().lower()
-            if should_inject_csrf and media_type == "application/x-www-form-urlencoded":
-                existing_keys = {k for k, _ in parse_qsl(body_preview, keep_blank_values=True)}
-                if csrf_field not in existing_keys:
-                    csrf_pair = urlencode([(csrf_field, csrf_tok)])
-                    if not body_preview:
-                        body_preview = csrf_pair
-                    elif body_preview.endswith("&"):
-                        body_preview = f"{body_preview}{csrf_pair}"
+            looks_like_form = (
+                media_type == "application/x-www-form-urlencoded"
+                or (
+                    not media_type
+                    and "=" in body_preview
+                    and not body_preview.lstrip().startswith(("{", "[", "<"))
+                )
+            )
+            if should_inject_csrf and looks_like_form:
+                parsed_pairs = parse_qsl(body_preview, keep_blank_values=True)
+                substituted = False
+                updated_pairs: list[tuple[str, str]] = []
+                for pk, pv in parsed_pairs:
+                    if pk == csrf_field and "<REDACTED" in pv:
+                        updated_pairs.append((pk, csrf_tok))
+                        substituted = True
                     else:
-                        body_preview = f"{body_preview}&{csrf_pair}"
+                        updated_pairs.append((pk, pv))
+                if substituted:
+                    body_preview = urlencode(updated_pairs)
+                elif media_type == "application/x-www-form-urlencoded":
+                    existing_keys = {k for k, _ in parsed_pairs}
+                    if csrf_field not in existing_keys:
+                        csrf_pair = urlencode([(csrf_field, csrf_tok)])
+                        if not body_preview:
+                            body_preview = csrf_pair
+                        elif body_preview.endswith("&"):
+                            body_preview = f"{body_preview}{csrf_pair}"
+                        else:
+                            body_preview = f"{body_preview}&{csrf_pair}"
             body_bytes = body_preview.encode("utf-8")
 
         return body_bytes, body_preview, eff_headers
@@ -2830,7 +3492,7 @@ class AgenticHTTPClient:
         with self._auth_lock:
             try:
                 c_url, c_path, c_query = self.resolve_in_scope(self.actors.session_check_path)
-                headers = session.build_headers("GET")
+                headers = session.build_headers("GET", target_url=c_url)
                 self._send_wire(
                     actor=alias,
                     method="GET",
@@ -2884,6 +3546,8 @@ class AgenticHTTPClient:
         auth_header_name: str = "",
         follow_redirects: bool = False,
         allow_lifecycle_routes: bool | None = None,
+        concurrent_burst: bool = False,
+        stop_on_out_of_scope_redirect: bool = False,
     ) -> dict[str, Any]:
         """Execute a scope-locked, metered, receipted HTTP or WebSocket request."""
         clean_auth_header_name = _validate_auth_header_name(auth_header_name, strict=True)
@@ -2942,7 +3606,7 @@ class AgenticHTTPClient:
             elif raw_body is not None:
                 ws_preview = str(raw_body)
                 ws_messages = [ws_preview]
-            ws_headers = session.build_headers("GET", extra_headers)
+            ws_headers = session.build_headers("GET", extra_headers, target_url=clean_url)
             ws_receipt = self._send_websocket_wire(
                 actor=actor,
                 url=clean_url,
@@ -2989,7 +3653,7 @@ class AgenticHTTPClient:
                     result["cached"] = True
                     return result
 
-        req_headers = session.build_headers(norm_method, eff_extra_headers)
+        req_headers = session.build_headers(norm_method, eff_extra_headers, target_url=clean_url)
         hop_cookies: dict[str, str] = {}
         receipt = self._send_wire_with_rate_limit_retry(
             actor=actor,
@@ -3003,6 +3667,8 @@ class AgenticHTTPClient:
             save_session_as=save_session_as,
             auth_header_name=clean_auth_header_name,
             out_cookies=hop_cookies if follow_redirects else None,
+            skip_rate_limit=bool(concurrent_burst),
+            is_burst=bool(concurrent_burst),
         )
 
         # Auto mid-run session refresh / re-login once on unexpected 401 when not overriding auth.
@@ -3029,7 +3695,7 @@ class AgenticHTTPClient:
                     form_body=form_body,
                     raw_body=raw_body,
                 )
-                req_headers = session.build_headers(norm_method, eff_extra_headers)
+                req_headers = session.build_headers(norm_method, eff_extra_headers, target_url=clean_url)
                 hop_cookies.clear()
                 receipt = self._send_wire_with_rate_limit_retry(
                     actor=actor,
@@ -3041,6 +3707,8 @@ class AgenticHTTPClient:
                     body_bytes=body_bytes,
                     body_preview=body_preview,
                     out_cookies=hop_cookies if follow_redirects else None,
+                    skip_rate_limit=bool(concurrent_burst),
+                    is_burst=bool(concurrent_burst),
                 )
 
         # Auto CSRF refresh once on mutating 403 mentioning CSRF when caller didn't override a CSRF header.
@@ -3064,7 +3732,7 @@ class AgenticHTTPClient:
                 form_body=form_body,
                 raw_body=raw_body,
             )
-            req_headers = session.build_headers(norm_method, eff_extra_headers)
+            req_headers = session.build_headers(norm_method, eff_extra_headers, target_url=clean_url)
             hop_cookies.clear()
             receipt = self._send_wire_with_rate_limit_retry(
                 actor=actor,
@@ -3076,6 +3744,8 @@ class AgenticHTTPClient:
                 body_bytes=body_bytes,
                 body_preview=body_preview,
                 out_cookies=hop_cookies if follow_redirects else None,
+                skip_rate_limit=bool(concurrent_burst),
+                is_burst=bool(concurrent_burst),
             )
 
         redirect_chain: list[dict[str, Any]] = []
@@ -3091,13 +3761,29 @@ class AgenticHTTPClient:
                 if status_code not in _REDIRECT_STATUS_CODES or not location:
                     break
                 if location.startswith("//"):
+                    if stop_on_out_of_scope_redirect:
+                        break
                     raise ScopeViolationError(f"scheme-relative redirect blocked: {location!r}")
                 joined_target = urljoin(cur_url, location)
-                next_url, next_path, next_query = self.resolve_in_scope(
-                    joined_target,
-                    allow_websocket=False,
-                    allow_lifecycle_routes=eff_allow_lifecycle,
-                )
+                try:
+                    next_url, next_path, next_query = self.resolve_in_scope(
+                        joined_target,
+                        allow_websocket=False,
+                        allow_lifecycle_routes=eff_allow_lifecycle,
+                    )
+                except ScopeViolationError as exc:
+                    msg_low = str(exc).lower()
+                    is_hard_block = (
+                        "destructive service-lifecycle" in msg_low
+                        or "excluded" in msg_low
+                        or "dns resolution blocked" in msg_low
+                        or "websocket" in msg_low
+                        or joined_target.lower().startswith(("ws://", "wss://"))
+                    )
+                    if stop_on_out_of_scope_redirect and not is_hard_block:
+                        # Opt-in graceful stop for external SSO/IdP redirects (0 off-scope wire traffic).
+                        break
+                    raise
                 self._check_actor_logout_guard(
                     path=next_path,
                     actor=actor,
@@ -3134,9 +3820,37 @@ class AgenticHTTPClient:
                         f"Redirect follow-up method {cur_method!r} not allowed; "
                         f"permitted: {sorted(self.allowed_methods)}"
                     )
+                cur_origin = _origin_tuple_from_url(cur_url)
+                next_origin = _origin_tuple_from_url(next_url)
+                origin_changed = next_origin != cur_origin
+                downgraded = cur_origin[0] == "https" and next_origin[0] == "http"
+                strip_auth_names: set[str] = set()
+                if origin_changed or downgraded:
+                    strip_auth_names = (
+                        set(_AUTH_OVERRIDE_HEADERS)
+                        | {"proxy-authorization", "x-api-key"}
+                        | _ANON_OBSERVED_AUTH_HEADERS
+                    )
+                    if actor_auth_hdr:
+                        strip_auth_names.add(actor_auth_hdr)
+                    disc_hdr, _ = self.actors.get_discovered_auth_header()
+                    if disc_hdr:
+                        strip_auth_names.add(disc_hdr.strip().lower())
+                    if clean_auth_header_name:
+                        strip_auth_names.add(clean_auth_header_name.strip().lower())
+                    cur_extra_headers = {
+                        k: v
+                        for k, v in cur_extra_headers.items()
+                        if k.strip().lower() not in strip_auth_names
+                    }
+                    hop_cookies.clear()
+
                 cur_url = next_url
-                hop_headers = session.build_headers(cur_method, cur_extra_headers)
-                if hop_cookies:
+                hop_headers = session.build_headers(cur_method, cur_extra_headers, target_url=next_url)
+                if downgraded and strip_auth_names:
+                    for ek in [k for k in hop_headers if k.strip().lower() in strip_auth_names]:
+                        hop_headers.pop(ek, None)
+                if hop_cookies and not downgraded:
                     hop_headers = self._merge_hop_cookies(hop_headers, hop_cookies)
                 new_hop_cookies: dict[str, str] = {}
                 receipt = self._send_wire_with_rate_limit_retry(
@@ -3151,6 +3865,8 @@ class AgenticHTTPClient:
                     save_session_as=save_session_as,
                     auth_header_name=clean_auth_header_name,
                     out_cookies=new_hop_cookies,
+                    skip_rate_limit=bool(concurrent_burst),
+                    is_burst=bool(concurrent_burst),
                 )
                 if new_hop_cookies:
                     hop_cookies.update(new_hop_cookies)

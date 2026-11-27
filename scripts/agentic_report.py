@@ -19,8 +19,10 @@ SCRIPTS = Path(__file__).resolve().parent
 if str(SCRIPTS) not in sys.path:
     sys.path.insert(0, str(SCRIPTS))
 
+from agentic_evidence import canonicalize_and_deduplicate_findings  # noqa: E402
 from agentic_receipts import (  # noqa: E402
     SENSITIVE_HEADER_NAMES,
+    ReceiptStore,
     redact_headers,
     redact_secrets,
 )
@@ -46,12 +48,77 @@ _EXTRA_SENSITIVE_HEADERS = frozenset({
     "apikey",
     "x-access-token",
     "x-api-secret",
+    "x-api-token",
+    "x-csrftoken",
     "x-refresh-token",
     "x-secret",
     "x-session-token",
     "x-token",
 })
 _ALL_SENSITIVE_HEADERS = SENSITIVE_HEADER_NAMES | _EXTRA_SENSITIVE_HEADERS
+_SECRET_HEADER_SUFFIX_TOKENS = frozenset({
+    "token",
+    "secret",
+    "apikey",
+    "password",
+    "passwd",
+    "credential",
+    "credentials",
+    "jwt",
+    "cookie",
+    "auth",
+})
+_SECRET_HEADER_KEY_PAIRS = frozenset({
+    ("api", "key"),
+    ("auth", "key"),
+    ("access", "key"),
+    ("private", "key"),
+    ("signing", "key"),
+    ("session", "key"),
+    ("secret", "key"),
+})
+
+
+def _extract_origin(raw_url: str) -> str:
+    """Return normalized `scheme://netloc` origin for an explicit HTTP(S)/WS(S) URL, else ''."""
+    raw = str(raw_url or "").strip()
+    if not raw:
+        return ""
+    try:
+        parsed = urlsplit(raw)
+    except ValueError:
+        return ""
+    scheme = parsed.scheme.lower()
+    if scheme not in {"http", "https", "ws", "wss"} or not parsed.netloc:
+        return ""
+    host = (parsed.hostname or "").strip().lower().rstrip(".")
+    if not host:
+        return ""
+    try:
+        port = parsed.port
+    except ValueError:
+        return ""
+    default_port = 80 if scheme in {"http", "ws"} else 443
+    host_part = f"[{host}]" if ":" in host else host
+    netloc = f"{host_part}:{port}" if (port is not None and port != default_port) else host_part
+    return f"{scheme}://{netloc}"
+
+
+def _is_secret_carrier_header(header_name_lower: str) -> bool:
+    """Return True if a header name is a credential/token/cookie/CSRF secret carrier."""
+    nl = str(header_name_lower or "").strip().lower()
+    if not nl:
+        return False
+    if nl in _ALL_SENSITIVE_HEADERS:
+        return True
+    segs = [s for s in re.split(r"[-_]+", nl) if s]
+    if not segs:
+        return False
+    if segs[-1] in _SECRET_HEADER_SUFFIX_TOKENS:
+        return True
+    if len(segs) >= 2 and (segs[-2], segs[-1]) in _SECRET_HEADER_KEY_PAIRS:
+        return True
+    return False
 
 _SENSITIVE_QUERY_KEYS = frozenset({
     "access_token",
@@ -608,9 +675,7 @@ def _extract_secrets_from_headers(headers: Any, sink: set[str]) -> None:
             continue
         if name in {"x-actor-alias", "x-authenticated-user", "x-user", "www-authenticate", "proxy-authenticate"}:
             continue
-        is_sensitive_header = name in _ALL_SENSITIVE_HEADERS or any(
-            tok in name for tok in ("token", "secret", "api-key", "apikey", "cookie", "auth")
-        )
+        is_sensitive_header = _is_secret_carrier_header(name)
         if not is_sensitive_header:
             continue
 
@@ -801,11 +866,58 @@ def _sanitize_header_dict(headers: Any, secret_values: Sequence[str] = ()) -> di
     out: dict[str, str] = {}
     for k, v in base.items():
         kl = k.strip().lower()
-        if kl in _ALL_SENSITIVE_HEADERS and kl not in SENSITIVE_HEADER_NAMES:
+        if _is_secret_carrier_header(kl) and kl not in SENSITIVE_HEADER_NAMES:
             out[k] = "<REDACTED_HEADER>"
         else:
             out[k] = _sanitize_text(v, secret_values)
     return out
+
+
+def _extract_actor_meta_map(
+    manifest: dict[str, Any],
+    checkpoint: dict[str, Any],
+) -> dict[str, dict[str, str]]:
+    """Reconstruct normalized actor metadata map from manifest/checkpoint artifacts."""
+    actor_meta: dict[str, dict[str, str]] = {}
+    for container in (manifest, checkpoint):
+        sf = container.get("surface_frontier")
+        if isinstance(sf, dict):
+            raw_actors = sf.get("actors")
+            if isinstance(raw_actors, dict):
+                for alias, meta in raw_actors.items():
+                    if not isinstance(meta, dict):
+                        continue
+                    clean_alias = str(meta.get("alias") or alias or "").strip()
+                    if clean_alias:
+                        actor_meta[clean_alias] = {
+                            "alias": clean_alias,
+                            "role": str(meta.get("role") or "").strip().lower(),
+                            "tenant": str(meta.get("tenant") or "").strip().lower(),
+                        }
+            elif isinstance(raw_actors, list):
+                for meta in raw_actors:
+                    if not isinstance(meta, dict):
+                        continue
+                    clean_alias = str(meta.get("alias") or "").strip()
+                    if clean_alias:
+                        actor_meta[clean_alias] = {
+                            "alias": clean_alias,
+                            "role": str(meta.get("role") or "").strip().lower(),
+                            "tenant": str(meta.get("tenant") or "").strip().lower(),
+                        }
+    auth_block = manifest.get("auth")
+    if isinstance(auth_block, dict) and isinstance(auth_block.get("actors"), list):
+        for meta in auth_block["actors"]:
+            if not isinstance(meta, dict):
+                continue
+            clean_alias = str(meta.get("alias") or "").strip()
+            if clean_alias and clean_alias not in actor_meta:
+                actor_meta[clean_alias] = {
+                    "alias": clean_alias,
+                    "role": str(meta.get("role") or "").strip().lower(),
+                    "tenant": str(meta.get("tenant") or "").strip().lower(),
+                }
+    return actor_meta
 
 
 def load_run_artifacts(run_dir: Path) -> dict[str, Any]:
@@ -849,7 +961,8 @@ def load_run_artifacts(run_dir: Path) -> dict[str, Any]:
 
     receipts: dict[str, dict[str, Any]] = {}
     receipts_dir = root / "receipts"
-    if receipts_dir.is_dir():
+    has_receipts_dir = receipts_dir.is_dir()
+    if has_receipts_dir:
         for rpath in sorted(receipts_dir.glob("*.json")):
             rdata = _read_json_safe(rpath)
             if isinstance(rdata, dict):
@@ -857,6 +970,23 @@ def load_run_artifacts(run_dir: Path) -> dict[str, Any]:
                 receipts[rid] = rdata
     else:
         missing_artifacts.append("receipts/")
+
+    # Recover verified shard findings from crashed/aborted Stage-2 runs when missing from root findings.json.
+    shard_findings: list[dict[str, Any]] = []
+    shards_dir = root / "shards"
+    if shards_dir.is_dir():
+        for spath in sorted(shards_dir.glob("*/findings.json")):
+            sdata = _read_json_safe(spath)
+            if isinstance(sdata, list):
+                shard_findings.extend(dict(item) for item in sdata if isinstance(item, dict))
+    if shard_findings:
+        actor_meta_map = _extract_actor_meta_map(manifest, checkpoint)
+        receipt_store = ReceiptStore(root) if has_receipts_dir else None
+        findings = canonicalize_and_deduplicate_findings(
+            [*findings, *shard_findings],
+            actor_meta_map=actor_meta_map,
+            receipt_store=receipt_store,
+        )
 
     return {
         "run_dir": str(root),
@@ -994,14 +1124,17 @@ def _build_curl_reproduction(
                 continue
             if nl in {"authorization", "proxy-authorization"}:
                 parts.append(_format_curl_header_arg(name, "<REDACTED_AUTH_HEADER>"))
-            elif nl == "cookie":
+            elif nl in {"cookie", "set-cookie"}:
                 parts.append(_format_curl_header_arg(name, "<REDACTED_COOKIE>"))
-            elif nl in _ALL_SENSITIVE_HEADERS or any(t in nl for t in ("token", "secret", "api-key", "apikey")):
+            elif _is_secret_carrier_header(nl):
                 parts.append(_format_curl_header_arg(name, "<REDACTED_HEADER>"))
             else:
                 safe_val = safe_headers[k]
                 if safe_val:
-                    parts.append(_format_curl_header_arg(name, safe_val))
+                    if _is_already_redacted(safe_val):
+                        parts.append(_format_curl_header_arg(name, "<REDACTED_HEADER>"))
+                    else:
+                        parts.append(_format_curl_header_arg(name, safe_val))
 
         if is_multipart:
             parts.extend(_build_multipart_curl_args(req_body, secret_values))
@@ -1076,6 +1209,10 @@ def _extract_run_metadata(artifacts: dict[str, Any], secret_values: Sequence[str
     wall_clock = manifest.get("wall_clock_seconds")
     budget_raw = manifest.get("budget")
     budget: dict[str, Any] = budget_raw if isinstance(budget_raw, dict) else {}
+    budget_used_raw = budget.get("used")
+    budget_used: dict[str, Any] = budget_used_raw if isinstance(budget_used_raw, dict) else {}
+    budget_limits_raw = budget.get("limits")
+    budget_limits: dict[str, Any] = budget_limits_raw if isinstance(budget_limits_raw, dict) else {}
     limits_raw = manifest.get("limits")
     limits: dict[str, Any] = limits_raw if isinstance(limits_raw, dict) else {}
 
@@ -1084,6 +1221,8 @@ def _extract_run_metadata(artifacts: dict[str, Any], secret_values: Sequence[str
         http_used = manifest.get("target_requests")
     if http_used is None:
         http_used = checkpoint.get("http_used")
+    if http_used is None:
+        http_used = budget_used.get("http")
     if http_used is None:
         http_used = budget.get("http_used")
     if http_used is None:
@@ -1094,6 +1233,8 @@ def _extract_run_metadata(artifacts: dict[str, Any], secret_values: Sequence[str
         http_limit = limits.get("http_requests")
     if http_limit is None:
         http_limit = checkpoint.get("http_limit")
+    if http_limit is None:
+        http_limit = budget_limits.get("http")
     if http_limit is None:
         http_limit = budget.get("http_limit")
 
@@ -1121,9 +1262,18 @@ def _extract_run_metadata(artifacts: dict[str, Any], secret_values: Sequence[str
     ):
         if opt_key not in token_usage and opt_key in budget:
             token_usage[opt_key] = budget[opt_key]
+    if "total_tokens" not in token_usage and budget_used.get("tokens") is not None:
+        token_usage["total_tokens"] = budget_used["tokens"]
     if "total_tokens" not in token_usage and isinstance(metrics.get("counts"), dict):
         if metrics["counts"].get("total_tokens") is not None:
             token_usage["total_tokens"] = metrics["counts"]["total_tokens"]
+    token_limit = manifest.get("tokens_limit")
+    if token_limit is None:
+        token_limit = limits.get("tokens")
+    if token_limit is None:
+        token_limit = budget_limits.get("tokens")
+    if token_limit is not None and "token_limit" not in token_usage:
+        token_usage["token_limit"] = token_limit
 
     exp_raw = metrics.get("exposure_rate")
     exp_block: dict[str, Any] = exp_raw if isinstance(exp_raw, dict) else {}
@@ -1299,6 +1449,9 @@ def _sorted_findings(artifacts: dict[str, Any], secret_values: Sequence[str], *,
         sanitized_path = parsed_ep.path or "/"
         if parsed_ep.query:
             sanitized_path = f"{sanitized_path}?{parsed_ep.query}"
+        f_origin = _extract_origin(safe_url) or _extract_origin(safe_endpoint)
+        if not f_origin and proof_rec is not None:
+            f_origin = _extract_origin(str(proof_rec.get("url") or ""))
 
         enriched.append({
             "index": idx,
@@ -1314,8 +1467,11 @@ def _sorted_findings(artifacts: dict[str, Any], secret_values: Sequence[str], *,
             "method": method,
             "endpoint": safe_endpoint,
             "url": safe_url,
+            "origin": f_origin,
             "sanitized_path": sanitized_path,
+            "display_location": sanitized_path,
             "route_template": route_template,
+            "canonical_scope_route": route_template,
             "actor": actor,
             "supporting_actors": supporting_actors,
             "verification": verification,
@@ -1330,6 +1486,20 @@ def _sorted_findings(artifacts: dict[str, Any], secret_values: Sequence[str], *,
             "primary_proof_receipt": str(proof_rec.get("receipt_id") if proof_rec else (proof_ids[0] if proof_ids else "")),
             "primary_control_receipt": control_ids[0] if control_ids else "",
         })
+
+    target_origin = _extract_origin(base_url)
+    finding_origins = {str(item.get("origin") or "") for item in enriched if str(item.get("origin") or "")}
+    is_multi_origin = len(finding_origins) > 1 or bool(
+        target_origin and any(o != target_origin for o in finding_origins)
+    )
+    for item in enriched:
+        item_origin = str(item.get("origin") or "")
+        if item_origin and (is_multi_origin or (target_origin and item_origin != target_origin)):
+            item["display_location"] = f"{item_origin}{item['sanitized_path']}"
+            tmpl = str(item.get("route_template") or "/")
+            if not tmpl.startswith("/"):
+                tmpl = "/" + tmpl
+            item["canonical_scope_route"] = f"{item_origin}{tmpl}"
 
     enriched.sort(key=lambda item: (_SEVERITY_ORDER.get(item["severity"], 99), item["finding_id"], item["index"]))
     return enriched
@@ -1434,7 +1604,7 @@ def render_markdown_report(artifacts: dict[str, Any]) -> str:
             "| :--- | :--- | :--- | :--- | :--- | :--- |",
         ])
         for f in findings:
-            ep_display = f"{f['method']} {f['sanitized_path']}"
+            ep_display = f"{f['method']} {f['display_location']}"
             lines.append(
                 f"| {f['finding_id']} | {f['severity'].upper()} | `{f['class_type']}` | "
                 f"`{ep_display}` | `{f['actor']}` | {f['verification']} |"
@@ -1647,10 +1817,10 @@ def render_sarif_report(artifacts: dict[str, Any]) -> dict[str, Any]:
     for f in findings:
         cls_type = f["class_type"]
         rule_idx = rule_index_by_class[cls_type]
-        canonical_key = f"{cls_type}:{f['method']}:{f['route_template']}"
+        canonical_key = f"{cls_type}:{f['method']}:{f['canonical_scope_route']}"
         line_hash = hashlib.sha256(canonical_key.encode("utf-8")).hexdigest()[:16]
 
-        msg_parts = [f"{f['finding_id']} [{f['severity'].upper()}] {f['title']} at {f['method']} {f['sanitized_path']} (actor={f['actor']})"]
+        msg_parts = [f"{f['finding_id']} [{f['severity'].upper()}] {f['title']} at {f['method']} {f['display_location']} (actor={f['actor']})"]
         if f["summary"]:
             msg_parts.append(f["summary"])
         if f["evidence"]:
@@ -1666,13 +1836,13 @@ def render_sarif_report(artifacts: dict[str, Any]) -> dict[str, Any]:
                 {
                     "physicalLocation": {
                         "artifactLocation": {
-                            "uri": f["sanitized_path"],
+                            "uri": f["display_location"],
                         }
                     },
                     "logicalLocations": [
                         {
-                            "name": f["sanitized_path"],
-                            "fullyQualifiedName": f"{f['method']} {f['sanitized_path']}",
+                            "name": f["display_location"],
+                            "fullyQualifiedName": f"{f['method']} {f['display_location']}",
                             "kind": "endpoint",
                         }
                     ],
@@ -1686,14 +1856,17 @@ def render_sarif_report(artifacts: dict[str, Any]) -> dict[str, Any]:
                 "finding_id": f["finding_id"],
                 "severity": f["severity"],
                 "actor": f["actor"],
+                "supporting_actors": f["supporting_actors"],
                 "method": f["method"],
-                "endpoint": f["sanitized_path"],
+                "endpoint": f["display_location"],
+                "url": f["url"],
                 "owasp": f["owasp"],
                 "cwe": f["cwe"],
                 "proof_receipt": f["primary_proof_receipt"],
                 "proof_receipt_ids": f["proof_receipt_ids"],
                 "control_receipt": f["primary_control_receipt"],
                 "control_receipt_ids": f["control_receipt_ids"],
+                "clean_replay_receipt_id": f["clean_replay_receipt_id"],
                 "verification": f["verification"],
                 "reproduction_curl": f["reproduction_curl"],
             },

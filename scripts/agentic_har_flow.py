@@ -142,7 +142,7 @@ _STRIPPED_EXACT_HEADERS = frozenset({
     "x-cloud-trace-context",
 })
 
-_STRIPPED_HEADER_PREFIXES = ("sec-", "x-b3-", ":")
+_STRIPPED_HEADER_PREFIXES = ("sec-", "x-b3-", "x-amz-", ":")
 _SECRET_HEADER_TOKENS = frozenset({
     "auth",
     "authorization",
@@ -155,18 +155,58 @@ _SECRET_HEADER_TOKENS = frozenset({
     "bearer",
     "apikey",
     "credential",
-    "private_key",
+    "credentials",
+    "private",
+    "key",
     "signature",
-    "session_id",
+    "sig",
+    "hmac",
+    "session",
     "sessionid",
+    "sid",
     "csrf",
     "xsrf",
+    "otp",
+    "pin",
 })
+_SECRET_HEADER_SUBSTRINGS = (
+    "password",
+    "passwd",
+    "secret",
+    "token",
+    "cookie",
+    "apikey",
+    "api_key",
+    "csrf",
+    "xsrf",
+    "session",
+    "auth",
+    "private_key",
+    "signature",
+    "credential",
+    "jwt",
+    "bearer",
+    "hmac",
+)
 
 _CAMEL_BOUNDARY_RE = re.compile(r"([a-z0-9])([A-Z])")
 _TOKEN_SPLIT_RE = re.compile(r"[^a-z0-9]+")
-_JWT_LIKE_RE = re.compile(r"^eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]*$")
+_JWT_LIKE_RE = re.compile(r"(?:^|(?<![A-Za-z0-9_-]))eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]*(?:$|(?![A-Za-z0-9_-]))")
 _EMAIL_VALUE_RE = re.compile(r"^[^@\s]{1,64}@[^@\s]{1,128}\.[A-Za-z]{2,24}$")
+_AWS_KEY_VALUE_RE = re.compile(r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b")
+_KNOWN_SECRET_TOKEN_RE = re.compile(
+    r"\b(?:(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{12,}"
+    r"|github_pat_[A-Za-z0-9_]{12,}"
+    r"|sk_(?:live|test)_[0-9A-Za-z]{8,}"
+    r"|xox[baprs]-[0-9A-Za-z-]{8,}"
+    r"|AIza[0-9A-Za-z_-]{16,})\b"
+)
+_PEM_MARKER_RE = re.compile(r"-----BEGIN\s+[A-Z0-9 ]+-----")
+_COOKIE_PAIR_VALUE_RE = re.compile(
+    r"(?:^|;\s*)[A-Za-z0-9_.-]{1,48}=[^;\s]{1,256}\s*;\s*"
+    r"(?:[A-Za-z0-9_.-]{1,48}=[^;\s]{1,256}|(?:httponly|secure|samesite|path|domain|max-age|expires)\b)",
+    re.IGNORECASE,
+)
 
 _SENSITIVE_JSON_SUBSTRINGS = (
     "password",
@@ -188,6 +228,11 @@ _SENSITIVE_JSON_SUBSTRINGS = (
     "card_no",
     "credit_card",
     "phone_number",
+    "csrf",
+    "xsrf",
+    "session",
+    "signature",
+    "hmac",
 )
 _SENSITIVE_JSON_TOKENS = frozenset({
     "pwd",
@@ -195,7 +240,7 @@ _SENSITIVE_JSON_TOKENS = frozenset({
     "authorization",
     "csrf",
     "xsrf",
-    "session_id",
+    "session",
     "sessionid",
     "sid",
     "otp",
@@ -214,6 +259,8 @@ _SENSITIVE_JSON_TOKENS = frozenset({
     "iban",
     "ssn",
     "signature",
+    "sig",
+    "hmac",
 })
 
 _NUMERIC_LOGIC_TOKENS = frozenset({
@@ -334,6 +381,12 @@ _PRODUCED_ID_EXACT_TOKENS = frozenset({
 _IGNORED_ID_SCALARS = frozenset({"true", "false", "null", "none", "ok", "pending", "active", "paid", "failed"})
 _CAMEL_ID_KEY_RE = re.compile(r"^[a-z][A-Za-z0-9]*Id$")
 _API_STEP_PATH_RE = re.compile(r"^/(?:api|ajax[-_]?api|bff|rest|rpc|graphql|v\d+(?:\.\d+)?)(?:/|$)", re.I)
+_XML_CDATA_RE = re.compile(r"<!\[CDATA\[.*?\]\]>", re.DOTALL)
+_XML_COMMENT_RE = re.compile(r"<!--.*?-->", re.DOTALL)
+_XML_OPEN_TAG_RE = re.compile(r"<([A-Za-z_][A-Za-z0-9_.:-]{0,63})(?=[\s/>])")
+_NUMERIC_STR_RE = re.compile(r"^-?\d+(?:\.\d+)?$")
+_XML_CONTENT_TYPES = frozenset({"application/xml", "text/xml", "application/soap+xml"})
+_MAX_XML_TAGS = 24
 
 
 def _has_control_chars(value: str) -> bool:
@@ -449,21 +502,33 @@ def _is_secret_header_name(header_name: str) -> bool:
     snake, tokens = _to_snake_tokens(low)
     if snake in _SECRET_HEADER_TOKENS or any(tok in _SECRET_HEADER_TOKENS for tok in tokens):
         return True
-    return any(sub in snake for sub in ("password", "passwd", "secret", "token", "cookie", "apikey", "api_key"))
+    return any(sub in snake for sub in _SECRET_HEADER_SUBSTRINGS)
+
+
+def _has_secret_value_pattern(stripped: str) -> bool:
+    low = stripped.lower()
+    if "<redacted" in low:
+        return True
+    if low.startswith(("bearer ", "basic ", "token ", "digest ")) and len(stripped) > 8:
+        return True
+    if "aws4-hmac-sha256" in low:
+        return True
+    if _JWT_LIKE_RE.search(stripped):
+        return True
+    if _AWS_KEY_VALUE_RE.search(stripped) or _KNOWN_SECRET_TOKEN_RE.search(stripped):
+        return True
+    if _PEM_MARKER_RE.search(stripped):
+        return True
+    if _COOKIE_PAIR_VALUE_RE.search(stripped):
+        return True
+    return False
 
 
 def _is_secret_header_value(value: str) -> bool:
     stripped = value.strip()
     if not stripped or _has_control_chars(stripped):
         return True
-    low = stripped.lower()
-    if "<redacted" in low:
-        return True
-    if low.startswith(("bearer ", "basic ")) and len(stripped) > 8:
-        return True
-    if _JWT_LIKE_RE.fullmatch(stripped):
-        return True
-    return False
+    return _has_secret_value_pattern(stripped)
 
 
 def _sanitize_app_headers(raw_headers: Any) -> dict[str, str]:
@@ -515,12 +580,7 @@ def _is_sensitive_json_string(value: str) -> bool:
     stripped = value.strip()
     if not stripped:
         return False
-    low = stripped.lower()
-    if "<redacted" in low:
-        return True
-    if low.startswith(("bearer ", "basic ")) and len(stripped) > 10:
-        return True
-    if _JWT_LIKE_RE.fullmatch(stripped):
+    if _has_secret_value_pattern(stripped):
         return True
     if _EMAIL_VALUE_RE.fullmatch(stripped):
         return True
@@ -581,6 +641,89 @@ def _parse_json_payload(text: str) -> Any:
         return json.loads(stripped)
     except ValueError:
         return None
+
+
+def _sanitize_form_template(raw_map: dict[str, Any]) -> dict[str, str]:
+    """Redact sensitive keys/values in a form-urlencoded template and bound key/value sizes."""
+    out: dict[str, str] = {}
+    for k, v in list(raw_map.items())[:_MAX_TEMPLATE_KEYS]:
+        key_s = str(k or "").strip()[:64]
+        if not key_s or _has_control_chars(key_s):
+            continue
+        val_s = "" if v is None else str(v).strip()
+        if (
+            _is_sensitive_json_key(key_s)
+            or _is_sensitive_json_string(val_s)
+            or _has_control_chars(val_s)
+        ):
+            out[key_s] = "<redacted>"
+        elif len(val_s) > _MAX_TEMPLATE_STR_LEN:
+            out[key_s] = val_s[: _MAX_TEMPLATE_STR_LEN - 3] + "..."
+        else:
+            out[key_s] = val_s
+    return out
+
+
+def _parse_form_payload(
+    post_data: dict[str, Any],
+    req_text: str,
+) -> tuple[list[tuple[str, str]], dict[str, str]]:
+    """Parse HAR `application/x-www-form-urlencoded` body from `postData.params` or `req_text`."""
+    raw_pairs: list[tuple[str, str]] = []
+    raw_params = post_data.get("params")
+    if isinstance(raw_params, list):
+        for item in raw_params:
+            if not isinstance(item, dict):
+                continue
+            name = item.get("name")
+            if not isinstance(name, str):
+                continue
+            clean_k = name.strip()[:64]
+            if not clean_k or _has_control_chars(clean_k):
+                continue
+            raw_v = item.get("value")
+            val_s = str(raw_v).strip() if raw_v is not None else ""
+            raw_pairs.append((clean_k, val_s))
+    if not raw_pairs and req_text:
+        for qk, qv in parse_qsl(req_text, keep_blank_values=True, max_num_fields=128):
+            clean_k = qk.strip()[:64]
+            if not clean_k or _has_control_chars(clean_k):
+                continue
+            raw_pairs.append((clean_k, qv.strip()))
+    if not raw_pairs:
+        return [], {}
+    template_map: dict[str, Any] = {}
+    for k, v in raw_pairs:
+        if k not in template_map and len(template_map) < _MAX_TEMPLATE_KEYS:
+            template_map[k] = v
+    return raw_pairs, _sanitize_form_template(template_map)
+
+
+def _extract_xml_tags(req_text: str, *, max_tags: int = _MAX_XML_TAGS) -> list[str]:
+    """Extract unique top XML element names safely via regex (XXE-proof, zero text/value leakage)."""
+    if not req_text:
+        return []
+    sample = req_text[:65536]
+    cleaned = _XML_CDATA_RE.sub("", sample)
+    cleaned = _XML_COMMENT_RE.sub("", cleaned)
+    tags: list[str] = []
+    seen: set[str] = set()
+    for match in _XML_OPEN_TAG_RE.finditer(cleaned):
+        tag = match.group(1).strip()[:64]
+        if tag and tag not in seen:
+            seen.add(tag)
+            tags.append(tag)
+            if len(tags) >= max_tags:
+                break
+    return tags
+
+
+def _header_value_ci(headers: dict[str, str], target: str) -> str:
+    low = target.lower()
+    for k, v in headers.items():
+        if k.lower() == low:
+            return v
+    return ""
 
 
 def _is_candidate_id_key(key: str) -> bool:
@@ -680,6 +823,10 @@ def _detect_mutation_targets(
     url_path: str,
     query_keys: Sequence[str],
     json_template: Any,
+    *,
+    form_template: dict[str, Any] | None = None,
+    xml_tags: Sequence[str] = (),
+    body_kind: str = "",
 ) -> list[str]:
     """Identify business-logic numeric/role/status/owner fields and race-prone endpoints."""
     targets: list[str] = []
@@ -720,6 +867,17 @@ def _detect_mutation_targets(
 
     if json_template is not None:
         _walk_json(json_template, 0)
+
+    if isinstance(form_template, dict):
+        for fk in form_template:
+            _check_key(str(fk))
+
+    if xml_tags or body_kind == "xml":
+        _add("xml")
+        for tag in xml_tags:
+            local_tag = str(tag).split(":", 1)[-1].strip()
+            if local_tag:
+                _check_key(local_tag)
 
     if method in _WRITE_METHODS:
         low_path = url_path.lower()
@@ -864,6 +1022,8 @@ def _build_recommended_app_headers(steps: Sequence[dict[str, Any]]) -> dict[str,
         if (
             s["method"] in _WRITE_METHODS
             or s["json_template"] is not None
+            or s.get("form_template") is not None
+            or s.get("body_kind") in {"json", "form", "xml", "raw"}
             or _API_STEP_PATH_RE.search(s["path"])
             or "bff" in s["host"]
         )
@@ -1012,10 +1172,43 @@ def extract_har_flows(
         app_headers = _sanitize_app_headers(req.get("headers"))
         raw_post_data = req.get("postData")
         post_data: dict[str, Any] = raw_post_data if isinstance(raw_post_data, dict) else {}
-        raw_ct = str(post_data.get("mimeType") or app_headers.get("Content-Type") or "").split(";", 1)[0].strip().lower()
+        raw_ct = str(
+            post_data.get("mimeType") or _header_value_ci(app_headers, "content-type") or ""
+        ).split(";", 1)[0].strip().lower()
         req_text = _decode_har_text_payload(post_data) if post_data else ""
         req_json = _parse_json_payload(req_text) if req_text else None
         json_template = _sanitize_json_value(req_json) if req_json is not None else None
+        form_template: dict[str, str] | None = None
+        raw_form_pairs: list[tuple[str, str]] = []
+        xml_tags: list[str] = []
+        body_kind = ""
+        if req_json is not None:
+            body_kind = "json"
+        elif (
+            "x-www-form-urlencoded" in raw_ct
+            or (
+                isinstance(post_data.get("params"), list)
+                and bool(post_data.get("params"))
+                and "multipart" not in raw_ct
+            )
+        ):
+            raw_form_pairs, parsed_form = _parse_form_payload(post_data, req_text)
+            if parsed_form:
+                form_template = parsed_form
+                body_kind = "form"
+        elif (
+            raw_ct in _XML_CONTENT_TYPES
+            or raw_ct.endswith("+xml")
+            or (
+                req_text.lstrip().startswith("<")
+                and not raw_ct
+                and not req_text.lstrip().lower().startswith(("<!doctype html", "<html"))
+            )
+        ):
+            xml_tags = _extract_xml_tags(req_text)
+            body_kind = "xml"
+        elif "text/plain" in raw_ct or bool(req_text.strip()):
+            body_kind = "raw"
 
         resp_text = _decode_har_text_payload(resp_content) if resp_content else ""
         resp_json = _parse_json_payload(resp_text) if resp_text else None
@@ -1030,8 +1223,20 @@ def extract_har_flows(
             seen_readonly_keys.add(readonly_key)
 
         path_segments = [seg for seg in norm_path.split("/") if seg]
-        req_path_set, req_kv_pairs = _collect_request_scalars(path_segments, query_pairs, req_json)
-        mutation_targets = _detect_mutation_targets(method, norm_path, query_keys, json_template)
+        req_path_set, req_kv_pairs = _collect_request_scalars(
+            path_segments,
+            [*query_pairs, *raw_form_pairs],
+            req_json,
+        )
+        mutation_targets = _detect_mutation_targets(
+            method,
+            norm_path,
+            query_keys,
+            json_template,
+            form_template=form_template,
+            xml_tags=xml_tags,
+            body_kind=body_kind,
+        )
 
         candidates.append({
             "_raw_idx": len(candidates),
@@ -1048,8 +1253,11 @@ def extract_har_flows(
             "url": step_url,
             "query_keys": query_keys,
             "content_type": raw_ct,
+            "body_kind": body_kind,
             "required_app_headers": app_headers,
             "json_template": json_template,
+            "form_template": form_template,
+            "xml_tags": xml_tags,
             "response_status": resp_status,
             "mutation_targets": mutation_targets,
         })
@@ -1140,8 +1348,11 @@ def extract_har_flows(
                 "url": item["url"],
                 "query_keys": list(item["query_keys"]),
                 "content_type": item["content_type"],
+                "body_kind": item["body_kind"],
                 "required_app_headers": dict(item["required_app_headers"]),
                 "json_template": copy.deepcopy(item["json_template"]),
+                "form_template": copy.deepcopy(item["form_template"]),
+                "xml_tags": list(item["xml_tags"]),
                 "response_status": item["response_status"],
                 "produced_id_fields": list(item["_produced_fields_ordered"]),
                 "chained_from_step": chained_from_step,
@@ -1251,6 +1462,9 @@ def build_flow_mutation_cases(
             url = str(step.get("url") or "")
             step_index = int(step.get("step_index") or 0)
             json_tmpl = step.get("json_template")
+            form_tmpl = step.get("form_template")
+            xml_tags = [str(t) for t in (step.get("xml_tags") or []) if str(t).strip()]
+            body_kind = str(step.get("body_kind") or "").strip().lower()
             targets = [str(t) for t in (step.get("mutation_targets") or [])]
             headers = dict(step.get("required_app_headers") or {})
 
@@ -1307,11 +1521,120 @@ def build_flow_mutation_cases(
                             "description": f"Test cross-actor owner/tenant tampering via {key} on {method} {url}",
                         })
 
+            # 1b. Form-urlencoded mutation cases (numeric, mass assignment, owner/tenant tamper)
+            if isinstance(form_tmpl, dict) and form_tmpl:
+                for key, val in form_tmpl.items():
+                    snake, tokens = _to_snake_tokens(str(key))
+                    val_str = str(val or "").strip()
+                    if snake in _NUMERIC_LOGIC_TOKENS or any(tok in _NUMERIC_LOGIC_TOKENS for tok in tokens):
+                        if (isinstance(val, (int, float)) and not isinstance(val, bool)) or _NUMERIC_STR_RE.fullmatch(val_str):
+                            _push({
+                                "flow_id": flow_id,
+                                "step_index": step_index,
+                                "category": "business_logic_numeric",
+                                "tool": "http_request",
+                                "method": method,
+                                "url": url,
+                                "target_field": str(key),
+                                "form_overrides": {str(key): "-1"},
+                                "zero_override": {str(key): "0"},
+                                "required_app_headers": headers,
+                                "description": f"Test negative/zero form field {key} validation on {method} {url}",
+                            })
+                    if snake in _ROLE_STATUS_TOKENS or any(tok in _ROLE_STATUS_TOKENS for tok in tokens):
+                        form_tamper = "true" if (val_str.lower() in {"true", "false"} or "admin" in snake) else "admin"
+                        if "status" in snake or "state" in snake:
+                            form_tamper = "paid"
+                        _push({
+                            "flow_id": flow_id,
+                            "step_index": step_index,
+                            "category": "mass_assignment",
+                            "tool": "http_request",
+                            "method": method,
+                            "url": url,
+                            "target_field": str(key),
+                            "form_overrides": {str(key): form_tamper},
+                            "required_app_headers": headers,
+                            "description": f"Test form privilege/status mass assignment via {key} on {method} {url}",
+                        })
+                    if snake in _OWNER_BOLA_TOKENS:
+                        _push({
+                            "flow_id": flow_id,
+                            "step_index": step_index,
+                            "category": "idor_owner_tamper",
+                            "tool": "replay_as",
+                            "method": method,
+                            "url": url,
+                            "target_field": str(key),
+                            "form_overrides": {str(key): val_str},
+                            "required_app_headers": headers,
+                            "description": f"Test cross-actor form owner/tenant tampering via {key} on {method} {url}",
+                        })
+
+            # 1c. XML / XXE and XML element mutation cases
+            if body_kind == "xml" or xml_tags:
+                tag_preview = ",".join(xml_tags[:4]) if xml_tags else "xml"
+                _push({
+                    "flow_id": flow_id,
+                    "step_index": step_index,
+                    "category": "xml_injection",
+                    "tool": "http_request",
+                    "method": method,
+                    "url": url,
+                    "target_field": tag_preview,
+                    "body_kind": "xml",
+                    "xml_tags": list(xml_tags[:8]),
+                    "required_app_headers": headers,
+                    "description": f"Test XML/XXE entity handling on {method} {url} (tags: {tag_preview})",
+                })
+                for tag in xml_tags:
+                    local_tag = tag.split(":", 1)[-1].strip()
+                    snake, tokens = _to_snake_tokens(local_tag)
+                    if snake in _NUMERIC_LOGIC_TOKENS or any(tok in _NUMERIC_LOGIC_TOKENS for tok in tokens):
+                        _push({
+                            "flow_id": flow_id,
+                            "step_index": step_index,
+                            "category": "business_logic_numeric",
+                            "tool": "http_request",
+                            "method": method,
+                            "url": url,
+                            "target_field": local_tag,
+                            "body_kind": "xml",
+                            "required_app_headers": headers,
+                            "description": f"Test negative/zero XML element <{local_tag}> validation on {method} {url}",
+                        })
+                    if snake in _ROLE_STATUS_TOKENS or any(tok in _ROLE_STATUS_TOKENS for tok in tokens):
+                        _push({
+                            "flow_id": flow_id,
+                            "step_index": step_index,
+                            "category": "mass_assignment",
+                            "tool": "http_request",
+                            "method": method,
+                            "url": url,
+                            "target_field": local_tag,
+                            "body_kind": "xml",
+                            "required_app_headers": headers,
+                            "description": f"Test privilege/status tampering via XML element <{local_tag}> on {method} {url}",
+                        })
+                    if snake in _OWNER_BOLA_TOKENS:
+                        _push({
+                            "flow_id": flow_id,
+                            "step_index": step_index,
+                            "category": "idor_owner_tamper",
+                            "tool": "replay_as",
+                            "method": method,
+                            "url": url,
+                            "target_field": local_tag,
+                            "body_kind": "xml",
+                            "required_app_headers": headers,
+                            "description": f"Test cross-actor owner/tenant tampering via XML element <{local_tag}> on {method} {url}",
+                        })
+
             # Implicit mass-assignment probe on user/profile/account writes lacking explicit role fields
-            if method in {"POST", "PUT", "PATCH"} and isinstance(json_tmpl, dict):
+            if method in {"POST", "PUT", "PATCH"} and (isinstance(json_tmpl, dict) or isinstance(form_tmpl, dict)):
                 low_url = url.lower()
                 if any(tok in low_url for tok in ("/profile", "/account", "/users", "/register", "/me")):
-                    _push({
+                    case_obj: dict[str, Any] = {
                         "flow_id": flow_id,
                         "step_index": step_index,
                         "category": "mass_assignment",
@@ -1319,10 +1642,14 @@ def build_flow_mutation_cases(
                         "method": method,
                         "url": url,
                         "target_field": "role,isAdmin",
-                        "json_overrides": {"role": "admin", "isAdmin": True},
                         "required_app_headers": headers,
                         "description": f"Probe hidden role/isAdmin mass assignment on {method} {url}",
-                    })
+                    }
+                    if isinstance(json_tmpl, dict):
+                        case_obj["json_overrides"] = {"role": "admin", "isAdmin": True}
+                    else:
+                        case_obj["form_overrides"] = {"role": "admin", "isAdmin": "true"}
+                    _push(case_obj)
 
             # 4. Concurrent race check on one-shot / state-changing endpoints
             if method in _WRITE_METHODS:
@@ -1332,7 +1659,7 @@ def build_flow_mutation_cases(
                     if raw_m in low_path or canonical in targets
                 ]
                 if race_hits:
-                    _push({
+                    race_case: dict[str, Any] = {
                         "flow_id": flow_id,
                         "step_index": step_index,
                         "category": "concurrent_race",
@@ -1344,7 +1671,10 @@ def build_flow_mutation_cases(
                         "json_template": copy.deepcopy(json_tmpl) if isinstance(json_tmpl, dict) else None,
                         "required_app_headers": headers,
                         "description": f"Run concurrent_check for TOCTOU/double-spend on {method} {url}",
-                    })
+                    }
+                    if isinstance(form_tmpl, dict) and form_tmpl:
+                        race_case["form_template"] = copy.deepcopy(form_tmpl)
+                    _push(race_case)
 
             # 5. Cross-actor replay (BOLA / BFLA) on chained, ID-bearing, or state-changing steps
             has_id_seg = any(is_id_segment(seg) for seg in urlsplit(url).path.split("/") if seg)
@@ -1423,6 +1753,19 @@ def format_har_flows_handoff(
                 if len(tmpl_str) > 140:
                     tmpl_str = tmpl_str[:137] + "..."
                 meta_parts.append(f"json={tmpl_str}")
+            form_tmpl = step.get("form_template")
+            if isinstance(form_tmpl, dict) and form_tmpl:
+                sanitized_form = _sanitize_form_template(form_tmpl)
+                form_str = json.dumps(sanitized_form, ensure_ascii=False, separators=(",", ":"))
+                if len(form_str) > 140:
+                    form_str = form_str[:137] + "..."
+                meta_parts.append(f"form={form_str}")
+            step_xml_tags = [str(t)[:32] for t in (step.get("xml_tags") or []) if str(t).strip()]
+            step_body_kind = str(step.get("body_kind") or "").strip().lower()
+            if step_xml_tags:
+                meta_parts.append("xml_tags=" + ",".join(step_xml_tags[:8]))
+            elif step_body_kind in {"xml", "raw"}:
+                meta_parts.append(f"body_kind={step_body_kind}")
             suffix = f" ({'; '.join(meta_parts)})" if meta_parts else ""
             lines.append(f"  {idx}. {method} {url}{suffix}")
 
@@ -1457,6 +1800,7 @@ def replay_har_flow_step(
     *,
     actor: str = "anon",
     json_overrides: dict[str, Any] | None = None,
+    form_overrides: dict[str, Any] | None = None,
     header_overrides: dict[str, Any] | None = None,
     query_overrides: dict[str, Any] | None = None,
     url_override: str | None = None,
@@ -1492,20 +1836,38 @@ def replay_har_flow_step(
         json_body = _deep_merge_json(base_tmpl, json_overrides)
     elif isinstance(json_overrides, dict):
         json_body = copy.deepcopy(json_overrides)
-    elif base_tmpl is not None:
+    elif base_tmpl is not None and form_overrides is None:
         json_body = copy.deepcopy(base_tmpl)
+
+    form_body: dict[str, Any] | None = None
+    base_form = step.get("form_template")
+    is_form_step = isinstance(base_form, dict) or str(step.get("body_kind") or "").strip().lower() == "form"
+    if json_body is None and (is_form_step or isinstance(form_overrides, dict)):
+        merged_form: dict[str, Any] = copy.deepcopy(base_form) if isinstance(base_form, dict) else {}
+        if isinstance(form_overrides, dict):
+            merged_form.update(copy.deepcopy(form_overrides))
+        if merged_form or isinstance(form_overrides, dict):
+            form_body = merged_form
 
     if json_body is not None:
         ct_key = next((k for k in merged_headers if k.lower() == "content-type"), None)
         if ct_key is not None and "json" not in merged_headers[ct_key].lower():
             merged_headers.pop(ct_key, None)
+    elif form_body is not None:
+        ct_key = next((k for k in merged_headers if k.lower() == "content-type"), None)
+        if ct_key is not None and "x-www-form-urlencoded" not in merged_headers[ct_key].lower():
+            merged_headers.pop(ct_key, None)
 
-    return http_client.request(
-        method=method,
-        url=target_url,
-        actor=actor,
-        headers=merged_headers or None,
-        query=query_overrides,
-        json_body=json_body,
-        force=bool(force),
-    )
+    req_kwargs: dict[str, Any] = {
+        "method": method,
+        "url": target_url,
+        "actor": actor,
+        "headers": merged_headers or None,
+        "query": query_overrides,
+        "json_body": json_body,
+        "force": bool(force),
+    }
+    if form_body is not None:
+        req_kwargs["form_body"] = form_body
+
+    return http_client.request(**req_kwargs)

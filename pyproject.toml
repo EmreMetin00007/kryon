@@ -97,6 +97,7 @@ files = [
   "scripts/agentic_sharding.py",
   "scripts/agentic_stage0_crawl.py",
   "scripts/agentic_surface.py",
+  "scripts/agentic_surface_map.py",
   "scripts/agentic_telemetry.py",
   "scripts/agentic_tools.py",
   "scripts/agentic_tui.py",

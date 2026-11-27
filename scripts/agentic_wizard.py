@@ -45,6 +45,13 @@ _SENSITIVE_HEADER_TOKENS: tuple[str, ...] = (
     "cookie",
     "pass",
     "credential",
+    "csrf",
+    "xsrf",
+    "session",
+    "jwt",
+    "bearer",
+    "sig",
+    "hmac",
 )
 
 
@@ -224,6 +231,7 @@ def _write_reusable_run_config(
     credentials_file: Path | None,
     seed_surface_files: Sequence[Path] | None = None,
     discovery_hints: Sequence[str] | None = None,
+    asset_graph_file: Path | None = None,
 ) -> Path:
     """Save a safe ``cco-run/1`` config (chmod 0600, omitting sensitive header values)."""
     cfg: dict[str, Any] = {
@@ -249,6 +257,8 @@ def _write_reusable_run_config(
     clean_hints = [str(h).strip() for h in (discovery_hints or ()) if str(h).strip()]
     if clean_hints:
         cfg["discovery_hints"] = clean_hints
+    if asset_graph_file is not None:
+        cfg["asset_graph_file"] = str(Path(asset_graph_file).expanduser().resolve())
 
     output_dir.mkdir(parents=True, exist_ok=True)
     cfg_path = output_dir / "run.json"
@@ -399,7 +409,9 @@ def run_wizard(
     # 6. Optional test account / Playwright storage_state (also accepts AssetGraph or HAR seed)
     storage_states: list[str] = []
     credentials_file: Path | None = None
-    eff_asset_graph_file: Path | None = Path(asset_graph_file).expanduser() if asset_graph_file is not None else None
+    eff_asset_graph_file: Path | None = (
+        Path(asset_graph_file).expanduser().resolve() if asset_graph_file is not None else None
+    )
     eff_seed_files: list[Path] = [
         Path(p).expanduser() for p in (seed_surface_files or ()) if str(p).strip()
     ]
@@ -415,7 +427,7 @@ def run_wizard(
         if kind == "storage_state":
             storage_states.append(value)
         elif kind == "asset_graph":
-            eff_asset_graph_file = Path(value)
+            eff_asset_graph_file = Path(value).expanduser().resolve()
         elif kind == "seed_surface":
             seed_cand = Path(value)
             if seed_cand not in eff_seed_files:
@@ -473,6 +485,7 @@ def run_wizard(
         credentials_file=credentials_file,
         seed_surface_files=eff_seed_files or None,
         discovery_hints=ag_hints or None,
+        asset_graph_file=eff_asset_graph_file,
     )
 
     runner_kwargs: dict[str, Any] = {
@@ -579,6 +592,8 @@ def run_wizard(
         exec_argv.extend(["--credentials-file", str(credentials_file)])
     for seed_path in eff_seed_files:
         exec_argv.extend(["--seed-surface", str(seed_path)])
+    if eff_asset_graph_file is not None:
+        exec_argv.extend(["--asset-graph", str(eff_asset_graph_file)])
     for hint in ag_hints:
         exec_argv.extend(["--discovery-hint", hint])
 

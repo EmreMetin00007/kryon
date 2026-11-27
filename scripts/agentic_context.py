@@ -55,6 +55,7 @@ _PROMPT_HARD_CHAR_LIMIT = 24_000
 _EPOCH_HARD_CHAR_LIMIT = 80_000
 _FRAMING_RESERVE_TOKENS = 2048
 _LOCAL_READ_TOOLS = frozenset({"read_receipt", "extract_surface", "notebook", "analyze_token"})
+_TOKEN_TOOL_KINDS = frozenset({"jwt", "jwt_test", "opaque", "serialization"})
 
 
 def _new_usage_dict() -> dict[str, int]:
@@ -447,9 +448,35 @@ def _sanitize_messages_for_http400(messages: list[dict[str, Any]]) -> list[dict[
     return sanitized
 
 
+def _one_line(val: Any, max_len: int = 160) -> str:
+    """Collapse whitespace/CR/LF so untrusted target content stays strictly single-line."""
+    return " ".join(str(val or "").split())[:max_len]
+
+
+def _extract_waf_tags(obj: dict[str, Any], nested: dict[str, Any] | None = None) -> list[str]:
+    """Return compact WAF block/pivot tags if present on a tool response object."""
+    tags: list[str] = []
+    waf_blk = (nested.get("waf_block") if isinstance(nested, dict) else None) or obj.get("waf_block")
+    if not waf_blk and isinstance(obj.get("results"), list):
+        for item in obj["results"]:
+            if isinstance(item, dict) and item.get("waf_block"):
+                waf_blk = item["waf_block"]
+                break
+    if waf_blk:
+        if isinstance(waf_blk, dict):
+            vendor = _one_line(waf_blk.get("vendor") or "generic", 32)
+        else:
+            vendor = _one_line(waf_blk, 32)
+        tags.append(f"waf={vendor or 'generic'}")
+    waf_piv = (nested.get("waf_pivot_guidance") if isinstance(nested, dict) else None) or obj.get("waf_pivot_guidance")
+    if waf_piv:
+        tags.append("waf_pivot=ACTIVE")
+    return tags
+
+
 def _collapse_tool_content(content: str) -> str:
     """Compact an old tool response into a terse 1-line receipt pointer without losing key metadata."""
-    if len(content) <= 220 and "\n" not in content:
+    if len(content) <= 220 and "\n" not in content and "\r" not in content:
         return content
 
     inner = _strip_untrusted_markers(content)
@@ -462,29 +489,126 @@ def _collapse_tool_content(content: str) -> str:
             if "replay" in obj and isinstance(obj["replay"], dict) and isinstance(obj.get("diff"), dict):
                 r = obj["replay"]
                 d = obj["diff"]
+                waf_tags = _extract_waf_tags(obj, r)
+                waf_suffix = (" " + " ".join(waf_tags)) if waf_tags else ""
                 return (
-                    f"[replay baseline={obj.get('baseline_receipt_id', '')} -> "
-                    f"receipt_id={r.get('receipt_id', '')} {r.get('method', '')} {r.get('url', '')} "
-                    f"actor={r.get('actor', '')} status={r.get('status', '')} "
-                    f"len={r.get('response_length', 0)} diff={d.get('status_diff')}]"
+                    f"[replay baseline={_one_line(obj.get('baseline_receipt_id', ''), 40)} -> "
+                    f"receipt_id={_one_line(r.get('receipt_id', ''), 40)} "
+                    f"{_one_line(r.get('method', ''), 16)} {_one_line(r.get('url', ''), 160)} "
+                    f"actor={_one_line(r.get('actor', ''), 40)} status={_one_line(r.get('status', ''), 16)} "
+                    f"len={_one_line(r.get('response_length', 0), 24)} "
+                    f"diff={_one_line(d.get('status_diff'), 40)}{waf_suffix}]"
                 )
-            if "openapi_operations" in obj or "js_calls" in obj:
+            if "concurrent_burst_id" in obj:
+                burst_id = _one_line(obj.get("concurrent_burst_id"), 40)
+                rids = [_one_line(r, 40) for r in (obj.get("receipt_ids") or []) if _one_line(r, 40)][:6]
+                if not rids and isinstance(obj.get("results"), list):
+                    rids = [
+                        _one_line(item.get("receipt_id"), 40)
+                        for item in obj["results"]
+                        if isinstance(item, dict) and _one_line(item.get("receipt_id"), 40)
+                    ][:6]
+                raw_sc = obj.get("status_counts")
+                safe_sc: dict[str, Any] = {}
+                if isinstance(raw_sc, dict):
+                    for k, v in list(raw_sc.items())[:16]:
+                        safe_sc[_one_line(k, 16)] = v if isinstance(v, (int, float)) and not isinstance(v, bool) else _one_line(v, 24)
+                sc_str = _one_line(
+                    json.dumps(safe_sc, ensure_ascii=False, separators=(",", ":")),
+                    160,
+                )
+                raw_hashes = obj.get("distinct_body_hashes")
+                if isinstance(raw_hashes, list):
+                    short_hashes = [_one_line(h, 12) for h in raw_hashes if _one_line(h, 12)]
+                    hashes_str = f"{len(short_hashes)}({','.join(short_hashes[:4])})" if short_hashes else "0"
+                elif isinstance(raw_hashes, int) and not isinstance(raw_hashes, bool):
+                    hashes_str = str(raw_hashes)
+                else:
+                    hashes_str = "0"
+                c_parts: list[str] = [f"burst={burst_id}"]
+                if obj.get("method"):
+                    c_parts.append(_one_line(obj["method"], 16))
+                if obj.get("url"):
+                    c_parts.append(_one_line(obj["url"], 120))
+                if obj.get("actor"):
+                    c_parts.append(f"actor={_one_line(obj['actor'], 40)}")
+                c_parts.append(f"receipt_ids={rids}")
+                c_parts.append(f"status_counts={sc_str}")
+                c_parts.append(f"distinct_body_hashes={hashes_str}")
+                c_parts.extend(_extract_waf_tags(obj))
+                return f"[concurrent {' '.join(c_parts)}]"
+            if (
+                any(k in obj for k in ("openapi_operations", "js_calls", "graphql_ops", "spec_urls", "postman_ops"))
+                or (
+                    "receipt_id" in obj
+                    and "status" not in obj
+                    and any(k in obj for k in ("forms", "links", "candidate_ids", "spa_routes"))
+                )
+            ):
                 sample_forms = [
-                    f"{f.get('method','GET')} {f.get('url','')}"
-                    + (f"({','.join(str(p) for p in (f.get('params') or [])[:4])})" if f.get("params") else "")
+                    (
+                        f"{_one_line(f.get('method') or 'GET', 16)} {_one_line(f.get('url'), 64)}"
+                        + (
+                            f"({','.join(_one_line(p, 24) for p in (f.get('params') or [])[:4] if _one_line(p, 24))})"
+                            if f.get("params")
+                            else ""
+                        )
+                    )
                     for f in (obj.get("forms") or [])[:3]
                     if isinstance(f, dict)
                 ]
                 sample_ids = [
-                    str(c.get("value") or "")
+                    _one_line(c.get("value"), 40)
                     for c in (obj.get("candidate_ids") or [])[:5]
-                    if isinstance(c, dict) and c.get("value")
+                    if isinstance(c, dict) and _one_line(c.get("value"), 40)
                 ]
                 sample_links = [
-                    str(lk.get("url") or "")
+                    _one_line(lk.get("url"), 64)
                     for lk in (obj.get("links") or [])[:6]
-                    if isinstance(lk, dict) and lk.get("url")
+                    if isinstance(lk, dict) and _one_line(lk.get("url"), 64)
                 ]
+                sample_openapi: list[str] = []
+                for op in (obj.get("openapi_operations") or [])[:4]:
+                    if isinstance(op, dict):
+                        op_lbl = _one_line(f"{op.get('method', 'GET')} {op.get('path') or op.get('url') or ''}", 72)
+                    else:
+                        op_lbl = _one_line(op, 72)
+                    if op_lbl:
+                        sample_openapi.append(op_lbl)
+                sample_graphql: list[str] = []
+                for g in (obj.get("graphql_ops") or [])[:4]:
+                    if isinstance(g, dict):
+                        g_kind = _one_line(g.get("kind") or "op", 24)
+                        g_name = _one_line(g.get("name"), 48)
+                        g_args = [_one_line(a, 24) for a in (g.get("args") or [])[:3] if _one_line(a, 24)]
+                        g_lbl = _one_line(f"{g_kind}:{g_name}" + (f"({','.join(g_args)})" if g_args else ""), 72)
+                    else:
+                        g_lbl = _one_line(g, 72)
+                    if g_lbl:
+                        sample_graphql.append(g_lbl)
+                sample_js_calls: list[str] = []
+                for jc in (obj.get("js_calls") or [])[:4]:
+                    if isinstance(jc, dict):
+                        jc_lbl = _one_line(f"{jc.get('method', 'GET')} {jc.get('url') or jc.get('path') or ''}", 72)
+                    else:
+                        jc_lbl = _one_line(jc, 72)
+                    if jc_lbl:
+                        sample_js_calls.append(jc_lbl)
+                sample_specs: list[str] = []
+                for su in (obj.get("spec_urls") or [])[:3]:
+                    s_lbl = _one_line(su.get("url") if isinstance(su, dict) else su, 80)
+                    if s_lbl:
+                        sample_specs.append(s_lbl)
+                counts = [
+                    f"links={len(obj.get('links') or [])}",
+                    f"forms={len(obj.get('forms') or [])}",
+                    f"js={len(obj.get('js_calls') or [])}",
+                    f"openapi={len(obj.get('openapi_operations') or [])}",
+                ]
+                if obj.get("graphql_ops"):
+                    counts.append(f"graphql={len(obj.get('graphql_ops') or [])}")
+                if obj.get("spec_urls"):
+                    counts.append(f"specs={len(obj.get('spec_urls') or [])}")
                 extras = []
                 if sample_forms:
                     extras.append(f"forms={sample_forms}")
@@ -492,36 +616,228 @@ def _collapse_tool_content(content: str) -> str:
                     extras.append(f"ids={sample_ids}")
                 if sample_links:
                     extras.append(f"top_links={sample_links}")
+                if sample_openapi:
+                    extras.append(f"openapi_ops={sample_openapi}")
+                if sample_graphql:
+                    extras.append(f"graphql_ops={sample_graphql}")
+                if sample_js_calls:
+                    extras.append(f"js_calls={sample_js_calls}")
+                if sample_specs:
+                    extras.append(f"spec_urls={sample_specs}")
                 extra_str = (" " + " ".join(extras)) if extras else ""
-                return (
-                    f"[surface receipt_id={obj.get('receipt_id', '')} url={obj.get('url', '')} "
-                    f"links={len(obj.get('links') or [])} forms={len(obj.get('forms') or [])} "
-                    f"js={len(obj.get('js_calls') or [])} openapi={len(obj.get('openapi_operations') or [])}"
-                    f"{extra_str}]"
+                rendered_surface = (
+                    f"[surface receipt_id={_one_line(obj.get('receipt_id', ''), 40)} "
+                    f"url={_one_line(obj.get('url'), 120)} "
+                    f"{' '.join(counts)}{extra_str}]"
                 )
+                if len(rendered_surface) > 900:
+                    return rendered_surface[:896].rstrip() + "...]"
+                return rendered_surface
             if "returned_chars" in obj and "total_length" in obj:
-                body_snip = " ".join(str(obj.get("body") or "").split())[:90]
+                body_snip = _one_line(obj.get("body"), 90)
                 return (
-                    f"[read receipt_id={obj.get('receipt_id', '')} offset={obj.get('offset', 0)} "
-                    f"returned={obj.get('returned_chars', 0)} total={obj.get('total_length', 0)} "
+                    f"[read receipt_id={_one_line(obj.get('receipt_id', ''), 40)} "
+                    f"offset={_one_line(obj.get('offset', 0), 24)} "
+                    f"returned={_one_line(obj.get('returned_chars', 0), 24)} "
+                    f"total={_one_line(obj.get('total_length', 0), 24)} "
                     f"body={body_snip!r}]"
                 )
             if "receipt_id" in obj and "status" in obj:
-                parts = [f"receipt_id={obj.get('receipt_id', '')}"]
+                parts = [f"receipt_id={_one_line(obj.get('receipt_id', ''), 40)}"]
                 if obj.get("method"):
-                    parts.append(str(obj["method"]))
+                    parts.append(_one_line(obj["method"], 16))
                 if obj.get("url"):
-                    parts.append(str(obj["url"]))
+                    parts.append(_one_line(obj["url"], 160))
                 if obj.get("actor"):
-                    parts.append(f"actor={obj['actor']}")
-                parts.append(f"status={obj.get('status', '')}")
+                    parts.append(f"actor={_one_line(obj['actor'], 40)}")
+                parts.append(f"status={_one_line(obj.get('status', ''), 16)}")
                 length_val = obj.get("response_length") if obj.get("response_length") is not None else len(str(obj.get("body") or ""))
-                parts.append(f"len={length_val}")
+                parts.append(f"len={_one_line(length_val, 24)}")
                 if obj.get("cached"):
                     parts.append("cached=true")
                 if obj.get("redirect_location"):
-                    parts.append(f"redirect={obj['redirect_location']}")
+                    parts.append(f"redirect={_one_line(obj['redirect_location'], 120)}")
+                parts.extend(_extract_waf_tags(obj))
                 return f"[collapsed ({len(content)} chars): {' '.join(parts)}]"
+            if (
+                "pages_crawled" in obj
+                or "pages_visited" in obj
+                or "xhr_calls" in obj
+                or "dom_sinks" in obj
+                or "verified_dom_injection" in obj
+                or ("marker_check" in obj and "runtime_requests" in obj)
+                or (
+                    str(obj.get("mode") or "").strip().lower() in {"crawl", "inspect", "dom_verify"}
+                    and any(
+                        k in obj
+                        for k in ("pages", "links", "forms", "url", "start_url", "links_count", "forms_count")
+                    )
+                )
+            ):
+                b_mode = _one_line(obj.get("mode"), 24).lower()
+                if not b_mode:
+                    if "verified_dom_injection" in obj:
+                        b_mode = "dom_verify"
+                    elif any(k in obj for k in ("pages_crawled", "pages_visited", "pages", "xhr_calls")):
+                        b_mode = "crawl"
+                    elif "dom_sinks" in obj or "marker_check" in obj or "runtime_requests" in obj:
+                        b_mode = "inspect"
+                    else:
+                        b_mode = "crawl"
+                raw_pv = obj.get("pages_visited")
+                raw_pc = obj.get("pages_crawled")
+                if isinstance(raw_pv, int) and not isinstance(raw_pv, bool):
+                    pages_visited = raw_pv
+                elif isinstance(raw_pc, int) and not isinstance(raw_pc, bool):
+                    pages_visited = raw_pc
+                elif isinstance(obj.get("pages"), list):
+                    pages_visited = len(obj["pages"])
+                else:
+                    pages_visited = 1 if (b_mode in {"inspect", "dom_verify"} and obj.get("ok")) else 0
+                raw_lc = obj.get("links_count")
+                links_count = (
+                    raw_lc
+                    if isinstance(raw_lc, int) and not isinstance(raw_lc, bool)
+                    else len(obj.get("links") or [])
+                )
+                raw_fc = obj.get("forms_count")
+                forms_count = (
+                    raw_fc
+                    if isinstance(raw_fc, int) and not isinstance(raw_fc, bool)
+                    else len(obj.get("forms") or [])
+                )
+                raw_sinks = obj.get("dom_sinks") if "dom_sinks" in obj else obj.get("matched_sinks")
+                if isinstance(raw_sinks, int) and not isinstance(raw_sinks, bool):
+                    dom_sinks_count = raw_sinks
+                elif isinstance(raw_sinks, list):
+                    dom_sinks_count = len(raw_sinks)
+                elif isinstance(obj.get("dom_sinks_count"), int) and not isinstance(obj.get("dom_sinks_count"), bool):
+                    dom_sinks_count = obj["dom_sinks_count"]
+                else:
+                    dom_sinks_count = 0
+                sample_paths: list[str] = []
+                seen_paths: set[str] = set()
+
+                def _push_path(raw_p: Any) -> None:
+                    if len(sample_paths) >= 6:
+                        return
+                    p_str = _one_line(raw_p, 64)
+                    if p_str and p_str not in seen_paths:
+                        seen_paths.add(p_str)
+                        sample_paths.append(p_str)
+
+                for pg in obj.get("pages") or []:
+                    _push_path(pg.get("url") if isinstance(pg, dict) else pg)
+                for lk in obj.get("links") or []:
+                    _push_path(lk.get("url") if isinstance(lk, dict) else lk)
+                for xh in obj.get("xhr_calls") or obj.get("runtime_requests") or []:
+                    if isinstance(xh, dict):
+                        _push_path(xh.get("url") or xh.get("path"))
+                for fm in obj.get("forms") or []:
+                    if isinstance(fm, dict):
+                        _push_path(fm.get("action") or fm.get("url"))
+                if not sample_paths:
+                    _push_path(obj.get("url") or obj.get("start_url"))
+
+                b_parts = [
+                    f"mode={b_mode}",
+                    f"pages_visited={pages_visited}",
+                    f"links_count={links_count}",
+                    f"forms_count={forms_count}",
+                    f"dom_sinks={dom_sinks_count}",
+                ]
+                xhr_list = obj.get("xhr_calls") or obj.get("runtime_requests")
+                if isinstance(xhr_list, list) and xhr_list:
+                    b_parts.append(f"xhr={len(xhr_list)}")
+                if "verified_dom_injection" in obj:
+                    b_parts.append(f"verified={bool(obj['verified_dom_injection'])}")
+                if sample_paths:
+                    b_parts.append(f"paths={sample_paths}")
+                return f"[browser {' '.join(b_parts)}]"
+            if (
+                str(obj.get("kind") or "").strip().lower() in _TOKEN_TOOL_KINDS
+                or "token_type" in obj
+                or "valid_jwt" in obj
+            ):
+                tok_type = _one_line(obj.get("token_type") or obj.get("kind") or "token", 32)
+                raw_hdr = obj.get("header")
+                hdr_obj: dict[str, Any] = raw_hdr if isinstance(raw_hdr, dict) else {}
+                alg = _one_line(obj.get("alg") or hdr_obj.get("alg"), 32)
+                claim_keys: list[str] = []
+                for ck_src in (obj.get("claims"), obj.get("payload")):
+                    if isinstance(ck_src, dict):
+                        for k in ck_src.keys():
+                            ks = _one_line(k, 40)
+                            if ks and ks not in claim_keys and len(claim_keys) < 12:
+                                claim_keys.append(ks)
+                    elif isinstance(ck_src, list):
+                        for item in ck_src:
+                            ks = _one_line(item, 40)
+                            if ks and ks not in claim_keys and len(claim_keys) < 12:
+                                claim_keys.append(ks)
+                issues: list[str] = []
+                for issue_key in ("issues", "findings", "warnings", "observations"):
+                    raw_iss = obj.get(issue_key)
+                    if isinstance(raw_iss, list):
+                        for item in raw_iss:
+                            if isinstance(item, dict):
+                                lbl = _one_line(item.get("code") or item.get("id") or item.get("message"), 64)
+                            else:
+                                lbl = _one_line(item, 64)
+                            if lbl and lbl not in issues and len(issues) < 8:
+                                issues.append(lbl)
+                t_parts = [f"token_type={tok_type}"]
+                if alg:
+                    t_parts.append(f"alg={alg}")
+                if tok_type == "serialization" and obj.get("format"):
+                    t_parts.append(f"format={_one_line(obj['format'], 32)}")
+                if obj.get("actor"):
+                    t_parts.append(f"actor={_one_line(obj['actor'], 32)}")
+                if claim_keys:
+                    t_parts.append(f"claims_keys={claim_keys}")
+                if issues:
+                    t_parts.append(f"issues={issues}")
+                if isinstance(obj.get("variants"), list) and obj["variants"]:
+                    v_labels = [
+                        _one_line(v.get("label") or v.get("alg"), 32)
+                        for v in obj["variants"][:4]
+                        if isinstance(v, dict) and _one_line(v.get("label") or v.get("alg"), 32)
+                    ]
+                    if v_labels:
+                        t_parts.append(f"variants={v_labels}")
+                return f"[token {' '.join(t_parts)}]"
+            if (
+                "callback_url" in obj
+                or ("bind_scope" in obj and "token" in obj and "url" in obj)
+                or ("hit_count" in obj and ("hits" in obj or "token" in obj or "registered" in obj))
+                or ("hits_count" in obj and ("token" in obj or "callback_url" in obj or "action" in obj))
+                or ("total_hits" in obj and "hits" in obj)
+            ):
+                cb_action = _one_line(
+                    obj.get("action")
+                    or ("poll" if any(k in obj for k in ("hit_count", "hits_count", "total_hits", "hits")) else "create_url"),
+                    24,
+                )
+                cb_token = _one_line(obj.get("token"), 48)
+                cb_url = _one_line(obj.get("callback_url") or obj.get("url"), 120)
+                raw_hc = obj.get("hits_count")
+                if not (isinstance(raw_hc, int) and not isinstance(raw_hc, bool)):
+                    raw_hc = obj.get("hit_count")
+                if not (isinstance(raw_hc, int) and not isinstance(raw_hc, bool)):
+                    raw_hc = obj.get("total_hits")
+                if isinstance(raw_hc, int) and not isinstance(raw_hc, bool):
+                    hits_count = raw_hc
+                elif isinstance(obj.get("hits"), list):
+                    hits_count = len(obj["hits"])
+                else:
+                    hits_count = 0
+                cb_parts = [f"action={cb_action}"]
+                if cb_token:
+                    cb_parts.append(f"token={cb_token}")
+                if cb_url:
+                    cb_parts.append(f"callback_url={cb_url}")
+                cb_parts.append(f"hits_count={hits_count}")
+                return f"[callback {' '.join(cb_parts)}]"
             if "surface_notes" in obj and "hypotheses" in obj:
                 return f"[notebook len={len(content)} (pinned in [NOTEBOOK])]"
 
@@ -610,7 +926,20 @@ def _build_rolled_history_summary(
                     continue
                 rid_m = _RECEIPT_ID_RE.search(line)
                 rid = rid_m.group(0) if rid_m else ""
-                kind = "surface" if line.startswith("[surface ") else ("replay" if line.startswith("[replay ") else "http")
+                if line.startswith("[surface "):
+                    kind = "surface"
+                elif line.startswith("[replay "):
+                    kind = "replay"
+                elif line.startswith("[concurrent "):
+                    kind = "concurrent"
+                elif line.startswith("[browser "):
+                    kind = "browser"
+                elif line.startswith("[token "):
+                    kind = "token"
+                elif line.startswith("[callback "):
+                    kind = "callback"
+                else:
+                    kind = "http"
                 if rid and (kind, rid) in seen_receipt_kinds:
                     continue
                 if rid:

@@ -226,6 +226,190 @@ _FILE_BASENAME_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{1,80}\.[a-z0-9]{1,10}$", r
 _PLAIN_FILENAME_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{2,64}$", re.I)
 _TRIVIAL_BODY_STRINGS = frozenset({"", "{}", "[]", "null", "ok", "true", "false"})
 _ALIAS_NOTE_PREFIX = "Also observed via alias route(s): "
+_OWNER_TENANT_ENVELOPE_KEYS = frozenset({
+    "data",
+    "result",
+    "user",
+    "account",
+    "order",
+    "item",
+    "record",
+    "profile",
+    "payload",
+})
+_GRAPHQL_PATHS = frozenset({"/graphql", "/gql"})
+
+
+def extract_origin(url_or_path: str) -> str:
+    """Return normalized `scheme://netloc` origin for an explicit HTTP(S)/WS(S) URL, else ''."""
+    raw = str(url_or_path or "").strip()
+    if not raw:
+        return ""
+    parsed = urlsplit(raw)
+    scheme = parsed.scheme.lower()
+    if scheme not in {"http", "https", "ws", "wss"} or not parsed.netloc:
+        return ""
+    host = (parsed.hostname or "").strip().lower().rstrip(".")
+    if not host:
+        return ""
+    try:
+        port = parsed.port
+    except ValueError:
+        return ""
+    default_port = 80 if scheme in {"http", "ws"} else 443
+    host_part = f"[{host}]" if ":" in host else host
+    netloc = f"{host_part}:{port}" if (port is not None and port != default_port) else host_part
+    return f"{scheme}://{netloc}"
+
+
+def _is_graphql_path(url_or_path: str) -> bool:
+    """Return True if a URL or path targets a `/graphql` or `/gql` endpoint."""
+    norm = _norm_path(url_or_path)
+    return norm in _GRAPHQL_PATHS or norm.endswith(("/graphql", "/gql"))
+
+
+def _extract_gql_op_from_query_text(query_text: str) -> str:
+    """Extract operation name or first root selection field from a GraphQL query string."""
+    raw = str(query_text or "")
+    if not raw.strip():
+        return ""
+    cleaned = re.sub(r"#[^\r\n]*", "", raw).strip()
+    if not cleaned:
+        return ""
+    named_match = re.match(
+        r"^(?:query|mutation|subscription)\s+([A-Za-z_][A-Za-z0-9_]*)\b",
+        cleaned,
+    )
+    if named_match:
+        return named_match.group(1)
+
+    idx = 0
+    n = len(cleaned)
+    kw_match = re.match(r"^(?:query|mutation|subscription)\b", cleaned)
+    if kw_match:
+        idx = kw_match.end()
+    paren_depth = 0
+    in_str = False
+    escaped = False
+    brace_idx = -1
+    while idx < n:
+        ch = cleaned[idx]
+        if in_str:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_str = False
+        else:
+            if ch == '"':
+                in_str = True
+            elif ch == "(":
+                paren_depth += 1
+            elif ch == ")" and paren_depth > 0:
+                paren_depth -= 1
+            elif ch == "{" and paren_depth == 0:
+                brace_idx = idx
+                break
+        idx += 1
+    if brace_idx == -1:
+        return ""
+    selection = cleaned[brace_idx + 1 :].lstrip()
+    field_match = re.match(
+        r"^(?:([A-Za-z_][A-Za-z0-9_]*)\s*:\s*)?([A-Za-z_][A-Za-z0-9_]*)\b",
+        selection,
+    )
+    if field_match:
+        return field_match.group(2)
+    return ""
+
+
+def extract_graphql_operation_key(request_body: Any) -> str:
+    """Extract GraphQL operationName or first root operation/field name from a request body."""
+    if request_body is None:
+        return ""
+    parsed: Any = None
+    raw = ""
+    if isinstance(request_body, dict):
+        parsed = request_body
+    elif isinstance(request_body, list):
+        parsed = next((item for item in request_body if isinstance(item, dict)), None)
+    else:
+        raw = str(request_body).strip()
+        if not raw:
+            return ""
+        if raw.startswith(("{", "[")):
+            try:
+                loaded = json.loads(raw, strict=False)
+            except ValueError:
+                loaded = None
+            if isinstance(loaded, dict):
+                parsed = loaded
+            elif isinstance(loaded, list):
+                parsed = next((item for item in loaded if isinstance(item, dict)), None)
+
+    if isinstance(parsed, dict):
+        op_name = str(parsed.get("operationName") or "").strip()
+        if op_name and op_name.lower() != "null":
+            return op_name
+        query_val = parsed.get("query")
+        if isinstance(query_val, str) and query_val.strip():
+            return _extract_gql_op_from_query_text(query_val)
+        return ""
+
+    if "=" in raw and not raw.startswith("{") and "\n" not in raw[:256]:
+        q_map = dict(parse_qsl(raw, keep_blank_values=False))
+        op_name = str(q_map.get("operationName") or "").strip()
+        if op_name and op_name.lower() != "null":
+            return op_name
+        if q_map.get("query"):
+            return _extract_gql_op_from_query_text(q_map["query"])
+
+    if "{" in raw:
+        return _extract_gql_op_from_query_text(raw)
+    return ""
+
+
+def _receipt_graphql_operation_key(receipt: dict[str, Any]) -> str:
+    """Extract GraphQL operation identifier from a receipt if it targets `/graphql` or `/gql`."""
+    url_or_path = str(receipt.get("url") or receipt.get("path") or "")
+    if not _is_graphql_path(url_or_path):
+        return ""
+    op = extract_graphql_operation_key(receipt.get("request_body"))
+    if op:
+        return op
+    parsed = urlsplit(url_or_path)
+    q_str = parsed.query or str(receipt.get("query") or "")
+    if q_str:
+        q_map = dict(parse_qsl(q_str, keep_blank_values=False))
+        if q_map.get("operationName") or q_map.get("query"):
+            return extract_graphql_operation_key({
+                "operationName": q_map.get("operationName") or "",
+                "query": q_map.get("query") or "",
+            })
+    return ""
+
+
+def _is_graphql_error_envelope(receipt: dict[str, Any]) -> bool:
+    """Return True if receipt JSON body is a GraphQL error-only envelope (`errors` with empty/null `data`)."""
+    body = str(receipt.get("body") or "").strip()
+    if not body.startswith("{"):
+        return False
+    try:
+        parsed = json.loads(body)
+    except ValueError:
+        return False
+    if not isinstance(parsed, dict):
+        return False
+    errors = parsed.get("errors")
+    if not isinstance(errors, list) or len(errors) == 0:
+        return False
+    if "data" not in parsed or parsed["data"] is None:
+        return True
+    data = parsed["data"]
+    if isinstance(data, dict):
+        return all(v is None for v in data.values())
+    return False
 
 
 def _norm_path(url_or_path: str) -> str:
@@ -366,32 +550,52 @@ def _extract_record_owner_and_tenant(
     receipt: dict[str, Any],
     actor_meta_map: dict[str, dict[str, str]],
 ) -> tuple[str, str]:
-    """Extract explicit record owner alias and tenant from a JSON response body if present."""
+    """Extract explicit record owner alias and tenant from top-level or nested JSON envelope bodies."""
     body = str(receipt.get("body") or "").strip()
-    if not body.startswith("{"):
+    if not body.startswith(("{", "[")):
         return "", ""
     try:
         parsed = json.loads(body)
     except ValueError:
         return "", ""
-    if not isinstance(parsed, dict):
+    if not isinstance(parsed, (dict, list)):
         return "", ""
 
     owner_actor = ""
-    for key in _RECORD_OWNER_KEYS:
-        val = parsed.get(key)
-        if isinstance(val, str):
-            clean = val.strip()
-            if clean and clean != "anon" and (clean in actor_meta_map or not actor_meta_map):
-                owner_actor = clean
-                break
-
     record_tenant = ""
-    for key in _RECORD_TENANT_KEYS:
-        val = parsed.get(key)
-        if isinstance(val, str) and val.strip():
-            record_tenant = val.strip().lower()
-            break
+    queue: list[tuple[Any, int]] = [(parsed, 0)]
+    q_idx = 0
+    visited = 0
+    while q_idx < len(queue) and visited < 120:
+        node, depth = queue[q_idx]
+        q_idx += 1
+        visited += 1
+        if isinstance(node, dict):
+            if not owner_actor:
+                for key in _RECORD_OWNER_KEYS:
+                    val = node.get(key)
+                    if isinstance(val, str):
+                        clean = val.strip()
+                        if clean and clean != "anon" and (clean in actor_meta_map or not actor_meta_map):
+                            owner_actor = clean
+                            break
+            if not record_tenant:
+                for key in _RECORD_TENANT_KEYS:
+                    val = node.get(key)
+                    if isinstance(val, str) and val.strip():
+                        record_tenant = val.strip().lower()
+                        break
+            if owner_actor and record_tenant:
+                break
+            if depth < 3:
+                for k, v in node.items():
+                    if str(k).lower() in _OWNER_TENANT_ENVELOPE_KEYS and isinstance(v, (dict, list)):
+                        queue.append((v, depth + 1))
+        elif isinstance(node, list) and 1 <= len(node) <= 5 and depth < 3:
+            for item in node:
+                if isinstance(item, (dict, list)):
+                    queue.append((item, depth + 1))
+
     if not record_tenant and owner_actor and owner_actor in actor_meta_map:
         record_tenant = str(actor_meta_map[owner_actor].get("tenant") or "").lower()
     return owner_actor, record_tenant
@@ -409,6 +613,8 @@ def _is_genuine_anon_2xx(
         return False
     body = str(receipt.get("body") or "").strip()
     if len(body) <= 2:
+        return False
+    if _is_graphql_error_envelope(receipt):
         return False
     path = _norm_path(str(receipt.get("url") or receipt.get("path") or ""))
     ctype = str(receipt.get("content_type") or "").lower()
@@ -1001,6 +1207,23 @@ def select_primary_proof(
     return primary, ordered_actors
 
 
+def _extract_gql_op_from_receipts(
+    receipts: list[dict[str, Any]],
+    target_path: str = "",
+) -> str:
+    """Return the first non-empty GraphQL operation key found on matching receipts."""
+    for rec in receipts:
+        if not isinstance(rec, dict):
+            continue
+        rec_url = str(rec.get("url") or rec.get("path") or "")
+        if target_path and rec_url and _norm_path(rec_url) != target_path:
+            continue
+        op = _receipt_graphql_operation_key(rec)
+        if op:
+            return op
+    return ""
+
+
 def _find_exact_route_anon_2xx(
     norm_path: str,
     method: str,
@@ -1010,6 +1233,8 @@ def _find_exact_route_anon_2xx(
     actor_meta_map: dict[str, dict[str, str]],
     receipt_store: ReceiptStore | None = None,
     evidence_value: str = "",
+    origin: str = "",
+    graphql_op: str = "",
 ) -> tuple[dict[str, Any] | None, bool]:
     """Find a genuine `anon` 2xx receipt on the exact `(norm_path, method)` if `anon` was not denied (401/403).
 
@@ -1017,6 +1242,14 @@ def _find_exact_route_anon_2xx(
     """
     target_path = _norm_path(norm_path)
     target_method = str(method or "GET").strip().upper()
+    target_origin = str(origin or "").strip() or extract_origin(norm_path) or next(
+        (extract_origin(str(r.get("url") or "")) for r in proof_recs if extract_origin(str(r.get("url") or ""))),
+        "",
+    )
+    is_gql = _is_graphql_path(target_path)
+    target_gql_op = str(graphql_op or "").strip() or (
+        _extract_gql_op_from_receipts(proof_recs, target_path) if is_gql else ""
+    )
     candidates: list[dict[str, Any]] = []
     seen_ids: set[str] = set()
 
@@ -1024,11 +1257,20 @@ def _find_exact_route_anon_2xx(
         rid = str(rec.get("receipt_id") or "")
         if rid and rid in seen_ids:
             return
-        if _norm_path(str(rec.get("url") or rec.get("path") or "")) != target_path:
+        rec_url = str(rec.get("url") or rec.get("path") or "")
+        if _norm_path(rec_url) != target_path:
             return
+        if target_origin:
+            rec_origin = extract_origin(rec_url)
+            if rec_origin and rec_origin != target_origin:
+                return
         rec_method = str(rec.get("method") or "GET").strip().upper()
         if target_method and rec_method != target_method:
             return
+        if is_gql and target_gql_op:
+            rec_gql_op = _receipt_graphql_operation_key(rec)
+            if rec_gql_op and rec_gql_op != target_gql_op:
+                return
         if rid:
             seen_ids.add(rid)
         candidates.append(rec)
@@ -1052,7 +1294,12 @@ def _find_exact_route_anon_2xx(
     if anon_denied:
         return None, True
 
-    anon_2xx = [r for r in candidates if _is_genuine_anon_2xx(r, actor_meta_map)]
+    anon_2xx = [
+        r
+        for r in candidates
+        if _is_genuine_anon_2xx(r, actor_meta_map)
+        and (not (is_gql and target_gql_op) or _receipt_graphql_operation_key(r) == target_gql_op)
+    ]
     if not anon_2xx:
         return None, False
 
@@ -1073,6 +1320,8 @@ def _resolve_route_auth_bypass_vs_bfla(
     receipt_store: ReceiptStore | None = None,
     exact_path: str = "",
     method: str = "",
+    origin: str = "",
+    graphql_op: str = "",
 ) -> str:
     """Deterministically resolve auth_bypass vs bfla on a route from observed receipts.
 
@@ -1082,9 +1331,38 @@ def _resolve_route_auth_bypass_vs_bfla(
     """
     norm_exact = _norm_path(exact_path) if exact_path else ""
     norm_method = str(method or "").strip().upper()
-    all_recs = [*proof_recs, *ctrl_recs]
+    target_origin = str(origin or "").strip() or extract_origin(exact_path) or next(
+        (extract_origin(str(r.get("url") or "")) for r in proof_recs if extract_origin(str(r.get("url") or ""))),
+        "",
+    )
+    is_gql = _is_graphql_path(exact_path or route_template)
+    target_gql_op = str(graphql_op or "").strip() or (
+        _extract_gql_op_from_receipts(proof_recs, norm_exact) if is_gql else ""
+    )
+
+    def _matches_scope(rec: dict[str, Any], *, require_route: bool) -> bool:
+        rec_url = str(rec.get("url") or rec.get("path") or "")
+        if target_origin:
+            rec_origin = extract_origin(rec_url)
+            if rec_origin and rec_origin != target_origin:
+                return False
+        if require_route:
+            if norm_exact:
+                if _norm_path(rec_url) != norm_exact:
+                    return False
+                if norm_method and str(rec.get("method") or "").strip().upper() != norm_method:
+                    return False
+            elif normalize_route_template(rec_url) != route_template:
+                return False
+        if is_gql and target_gql_op and _is_graphql_path(rec_url):
+            rec_gql_op = _receipt_graphql_operation_key(rec)
+            if rec_gql_op and rec_gql_op != target_gql_op:
+                return False
+        return True
+
+    all_recs = [r for r in [*proof_recs, *ctrl_recs] if _matches_scope(r, require_route=False)]
     if receipt_store is not None:
-        seen_ids = {r.get("receipt_id") for r in all_recs}
+        seen_ids = {r.get("receipt_id") for r in [*proof_recs, *ctrl_recs]}
         for rid in receipt_store.list_ids():
             if rid in seen_ids:
                 continue
@@ -1092,13 +1370,7 @@ def _resolve_route_auth_bypass_vs_bfla(
                 rec = receipt_store.get(rid)
             except (KeyError, ValueError):
                 continue
-            rec_url = str(rec.get("url") or rec.get("path") or "")
-            if norm_exact:
-                if _norm_path(rec_url) != norm_exact:
-                    continue
-                if norm_method and str(rec.get("method") or "").strip().upper() != norm_method:
-                    continue
-            elif normalize_route_template(rec_url) != route_template:
+            if not _matches_scope(rec, require_route=True):
                 continue
             all_recs.append(rec)
 
@@ -1106,18 +1378,26 @@ def _resolve_route_auth_bypass_vs_bfla(
         str(r.get("actor") or "") == "anon" and int(r.get("status") or 0) in {401, 403}
         for r in all_recs
     )
+    anon_pool = all_recs if norm_exact else [r for r in proof_recs if _matches_scope(r, require_route=False)]
     anon_genuine_2xx = any(
         _is_genuine_anon_2xx(r, actor_meta_map)
-        for r in (all_recs if norm_exact else proof_recs)
+        and (not (is_gql and target_gql_op) or _receipt_graphql_operation_key(r) == target_gql_op)
+        for r in anon_pool
     )
     non_admin_2xx = any(
         str(r.get("actor") or "") not in {"", "anon"}
         and not _is_admin_role((actor_meta_map.get(str(r.get("actor") or "")) or {}).get("role", ""))
         and 200 <= int(r.get("status") or 0) < 300
+        and not _is_graphql_error_envelope(r)
         for r in all_recs
     )
     if anon_denied or not anon_genuine_2xx:
-        if non_admin_2xx or any(str(r.get("actor") or "") != "anon" and 200 <= int(r.get("status") or 0) < 300 for r in proof_recs):
+        if non_admin_2xx or any(
+            str(r.get("actor") or "") != "anon"
+            and 200 <= int(r.get("status") or 0) < 300
+            and not _is_graphql_error_envelope(r)
+            for r in proof_recs
+        ):
             return "bfla"
     if anon_genuine_2xx and not anon_denied:
         return "auth_bypass"
@@ -1721,6 +2001,92 @@ def _methods_compatible(
     return bool(methods_a & methods_b)
 
 
+def _finding_origin(
+    entry: dict[str, Any],
+    receipt_store: ReceiptStore | None = None,
+) -> str:
+    """Return normalized origin (`scheme://netloc`) for a finding from URL, proofs, or excerpts."""
+    for raw in (entry.get("origin"), entry.get("url"), entry.get("path")):
+        origin = extract_origin(str(raw or ""))
+        if origin:
+            return origin
+    if receipt_store is not None:
+        for rid in (entry.get("proof_receipt_ids") or []):
+            try:
+                rec = receipt_store.get(str(rid))
+            except (KeyError, ValueError):
+                continue
+            origin = extract_origin(str(rec.get("url") or ""))
+            if origin:
+                return origin
+    for ex in (entry.get("evidence_excerpts") or []):
+        if isinstance(ex, dict):
+            origin = extract_origin(str(ex.get("url") or ""))
+            if origin:
+                return origin
+    return ""
+
+
+def _finding_graphql_op(
+    entry: dict[str, Any],
+    receipt_store: ReceiptStore | None = None,
+) -> str:
+    """Return GraphQL operation identifier for a finding targeting `/graphql` or `/gql`, else ''."""
+    url_or_path = str(entry.get("url") or entry.get("path") or entry.get("route_template") or "")
+    if not _is_graphql_path(url_or_path):
+        return ""
+    explicit_op = str(entry.get("graphql_operation") or "").strip()
+    if explicit_op:
+        return explicit_op
+    if entry.get("request_body"):
+        op = extract_graphql_operation_key(entry.get("request_body"))
+        if op:
+            return op
+    parsed = urlsplit(url_or_path)
+    if parsed.query:
+        q_map = dict(parse_qsl(parsed.query, keep_blank_values=False))
+        if q_map.get("operationName") or q_map.get("query"):
+            op = extract_graphql_operation_key({
+                "operationName": q_map.get("operationName") or "",
+                "query": q_map.get("query") or "",
+            })
+            if op:
+                return op
+    if receipt_store is not None:
+        for rid in (entry.get("proof_receipt_ids") or []):
+            try:
+                rec = receipt_store.get(str(rid))
+            except (KeyError, ValueError):
+                continue
+            op = _receipt_graphql_operation_key(rec)
+            if op:
+                return op
+    for ex in (entry.get("evidence_excerpts") or []):
+        if isinstance(ex, dict):
+            op = _receipt_graphql_operation_key(ex)
+            if op:
+                return op
+    return ""
+
+
+def _entries_compatible_origin_and_gql(
+    entry_a: dict[str, Any],
+    entry_b: dict[str, Any],
+    *,
+    receipt_store: ReceiptStore | None = None,
+) -> bool:
+    """Return False if two findings explicitly belong to distinct origins or distinct GraphQL operations."""
+    origin_a = _finding_origin(entry_a, receipt_store=receipt_store)
+    origin_b = _finding_origin(entry_b, receipt_store=receipt_store)
+    if origin_a and origin_b and origin_a != origin_b:
+        return False
+    gql_a = _finding_graphql_op(entry_a, receipt_store=receipt_store)
+    gql_b = _finding_graphql_op(entry_b, receipt_store=receipt_store)
+    if gql_a and gql_b and gql_a != gql_b:
+        return False
+    return True
+
+
 def _resolve_cross_class_overlap(
     entry_a: dict[str, Any],
     entry_b: dict[str, Any],
@@ -1737,6 +2103,8 @@ def _resolve_cross_class_overlap(
     cls_a = str(entry_a.get("class_type") or "").strip().lower()
     cls_b = str(entry_b.get("class_type") or "").strip().lower()
     if not cls_a or not cls_b or cls_a == cls_b or {cls_a, cls_b} == {"auth_bypass", "bfla"}:
+        return None
+    if not _entries_compatible_origin_and_gql(entry_a, entry_b, receipt_store=receipt_store):
         return None
 
     tmpl_a = str(
@@ -1885,6 +2253,8 @@ def _resolve_alias_or_family_overlap(
     cls_b = str(entry_b.get("class_type") or "").strip().lower()
     if not cls_a or not cls_b:
         return None
+    if not _entries_compatible_origin_and_gql(entry_a, entry_b, receipt_store=receipt_store):
+        return None
 
     tmpl_a = str(
         entry_a.get("route_template")
@@ -2005,9 +2375,19 @@ def canonicalize_and_deduplicate_findings(
     actor_meta_map: dict[str, dict[str, str]],
     receipt_store: ReceiptStore | None = None,
 ) -> list[dict[str, Any]]:
-    """Normalize classes/routes, resolve auth_bypass/bfla overlap, deduplicate by (route_template, class), and rank primary actors."""
-    grouped: dict[tuple[str, str], dict[str, Any]] = {}
-    order: list[tuple[str, str]] = []
+    """Normalize classes/routes, resolve auth_bypass/bfla overlap, deduplicate by (origin, route_template, graphql_op, class), and rank primary actors."""
+    grouped: dict[tuple[tuple[str, str, str], str], dict[str, Any]] = {}
+    order: list[tuple[tuple[str, str, str], str]] = []
+    explicit_origins = {
+        o
+        for o in (
+            _finding_origin(raw_f, receipt_store=receipt_store)
+            for raw_f in findings
+            if isinstance(raw_f, dict)
+        )
+        if o
+    }
+    multi_origin = len(explicit_origins) > 1
 
     def _is_actor_eligible_over(cls_name: str, cand_actor: str, ref_actor: str) -> bool:
         if not cand_actor:
@@ -2176,23 +2556,27 @@ def canonicalize_and_deduplicate_findings(
             f["actor"] = fallback_actor
             f["actor_alias"] = fallback_actor
 
-        key = (route_template, canonical_class)
+        scope_origin = _finding_origin(f, receipt_store=receipt_store) if multi_origin else ""
+        gql_op = _finding_graphql_op(f, receipt_store=receipt_store) if _is_graphql_path(url_val or route_template) else ""
+        scope_key = (scope_origin, route_template, gql_op)
+        key = (scope_key, canonical_class)
         if key not in grouped:
             grouped[key] = f
             order.append(key)
         else:
             _merge_entries(grouped[key], f)
 
-    # Resolve any (route_template, auth_bypass) vs (route_template, bfla) overlap deterministically.
+    # Resolve any (scope_key, auth_bypass) vs (scope_key, bfla) overlap deterministically.
     routes_with_both = {
-        tmpl
-        for (tmpl, cls) in list(order)
+        scope_key
+        for (scope_key, cls) in list(order)
         if cls in {"auth_bypass", "bfla"}
-        and ((tmpl, "auth_bypass") in grouped and (tmpl, "bfla") in grouped)
+        and ((scope_key, "auth_bypass") in grouped and (scope_key, "bfla") in grouped)
     }
-    for tmpl in routes_with_both:
-        ab_entry = grouped[(tmpl, "auth_bypass")]
-        bf_entry = grouped[(tmpl, "bfla")]
+    for scope_key in routes_with_both:
+        s_origin, s_tmpl, s_gql_op = scope_key
+        ab_entry = grouped[(scope_key, "auth_bypass")]
+        bf_entry = grouped[(scope_key, "bfla")]
         combined_proof_ids = list(dict.fromkeys([
             *(ab_entry.get("proof_receipt_ids") or []),
             *(bf_entry.get("proof_receipt_ids") or []),
@@ -2215,30 +2599,37 @@ def canonicalize_and_deduplicate_findings(
                 except (KeyError, ValueError):
                     continue
         winner_class = _resolve_route_auth_bypass_vs_bfla(
-            tmpl,
+            s_tmpl,
             proof_recs,
             ctrl_recs,
             actor_meta_map=actor_meta_map,
             receipt_store=receipt_store,
+            origin=s_origin or _finding_origin(ab_entry, receipt_store=receipt_store),
+            graphql_op=s_gql_op,
         )
         loser_class = "bfla" if winner_class == "auth_bypass" else "auth_bypass"
-        _merge_entries(grouped[(tmpl, winner_class)], grouped[(tmpl, loser_class)])
-        del grouped[(tmpl, loser_class)]
-        order = [k for k in order if k != (tmpl, loser_class)]
+        _merge_entries(grouped[(scope_key, winner_class)], grouped[(scope_key, loser_class)])
+        del grouped[(scope_key, loser_class)]
+        order = [k for k in order if k != (scope_key, loser_class)]
 
-    # Resolve cross-class root-cause duplicates on the same (route_template, actor)
+    # Resolve cross-class root-cause duplicates on the same (origin, route_template, graphql_op, actor)
     # (Rule 1: `other` subsumption; Rule 2: state-tampering family & identical-proof race/logic overlap).
     cross_changed = True
     while cross_changed:
         cross_changed = False
-        by_route: dict[str, list[tuple[str, str]]] = {}
+        by_route: dict[tuple[str, str, str], list[tuple[tuple[str, str, str], str]]] = {}
         for k in order:
             by_route.setdefault(k[0], []).append(k)
 
         for route_keys in by_route.values():
             if len(route_keys) < 2:
                 continue
-            best_merge: tuple[int, int, tuple[str, str], tuple[str, str]] | None = None
+            best_merge: tuple[
+                int,
+                int,
+                tuple[tuple[str, str, str], str],
+                tuple[tuple[str, str, str], str],
+            ] | None = None
             for i in range(len(route_keys)):
                 k1 = route_keys[i]
                 if k1 not in grouped:
@@ -2281,8 +2672,8 @@ def canonicalize_and_deduplicate_findings(
                 tuple[int, int, int, int, int, int, str, str],
                 tuple[int, int, int, int, int, int, str, str],
             ],
-            tuple[str, str],
-            tuple[str, str],
+            tuple[tuple[str, str, str], str],
+            tuple[tuple[str, str, str], str],
             str,
         ] | None = None
         for i in range(len(order)):
@@ -2324,6 +2715,8 @@ def canonicalize_and_deduplicate_findings(
     out: list[dict[str, Any]] = []
     for idx, key in enumerate(order, start=1):
         entry = grouped[key]
+        entry_origin = _finding_origin(entry, receipt_store=receipt_store)
+        entry_gql_op = key[0][2] or _finding_graphql_op(entry, receipt_store=receipt_store)
         entry["finding_id"] = f"F-{idx:03d}"
         if receipt_store is not None:
             proof_recs = []
@@ -2351,6 +2744,8 @@ def canonicalize_and_deduplicate_findings(
                     receipt_store=receipt_store,
                     exact_path=str(entry.get("url") or entry.get("path") or ""),
                     method=str(entry.get("method") or "GET"),
+                    origin=entry_origin,
+                    graphql_op=entry_gql_op,
                 )
                 if resolved_cls == "bfla":
                     non_anon_proofs = [r for r in proof_recs if str(r.get("actor") or "") != "anon"]
@@ -2373,6 +2768,8 @@ def canonicalize_and_deduplicate_findings(
                     actor_meta_map=actor_meta_map,
                     receipt_store=receipt_store,
                     evidence_value=ev_hint,
+                    origin=entry_origin,
+                    graphql_op=entry_gql_op,
                 )
                 if anon_rec is not None and not anon_denied:
                     entry["class_type"] = "auth_bypass"
@@ -2397,6 +2794,7 @@ def canonicalize_and_deduplicate_findings(
             # For BOLA, if receipt_store also has a same-path 2xx receipt from a higher-priority peer actor containing evidence_value, include it.
             if entry["class_type"] == "bola" and proof_recs:
                 target_norm_p = _norm_path(str(proof_recs[0].get("url") or entry.get("url") or ""))
+                target_rec_origin = entry_origin or extract_origin(str(proof_recs[0].get("url") or ""))
                 ev_val = str(entry.get("evidence_value") or "").strip()
                 seen_proof_ids = {r["receipt_id"] for r in proof_recs}
                 for rid in receipt_store.list_ids():
@@ -2406,9 +2804,17 @@ def canonicalize_and_deduplicate_findings(
                         cand = receipt_store.get(rid)
                     except (KeyError, ValueError):
                         continue
+                    cand_url = str(cand.get("url") or "")
+                    cand_origin = extract_origin(cand_url)
+                    if target_rec_origin and cand_origin and cand_origin != target_rec_origin:
+                        continue
+                    if entry_gql_op and _is_graphql_path(cand_url):
+                        cand_gql_op = _receipt_graphql_operation_key(cand)
+                        if cand_gql_op and cand_gql_op != entry_gql_op:
+                            continue
                     if (
                         200 <= int(cand.get("status") or 0) < 300
-                        and _norm_path(str(cand.get("url") or "")) == target_norm_p
+                        and _norm_path(cand_url) == target_norm_p
                         and str(cand.get("method") or "").upper() == str(entry.get("method") or "GET").upper()
                         and (not ev_val or ev_val in str(cand.get("body") or ""))
                     ):

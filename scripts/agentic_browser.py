@@ -12,12 +12,13 @@ from __future__ import annotations
 
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 import inspect
 import json
 from pathlib import Path
 import sys
-from typing import Any, Callable, Sequence
+import threading
+from typing import Any, Callable, Iterator, Sequence
 from urllib.parse import parse_qsl, quote, urlencode, urljoin, urlsplit, urlunsplit
 
 from agentic_http import (
@@ -186,6 +187,87 @@ _INSPECT_DOM_JS = r"""(marker) => {
     event_attr_matches: eventAttrMatches,
   };
 }"""
+
+
+_CRAWL_CONTEXT_HOOK_LOCK = threading.Lock()
+
+
+class _AttrProxy:
+    """Lightweight proxy forwarding attribute access except explicit method/attribute overrides."""
+
+    def __init__(self, target: Any, **overrides: Any) -> None:
+        self._target = target
+        self._overrides = overrides
+
+    def __getattr__(self, name: str) -> Any:
+        if name in self._overrides:
+            return self._overrides[name]
+        return getattr(self._target, name)
+
+
+class _SyncPwContextProxy:
+    """Proxy for ``sync_playwright()`` injecting init scripts and cookies on every new BrowserContext."""
+
+    def __init__(self, inner: Any, on_context: Callable[[Any], None]) -> None:
+        self._inner = inner
+        self._on_context = on_context
+
+    def __enter__(self) -> Any:
+        pw = self._inner.__enter__()
+        orig_chromium = pw.chromium
+
+        def _launch(*args: Any, **kwargs: Any) -> Any:
+            browser = orig_chromium.launch(*args, **kwargs)
+            orig_new_context = browser.new_context
+
+            def _new_context(*nc_args: Any, **nc_kwargs: Any) -> Any:
+                ctx = orig_new_context(*nc_args, **nc_kwargs)
+                self._on_context(ctx)
+                return ctx
+
+            return _AttrProxy(browser, new_context=_new_context)
+
+        chromium_proxy = _AttrProxy(orig_chromium, launch=_launch)
+        return _AttrProxy(pw, chromium=chromium_proxy)
+
+    def __exit__(self, *args: Any) -> Any:
+        return self._inner.__exit__(*args)
+
+
+@contextmanager
+def _inject_crawl_browser_state(
+    ls_init_script: str,
+    cookie_records: Sequence[dict[str, Any]] = (),
+) -> Iterator[None]:
+    """Ensure ``kryon_core.surface.crawl.crawl_site`` receives init scripts and per-origin cookies."""
+    if not ls_init_script and not cookie_records:
+        yield
+        return
+    try:
+        import kryon_core.surface.crawl as crawl_mod
+    except Exception:
+        yield
+        return
+    orig_sync_pw = getattr(crawl_mod, "sync_playwright", None)
+    if orig_sync_pw is None:
+        yield
+        return
+
+    def _on_context(ctx: Any) -> None:
+        if ls_init_script:
+            ctx.add_init_script(ls_init_script)
+        if cookie_records:
+            ctx.add_cookies(list(cookie_records))
+
+    def _wrapped_sync_pw(*args: Any, **kwargs: Any) -> Any:
+        return _SyncPwContextProxy(orig_sync_pw(*args, **kwargs), _on_context)
+
+    with _CRAWL_CONTEXT_HOOK_LOCK:
+        crawl_mod.sync_playwright = _wrapped_sync_pw
+        try:
+            yield
+        finally:
+            crawl_mod.sync_playwright = orig_sync_pw
 
 
 def _run_sync(fn: Callable[[], dict[str, Any]], *, timeout: float = 120.0) -> dict[str, Any]:
@@ -385,6 +467,131 @@ def _extract_actor_browser_auth(http: AgenticHTTPClient, actor: str) -> tuple[st
     ))
 
 
+def _extract_actor_cookie_records(
+    http: AgenticHTTPClient,
+    actor: str,
+    *,
+    base_url: str,
+    fallback_cookie_hdr: str = "",
+) -> list[dict[str, Any]]:
+    """Build scope-validated Playwright cookie dicts preserving per-origin/domain attributes when available."""
+    clean_actor = str(actor or "anon").strip() or "anon"
+    if clean_actor == "anon":
+        return []
+
+    raw_records: Any = None
+    get_state = getattr(http.actors, "get_browser_auth_state", None)
+    if callable(get_state):
+        state = get_state(clean_actor)
+        if isinstance(state, dict) and isinstance(state.get("cookie_records"), (list, tuple)):
+            raw_records = state.get("cookie_records")
+
+    if raw_records is None:
+        try:
+            session = http.actors.get(clean_actor)
+        except (ValueError, KeyError):
+            session = None
+        if session is not None:
+            lock = getattr(session, "_lock", None)
+            ctx = lock if lock is not None else nullcontext()
+            with ctx:
+                raw_records = list(getattr(session, "cookie_records", None) or ())
+
+    scope_guard = getattr(http, "scope_guard", None)
+    parsed_base = urlsplit(str(base_url or "").strip())
+    base_scheme = (parsed_base.scheme or "http").lower()
+    base_host = (parsed_base.hostname or "").strip().lower().rstrip(".")
+    base_port = parsed_base.port or (443 if base_scheme == "https" else 80)
+
+    def _domain_allowed(raw_domain: str) -> bool:
+        dom = raw_domain.strip().lower().lstrip(".").rstrip(".")
+        if not dom:
+            return False
+        if dom == base_host or (base_host and base_host.endswith("." + dom)):
+            if scope_guard is not None and any(
+                rule.matches_origin(base_scheme, dom, base_port)
+                for rule in getattr(scope_guard, "_out_of_scope_origin_rules", ())
+            ):
+                return False
+            return True
+        if scope_guard is None:
+            return False
+        for sch, prt in ((base_scheme, base_port), ("https", 443), ("http", 80)):
+            if scope_guard.check_origin(sch, dom, prt):
+                return True
+        return False
+
+    cookies_out: list[dict[str, Any]] = []
+    seen_keys: set[tuple[str, str, str, str]] = set()
+    recorded_names: set[str] = set()
+    rejected_record_names: set[str] = set()
+
+    for rec in raw_records or ():
+        if not isinstance(rec, dict):
+            continue
+        cname = str(rec.get("name") or "").strip()
+        cval = rec.get("value")
+        if not cname or not isinstance(cval, str):
+            continue
+        raw_domain = str(rec.get("domain") or "").strip()
+        raw_url = str(rec.get("url") or rec.get("origin") or "").strip()
+        cpath = str(rec.get("path") or "/").strip() or "/"
+        cookie_dict: dict[str, Any]
+        if raw_domain:
+            if not _domain_allowed(raw_domain):
+                rejected_record_names.add(cname)
+                continue
+            cookie_dict = {
+                "name": cname,
+                "value": cval,
+                "domain": raw_domain,
+                "path": cpath,
+            }
+            dedup_scope = f"d:{raw_domain.lower()}:{cpath}"
+        elif raw_url:
+            try:
+                checked_url = _resolve_and_check_scope(http, raw_url)
+            except ScopeViolationError:
+                rejected_record_names.add(cname)
+                continue
+            cookie_dict = {
+                "name": cname,
+                "value": cval,
+                "url": checked_url,
+            }
+            dedup_scope = f"u:{_normalize_js_origin(checked_url)}"
+        else:
+            cookie_dict = {
+                "name": cname,
+                "value": cval,
+                "url": base_url,
+            }
+            dedup_scope = f"u:{_normalize_js_origin(base_url)}"
+
+        if isinstance(rec.get("secure"), bool):
+            cookie_dict["secure"] = rec["secure"]
+        if isinstance(rec.get("httpOnly"), bool):
+            cookie_dict["httpOnly"] = rec["httpOnly"]
+        raw_same_site = str(rec.get("sameSite") or "").strip().lower()
+        norm_same_site = {"strict": "Strict", "lax": "Lax", "none": "None"}.get(raw_same_site, "")
+        if norm_same_site:
+            cookie_dict["sameSite"] = norm_same_site
+
+        dedup_key = (cname, dedup_scope, str(cookie_dict.get("domain") or ""), str(cookie_dict.get("url") or ""))
+        if dedup_key in seen_keys:
+            continue
+        seen_keys.add(dedup_key)
+        recorded_names.add(cname)
+        cookies_out.append(cookie_dict)
+
+    for cname, cval in _parse_cookie_pairs(fallback_cookie_hdr):
+        if cname in recorded_names or cname in rejected_record_names:
+            continue
+        cookies_out.append({"name": cname, "value": cval, "url": base_url})
+
+    return cookies_out
+
+
 def _extract_actor_local_storage(http: AgenticHTTPClient, actor: str) -> dict[str, str]:
     """Extract host-side same-origin ``localStorage`` key/value pairs for ``actor``.
 
@@ -426,6 +633,60 @@ def _extract_actor_local_storage(http: AgenticHTTPClient, actor: str) -> dict[st
     with ctx:
         raw_ls = getattr(session, "local_storage", None)
         return _clean_map(raw_ls)
+
+
+def _extract_actor_local_storage_by_origin(
+    http: AgenticHTTPClient,
+    actor: str,
+) -> dict[str, dict[str, str]]:
+    """Extract scope-validated per-origin ``localStorage`` maps for ``actor`` when present."""
+    clean_actor = str(actor or "anon").strip() or "anon"
+    if clean_actor == "anon":
+        return {}
+
+    raw_by_origin: Any = None
+    get_state = getattr(http.actors, "get_browser_auth_state", None)
+    used_get_state = callable(get_state)
+    if used_get_state:
+        assert callable(get_state)
+        state = get_state(clean_actor)
+        if isinstance(state, dict) and isinstance(state.get("local_storage_by_origin"), dict):
+            raw_by_origin = state.get("local_storage_by_origin")
+
+    if raw_by_origin is None:
+        try:
+            session = http.actors.get(clean_actor)
+        except (ValueError, KeyError):
+            if used_get_state:
+                return {}
+            raise
+        lock = getattr(session, "_lock", None)
+        ctx = lock if lock is not None else nullcontext()
+        with ctx:
+            raw_by_origin = getattr(session, "local_storage_by_origin", None)
+
+    if not isinstance(raw_by_origin, dict):
+        return {}
+
+    out: dict[str, dict[str, str]] = {}
+    for raw_orig, raw_kv in raw_by_origin.items():
+        if not isinstance(raw_orig, str) or not isinstance(raw_kv, dict):
+            continue
+        norm_orig = _normalize_js_origin(raw_orig)
+        if not norm_orig:
+            continue
+        try:
+            _resolve_and_check_scope(http, norm_orig)
+        except ScopeViolationError:
+            continue
+        cleaned_kv: dict[str, str] = {}
+        for k, v in raw_kv.items():
+            if isinstance(k, str) and isinstance(v, str) and k.strip():
+                cleaned_kv[k.strip()] = v
+        if cleaned_kv:
+            merged = out.setdefault(norm_orig, {})
+            merged.update(cleaned_kv)
+    return out
 
 
 def _normalize_js_origin(expected_origin: str) -> str:
@@ -474,11 +735,71 @@ def _build_origin_localstorage_init_script(expected_origin: str, local_storage: 
     )
 
 
+def _build_multi_origin_localstorage_init_script(
+    local_storage_by_origin: dict[str, dict[str, str]] | None = None,
+    *,
+    fallback_origin: str = "",
+    fallback_local_storage: dict[str, str] | None = None,
+) -> str:
+    """Build an origin-isolated Playwright init script from ``local_storage_by_origin`` or flat fallback."""
+    if not local_storage_by_origin:
+        return _build_origin_localstorage_init_script(
+            fallback_origin,
+            fallback_local_storage or {},
+        )
+
+    origin_entries: dict[str, list[list[str]]] = {}
+    norm_fb = _normalize_js_origin(fallback_origin)
+    merged_by_origin: dict[str, dict[str, str]] = {}
+    if norm_fb and fallback_local_storage:
+        fb_clean = {
+            k.strip(): v
+            for k, v in fallback_local_storage.items()
+            if isinstance(k, str) and isinstance(v, str) and k.strip()
+        }
+        if fb_clean:
+            merged_by_origin[norm_fb] = fb_clean
+
+    for raw_orig, kv in local_storage_by_origin.items():
+        norm_orig = _normalize_js_origin(raw_orig)
+        if not norm_orig or not isinstance(kv, dict):
+            continue
+        target = merged_by_origin.setdefault(norm_orig, {})
+        for k, v in kv.items():
+            if isinstance(k, str) and isinstance(v, str) and k.strip():
+                target[k.strip()] = v
+
+    for orig_key, kv in merged_by_origin.items():
+        pairs = [[k, v] for k, v in kv.items()]
+        if pairs:
+            origin_entries[orig_key] = pairs
+
+    if not origin_entries:
+        return ""
+
+    map_json = json.dumps(origin_entries, ensure_ascii=True)
+    return (
+        "(() => {\n"
+        f"  const map = {map_json};\n"
+        "  if (Object.prototype.hasOwnProperty.call(map, window.location.origin) && map[window.location.origin]) {\n"
+        "    try {\n"
+        "      for (const [k, v] of map[window.location.origin]) {\n"
+        "        window.localStorage.setItem(k, v);\n"
+        "      }\n"
+        "    } catch (_) {}\n"
+        "  }\n"
+        "})();\n"
+    )
+
+
 def _collect_actor_secrets(
     http: AgenticHTTPClient,
     cookie_hdr: str,
     extra_headers: dict[str, str],
     local_storage: dict[str, str] | None = None,
+    *,
+    cookie_records: Sequence[dict[str, Any]] = (),
+    local_storage_by_origin: dict[str, dict[str, str]] | None = None,
 ) -> list[str]:
     """Collect sensitive strings for defense-in-depth scrubbing of model-facing outputs."""
     secrets: list[str] = []
@@ -493,19 +814,30 @@ def _collect_actor_secrets(
     for _, cv in _parse_cookie_pairs(cookie_hdr):
         if len(cv) >= 4:
             secrets.append(cv)
+    for crec in cookie_records:
+        if isinstance(crec, dict):
+            cval = str(crec.get("value") or "")
+            if len(cval) >= 4:
+                secrets.append(cval)
     for hk, hv in extra_headers.items():
         if hk.lower() in {"authorization", "cookie", "x-api-key", "x-csrf-token"} and len(hv) >= 4:
             secrets.append(hv)
             parts = hv.strip().split(None, 1)
             if len(parts) == 2 and len(parts[1].strip()) >= 4:
                 secrets.append(parts[1].strip())
-    for lv in (local_storage or {}).values():
-        sval = str(lv or "")
-        if len(sval) >= 4:
-            secrets.append(sval)
-            parts = sval.strip().split(None, 1)
-            if len(parts) == 2 and parts[0].lower() == "bearer" and len(parts[1].strip()) >= 4:
-                secrets.append(parts[1].strip())
+
+    def _add_ls_values(kv: dict[str, str] | None) -> None:
+        for lv in (kv or {}).values():
+            sval = str(lv or "")
+            if len(sval) >= 4:
+                secrets.append(sval)
+                parts = sval.strip().split(None, 1)
+                if len(parts) == 2 and parts[0].lower() == "bearer" and len(parts[1].strip()) >= 4:
+                    secrets.append(parts[1].strip())
+
+    _add_ls_values(local_storage)
+    for kv in (local_storage_by_origin or {}).values():
+        _add_ls_values(kv)
     return sorted(set(secrets), key=len, reverse=True)
 
 
@@ -580,8 +912,9 @@ def _compact_same_origin_url(
     base_scheme: str,
     base_netloc: str,
     allow_fragment_route: bool = False,
+    scope_guard: Any | None = None,
 ) -> str | None:
-    """Validate strict same-origin and compact to a relative ``/path?query`` string."""
+    """Validate primary or in-scope sibling URL; compact primary to ``/path?query`` and preserve origin on siblings."""
     raw = str(raw_url or "").strip()
     if not raw:
         return None
@@ -590,12 +923,29 @@ def _compact_same_origin_url(
         return None
     resolved = urljoin(base_url, raw)
     parsed = urlsplit(resolved)
-    if parsed.scheme not in {"http", "https"}:
-        return None
-    if parsed.scheme != base_scheme or parsed.netloc != base_netloc:
+    scheme_low = parsed.scheme.lower()
+    netloc_low = parsed.netloc.lower()
+    if scheme_low not in {"http", "https"} or not netloc_low:
         return None
     path = parsed.path or "/"
-    compact = f"{path}?{parsed.query}" if parsed.query else path
+    is_primary = scheme_low == base_scheme.lower() and netloc_low == base_netloc.lower()
+    if not is_primary:
+        if scope_guard is None:
+            return None
+        try:
+            scope_guard.check_url(resolved)
+        except ValueError:
+            return None
+        compact = f"{scheme_low}://{netloc_low}{path}"
+        if parsed.query:
+            compact = f"{compact}?{parsed.query}"
+    else:
+        if scope_guard is not None:
+            try:
+                scope_guard.check_url(resolved)
+            except ValueError:
+                return None
+        compact = f"{path}?{parsed.query}" if parsed.query else path
     if allow_fragment_route and parsed.fragment.startswith("/"):
         compact = f"{compact}#{parsed.fragment}"
     return compact
@@ -669,8 +1019,9 @@ def run_browser_crawl(
     timeout_ms: int = 12000,
     crawl_fn: Callable[..., dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
-    """Run a bounded, read-only, same-origin Playwright crawl and ingest into ``surface_tracker``."""
+    """Run a bounded, read-only, scope-locked Playwright crawl and ingest into ``surface_tracker``."""
     full_url = _resolve_and_check_scope(http, url)
+    scope_guard = getattr(http, "scope_guard", None)
     base_parsed = urlsplit(http.base_url)
     base_scheme = base_parsed.scheme
     base_netloc = base_parsed.netloc
@@ -681,6 +1032,7 @@ def run_browser_crawl(
             base_scheme=base_scheme,
             base_netloc=base_netloc,
             allow_fragment_route=True,
+            scope_guard=scope_guard,
         )
         or "/"
     )
@@ -688,7 +1040,21 @@ def run_browser_crawl(
     clean_actor = str(actor or "anon").strip() or "anon"
     cookie_hdr, extra_headers = _extract_actor_browser_auth(http, clean_actor)
     local_storage = _extract_actor_local_storage(http, clean_actor)
-    secrets = _collect_actor_secrets(http, cookie_hdr, extra_headers, local_storage=local_storage)
+    local_storage_by_origin = _extract_actor_local_storage_by_origin(http, clean_actor)
+    cookie_records = _extract_actor_cookie_records(
+        http,
+        clean_actor,
+        base_url=http.base_url,
+        fallback_cookie_hdr=cookie_hdr,
+    )
+    secrets = _collect_actor_secrets(
+        http,
+        cookie_hdr,
+        extra_headers,
+        local_storage=local_storage,
+        cookie_records=cookie_records,
+        local_storage_by_origin=local_storage_by_origin,
+    )
 
     remaining = _budget_remaining(http)
     if remaining <= 0:
@@ -698,6 +1064,7 @@ def run_browser_crawl(
     eff_max_pages = min(clamped_pages, remaining)
     eff_wait_ms = max(0, min(int(wait_ms), _MAX_WAIT_MS))
     eff_timeout_ms = max(_MIN_TIMEOUT_MS, min(int(timeout_ms), _MAX_TIMEOUT_MS))
+    allow_subdomains = bool(getattr(scope_guard, "is_multi_origin", False))
 
     if crawl_fn is None and (not HAS_PLAYWRIGHT or _default_crawl_site is None):
         return {
@@ -712,7 +1079,7 @@ def run_browser_crawl(
 
     if crawl_fn is not None:
         call_kwargs: dict[str, Any] = {
-            "allow_subdomains": False,
+            "allow_subdomains": allow_subdomains,
             "max_pages": eff_max_pages,
             "wait_ms": eff_wait_ms,
             "timeout_ms": eff_timeout_ms,
@@ -724,6 +1091,12 @@ def run_browser_crawl(
             call_kwargs["extra_headers"] = extra_headers
         if local_storage and _fn_accepts_kwarg(crawl_fn, "local_storage"):
             call_kwargs["local_storage"] = dict(local_storage)
+        if local_storage_by_origin and _fn_accepts_kwarg(crawl_fn, "local_storage_by_origin"):
+            call_kwargs["local_storage_by_origin"] = {
+                k: dict(v) for k, v in local_storage_by_origin.items()
+            }
+        if cookie_records and _fn_accepts_kwarg(crawl_fn, "cookie_records"):
+            call_kwargs["cookie_records"] = [dict(c) for c in cookie_records]
         raw = crawl_fn(full_url, **call_kwargs)
     else:
         assert _default_crawl_site is not None
@@ -736,13 +1109,30 @@ def run_browser_crawl(
             "cookie": cookie_hdr,
             "headers": crawl_headers,
             "timeout_ms": eff_timeout_ms,
-            "allow_subdomains": False,
+            "allow_subdomains": allow_subdomains,
             "wait_ms": eff_wait_ms,
             "wire_gate": _build_crawl_wire_gate(http),
         }
-        if local_storage and _fn_accepts_kwarg(_default_crawl_site, "local_storage"):
+        accepts_ls = _fn_accepts_kwarg(_default_crawl_site, "local_storage")
+        if local_storage and accepts_ls:
             default_kwargs["local_storage"] = dict(local_storage)
-        raw = _default_crawl_site(full_url, **default_kwargs)
+        ls_init_script = (
+            ""
+            if (accepts_ls and not local_storage_by_origin)
+            else _build_multi_origin_localstorage_init_script(
+                local_storage_by_origin,
+                fallback_origin=http.base_url,
+                fallback_local_storage=local_storage,
+            )
+        )
+        start_origin = _normalize_js_origin(full_url)
+        extra_crawl_cookies = [
+            c
+            for c in cookie_records
+            if "domain" in c or _normalize_js_origin(str(c.get("url") or "")) != start_origin
+        ]
+        with _inject_crawl_browser_state(ls_init_script, extra_crawl_cookies):
+            raw = _default_crawl_site(full_url, **default_kwargs)
 
     raw_dict = raw if isinstance(raw, dict) else {}
     raw_pages_val = raw_dict.get("pages")
@@ -768,7 +1158,7 @@ def run_browser_crawl(
     pages_to_charge = min(remaining, max(1, len(raw_pages)))
     _consume_budget(http, pages_to_charge)
 
-    # 1. Filter & compact pages strictly to same-origin
+    # 1. Filter & compact pages strictly to in-scope origins
     all_pages: list[dict[str, Any]] = []
     seen_pages: set[str] = set()
     for p_item in raw_pages:
@@ -788,6 +1178,7 @@ def run_browser_crawl(
             base_scheme=base_scheme,
             base_netloc=base_netloc,
             allow_fragment_route=True,
+            scope_guard=scope_guard,
         )
         if compact_p is None or compact_p in seen_pages:
             continue
@@ -817,6 +1208,7 @@ def run_browser_crawl(
             base_scheme=base_scheme,
             base_netloc=base_netloc,
             allow_fragment_route=True,
+            scope_guard=scope_guard,
         )
         if compact_l is None or is_static_asset_url(compact_l):
             continue
@@ -840,6 +1232,7 @@ def run_browser_crawl(
             base_url=urljoin(full_url, page_ref),
             base_scheme=base_scheme,
             base_netloc=base_netloc,
+            scope_guard=scope_guard,
         )
         if compact_action is None:
             continue
@@ -873,6 +1266,7 @@ def run_browser_crawl(
             base_url=full_url,
             base_scheme=base_scheme,
             base_netloc=base_netloc,
+            scope_guard=scope_guard,
         )
         if compact_x is None:
             continue
@@ -899,7 +1293,7 @@ def run_browser_crawl(
         xhr_index[x_key] = entry
         all_xhr.append(entry)
 
-    # 5. Ingest discovered same-origin surface into SurfaceFrontierTracker
+    # 5. Ingest discovered in-scope surface into SurfaceFrontierTracker
     if surface_tracker is not None:
         surface_payload: dict[str, Any] = {
             "url": full_url,
@@ -951,21 +1345,28 @@ def _redact_query_to_same_origin(
     base_url: str,
     base_scheme: str,
     base_netloc: str,
+    scope_guard: Any | None = None,
 ) -> tuple[str, str, list[str]] | None:
-    """Resolve ``raw_url`` strictly on same-origin and redact all query parameter values."""
+    """Resolve ``raw_url`` within authorized origins and redact all query parameter values."""
     compact = _compact_same_origin_url(
         raw_url,
         base_url=base_url,
         base_scheme=base_scheme,
         base_netloc=base_netloc,
+        scope_guard=scope_guard,
     )
     if compact is None:
         return None
     parsed = urlsplit(compact)
     path = parsed.path or "/"
     q_names = sorted({k.strip() for k, _ in parse_qsl(parsed.query, keep_blank_values=True) if k.strip()})
-    safe_url = f"{path}?{'&'.join(f'{k}=<value>' for k in q_names)}" if q_names else path
-    return safe_url, path, q_names
+    origin_path = (
+        f"{parsed.scheme}://{parsed.netloc}{path}"
+        if compact.lower().startswith(("http://", "https://")) and parsed.netloc
+        else path
+    )
+    safe_url = f"{origin_path}?{'&'.join(f'{k}=<value>' for k in q_names)}" if q_names else origin_path
+    return safe_url, origin_path, q_names
 
 
 def _sanitize_runtime_requests(
@@ -974,8 +1375,9 @@ def _sanitize_runtime_requests(
     base_url: str,
     base_scheme: str,
     base_netloc: str,
+    scope_guard: Any | None = None,
 ) -> list[dict[str, Any]]:
-    """Normalize runtime fetch/XHR hook metadata into compact same-origin dicts without values."""
+    """Normalize runtime fetch/XHR hook metadata into compact in-scope dicts without values."""
     if callable(_normalize_runtime_events) and isinstance(raw_events, list):
         normalized = _normalize_runtime_events(raw_events)
         source_items = normalized.get("requests") if isinstance(normalized, dict) else []
@@ -998,6 +1400,7 @@ def _sanitize_runtime_requests(
             base_url=base_url,
             base_scheme=base_scheme,
             base_netloc=base_netloc,
+            scope_guard=scope_guard,
         )
         if redacted is None:
             continue
@@ -1034,6 +1437,8 @@ def _inspect_rendered_page_playwright(
     cookie_hdr: str,
     extra_headers: dict[str, str],
     local_storage: dict[str, str] | None = None,
+    local_storage_by_origin: dict[str, dict[str, str]] | None = None,
+    cookie_records: Sequence[dict[str, Any]] = (),
     marker: str,
     wait_ms: int,
     timeout_ms: int,
@@ -1058,9 +1463,10 @@ def _inspect_rendered_page_playwright(
                 user_agent=_operator_user_agent(http),
             )
             try:
-                ls_init_script = _build_origin_localstorage_init_script(
-                    http.base_url,
-                    local_storage or {},
+                ls_init_script = _build_multi_origin_localstorage_init_script(
+                    local_storage_by_origin,
+                    fallback_origin=http.base_url,
+                    fallback_local_storage=local_storage,
                 )
                 if ls_init_script:
                     context.add_init_script(ls_init_script)
@@ -1068,12 +1474,15 @@ def _inspect_rendered_page_playwright(
                 if callable(_build_runtime_hook_script):
                     context.add_init_script(_build_runtime_hook_script())
 
-                cookie_pairs = _parse_cookie_pairs(cookie_hdr)
-                if cookie_pairs:
-                    context.add_cookies([
-                        {"name": cname, "value": cval, "url": http.base_url}
-                        for cname, cval in cookie_pairs
-                    ])
+                if cookie_records:
+                    context.add_cookies([dict(c) for c in cookie_records])
+                else:
+                    cookie_pairs = _parse_cookie_pairs(cookie_hdr)
+                    if cookie_pairs:
+                        context.add_cookies([
+                            {"name": cname, "value": cval, "url": http.base_url}
+                            for cname, cval in cookie_pairs
+                        ])
 
                 async def _on_websocket(socket: Any) -> None:
                     route_obj = getattr(socket, "_impl_obj", socket)
@@ -1192,8 +1601,9 @@ def inspect_rendered_page(
     timeout_ms: int = 10000,
     runner: Callable[..., dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
-    """Inspect a single rendered page in a strictly read-only, same-origin Chromium context."""
+    """Inspect a single rendered page in a strictly read-only, scope-locked Chromium context."""
     full_url = _resolve_and_check_scope(http, url)
+    scope_guard = getattr(http, "scope_guard", None)
     base_parsed = urlsplit(http.base_url)
     base_scheme = base_parsed.scheme
     base_netloc = base_parsed.netloc
@@ -1204,6 +1614,7 @@ def inspect_rendered_page(
             base_scheme=base_scheme,
             base_netloc=base_netloc,
             allow_fragment_route=True,
+            scope_guard=scope_guard,
         )
         or "/"
     )
@@ -1211,7 +1622,21 @@ def inspect_rendered_page(
     clean_actor = str(actor or "anon").strip() or "anon"
     cookie_hdr, extra_headers = _extract_actor_browser_auth(http, clean_actor)
     local_storage = _extract_actor_local_storage(http, clean_actor)
-    secrets = _collect_actor_secrets(http, cookie_hdr, extra_headers, local_storage=local_storage)
+    local_storage_by_origin = _extract_actor_local_storage_by_origin(http, clean_actor)
+    cookie_records = _extract_actor_cookie_records(
+        http,
+        clean_actor,
+        base_url=http.base_url,
+        fallback_cookie_hdr=cookie_hdr,
+    )
+    secrets = _collect_actor_secrets(
+        http,
+        cookie_hdr,
+        extra_headers,
+        local_storage=local_storage,
+        cookie_records=cookie_records,
+        local_storage_by_origin=local_storage_by_origin,
+    )
 
     eff_wait_ms = max(0, min(int(wait_ms), _MAX_WAIT_MS))
     eff_timeout_ms = max(_MIN_TIMEOUT_MS, min(int(timeout_ms), _MAX_TIMEOUT_MS))
@@ -1244,6 +1669,12 @@ def inspect_rendered_page(
                 runner_kwargs["extra_headers"] = extra_headers
             if local_storage and _fn_accepts_kwarg(runner, "local_storage"):
                 runner_kwargs["local_storage"] = dict(local_storage)
+            if local_storage_by_origin and _fn_accepts_kwarg(runner, "local_storage_by_origin"):
+                runner_kwargs["local_storage_by_origin"] = {
+                    k: dict(v) for k, v in local_storage_by_origin.items()
+                }
+            if cookie_records and _fn_accepts_kwarg(runner, "cookie_records"):
+                runner_kwargs["cookie_records"] = [dict(c) for c in cookie_records]
             raw = runner(full_url, **runner_kwargs)
         else:
             raw = _inspect_rendered_page_playwright(
@@ -1252,6 +1683,8 @@ def inspect_rendered_page(
                 cookie_hdr=cookie_hdr,
                 extra_headers=extra_headers,
                 local_storage=local_storage,
+                local_storage_by_origin=local_storage_by_origin,
+                cookie_records=cookie_records,
                 marker=clean_marker,
                 wait_ms=eff_wait_ms,
                 timeout_ms=eff_timeout_ms,
@@ -1287,6 +1720,7 @@ def inspect_rendered_page(
             base_scheme=base_scheme,
             base_netloc=base_netloc,
             allow_fragment_route=True,
+            scope_guard=scope_guard,
         )
         or compact_requested
     )
@@ -1302,6 +1736,7 @@ def inspect_rendered_page(
         base_url=full_url,
         base_scheme=base_scheme,
         base_netloc=base_netloc,
+        scope_guard=scope_guard,
     )
 
     raw_marker_val = raw_dict.get("marker_check")
@@ -1414,6 +1849,7 @@ def verify_dom_sink_in_browser(
         raise ValueError(f"Unsupported DOM verification source: {source!r}")
 
     full_url = _resolve_and_check_scope(http, url)
+    scope_guard = getattr(http, "scope_guard", None)
     base_parsed = urlsplit(http.base_url)
     base_scheme = base_parsed.scheme
     base_netloc = base_parsed.netloc
@@ -1429,7 +1865,21 @@ def verify_dom_sink_in_browser(
     clean_actor = str(actor or "anon").strip() or "anon"
     cookie_hdr, extra_headers = _extract_actor_browser_auth(http, clean_actor)
     local_storage = _extract_actor_local_storage(http, clean_actor)
-    secrets = _collect_actor_secrets(http, cookie_hdr, extra_headers, local_storage=local_storage)
+    local_storage_by_origin = _extract_actor_local_storage_by_origin(http, clean_actor)
+    cookie_records = _extract_actor_cookie_records(
+        http,
+        clean_actor,
+        base_url=http.base_url,
+        fallback_cookie_hdr=cookie_hdr,
+    )
+    secrets = _collect_actor_secrets(
+        http,
+        cookie_hdr,
+        extra_headers,
+        local_storage=local_storage,
+        cookie_records=cookie_records,
+        local_storage_by_origin=local_storage_by_origin,
+    )
 
     eff_wait_ms = max(0, min(int(wait_ms), _MAX_WAIT_MS))
     eff_timeout_ms = max(_MIN_TIMEOUT_MS, min(int(timeout_ms), _MAX_TIMEOUT_MS))
@@ -1465,17 +1915,24 @@ def verify_dom_sink_in_browser(
                 user_agent=_operator_user_agent(http),
             )
             try:
-                ls_init = _build_origin_localstorage_init_script(http.base_url, local_storage or {})
+                ls_init = _build_multi_origin_localstorage_init_script(
+                    local_storage_by_origin,
+                    fallback_origin=http.base_url,
+                    fallback_local_storage=local_storage,
+                )
                 if ls_init:
                     context.add_init_script(ls_init)
                 if callable(_build_runtime_hook_script):
                     context.add_init_script(_build_runtime_hook_script())
-                cookie_pairs = _parse_cookie_pairs(cookie_hdr)
-                if cookie_pairs:
-                    context.add_cookies([
-                        {"name": cname, "value": cval, "url": http.base_url}
-                        for cname, cval in cookie_pairs
-                    ])
+                if cookie_records:
+                    context.add_cookies([dict(c) for c in cookie_records])
+                else:
+                    cookie_pairs = _parse_cookie_pairs(cookie_hdr)
+                    if cookie_pairs:
+                        context.add_cookies([
+                            {"name": cname, "value": cval, "url": http.base_url}
+                            for cname, cval in cookie_pairs
+                        ])
 
                 async def _on_websocket(socket: Any) -> None:
                     route_obj = getattr(socket, "_impl_obj", socket)
@@ -1583,6 +2040,7 @@ def verify_dom_sink_in_browser(
             base_scheme=base_scheme,
             base_netloc=base_netloc,
             allow_fragment_route=True,
+            scope_guard=scope_guard,
         )
         or probe_url
     )
@@ -1602,9 +2060,12 @@ def verify_dom_sink_in_browser(
 __all__ = [
     "CHROMIUM_ARGS",
     "HAS_PLAYWRIGHT",
+    "_build_multi_origin_localstorage_init_script",
     "_build_origin_localstorage_init_script",
     "_extract_actor_browser_auth",
+    "_extract_actor_cookie_records",
     "_extract_actor_local_storage",
+    "_extract_actor_local_storage_by_origin",
     "_merge_browser_route_headers",
     "_operator_browser_headers",
     "_operator_user_agent",
