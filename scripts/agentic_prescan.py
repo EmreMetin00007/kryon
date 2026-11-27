@@ -361,6 +361,9 @@ _PREMATRIX_SKIP_EXACT_PATHS = frozenset({
     "/auth/login",
     "/auth/signin",
     "/auth/register",
+    "/auth/refresh",
+    "/oauth/refresh",
+    "/oauth/token",
     "/health",
     "/healthz",
     "/ready",
@@ -956,14 +959,32 @@ def _scan_body_for_secrets(
     return leads
 
 
+_CLIENT_BUNDLE_EXTENSIONS = (".js", ".mjs", ".cjs", ".js.map", ".map")
+_AUTH_TOKEN_ENDPOINT_SEGMENTS = frozenset({"login", "signin", "sign-in", "refresh", "token"})
+
+
+def _is_client_bundle_or_sourcemap_url(url: str) -> bool:
+    path = (urlsplit(str(url or "")).path or "").lower()
+    return path.endswith(_CLIENT_BUNDLE_EXTENSIONS)
+
+
+def _is_auth_token_endpoint_url(url: str) -> bool:
+    path = (urlsplit(str(url or "")).path or "").lower()
+    if "/oauth/" in path:
+        return True
+    segs = [s for s in path.split("/") if s]
+    return bool(segs) and segs[-1] in _AUTH_TOKEN_ENDPOINT_SEGMENTS
+
+
 def scan_offline_secret_leads(
     receipt_store: ReceiptStore,
     *,
     max_receipts: int = _DEFAULT_OFFLINE_RECEIPT_TAIL,
     waf_vendors_out: set[str] | None = None,
     _secret_sink: set[str] | None = None,
+    _actor_secrets_to_ignore: frozenset[str] = frozenset(),
 ) -> tuple[list[PrescanLead], int]:
-    """Check 1 (0 HTTP requests): triage public `anon` receipts for exposed credentials/keys.
+    """Check 1 (0 HTTP requests): triage public `anon` and static JS/sourcemap receipts for exposed keys.
 
     CRITICAL SECRET HYGIENE: never emits raw secret substrings anywhere in returned
     leads; only records `kind`, `key_name`, `receipt_id`, `url`, `actor`, and redacted
@@ -981,13 +1002,16 @@ def scan_offline_secret_leads(
         except (KeyError, ValueError):
             continue
         actor = str(rec.get("actor") or "anon").strip() or "anon"
-        if actor != "anon":
+        url = str(rec.get("url") or rec.get("path") or "/")
+        is_client_asset = _is_client_bundle_or_sourcemap_url(url)
+        if actor != "anon" and not is_client_asset:
             continue
         status = int(rec.get("status") or 0)
         if not (200 <= status < 400):
             continue
-        url = str(rec.get("url") or rec.get("path") or "/")
-        if is_static_asset_url(url):
+        if not is_client_asset and is_static_asset_url(url):
+            continue
+        if _is_auth_token_endpoint_url(url):
             continue
         waf_info = detect_waf_block(rec)
         if waf_info is not None:
@@ -1000,15 +1024,24 @@ def scan_offline_secret_leads(
         if not body:
             continue
         scanned += 1
-        leads.extend(
-            _scan_body_for_secrets(
-                body,
-                receipt_id=str(rec.get("receipt_id") or rid),
-                url=url,
-                actor=actor,
-                collected_secrets=collected_secrets,
-            )
+        found = _scan_body_for_secrets(
+            body,
+            receipt_id=str(rec.get("receipt_id") or rid),
+            url=url,
+            actor=actor,
+            collected_secrets=collected_secrets,
         )
+        if _actor_secrets_to_ignore:
+            found = [
+                ld
+                for ld in found
+                if not any(
+                    sec in str(ld.get("summary") or "") or sec in str(ld.get("redacted_preview") or "")
+                    for sec in _actor_secrets_to_ignore
+                    if len(sec) >= 8
+                )
+            ]
+        leads.extend(found)
 
     return leads, scanned
 
@@ -1385,11 +1418,13 @@ def _collect_candidates(
             rec = http_client.receipt_store.get(rid)
         except (KeyError, ValueError):
             continue
+        status = int(rec.get("status") or 0)
+        if status in {404, 410}:
+            continue
         rec_url = str(rec.get("url") or rec.get("path") or "")
         rec_method = str(rec.get("method") or "GET").upper()
         if rec_url:
             cand.add_candidate(http_client, rec_url, method=rec_method)
-        status = int(rec.get("status") or 0)
         ctype = str(rec.get("content_type") or "").lower()
         body = str(rec.get("body") or "")[:_MAX_HTML_LINK_EXTRACT_CHARS]
         if 200 <= status < 400 and body and ("html" in ctype or "<a " in body.lower() or "<form" in body.lower()):
@@ -1426,8 +1461,19 @@ def _is_api_path(path: str) -> bool:
     return bool(_API_PATH_PREFIX_RE.search(normalize_path(path)))
 
 
-def _select_cors_targets(candidates: _SurfaceCandidates, max_endpoints: int = _DEFAULT_MAX_CORS_PROBES) -> list[str]:
+def _select_cors_targets(
+    candidates: _SurfaceCandidates,
+    max_endpoints: int = _DEFAULT_MAX_CORS_PROBES,
+    *,
+    base_url: str = "",
+) -> list[str]:
     """Select up to `max_endpoints` prioritized non-catalog API/root endpoints for CORS checks."""
+    base_origin = _origin_of_url(base_url) if base_url else ""
+    sibling_api_paths = {
+        norm_p
+        for origin, norm_p in candidates.seen_norm_paths
+        if _is_api_path(norm_p) and (not base_origin or origin != base_origin)
+    }
     scored: list[tuple[int, int, str]] = []
     seen_id_templates: set[tuple[str, str]] = set()
     for idx, url in enumerate(candidates.all_urls):
@@ -1442,24 +1488,45 @@ def _select_cors_targets(candidates: _SurfaceCandidates, max_endpoints: int = _D
             if tmpl_key in seen_id_templates:
                 continue
             seen_id_templates.add(tmpl_key)
+        segs = [s.lower() for s in norm_p.split("/") if s]
+        is_graphql = any(seg in _GRAPHQL_PATH_SEGMENTS for seg in segs)
+        is_docs = any(tok in norm_p.lower() for tok in ("api-docs", "swagger", "openapi"))
         is_api = _is_api_path(norm_p)
-        if norm_p == "/":
+        if is_graphql or is_docs:
+            tier = 4
+        elif norm_p == "/":
             tier = 1
         elif is_api and not has_id:
-            tier = 0
+            tier = 3 if (base_origin and origin == base_origin and norm_p in sibling_api_paths) else 0
         elif not is_api and not has_id:
             tier = 2
         elif is_api and has_id:
             tier = 3
         else:
             tier = 4
-        # Prefer non-login/functional endpoints and shorter API prefixes first.
-        segs = [s.lower() for s in norm_p.split("/") if s]
-        bonus = -1 if any(tok in segs for tok in ("cors", "config", "auth", "user", "profile", "session")) else 0
+        tokens = {tok for seg in segs for tok in _split_identifier_tokens(seg)}
+        bonus = -2 if any(tok in tokens for tok in ("cors", "config", "auth", "user", "profile", "session", "account", "export", "key", "keys", "token", "me")) else 0
         scored.append((tier * 10 + bonus, idx, url))
 
     scored.sort(key=lambda item: (item[0], len(item[2]), item[1]))
     return [url for _, _, url in scored[: max(0, int(max_endpoints))]]
+
+
+def _pick_non_admin_auth_actor(http_client: AgenticHTTPClient) -> str:
+    auth_actors = http_client.actors.authenticated_non_anon_aliases()
+    if not auth_actors:
+        return ""
+    actor_meta = {
+        str(row["alias"]): row
+        for row in http_client.actors.summaries()
+        if isinstance(row, dict) and row.get("alias")
+    }
+    non_admin = [
+        alias
+        for alias in auth_actors
+        if str((actor_meta.get(alias) or {}).get("role") or "").strip().lower() not in _ADMIN_ROLES
+    ]
+    return non_admin[0] if non_admin else auth_actors[0]
 
 
 def probe_cors_leads(
@@ -1470,18 +1537,67 @@ def probe_cors_leads(
     max_endpoints: int = _DEFAULT_MAX_CORS_PROBES,
     extra_headers: dict[str, str] | None = None,
 ) -> tuple[list[PrescanLead], int]:
-    """Check 2: Probe up to 4 non-catalog API/root endpoints for CORS origin reflection."""
+    """Check 2: Probe up to 4 non-catalog API/root endpoints for CORS origin (and null-origin) reflection."""
     if "GET" not in http_client.allowed_methods or not budget.can_request():
         return [], 0
 
     clean_extra = _sanitize_extra_headers(extra_headers)
-    req_headers = _merge_probe_headers(clean_extra, {"Origin": CORS_PROBE_ORIGIN})
-    targets = _select_cors_targets(candidates, max_endpoints=max_endpoints)
+    req_headers_std = _merge_probe_headers(clean_extra, {"Origin": CORS_PROBE_ORIGIN})
+    req_headers_null = _merge_probe_headers(clean_extra, {"Origin": "null"})
+    targets = _select_cors_targets(candidates, max_endpoints=max_endpoints, base_url=http_client.base_url)
+    fallback_auth = _pick_non_admin_auth_actor(http_client)
+    cors_req_cap = max(len(targets), min(8, len(targets) + 3))
     leads: list[PrescanLead] = []
     probed = 0
+    null_probes_used = 0
+
+    def _emit_cors_if_vulnerable(rec: dict[str, Any], target_url: str, sent_origin: str) -> bool:
+        acao = _response_header_ci(rec, "access-control-allow-origin")
+        acac = _response_header_ci(rec, "access-control-allow-credentials").lower()
+        if not acao:
+            return False
+        reflected = acao.lower() == sent_origin.lower()
+        wildcard_with_creds = acao == "*" and acac == "true"
+        if not reflected and not wildcard_with_creds:
+            return False
+        if reflected and acac == "true":
+            sev = "high"
+            pattern = "null_origin_with_credentials" if sent_origin == "null" else "reflected_origin_with_credentials"
+        else:
+            sev = "medium"
+            if wildcard_with_creds:
+                pattern = "wildcard_with_credentials"
+            elif sent_origin == "null":
+                pattern = "null_origin"
+            else:
+                pattern = "reflected_origin"
+        rid = str(rec.get("receipt_id") or "")
+        leads.append(
+            _make_lead(
+                kind="cors_misconfiguration",
+                suggested_class="cors_misconfiguration",
+                severity_hint=sev,
+                receipt_id=rid,
+                url=str(rec.get("url") or target_url),
+                actor=str(rec.get("actor") or "anon"),
+                status=int(rec.get("status") or 0),
+                probe_origin=sent_origin,
+                acao=acao,
+                acac=acac,
+                summary=(
+                    f"CORS {pattern} at {rec.get('url') or target_url}: "
+                    f"ACAO={acao!r}, ACAC={acac!r} ({rid})."
+                ),
+                next_step=(
+                    f"Verify cors_misconfiguration on {rid} with DifferentialOracle "
+                    "(compare untrusted Origin vs same-origin/absent Origin baseline)."
+                ),
+            )
+        )
+        return True
 
     for url in targets:
-        if not budget.can_request():
+        if probed >= cors_req_cap or not budget.can_request():
             break
         rec, waf_blocked = _safe_request(
             http_client,
@@ -1489,7 +1605,7 @@ def probe_cors_leads(
             method="GET",
             url=url,
             actor="anon",
-            headers=req_headers,
+            headers=req_headers_std,
             follow_redirects=False,
         )
         if rec is None:
@@ -1500,46 +1616,63 @@ def probe_cors_leads(
         if waf_blocked:
             continue
 
-        acao = _response_header_ci(rec, "access-control-allow-origin")
-        acac = _response_header_ci(rec, "access-control-allow-credentials").lower()
-        if not acao:
+        if _emit_cors_if_vulnerable(rec, url, CORS_PROBE_ORIGIN):
             continue
 
-        reflected = acao.lower() == CORS_PROBE_ORIGIN.lower()
-        wildcard_with_creds = acao == "*" and acac == "true"
-        if not reflected and not wildcard_with_creds:
-            continue
-
-        if reflected and acac == "true":
-            sev = "high"
-            pattern = "reflected_origin_with_credentials"
-        else:
-            sev = "medium"
-            pattern = "wildcard_with_credentials" if wildcard_with_creds else "reflected_origin"
-
-        rid = str(rec.get("receipt_id") or "")
-        leads.append(
-            _make_lead(
-                kind="cors_misconfiguration",
-                suggested_class="cors_misconfiguration",
-                severity_hint=sev,
-                receipt_id=rid,
-                url=str(rec.get("url") or url),
-                actor=str(rec.get("actor") or "anon"),
-                status=int(rec.get("status") or 0),
-                probe_origin=CORS_PROBE_ORIGIN,
-                acao=acao,
-                acac=acac,
-                summary=(
-                    f"CORS {pattern} at {rec.get('url') or url}: "
-                    f"ACAO={acao!r}, ACAC={acac!r} ({rid})."
-                ),
-                next_step=(
-                    f"Verify cors_misconfiguration on {rid} with DifferentialOracle "
-                    "(compare untrusted Origin vs same-origin/absent Origin baseline)."
-                ),
+        eval_rec = rec
+        eval_actor = "anon"
+        anon_status = int(rec.get("status") or 0)
+        if anon_status in {401, 403} and fallback_auth and probed < cors_req_cap and budget.can_request():
+            auth_rec, auth_waf = _safe_request(
+                http_client,
+                budget,
+                method="GET",
+                url=url,
+                actor=fallback_auth,
+                headers=req_headers_std,
+                follow_redirects=False,
             )
-        )
+            if auth_rec is None:
+                if budget.exhausted:
+                    break
+            else:
+                probed += 1
+                if auth_waf:
+                    continue
+                if _emit_cors_if_vulnerable(auth_rec, url, CORS_PROBE_ORIGIN):
+                    continue
+                eval_rec = auth_rec
+                eval_actor = fallback_auth
+
+        eval_acao = _response_header_ci(eval_rec, "access-control-allow-origin")
+        eval_status = int(eval_rec.get("status") or 0)
+        norm_p = normalize_path(urlsplit(url).path or "/")
+        if (
+            eval_acao != "*"
+            and 200 <= eval_status < 300
+            and _is_api_path(norm_p)
+            and (eval_actor != "anon" or not eval_acao)
+            and null_probes_used < 2
+            and probed < cors_req_cap
+            and budget.can_request()
+        ):
+            null_probes_used += 1
+            null_rec, null_waf = _safe_request(
+                http_client,
+                budget,
+                method="GET",
+                url=url,
+                actor=eval_actor,
+                headers=req_headers_null,
+                follow_redirects=False,
+            )
+            if null_rec is None:
+                if budget.exhausted:
+                    break
+            else:
+                probed += 1
+                if not null_waf:
+                    _emit_cors_if_vulnerable(null_rec, url, "null")
 
     return leads, probed
 
@@ -1953,10 +2086,6 @@ def probe_graphql_leads(
                 for q in (parsed_schema.get("queries") or [])
                 if isinstance(q, dict) and q.get("is_admin_like")
             }
-            eff_actor_is_admin = (
-                eff_actor != "anon"
-                and str((actor_meta.get(eff_actor) or {}).get("role") or "").strip().lower() in _ADMIN_ROLES
-            )
 
             for probe in safe_probes[:3]:
                 if not budget.can_request():
@@ -2005,13 +2134,46 @@ def probe_graphql_leads(
                         break
                     continue
                 probed += 1
-                if p_waf or int(p_rec.get("status") or 0) != 200:
+                if p_waf:
                     continue
 
                 p_parsed = _parse_json_body(p_rec)
+                if (
+                    eff_actor == "anon"
+                    and fallback_auth_actor
+                    and _is_graphql_probe_denied_or_unauth(p_rec, p_parsed)
+                    and budget.can_request()
+                ):
+                    p_auth_rec, p_auth_waf = _safe_request(
+                        http_client,
+                        budget,
+                        method=p_method,
+                        url=gql_url,
+                        actor=fallback_auth_actor,
+                        headers=req_headers,
+                        json_body=p_json_body,
+                        query=p_query_params,
+                        follow_redirects=False,
+                    )
+                    if p_auth_rec is None:
+                        if budget.exhausted:
+                            break
+                    else:
+                        probed += 1
+                        if not p_auth_waf and int(p_auth_rec.get("status") or 0) == 200:
+                            p_rec = p_auth_rec
+                            p_parsed = _parse_json_body(p_auth_rec)
+
+                if int(p_rec.get("status") or 0) != 200:
+                    continue
+
                 p_rid = str(p_rec.get("receipt_id") or "")
                 p_url = str(p_rec.get("url") or gql_url)
                 p_actor = str(p_rec.get("actor") or eff_actor)
+                p_actor_is_admin = (
+                    p_actor != "anon"
+                    and str((actor_meta.get(p_actor) or {}).get("role") or "").strip().lower() in _ADMIN_ROLES
+                )
 
                 if p_kind == "batching_check":
                     if (
@@ -2056,7 +2218,7 @@ def probe_graphql_leads(
                 if op_result in (None, "", [], {}):
                     continue
 
-                if (p_kind == "admin_query" or p_op in admin_query_names) and not eff_actor_is_admin:
+                if (p_kind == "admin_query" or p_op in admin_query_names) and not p_actor_is_admin:
                     leads.append(
                         _make_lead(
                             kind="graphql_admin_query_exposed",
@@ -2102,6 +2264,28 @@ def probe_graphql_leads(
                     )
 
     return leads, probed
+
+
+def _is_graphql_probe_denied_or_unauth(rec: dict[str, Any] | None, parsed: Any) -> bool:
+    if rec is None:
+        return False
+    status = int(rec.get("status") or 0)
+    if status in {401, 403}:
+        return True
+    if status != 200:
+        return False
+    if isinstance(parsed, dict):
+        return _is_error_or_soft_deny_json(parsed)
+    if isinstance(parsed, list) and parsed:
+        has_any_data = any(
+            isinstance(item, dict)
+            and isinstance(item.get("data"), dict)
+            and (bool(item["data"]) or not item.get("errors"))
+            for item in parsed
+        )
+        has_any_err = any(isinstance(item, dict) and bool(item.get("errors")) for item in parsed)
+        return not has_any_data and has_any_err
+    return False
 
 
 def _is_error_or_soft_deny_json(parsed: Any) -> bool:
@@ -2388,8 +2572,16 @@ def _has_body_object_id(body: Any, *, depth: int = 0) -> bool:
 def _select_prematrix_endpoints(
     candidates: _SurfaceCandidates,
     max_endpoints: int = _DEFAULT_MAX_MATRIX_ENDPOINTS,
+    *,
+    base_url: str = "",
 ) -> list[str]:
     """Select up to `max_endpoints` high-value non-catalog GET endpoints for BOLA/BFLA checks."""
+    base_origin = _origin_of_url(base_url) if base_url else ""
+    sibling_api_paths = {
+        norm_p
+        for origin, norm_p in candidates.seen_norm_paths
+        if _is_api_path(norm_p) and (not base_origin or origin != base_origin)
+    }
     scored: list[tuple[int, int, str]] = []
     template_counts: dict[tuple[str, str], int] = {}
 
@@ -2429,6 +2621,8 @@ def _select_prematrix_endpoints(
             score += 30
         if _is_privileged_or_admin_path(norm_p):
             score += 15
+        if is_api and base_origin and origin == base_origin and norm_p in sibling_api_paths:
+            score -= 60
         # Keep diversity across route templates before testing second/third IDs of the same template.
         score -= seen_for_tmpl * 12
         scored.append((-score, idx, url))
@@ -2554,7 +2748,11 @@ def run_bola_bfla_prematrix(
 
     probe_specs: list[tuple[str, str, dict[str, Any] | None]] = []
     if can_get:
-        for url in _select_prematrix_endpoints(candidates, max_endpoints=max_endpoints):
+        for url in _select_prematrix_endpoints(
+            candidates,
+            max_endpoints=max_endpoints,
+            base_url=http_client.base_url,
+        ):
             probe_specs.append(("GET", url, None))
     if can_post:
         for post_url, post_body in _select_prematrix_post_endpoints(
@@ -2670,41 +2868,48 @@ def run_bola_bfla_prematrix(
             and is_priv_route
             and rec_anon is not None
             and int(rec_anon.get("status") or 0) in {401, 403}
-            and admins
             and non_admins
             and rec_ref is not None
             and sub_ref
         ):
             member_actor = non_admins[0]
-            rec_mem, sub_mem, par_mem, _ = _fetch_actor(member_actor)
-            if rec_mem is not None and sub_mem:
-                sim_vert = _payload_similarity(rec_mem, rec_ref, par_mem, par_ref)
-                if sim_vert >= 0.70:
-                    mem_rid = str(rec_mem.get("receipt_id") or "")
-                    anon_rid = str(rec_anon.get("receipt_id") or "")
-                    leads.append(
-                        _make_lead(
-                            kind="bfla_candidate",
-                            suggested_class="bfla",
-                            severity_hint="high",
-                            receipt_id=mem_rid,
-                            proof_receipt_id=mem_rid,
-                            control_receipt_id=anon_rid,
-                            url=str(rec_mem.get("url") or url),
-                            method=method,
-                            actor=member_actor,
-                            control_actor="anon",
-                            similarity=sim_vert,
-                            summary=(
-                                f"Vertical BFLA candidate at {method} {url}: non-admin {member_actor} ({mem_rid}) "
-                                f"got 200 matching {ref_actor} while anon ({anon_rid}) got {rec_anon.get('status')}."
-                            ),
-                            next_step=(
-                                f"Verify bfla via DifferentialOracle using proof={mem_rid} "
-                                f"and control={anon_rid}."
-                            ),
-                        )
+            if admins:
+                rec_mem, sub_mem, par_mem, _ = _fetch_actor(member_actor)
+                vertical_match = bool(
+                    rec_mem is not None
+                    and sub_mem
+                    and _payload_similarity(rec_mem, rec_ref, par_mem, par_ref) >= 0.70
+                )
+            else:
+                rec_mem, par_mem = rec_ref, par_ref
+                vertical_match = _is_bfla_relevant_target(norm_p, par_mem)
+            if rec_mem is not None and vertical_match:
+                mem_rid = str(rec_mem.get("receipt_id") or "")
+                anon_rid = str(rec_anon.get("receipt_id") or "")
+                sim_vert = _payload_similarity(rec_mem, rec_ref, par_mem, par_ref) if admins else 1.0
+                leads.append(
+                    _make_lead(
+                        kind="bfla_candidate",
+                        suggested_class="bfla",
+                        severity_hint="high",
+                        receipt_id=mem_rid,
+                        proof_receipt_id=mem_rid,
+                        control_receipt_id=anon_rid,
+                        url=str(rec_mem.get("url") or url),
+                        method=method,
+                        actor=member_actor,
+                        control_actor="anon",
+                        similarity=sim_vert,
+                        summary=(
+                            f"Vertical BFLA candidate at {method} {url}: non-admin {member_actor} ({mem_rid}) "
+                            f"accessed privileged route with 200 while anon ({anon_rid}) got {rec_anon.get('status')}."
+                        ),
+                        next_step=(
+                            f"Verify bfla via DifferentialOracle using proof={mem_rid} "
+                            f"and control={anon_rid}."
+                        ),
                     )
+                )
 
         # 4. BOLA / Cross-Actor IDOR Check (object-ID routes across >= 2 authenticated actors)
         if is_object_route and bola_a and bola_b:
@@ -2848,11 +3053,16 @@ def run_deterministic_prescan(
                 if hk.strip().lower() not in operator_keys_low
             }
 
+    actor_secret_literals = frozenset(
+        str(s) for s in http_client.actors.all_secrets() if isinstance(s, str) and len(s) >= 8
+    )
+
     # Check 1 (0 HTTP): Triage already-stored receipts before live probing.
     offline_leads_pre, receipts_scanned = scan_offline_secret_leads(
         http_client.receipt_store,
         waf_vendors_out=budget.waf_vendors_seen,
         _secret_sink=discovered_secrets,
+        _actor_secrets_to_ignore=actor_secret_literals,
     )
 
     candidates = _collect_candidates(
@@ -2893,6 +3103,7 @@ def run_deterministic_prescan(
         http_client.receipt_store,
         waf_vendors_out=budget.waf_vendors_seen,
         _secret_sink=discovered_secrets,
+        _actor_secrets_to_ignore=actor_secret_literals,
     )
 
     all_leads = _dedup_and_sort_leads([

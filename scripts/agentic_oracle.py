@@ -22,6 +22,7 @@ from agentic_http import (
     BudgetExhaustedError,
     ScopeViolationError,
     _decode_raw_response,
+    _header_get,
 )
 from agentic_receipts import ReceiptStore, redact_header_value
 from agentic_surface import is_id_segment, normalize_path, route_template_of
@@ -2869,12 +2870,12 @@ class DifferentialOracle:
             try:
                 status = int(resp.status_code)
                 resp_headers = {str(k): str(v) for k, v in resp.headers.items()}
-                content_type = resp_headers.get("Content-Type", "").split(";", 1)[0].strip().lower()
-                redirect_location = resp_headers.get("Location", "")
+                content_type = _header_get(resp_headers, "Content-Type").split(";", 1)[0].strip().lower()
+                redirect_location = _header_get(resp_headers, "Location")
                 raw_stream = resp.raw.read(self.http.max_response_bytes + 1, decode_content=False)
                 if len(raw_stream) > self.http.max_response_bytes:
                     raw_stream = raw_stream[: self.http.max_response_bytes]
-                raw_bytes = _decode_raw_response(raw_stream, resp_headers.get("Content-Encoding", ""))
+                raw_bytes = _decode_raw_response(raw_stream, _header_get(resp_headers, "Content-Encoding"))
                 text = raw_bytes.decode("utf-8", errors="replace")
             finally:
                 resp.close()

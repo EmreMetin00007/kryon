@@ -47,7 +47,9 @@ from target_bootstrap import (  # noqa: E402
     _default_port,
     _extract_excluded_paths,
     _extract_scope_asset_lists,
+    _is_loopback_host,
     _is_valid_host,
+    _parse_scope_asset,
     load_scope_file,
     normalize_path,
     resolve_target_origin,
@@ -471,6 +473,22 @@ def _format_origin(scheme: str, host: str, port: int) -> str:
     if port == _default_port(scheme):
         return f"{scheme}://{host_netloc}"
     return f"{scheme}://{host_netloc}:{port}"
+
+
+def _filter_loopback_scope_assets(assets: Sequence[str] | Any) -> list[str]:
+    """Keep strictly loopback-host entries from scope asset rules (fail-closed in loopback mode)."""
+    if not isinstance(assets, (list, tuple)):
+        return []
+    out: list[str] = []
+    for raw_entry in assets:
+        entry = str(raw_entry or "").strip()
+        if not entry:
+            continue
+        rule = _parse_scope_asset(entry)
+        if rule is not None and rule.host_pattern and not rule.host_pattern.startswith("*.") and _is_loopback_host(rule.host_pattern):
+            if entry not in out:
+                out.append(entry)
+    return out
 
 
 def _normalize_base_origin(raw_url: str) -> str:
@@ -2623,6 +2641,9 @@ def build_surface_map_from_run_dir(run_dir: Path | str) -> dict[str, Any]:
                     if not bool(raw_scope.get("loopback_only", False)):
                         _extend_unique(in_scope_assets, sf_in)
                         _extend_unique(out_of_scope_assets, sf_out)
+                    else:
+                        _extend_unique(in_scope_assets, _filter_loopback_scope_assets(sf_in))
+                        _extend_unique(out_of_scope_assets, _filter_loopback_scope_assets(sf_out))
                     _extend_unique(excluded_paths, sf_exc)
                 except ValueError:
                     pass
@@ -2807,9 +2828,27 @@ def main(argv: list[str] | None = None) -> int:
     except ValueError as exc:
         parser.error(str(exc))
 
+    eff_loopback_only = bool(scope_meta.get("loopback_only", True))
     eff_excluded_paths = list(scope_meta.get("excluded_paths") or [])
     eff_in_scope_assets = list(scope_meta.get("in_scope_assets") or [])
     eff_out_of_scope_assets = list(scope_meta.get("out_of_scope_assets") or [])
+
+    def _extend_offline_unique(dest: list[str], items: Any) -> None:
+        if not isinstance(items, (list, tuple)):
+            return
+        for item in items:
+            s = str(item or "").strip()
+            if s and s not in dest:
+                dest.append(s)
+
+    if eff_loopback_only and opts.scope_file is not None:
+        try:
+            lb_scope_doc = load_scope_file(Path(opts.scope_file).expanduser())
+            sf_in, sf_out = _extract_scope_asset_lists(lb_scope_doc)
+            _extend_offline_unique(eff_in_scope_assets, _filter_loopback_scope_assets(sf_in))
+            _extend_offline_unique(eff_out_of_scope_assets, _filter_loopback_scope_assets(sf_out))
+        except ValueError:
+            pass
 
     asset_graph_doc: dict[str, Any] | None = None
     if opts.asset_graph is not None:
@@ -2820,6 +2859,17 @@ def main(argv: list[str] | None = None) -> int:
         if not isinstance(loaded_ag, dict) or loaded_ag.get("schema") != "cco-asset-graph/1":
             parser.error("asset graph must be a valid cco-asset-graph/1 JSON object")
         asset_graph_doc = loaded_ag
+        ag_scope = asset_graph_doc.get("scope")
+        if isinstance(ag_scope, dict):
+            ag_in = ag_scope.get("in_scope_assets")
+            ag_out = ag_scope.get("out_of_scope_assets")
+            if eff_loopback_only:
+                _extend_offline_unique(eff_in_scope_assets, _filter_loopback_scope_assets(ag_in))
+                _extend_offline_unique(eff_out_of_scope_assets, _filter_loopback_scope_assets(ag_out))
+            else:
+                _extend_offline_unique(eff_in_scope_assets, ag_in)
+                _extend_offline_unique(eff_out_of_scope_assets, ag_out)
+            _extend_offline_unique(eff_excluded_paths, ag_scope.get("excluded_paths"))
 
     seed_surface_doc: dict[str, Any] | None = None
     har_flows_doc: dict[str, Any] | None = None

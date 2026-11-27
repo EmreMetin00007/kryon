@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import importlib
 import inspect
 import json
@@ -10,6 +11,7 @@ import math
 import os
 from pathlib import Path
 import sys
+import tempfile
 import threading
 import time
 from typing import Any, Sequence
@@ -959,9 +961,53 @@ def run_agentic_target(
         "session_check_path": eff_session_check_path,
         "global_headers": global_headers,
     }
+    resolved_auth_hdr = ""
     if eff_refresh_path:
         actor_mgr_kwargs["refresh_path"] = eff_refresh_path
     actors = ActorManager(accounts, **actor_mgr_kwargs)
+
+    def _host_session_cache_path() -> Path:
+        raw_home = (os.environ.get("CCO_HOME") or "").strip()
+        cco_home = Path(raw_home).expanduser() if raw_home else (Path.home() / ".cco")
+        key = hashlib.sha256(str(output.resolve()).encode("utf-8")).hexdigest()[:24]
+        return cco_home / "run-state" / f"sessions-{key}.json"
+
+    def _save_private_actor_sessions() -> None:
+        snap = actors.export_private_sessions()
+        cache_path = _host_session_cache_path()
+        cache_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        fd, tmp_name = tempfile.mkstemp(prefix=".sessions-", suffix=".tmp", dir=str(cache_path.parent))
+        tmp_path = Path(tmp_name)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                json.dump(snap, fh, separators=(",", ":"))
+            os.chmod(tmp_path, 0o600)
+            os.replace(tmp_path, cache_path)
+        except Exception:
+            try:
+                tmp_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+    def _load_private_actor_sessions() -> None:
+        cache_path = _host_session_cache_path()
+        if not cache_path.is_file():
+            return
+        try:
+            loaded = json.loads(cache_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return
+        if isinstance(loaded, dict) and loaded:
+            actors.import_private_sessions(loaded)
+
+    if resume:
+        _load_private_actor_sessions()
+    else:
+        try:
+            _host_session_cache_path().unlink(missing_ok=True)
+        except OSError:
+            pass
+
     http_client = AgenticHTTPClient(
         base_url=base,
         receipt_store=receipt_store,
@@ -973,7 +1019,9 @@ def run_agentic_target(
         out_of_scope_assets=eff_out_of_scope_assets,
         max_degradation_streak=max(0, int(max_degradation_streak)),
         max_rps=eff_max_rps,
+        on_session_mutated=_save_private_actor_sessions,
     )
+    del resolved_auth_hdr
 
     scope_summary = {
         "loopback_only": eff_loopback_only,
@@ -1220,6 +1268,7 @@ def run_agentic_target(
     finally:
         if configured_oob is not None:
             configured_oob.close()
+        _save_private_actor_sessions()
         http_client.close()
         transport.close_upstream()
         findings_file = output / "findings.json"

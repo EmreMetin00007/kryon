@@ -11,7 +11,7 @@ import re
 import sys
 import threading
 from typing import Any, Callable, Iterable, Sequence
-from urllib.parse import urlsplit
+from urllib.parse import unquote_plus, urlsplit
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(_REPO_ROOT) not in sys.path:
@@ -60,6 +60,35 @@ _GENERIC_WAF_BODY_SIGNATURES: tuple[str, ...] = (
     "incident id",
     "support id",
     "web application firewall",
+)
+
+_ATTACK_PROBE_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"<\s*/?\s*(?:script|svg|iframe|object)\b", re.IGNORECASE),
+    re.compile(r"\bon(?:error|load|focus|mouseover|click)\s*=", re.IGNORECASE),
+    re.compile(r"\bjavascript\s*:", re.IGNORECASE),
+    re.compile(r"(?:'|\"|%27|%22)\s*(?:or|and)\s+(?:1\s*=\s*1|'[^']*'\s*=\s*'[^']*'|\d+\s*=\s*\d+)", re.IGNORECASE),
+    re.compile(r"\bunion\s+(?:all\s+)?select\b", re.IGNORECASE),
+    re.compile(r"\b(?:sleep|pg_sleep|benchmark)\s*\(|\bwaitfor\s+delay\b", re.IGNORECASE),
+    re.compile(r"(?:\.\./|\.\.\\|/etc/passwd)", re.IGNORECASE),
+    re.compile(r"\{\{\s*7\s*\*\s*7\s*\}\}|\$\{\s*(?:jndi:|7\s*\*\s*7)", re.IGNORECASE),
+    re.compile(r"(?:^|[;&|`])\s*(?:id|whoami|uname)\b|`(?:id|whoami)`|\$\(\s*(?:id|whoami)\s*\)", re.IGNORECASE),
+)
+
+_AUTH_OR_CSRF_PATH_TOKENS = ("/login", "/signin", "/oauth/", "/logout", "/csrf")
+_PROXY_SERVER_HINTS = (
+    "nginx",
+    "openresty",
+    "apache",
+    "caddy",
+    "envoy",
+    "haproxy",
+    "varnish",
+    "traefik",
+    "awselb",
+    "modsecurity",
+    "mod_security",
+    "coraza",
+    "naxsi",
 )
 
 _WAF_PROFILES_LOADED = False
@@ -182,6 +211,60 @@ def _match_fallback_signatures(
     return False, None
 
 
+def _request_contains_attack_probe(receipt: dict[str, Any]) -> bool:
+    """True when the request URL/query/body carries an explicit active-attack test pattern."""
+    raw_url = str(receipt.get("url") or receipt.get("path") or "")
+    raw_body = str(receipt.get("request_body") or "")
+    parsed = urlsplit(raw_url)
+    path_and_query = f"{parsed.path}?{parsed.query}" if parsed.query else parsed.path
+    decoded_url = unquote_plus(path_and_query)
+    decoded_body = unquote_plus(raw_body[:4096]) if raw_body else ""
+    samples = (path_and_query, decoded_url, raw_body[:4096], decoded_body)
+    return any(pat.search(sample) for sample in samples if sample for pat in _ATTACK_PROBE_PATTERNS)
+
+
+def _is_behavioral_edge_block(
+    *,
+    status: int,
+    receipt: dict[str, Any],
+    header_lower: str,
+    body_lower: str,
+    content_type: str,
+    is_json_app_error: bool,
+) -> bool:
+    """Detect generic edge/ModSecurity 403/406 HTML blocks triggered by active-attack payloads."""
+    if status not in {403, 406} or is_json_app_error:
+        return False
+    if len(body_lower) > 32768:
+        return False
+    url_path = (urlsplit(str(receipt.get("url") or receipt.get("path") or "")).path or "").lower()
+    if any(tok in url_path for tok in _AUTH_OR_CSRF_PATH_TOKENS):
+        return False
+    is_html_or_text = (
+        not content_type
+        or "html" in content_type
+        or "text/plain" in content_type
+        or "<html" in body_lower[:512]
+    )
+    if not is_html_or_text:
+        return False
+    has_block_text = any(
+        marker in body_lower
+        for marker in ("403 forbidden", "406 not acceptable", "<title>403", "<title>406", "<h1>403", "<h1>406", "access denied", "request blocked", "forbidden")
+    )
+    if not has_block_text:
+        return False
+    has_proxy_or_default_page = (
+        any(srv in header_lower or srv in body_lower for srv in _PROXY_SERVER_HINTS)
+        or "<center><h1>403 forbidden</h1></center>" in body_lower
+        or "<title>403 forbidden</title>" in body_lower
+        or "<title>406 not acceptable</title>" in body_lower
+    )
+    if not has_proxy_or_default_page:
+        return False
+    return _request_contains_attack_probe(receipt)
+
+
 def detect_waf_block(receipt: dict[str, Any]) -> dict[str, Any] | None:
     """Passively classify whether a stored HTTP receipt is an upstream WAF/CDN block.
 
@@ -254,6 +337,21 @@ def detect_waf_block(receipt: dict[str, Any]) -> dict[str, Any] | None:
         return {
             "waf_blocked": True,
             "vendor": vendor,
+            "classification": "waf_block",
+            "status": status,
+        }
+
+    if _is_behavioral_edge_block(
+        status=status,
+        receipt=receipt,
+        header_lower=header_lower,
+        body_lower=body_lower,
+        content_type=content_type,
+        is_json_app_error=is_json_app_error,
+    ):
+        return {
+            "waf_blocked": True,
+            "vendor": vendor_hint or "edge_waf",
             "classification": "waf_block",
             "status": status,
         }

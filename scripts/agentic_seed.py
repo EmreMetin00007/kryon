@@ -2244,6 +2244,43 @@ def _is_postman_dict(data: Any) -> bool:
     )
 
 
+_POSTMAN_SAFE_BASE_VAR_SUFFIXES = ("_base", "_url", "_origin", "_host", "_uri", "_endpoint")
+_POSTMAN_SECRET_VAR_SUBSTRINGS = (
+    "token",
+    "secret",
+    "password",
+    "passwd",
+    "cookie",
+    "credential",
+    "bearer",
+    "session",
+    "jwt",
+    "private",
+    "api_key",
+    "apikey",
+    "access_key",
+)
+
+
+def _is_safe_postman_url_base_var(key: str, val_s: str) -> bool:
+    """Allow safe Postman endpoint-base variables like ``authBase`` when value is a clean HTTP(S) URL."""
+    snake, tokens = _to_snake_tokens(key)
+    if not snake:
+        return False
+    if any(sub in snake for sub in _POSTMAN_SECRET_VAR_SUBSTRINGS) or "key" in tokens:
+        return False
+    if not (
+        snake in {"base", "host", "origin", "url"}
+        or snake.endswith(_POSTMAN_SAFE_BASE_VAR_SUFFIXES)
+    ):
+        return False
+    low_val = val_s.strip().lower()
+    if not low_val.startswith(("http://", "https://")):
+        return False
+    parsed = urlsplit(val_s.strip())
+    return bool(parsed.netloc) and parsed.username is None and parsed.password is None
+
+
 def _extract_postman_variables(raw_vars: Any) -> dict[str, str]:
     out: dict[str, str] = {}
     if not isinstance(raw_vars, list):
@@ -2256,7 +2293,9 @@ def _extract_postman_variables(raw_vars: Any) -> dict[str, str]:
         if not key or val is None:
             continue
         val_s = str(val).strip()
-        if not val_s or _is_sensitive_template_key(key):
+        if not val_s:
+            continue
+        if _is_sensitive_template_key(key) and not _is_safe_postman_url_base_var(key, val_s):
             continue
         out[key] = val_s
     return out

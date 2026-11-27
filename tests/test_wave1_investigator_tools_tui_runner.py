@@ -440,6 +440,7 @@ def test_sharded_resume_skips_stage1_and_completed_shards_and_rescues_mid_stage2
             enable_telemetry=True,
         )
         run1_stages: list[str] = []
+        shard1_done = threading.Event()
 
         def _run1_exec(**kwargs: Any) -> tuple[str, int, list[dict[str, Any]]]:
             disp = kwargs["dispatcher"]
@@ -464,7 +465,9 @@ def test_sharded_resume_skips_stage1_and_completed_shards_and_rescues_mid_stage2
             disp.findings.append(finding_stub)
             disp._save_findings()
             if cluster.shard_id == "shard-1":
+                shard1_done.set()
                 return "finished", 1, kwargs["messages"]
+            shard1_done.wait(timeout=5.0)
             cancel_ev.set()
             return "interrupted", 1, kwargs["messages"]
 

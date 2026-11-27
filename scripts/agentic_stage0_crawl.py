@@ -4259,11 +4259,11 @@ def _crawl_actor_playwright(
                 hdrs = dict(getattr(req, "headers", None) or {})
             except Exception:
                 hdrs = {}
-            blocked_app_hdrs = set(base_actor_auth_header_names) | set(operator_override_names)
+            blocked_app_hdrs = set(base_actor_auth_header_names)
             if callable(sensitive_fn):
                 for sh in sensitive_fn() or ():
                     low_sh = str(sh or "").strip().lower()
-                    if low_sh:
+                    if low_sh and low_sh not in operator_override_names:
                         blocked_app_hdrs.add(low_sh)
             collector.record_observed_app_headers(hdrs, blocked_names=blocked_app_hdrs)
             ctype = str(hdrs.get("content-type") or hdrs.get("Content-Type") or "")
@@ -5778,6 +5778,21 @@ def _run_layer4_passive_fusion(
         if stop_probing:
             return
 
+    # Next.js _buildManifest.js discovered directly via __NEXT_DATA__ precedes blind spec guessing.
+    for manifest_ref in discovered_lazy_manifests[:1]:
+        if (
+            stop_probing
+            or collector.passive_probes_sent >= primary_probe_limit
+            or not stage0_budget.can_spend(include_reserve=True)
+        ):
+            break
+        if manifest_ref in collector.captured_js:
+            continue
+        for m_cand in _prepare_probe_candidates([manifest_ref]):
+            _execute_probe(m_cand, probe_cap=primary_probe_limit)
+            if stop_probing:
+                return
+
     if not found_openapi_spec and collector.passive_probes_sent < primary_probe_limit:
         for probe_path in _prepare_probe_candidates(_ROOT_SPEC_PROBES):
             if collector.passive_probes_sent >= primary_probe_limit:
@@ -5803,21 +5818,6 @@ def _run_layer4_passive_fusion(
             if collector.passive_probes_sent >= primary_probe_limit:
                 break
             _execute_probe(probe_path, probe_cap=primary_probe_limit)
-            if stop_probing:
-                return
-
-    # Optional Next.js _buildManifest.js probe (at most 1) if discovered via __NEXT_DATA__.
-    for manifest_ref in discovered_lazy_manifests[:1]:
-        if (
-            stop_probing
-            or collector.passive_probes_sent >= primary_probe_limit
-            or not stage0_budget.can_spend(include_reserve=True)
-        ):
-            break
-        if manifest_ref in collector.captured_js:
-            continue
-        for m_cand in _prepare_probe_candidates([manifest_ref]):
-            _execute_probe(m_cand, probe_cap=primary_probe_limit)
             if stop_probing:
                 return
 

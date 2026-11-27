@@ -654,7 +654,8 @@ class ActorSession:
     last_auth_status: int | None = None
     last_auth_path: str = ""
     last_auth_error: str = ""
-    _lock: threading.RLock = field(default_factory=threading.RLock, init=False, repr=False, compare=False)
+    _auth_generation: int = field(default=0, init=False, repr=False, compare=False)
+    _lock: threading.RLock = field(default_factory=lambda: threading.RLock(), init=False, repr=False, compare=False)
     _registered_secrets: list[str] = field(default_factory=list, init=False, repr=False, compare=False)
 
     def register_secret(self, value: str) -> None:
@@ -1672,6 +1673,9 @@ class ActorManager:
                     session.register_secret(session.refresh_token)
                 session.refresh_token = cap_refresh
                 rotated_secrets.append(cap_refresh)
+        if mutated:
+            with session._lock:
+                session._auth_generation += 1
         if rotated_secrets:
             self.register_secrets(rotated_secrets, alias=alias)
         return mutated
@@ -1762,6 +1766,183 @@ class ActorManager:
             if session.local_storage:
                 state["local_storage"] = dict(session.local_storage)
             return state
+
+    def export_private_sessions(self) -> dict[str, dict[str, Any]]:
+        """Serialize authenticated non-anon actor tokens/cookies for private host-side `--resume` persistence."""
+        out: dict[str, dict[str, Any]] = {}
+        with self._lock:
+            items = list(self.actors.items())
+        for alias, session in items:
+            if alias == "anon":
+                continue
+            with session._lock:
+                if not (
+                    session.authenticated
+                    or session.access_token
+                    or session.refresh_token
+                    or session.cookies
+                    or session.cookie_records
+                    or session.csrf_token
+                ):
+                    continue
+                out[alias] = {
+                    "authenticated": bool(session.authenticated),
+                    "access_token": session.access_token,
+                    "auth_header_name": session.auth_header_name,
+                    "auth_header_prefix": session.auth_header_prefix,
+                    "refresh_token": session.refresh_token,
+                    "refresh_path": session.refresh_path,
+                    "csrf_token": session.csrf_token,
+                    "csrf_header_name": session.csrf_header_name,
+                    "csrf_field_name": session.csrf_field_name,
+                    "base_headers": dict(session.base_headers),
+                    "cookies": dict(session.cookies),
+                    "cookie_records": [dict(r) for r in session.cookie_records],
+                    "local_storage": dict(session.local_storage),
+                    "local_storage_by_origin": {
+                        orig: dict(vals) for orig, vals in session.local_storage_by_origin.items()
+                    },
+                    "last_auth_status": session.last_auth_status,
+                    "last_auth_path": session.last_auth_path,
+                    "auth_generation": int(session._auth_generation),
+                }
+        return out
+
+    def import_private_sessions(self, snapshot: dict[str, Any]) -> int:
+        """Restore private rotated actor sessions (preserving retired secrets for receipt redaction)."""
+        if not isinstance(snapshot, dict):
+            return 0
+        restored = 0
+        for raw_alias, payload in snapshot.items():
+            alias = str(raw_alias or "").strip()
+            if not alias or alias == "anon" or not isinstance(payload, dict):
+                continue
+            with self._lock:
+                session = self.actors.get(alias)
+            if session is None:
+                continue
+            prior_secrets = session.collect_secrets()
+            new_secrets: list[str] = []
+            with session._lock:
+                session.authenticated = bool(payload.get("authenticated", session.authenticated))
+                session.access_token = str(payload.get("access_token") or "")
+                session.auth_header_name = str(payload.get("auth_header_name") or session.auth_header_name)
+                session.auth_header_prefix = str(payload.get("auth_header_prefix") or session.auth_header_prefix)
+                session.refresh_token = str(payload.get("refresh_token") or "")
+                if payload.get("refresh_path"):
+                    session.refresh_path = str(payload["refresh_path"])
+                session.csrf_token = str(payload.get("csrf_token") or "")
+                if payload.get("csrf_header_name"):
+                    session.csrf_header_name = str(payload["csrf_header_name"])
+                if payload.get("csrf_field_name"):
+                    session.csrf_field_name = str(payload["csrf_field_name"])
+                if isinstance(payload.get("base_headers"), dict):
+                    session.base_headers = {str(k): str(v) for k, v in payload["base_headers"].items()}
+                if isinstance(payload.get("cookies"), dict):
+                    session.cookies = {str(k): str(v) for k, v in payload["cookies"].items()}
+                if isinstance(payload.get("cookie_records"), list):
+                    session.cookie_records = [dict(r) for r in payload["cookie_records"] if isinstance(r, dict)]
+                if isinstance(payload.get("local_storage"), dict):
+                    session.local_storage = {str(k): str(v) for k, v in payload["local_storage"].items()}
+                if isinstance(payload.get("local_storage_by_origin"), dict):
+                    session.local_storage_by_origin = {
+                        str(orig): {str(k): str(v) for k, v in vals.items()}
+                        for orig, vals in payload["local_storage_by_origin"].items()
+                        if isinstance(vals, dict)
+                    }
+                if isinstance(payload.get("last_auth_status"), int):
+                    session.last_auth_status = payload["last_auth_status"]
+                if payload.get("last_auth_path"):
+                    session.last_auth_path = str(payload["last_auth_path"])
+                try:
+                    restored_gen = int(payload.get("auth_generation") or 0)
+                except (TypeError, ValueError):
+                    restored_gen = 0
+                session._auth_generation = max(session._auth_generation, restored_gen)
+                new_secrets = session.collect_secrets()
+            if prior_secrets or new_secrets:
+                self.register_secrets([*prior_secrets, *new_secrets], alias=alias)
+            restored += 1
+        return restored
+
+
+_GQL_EXPIRED_CODES = frozenset({
+    "UNAUTHENTICATED",
+    "TOKEN_EXPIRED",
+    "EXPIRED_TOKEN",
+    "INVALID_TOKEN",
+    "INVALID_JWT",
+})
+_GQL_EXPIRED_MSGS = (
+    "unauthenticated",
+    "token expired",
+    "token_expired",
+    "expired token",
+    "jwt expired",
+    "session expired",
+    "authentication required",
+    "invalid refresh token",
+    "invalid token",
+)
+
+
+def _single_gql_obj_is_unauthenticated(obj: dict[str, Any]) -> tuple[bool, bool]:
+    """Return ``(is_unauthenticated, is_explicit_forbidden)`` for a single GraphQL JSON envelope."""
+    data_val = obj.get("data")
+    if isinstance(data_val, dict) and any(v is not None for v in data_val.values()):
+        return False, False
+    errors = obj.get("errors")
+    if not isinstance(errors, list) or not errors:
+        return False, False
+    for err in errors:
+        if not isinstance(err, dict):
+            continue
+        ext = err.get("extensions")
+        if isinstance(ext, dict):
+            code = str(ext.get("code") or "").strip().upper()
+            if code in {"FORBIDDEN", "PERMISSION_DENIED"}:
+                return False, True
+            if code in _GQL_EXPIRED_CODES:
+                return True, False
+        msg = str(err.get("message") or "").strip().lower()
+        if any(tok in msg for tok in _GQL_EXPIRED_MSGS):
+            return True, False
+    return False, False
+
+
+def _is_graphql_unauthenticated_response(receipt: dict[str, Any]) -> bool:
+    """True when HTTP 200 single or batched GraphQL response reports expired/unauthenticated credentials."""
+    if int(receipt.get("status") or 0) != 200:
+        return False
+    body = str(receipt.get("body") or "").lstrip()
+    if not body.startswith(("{", "[")):
+        return False
+    try:
+        parsed = json.loads(body[:65536])
+    except ValueError:
+        return False
+    if isinstance(parsed, dict):
+        is_unauth, _ = _single_gql_obj_is_unauthenticated(parsed)
+        return is_unauth
+    if isinstance(parsed, list) and parsed:
+        objs = [item for item in parsed if isinstance(item, dict)]
+        if not objs:
+            return False
+        any_substantive_data = any(
+            isinstance(item.get("data"), dict) and any(v is not None for v in item["data"].values())
+            for item in objs
+        )
+        if any_substantive_data:
+            return False
+        any_unauth = False
+        for item in objs:
+            u_flag, f_flag = _single_gql_obj_is_unauthenticated(item)
+            if f_flag:
+                return False
+            if u_flag:
+                any_unauth = True
+        return any_unauth
+    return False
 
 
 def _get_raw_socket(raw_stream: Any) -> Any:
@@ -2098,6 +2279,7 @@ class AgenticHTTPClient:
         max_rate_limit_retries: int = _MAX_RATE_LIMIT_RETRIES,
         deadline_monotonic: float | None = None,
         custom_headers: dict[str, Any] | Sequence[str] | None = None,
+        on_session_mutated: Callable[[], None] | None = None,
         _sleep_fn: Callable[[float], None] | None = None,
         _monotonic_fn: Callable[[], float] | None = None,
     ):
@@ -2152,11 +2334,22 @@ class AgenticHTTPClient:
         self._cache: dict[tuple[Any, ...], dict[str, Any]] = {}
         self._lock = threading.Lock()
         self._auth_lock = threading.RLock()
+        self._refresh_cond = threading.Condition(self._lock)
         self._in_session_refresh: bool = False
+        self._refresh_owner_tid: int | None = None
         self._refreshing_actors: set[str] = set()
         self._refresh_already_attempted: bool = False
+        self._on_session_mutated: Callable[[], None] | None = on_session_mutated
         self._dns_guard_enabled: bool = not bool(self.scope_guard.loopback_only)
         self._last_burst_degradation_at: float | None = None
+
+    def _notify_session_mutated(self) -> None:
+        cb = self._on_session_mutated
+        if cb is not None:
+            try:
+                cb()
+            except Exception:
+                pass
 
     def _acquire_rate_limit_slot(self, *, skip_adaptive: bool = False) -> None:
         """Pace live wire calls monotonically using max_rps and adaptive 429 delay."""
@@ -2904,6 +3097,8 @@ class AgenticHTTPClient:
                             session.last_auth_path = r_path
                             session.last_auth_error = ""
                             session.authenticated = True
+                            session._auth_generation += 1
+                        self._notify_session_mutated()
                         self._invalidate_actor_cache(alias)
                         return True
                 except (BudgetExhaustedError, ServiceDegradationError):
@@ -3073,6 +3268,8 @@ class AgenticHTTPClient:
                 with session._lock:
                     session.authenticated = True
                     session.last_auth_error = ""
+                    session._auth_generation += 1
+                self._notify_session_mutated()
                 if force_login:
                     self._invalidate_actor_cache(alias)
                 return True
@@ -3228,13 +3425,29 @@ class AgenticHTTPClient:
         if not alias or alias == "anon":
             return False
         session = self.actors.get(alias)
+        tid = threading.get_ident()
+        with session._lock:
+            start_gen = int(session._auth_generation)
         with self._lock:
-            if self._in_session_refresh or alias in self._refreshing_actors:
+            if self._in_session_refresh and (
+                self._refresh_owner_tid is None or self._refresh_owner_tid == tid
+            ):
                 return False
+            if alias in self._refreshing_actors:
+                deadline = time.monotonic() + 15.0
+                while alias in self._refreshing_actors:
+                    rem = deadline - time.monotonic()
+                    if rem <= 0.0:
+                        break
+                    self._refresh_cond.wait(timeout=rem)
+                with session._lock:
+                    return bool(session.authenticated and session._auth_generation > start_gen)
             self._refreshing_actors.add(alias)
         try:
             with self._auth_lock:
                 with session._lock:
+                    if session.authenticated and session._auth_generation > start_gen:
+                        return True
                     was_authenticated = bool(session.authenticated)
                     refresh_tok = session.refresh_token
                     actor_refresh_path = session.refresh_path
@@ -3337,8 +3550,10 @@ class AgenticHTTPClient:
                                 session.last_auth_path = r_path
                                 session.last_auth_error = ""
                                 session.authenticated = True
+                                session._auth_generation += 1
                                 rotated_secrets = session.collect_secrets()
                             self.actors.register_secrets(rotated_secrets, alias=alias)
+                            self._notify_session_mutated()
                             self._invalidate_actor_cache(alias)
                             return True
                     except (BudgetExhaustedError, ServiceDegradationError):
@@ -3348,7 +3563,11 @@ class AgenticHTTPClient:
 
                 if has_password and self.actors.login_path:
                     prev_skip = self._refresh_already_attempted
+                    prev_in = self._in_session_refresh
+                    prev_tid = self._refresh_owner_tid
                     self._refresh_already_attempted = attempted_step1_refresh
+                    self._in_session_refresh = True
+                    self._refresh_owner_tid = tid
                     try:
                         refreshed_via_login = bool(self.authenticate_actor(alias, force_login=True))
                         if refreshed_via_login:
@@ -3356,10 +3575,13 @@ class AgenticHTTPClient:
                         return refreshed_via_login
                     finally:
                         self._refresh_already_attempted = prev_skip
+                        self._in_session_refresh = prev_in
+                        self._refresh_owner_tid = prev_tid
                 return False
         finally:
             with self._lock:
                 self._refreshing_actors.discard(alias)
+                self._refresh_cond.notify_all()
 
     def _auth_exempt_paths(self, actor_refresh_path: str = "") -> set[str]:
         """Return normalized paths (login / refresh) that must never trigger mid-run auto-refresh."""
@@ -3671,13 +3893,17 @@ class AgenticHTTPClient:
             is_burst=bool(concurrent_burst),
         )
 
-        # Auto mid-run session refresh / re-login once on unexpected 401 when not overriding auth.
+        # Auto mid-run session refresh / re-login once on unexpected 401 or GraphQL UNAUTHENTICATED 200.
         with session._lock:
             actor_refresh_path = session.refresh_path
         auth_exempt_paths = self._auth_exempt_paths(actor_refresh_path)
         norm_req_path = path.rstrip("/") or "/"
-        if (
+        needs_auth_refresh = (
             receipt["status"] == 401
+            or _is_graphql_unauthenticated_response(receipt)
+        )
+        if (
+            needs_auth_refresh
             and actor != "anon"
             and not has_auth_override
             and not save_session_as
