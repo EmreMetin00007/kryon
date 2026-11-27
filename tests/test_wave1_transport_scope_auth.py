@@ -273,40 +273,52 @@ def test_decode_raw_response_zstd_chained_and_accept_encoding(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from compression import zstd
-
     payload = json.dumps({"msg": "compressed-ok", "n": 42}).encode("utf-8")
-    zstd_bytes = zstd.compress(payload)
-    assert _decode_raw_response(zstd_bytes, "zstd") == payload
+    if agentic_http._stdlib_zstd is not None:
+        zstd_bytes = agentic_http._stdlib_zstd.compress(payload)
+        assert _decode_raw_response(zstd_bytes, "zstd") == payload
 
     # Chained encoding: "gzip, deflate" (inner gzip -> outer deflate).
     chained_bytes = zlib.compress(gzip.compress(payload))
     assert _decode_raw_response(chained_bytes, "gzip, deflate") == payload
 
-    # Session Accept-Encoding advertises zstd (Python 3.14 stdlib) and NEVER advertises br when unavailable.
+    # Session Accept-Encoding advertises zstd only when runtime zstd support exists, never br when absent.
     store = ReceiptStore(tmp_path / "enc")
     client = AgenticHTTPClient(base_url="http://127.0.0.1:18080/", receipt_store=store)
     try:
         ae = client._get_session().headers["Accept-Encoding"].lower()
-        assert "gzip" in ae and "deflate" in ae and "zstd" in ae
+        assert "gzip" in ae and "deflate" in ae
+        if agentic_http._stdlib_zstd is not None or agentic_http._zstandard is not None:
+            assert "zstd" in ae
+        else:
+            assert "zstd" not in ae
         if agentic_http._brotli is None:
             assert "br" not in ae
     finally:
         client.close()
 
-    # Fake brotli module works end-to-end when importable.
+    # Fake brotli and stdlib zstd modules work end-to-end when importable (including on Python 3.12).
     monkeypatch.setattr(
         agentic_http,
         "_brotli",
         SimpleNamespace(decompress=lambda b: b.removeprefix(b"BR:")),
     )
     assert _decode_raw_response(b"BR:hello-br", "br") == b"hello-br"
+    monkeypatch.setattr(
+        agentic_http,
+        "_stdlib_zstd",
+        SimpleNamespace(decompress=lambda b: b.removeprefix(b"ZS:"), ZstdError=ValueError),
+    )
+    assert _decode_raw_response(b"ZS:hello-zstd", "zstd") == b"hello-zstd"
 
 
 def test_live_zstd_and_case_insensitive_headers(tmp_path: Path) -> None:
-    from compression import zstd
-
-    body_bytes = zstd.compress(b'{"hello":"zstd"}')
+    if agentic_http._stdlib_zstd is not None:
+        encoding_name = "zstd"
+        body_bytes = agentic_http._stdlib_zstd.compress(b'{"hello":"zstd"}')
+    else:
+        encoding_name = "gzip"
+        body_bytes = gzip.compress(b'{"hello":"zstd"}')
 
     def _handler(_method: str, path: str, _hdrs: dict[str, str], _body: bytes) -> tuple[int, list[tuple[str, str]], bytes]:
         if path == "/zstd":
@@ -314,7 +326,7 @@ def test_live_zstd_and_case_insensitive_headers(tmp_path: Path) -> None:
                 200,
                 [
                     ("content-type", "application/json; charset=utf-8"),
-                    ("content-encoding", "zstd"),
+                    ("content-encoding", encoding_name),
                 ],
                 body_bytes,
             )

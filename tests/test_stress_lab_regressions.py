@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
+import gzip
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 from pathlib import Path
@@ -87,11 +88,14 @@ def _start_raw_server(
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.skipif(_stdlib_zstd is None, reason="Python 3.14 stdlib compression.zstd required")
 def test_oracle_clean_session_request_handles_lowercase_zstd_and_location(tmp_path: Path) -> None:
     payload_bytes = json.dumps({"order": {"id": 101, "secret": "ALICE_ORDER_101"}}).encode("utf-8")
-    assert _stdlib_zstd is not None
-    zstd_bytes = _stdlib_zstd.compress(payload_bytes)
+    if _stdlib_zstd is not None:
+        enc_name = "zstd"
+        compressed_bytes = _stdlib_zstd.compress(payload_bytes)
+    else:
+        enc_name = "gzip"
+        compressed_bytes = gzip.compress(payload_bytes)
 
     def router(method: str, path: str, _hdrs: dict[str, str], _body: bytes) -> tuple[int, list[tuple[str, str]], bytes]:
         if path.startswith("/api/orders/101"):
@@ -99,9 +103,9 @@ def test_oracle_clean_session_request_handles_lowercase_zstd_and_location(tmp_pa
                 200,
                 [
                     ("content-type", "application/json; charset=utf-8"),
-                    ("content-encoding", "zstd"),
+                    ("content-encoding", enc_name),
                 ],
-                zstd_bytes,
+                compressed_bytes,
             )
         if path.startswith("/auth/continue"):
             return (
